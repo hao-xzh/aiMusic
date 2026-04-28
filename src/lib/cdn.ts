@@ -1,0 +1,46 @@
+/**
+ * 网易云 CDN 防盗链绕过。
+ *
+ * 背景：`p*.music.126.net`（封面图）和 `m*.music.126.net`（音频直链）CDN
+ * 都开了 Referer 防盗链。webview 直接加载这些 URL，Referer 是 `tauri://` 或
+ * `http://localhost:4321/`，统统 403。试过 `<meta name="referrer">` +
+ * `referrerpolicy="no-referrer"`，表现不稳定。
+ *
+ * 方案：走 Rust 侧注册的 `claudio-cdn` 自定义 scheme 做代理 —— 前端把 CDN
+ * URL 改写成 `claudio-cdn://localhost/?u=<encoded>`，Rust 侧 handler 用官方
+ * Referer 发出真请求，再把响应 body 塞回来。对 `<img>` 和 `<audio>` 透明。
+ *
+ * 非网易云域名原样返回（比如 `data:` / 相对路径 / 占位图）。
+ *
+ * 平台差异：Tauri 2 在 macOS/Linux 下把自定义 scheme 保留为 `<scheme>://localhost/…`，
+ * Windows 下翻译成 `http://<scheme>.localhost/…` 来绕开 Edge 的 scheme 黑名单。
+ * 这里按 UA 切换一下 base。Rust 侧两种 URI 都能解析，handler 一份就够。
+ */
+export function cdn(raw: string | null | undefined): string {
+  if (!raw) return "";
+  if (typeof raw !== "string") return "";
+  // 非 http(s) 一律不碰（data:、blob:、相对路径等）
+  if (!/^https?:\/\//i.test(raw)) return raw;
+
+  let host = "";
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return raw;
+  }
+  const isNetease =
+    host === "music.163.com" ||
+    host.endsWith(".music.163.com") ||
+    host.endsWith(".music.126.net");
+  if (!isNetease) return raw;
+
+  const base = isWindowsLike()
+    ? "http://claudio-cdn.localhost/"
+    : "claudio-cdn://localhost/";
+  return `${base}?u=${encodeURIComponent(raw)}`;
+}
+
+function isWindowsLike(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Windows/i.test(navigator.userAgent);
+}

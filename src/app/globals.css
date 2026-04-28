@@ -1,0 +1,64 @@
+* { box-sizing: border-box; }
+
+:root {
+  --bg-0: #05060a;
+  --bg-1: #0a0d14;
+  --ink: #e9efff;
+  --ink-dim: #8a93a8;
+  --accent: #9be3c6;
+  --card: rgba(255,255,255,0.96);
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  /* 拍平成纯黑底 —— 之前两条 radial-gradient（80%110% 和 20%10%）
+     透过半透明的 DotField 点会形成"明暗双中心"，肉眼看就是中间一条硬断层。
+     现在把视觉全部交给 DotField + AdaptiveDotField，body 只做底色。 */
+  background: #05060a;
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Inter", "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* body 严格锁死到视口高度，禁止任何方向滚动 ——
+   播放页是"始终铺满一屏"的设计，内容超了应该让卡内的元素（封面/歌词）
+   通过 clamp(...vh) 自己缩，而不是给整页出滚动条。 */
+html, body { height: 100%; }
+body {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+button { font: inherit; }
+
+@keyframes claudioPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.3); opacity: 0.6; }
+}
+
+.glass {
+  background: rgba(12,16,24,0.55);
+  border: 1px solid rgba(233,239,255,0.08);
+  backdrop-filter: blur(14px);
+  border-radius: 22px;
+}
+
+.muted { color: var(--ink-dim); }
+
+/* ===== Windows 适配 =====
+ * decorum 在 Windows 上把原生标题栏从 NCCALCSIZE 拿掉，但会用一个固定在
+ * 顶部的 32px 透明条作为 "标题栏 overlay"，里面包含拖动区 + 三个 min/max/close
+ * 控件（用 Segoe Fluent Icons 图标，外观与 Windows 11 一致）。
+ *
+ * 这条 overlay z-index: 100、position: fixed、top: 0，会盖住我们的 Nav。
+ * 所以 Windows 下把 body 内容下推 32px，给 overlay 让位。
+ */
+html[data-platform="windows"] body {
+  padding-top: 32px;
+}

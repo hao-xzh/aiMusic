@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "windows-only",
+  "description": "Windows 专属：decorum 标题栏控件需要的 plugin 命令权限。",
+  "platforms": ["windows"],
+  "windows": ["main"],
+  "permissions": [
+    "decorum:allow-show-snap-overlay"
+  ]
+}

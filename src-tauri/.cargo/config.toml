@@ -1,0 +1,5 @@
+# 强制忽略用户全局 git config 里那个挂掉的 Clash 代理（127.0.0.1:7890）。
+# 现在的 cargo 用 sparse registry + 自家 HTTP client，只要把 [http].proxy 显式置空，
+# 就能跳过 git config 的 proxy 设置，直连 index.crates.io。
+[http]
+proxy = ""

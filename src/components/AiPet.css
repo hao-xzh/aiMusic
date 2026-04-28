@@ -1,0 +1,325 @@
+/*
+ * Claudio 宠物视觉 ——
+ * 液态光点：几乎没有外壳、没有边框，只有一颗会呼吸的柔软发光核
+ * + 一圈被音波"推开"的软晕。
+ *
+ * 半停靠：
+ *   .claudio-pet-anchor 是一个看不见的"挂点"，位于宠物正上方约 36px。
+ *   一根细绳从挂点垂下来连到光点；整个 anchor 从挂点为原点做风场摆动。
+ *   风力由 rAF 写入 CSS 变量，底风 + 随机阵风，并跟随音乐振幅呼吸。
+ *   光点本身保持 pointer-events，绳索/容器不吃事件。
+ *
+ * 音频反应：
+ *   rAF 读取全局 __claudioAmp，只映射为视觉风力和轻微明度变化；
+ *   不影响音频播放、音量、转场和队列。
+ */
+
+/* ---------- 挂点 + 春风风场 ----------
+ * 两种模式：
+ *   - 默认（无封面）：固定屏幕右下角，挂点在光点正上方 36px。
+ *   - .is-attached（找到封面）：anchor 由 inline style 的 left/top 写进
+ *     视口坐标 = 封面右下角内侧；挂点就是 anchor 自身原点 (0,0)，
+ *     光点位置由 .claudio-pet 在 anchor 内部 absolute 定位垂下来。
+ * 风场都围绕"绳子顶端"做缓慢摆动。
+ */
+.claudio-pet-anchor {
+  position: fixed;
+  right: 36px;
+  bottom: 56px;
+  width: 44px;
+  height: 44px;
+  z-index: 60;
+  transform-origin: 50% -36px;
+  /* 摆动只走 rotate —— anchor 旋转时，下面的光点天然按 transform-origin
+     做钟摆轨迹；之前额外叠的 translate3d 是冗余且造成"双层位移"假象。 */
+  transform: rotate(var(--wind-rotate, 0deg));
+  /* 提示合成器走 GPU 通道，避免 layout/paint */
+  will-change: transform;
+  pointer-events: none;
+  /* --amp / --wind-rotate 由 rAF 写入；--orb-rgb / --orb-rgb-light 由 React 写入 */
+  --amp: 0;
+  --wind-rotate: 0deg;
+  --orb-rgb: 155, 227, 198;
+  --orb-rgb-light: 215, 245, 230;
+  transition: none;
+}
+
+/* 默认模式（无封面）下不挂绳 —— 没有挂点，绳子就该不存在 */
+.claudio-pet-anchor:not(.is-attached)::before {
+  display: none;
+}
+
+/* 绳索（默认模式备用）：光点正上方 36px —— 仅在 .is-attached 下激活，
+   下面那条 rule 的样式会被 .is-attached::before 覆盖；保留是为兼容旧调用 */
+.claudio-pet-anchor::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  width: 1px;
+  height: 36px;
+  margin-left: -0.5px;
+  background: linear-gradient(
+    to top,
+    rgba(var(--orb-rgb-light), 0.78) 0%,
+    rgba(var(--orb-rgb-light), 0.42) 60%,
+    rgba(var(--orb-rgb-light), 0) 100%
+  );
+  /* 不再用 drop-shadow（每帧 rasterize 太贵），仅 amp 触发 brightness/saturate */
+  filter: blur(0.3px) brightness(calc(0.92 + var(--amp, 0) * 0.22))
+    saturate(calc(0.95 + var(--amp, 0) * 0.3));
+  transition:
+    filter 200ms ease,
+    background 600ms ease;
+  pointer-events: none;
+}
+
+/* ----- 半停靠：挂在封面右下角 ----- */
+.claudio-pet-anchor.is-attached {
+  /* 由 inline style 写入 left/top，覆盖默认 right/bottom */
+  width: 0;
+  height: 0;
+  /* 钟摆原点 = 自身 (0,0) = 绳子顶端 = 封面右下内侧 */
+  transform-origin: 0 0;
+  /* 光点离挂点更远，rAF 会自动给 attached 更完整的春风幅度 */
+}
+
+/* 绳索（attached）：从挂点 (0,0) 垂下 ——
+ * 顶端不放结点，第一段半透明渐入，看起来像从封面后面挂出来。
+ * 末端潜入光晕里淡出，避免和液态光点的边交接生硬。
+ */
+.claudio-pet-anchor.is-attached::before {
+  position: absolute;
+  left: -0.5px;
+  top: 0;
+  bottom: auto;
+  margin-left: 0;
+  width: 1px;
+  height: 28px;
+  background: linear-gradient(
+    to bottom,
+    rgba(var(--orb-rgb-light), 0.32) 0%,
+    rgba(var(--orb-rgb-light), 0.78) 22%,
+    rgba(var(--orb-rgb-light), 0.65) 65%,
+    rgba(var(--orb-rgb-light), 0) 100%
+  );
+  filter: blur(0.4px) brightness(calc(0.92 + var(--amp, 0) * 0.22))
+    saturate(calc(0.95 + var(--amp, 0) * 0.3));
+}
+
+/* attached 模式下，光点在 anchor 内部相对挂点垂下来（短绳） */
+.claudio-pet-anchor.is-attached .claudio-pet {
+  position: absolute;
+  /* 按钮 44×44 → -22 水平居中；垂直 14px 让绳子末端潜入光晕 */
+  left: -22px;
+  top: 14px;
+}
+
+/* ---------- 光点本体 ----------
+ * 不再有任何"光晕/涟漪"。一颗安静的液滴坐在那儿，
+ * 靠 filter 跟着 --amp 做颜色/明度的细微变化适配播放页气氛。
+ */
+.claudio-pet {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  overflow: visible;
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.claudio-pet:hover {
+  transform: translateY(-1px);
+}
+
+.claudio-pet:active {
+  transform: translateY(0) scale(0.96);
+}
+
+/* ---------- 液态光点核 ----------
+ * 多层叠加：
+ *   1. 顶部高光：左上 specular highlight，模拟水珠折光
+ *   2. 底部 caustic 反光：水珠透光的回照
+ *   3. 主体：薄荷径向，从中上转底深
+ *   4. 内阴影：右下蓝绿暗面，水珠"重量感"
+ *   5. 上沿液面张力：极淡白细线
+ *   6. 接地：极轻的对比阴影；不是光晕，只是把它从背景拉出来
+ *
+ * 形状：border-radius 八值缓慢 morph，像挂着的液滴在重力下轻微伸缩。
+ * 颜色：filter 通过父级 --amp 做轻微 brightness/saturate 跟音乐适配，
+ *       不再有音乐缩放，不再有光晕。
+ */
+/* ---------- 球体：直接用 logo 作为球面 ----------
+ * 球本身就是 logo 图（裁成液滴形）。在它之上叠：
+ *   ::before specular —— 左上水珠折光高光，让 logo 看起来像被一层水裹住
+ *   ::after  cover 着色 —— soft-light 混合，让球的色调跟封面气氛对齐
+ *   inset box-shadow —— 上沿液面亮线 + 右下重量暗面
+ *   外 box-shadow —— 接地阴影
+ * 形状由 morph keyframes 缓慢变形，anchor 风场让它来回摆，跟"挂着"的设定贴合。
+ */
+.claudio-pet__core {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 26px;
+  height: 26px;
+  border-radius: 50% 48% 52% 49% / 51% 49% 50% 48%;
+  overflow: hidden;
+  background: #d8d4cb; /* logo 底色 fallback，图未载入时不至于全黑 */
+  box-shadow:
+    inset -1.6px -2.2px 4.5px rgba(0, 0, 0, 0.32),
+    inset 0.8px 1.4px 2px rgba(255, 255, 255, 0.45),
+    0 2px 5px rgba(0, 0, 0, 0.45);
+  /* 不再每帧改 drop-shadow / animation-duration —— 那些是上一版"卡顿"的元凶。
+     接地阴影由静态 box-shadow 提供，amp 只调亮度/饱和。 */
+  filter: brightness(calc(0.95 + var(--amp, 0) * 0.18))
+    saturate(calc(0.95 + var(--amp, 0) * 0.28));
+  transition: filter 200ms ease;
+  animation: claudioPetMorph 6.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.claudio-pet__core-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* 顶部 specular：让 logo 像被一层水裹住 */
+.claudio-pet__core::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(
+      ellipse 55% 42% at 30% 22%,
+      rgba(255, 255, 255, 0.55) 0%,
+      rgba(255, 255, 255, 0.18) 36%,
+      rgba(255, 255, 255, 0) 72%
+    ),
+    radial-gradient(
+      ellipse 70% 12% at 50% 92%,
+      rgba(255, 255, 255, 0.32) 0%,
+      rgba(255, 255, 255, 0) 70%
+    );
+  pointer-events: none;
+}
+
+/* 封面色调染：soft-light 让球面情绪跟着封面走，不抢 logo 主体 */
+.claudio-pet__core::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(var(--orb-rgb), 0.42);
+  mix-blend-mode: soft-light;
+  pointer-events: none;
+  transition: background 600ms ease;
+}
+
+/* 液滴形状缓慢 morph —— 八个值轮流偏移，像挂着的水球轻微涨缩 */
+@keyframes claudioPetMorph {
+  0%,
+  100% {
+    border-radius: 50% 48% 52% 49% / 51% 49% 50% 48%;
+  }
+  25% {
+    border-radius: 52% 48% 49% 51% / 48% 52% 49% 51%;
+  }
+  50% {
+    border-radius: 51% 49% 48% 52% / 53% 47% 49% 51%;
+  }
+  75% {
+    border-radius: 48% 52% 51% 49% / 49% 51% 53% 47%;
+  }
+}
+
+/* 涟漪环已经被软晕替代，不再需要硬边圆环 */
+.claudio-pet__ring {
+  display: none;
+}
+
+/* ---- hint 进入动画 ---- */
+@keyframes claudioPetHintIn {
+  0% {
+    transform: translateY(8px) scale(0.96);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+}
+
+/* ---- chat panel ----
+ * 磨砂玻璃面板：低透明 + 强 blur，顶上一道细白细边模拟 Apple 玻璃高光，
+ * 边框用极弱白色 + 一点点封面色，整体气质跟液态光点对齐：克制、温润、不噪。
+ */
+.claudio-pet-panel {
+  position: fixed;
+  right: 22px;
+  bottom: 114px;
+  width: min(360px, calc(100vw - 44px));
+  height: min(480px, calc(100vh - 160px));
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  border-radius: 22px;
+  background:
+    /* 极淡的封面色染层（玻璃下面的"光"） */
+    radial-gradient(
+        ellipse 80% 60% at 80% 0%,
+        rgba(var(--orb-rgb), 0.10) 0%,
+        rgba(var(--orb-rgb), 0) 60%
+      )
+      rgba(20, 22, 28, 0.62);
+  -webkit-backdrop-filter: blur(32px) saturate(160%);
+  backdrop-filter: blur(32px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    /* 顶沿玻璃高光 */
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    /* 整体下投影 */ 0 32px 80px rgba(0, 0, 0, 0.55),
+    /* 一点封面色辉，跟主页气氛勾连 */ 0 8px 32px
+      rgba(var(--orb-rgb), 0.18);
+  overflow: hidden;
+  transform-origin: bottom right;
+  animation: claudioPetPanelIn 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.claudio-pet-panel.is-closing {
+  animation: claudioPetPanelOut 200ms cubic-bezier(0.55, 0, 0.7, 0) forwards;
+}
+
+@keyframes claudioPetPanelIn {
+  0% {
+    transform: translateY(12px) scale(0.94);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes claudioPetPanelOut {
+  0% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(8px) scale(0.96);
+    opacity: 0;
+  }
+}
