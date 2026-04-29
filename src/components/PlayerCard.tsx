@@ -44,7 +44,7 @@ const TITLE_FS = "clamp(17px, 4vw, 22px)";
 const SUBTITLE_FS = "clamp(12px, 3.2vw, 14px)";
 // 容器高度跟行数成比例：3 行 × 每行 ~35px ≈ 105px。
 // 之前 5 行用的 110~180，现在按 3/5 缩到 70~120，单行高度仍维持 ~30-40px。
-const LYRIC_BOX_H = "clamp(72px, 12vh, 120px)";
+const LYRIC_BOX_H = "clamp(156px, 20vh, 220px)";
 // 激活行单独做大并加重 —— 跟 dim 行拉开 6px 字号差，避免 DotField 干扰
 const LYRIC_ACTIVE_FS = "clamp(16px, 4.2vw, 19px)";
 const LYRIC_DIM_FS = "clamp(11px, 2.8vw, 13px)";
@@ -298,10 +298,10 @@ function LyricStrip({
 
   // 渲染所有行：lines/yrcLines 数组本身不变就不重建
   // 但每行需要根据 positionSec 实时算字进度 —— 这一段必须每帧跑
-  const visibleStart = Math.max(0, idx - 2);
+  const visibleStart = Math.max(0, idx - 1);
   const visibleEnd = useYrc
-    ? Math.min(yrcLines.length, idx + 3)
-    : Math.min(lines.length, idx + 3);
+    ? Math.min(yrcLines.length, idx + 2)
+    : Math.min(lines.length, idx + 2);
 
   const renderedLines = useMemo(() => {
     if (useYrc) {
@@ -385,8 +385,8 @@ function LyricStrip({
 }
 
 // 颜色 token —— 已唱（白）/ 未唱（淡灰）。距离当前行越远的行颜色越浅
-const SUNG_WHITE = "rgba(255,255,255,1)";
-const UNSUNG_GRAY = "rgba(233,239,255,0.42)";
+const SUNG_WHITE = "rgba(255,255,255,0.9)";
+const UNSUNG_GRAY = "rgba(168,174,194,0.9)";
 
 /**
  * yrc 一行：每个字独立渲染，按播放进度做颜色过渡 + wipe 渐变。
@@ -406,39 +406,72 @@ function YrcLineView({
   return (
     <div style={lineFrame(isActive, dist)}>
       <div style={lineInner(isActive)}>
-        {line.chars.map((c, i) => (
-          <YrcChar
-            key={i}
-            c={c}
-            positionSec={positionSec}
-            isActive={isActive}
-          />
-        ))}
+        {isActive ? (
+          <YrcActiveLine line={line} positionSec={positionSec} />
+        ) : (
+          <span
+            style={{
+              color: UNSUNG_GRAY,
+              opacity: Math.max(0.4, 1 - dist * 0.18),
+              whiteSpace: "break-spaces",
+            }}
+          >
+            {line.text}
+          </span>
+        )}
       </div>
     </div>
   );
 }
 
-function YrcChar({
-  c,
+function YrcActiveLine({
+  line,
   positionSec,
-  isActive,
 }: {
-  c: { startSec: number; durSec: number; text: string };
+  line: YrcLine;
   positionSec: number;
-  isActive: boolean;
 }) {
+  const chars = line.chars;
+  if (chars.length === 0) {
+    return (
+      <span style={{ color: SUNG_WHITE, whiteSpace: "break-spaces" }}>
+        {line.text}
+      </span>
+    );
+  }
+
+  const currentIdx = chars.findIndex((c) => positionSec < c.startSec + c.durSec);
+  if (currentIdx === -1) {
+    return (
+      <span style={{ color: SUNG_WHITE, whiteSpace: "break-spaces" }}>
+        {line.text}
+      </span>
+    );
+  }
+
+  const current = chars[currentIdx]!;
+  let before = "";
+  let after = "";
+  for (let i = 0; i < currentIdx; i++) before += chars[i]!.text;
+  for (let i = currentIdx + 1; i < chars.length; i++) after += chars[i]!.text;
+
   // 已经过了字尾 → 白；还没到字头 → 灰
   // 正好正在唱 → 用 mask-image 的线性渐变 wipe
   let progress = 0;
-  if (positionSec >= c.startSec + c.durSec) progress = 1;
-  else if (positionSec > c.startSec) progress = (positionSec - c.startSec) / Math.max(0.001, c.durSec);
+  if (positionSec >= current.startSec + current.durSec) progress = 1;
+  else if (positionSec > current.startSec) progress = (positionSec - current.startSec) / Math.max(0.001, current.durSec);
 
-  const beingSung = isActive && progress > 0 && progress < 1;
+  const beingSung = progress > 0 && progress < 1;
   const sung = progress >= 1;
 
   return (
-    <span
+    <>
+      {before && (
+        <span style={{ color: SUNG_WHITE, whiteSpace: "break-spaces" }}>
+          {before}
+        </span>
+      )}
+      <span
       style={{
         position: "relative",
         display: "inline-block",
@@ -459,8 +492,14 @@ function YrcChar({
           : "none",
       }}
     >
-      {c.text}
-    </span>
+        {current.text}
+      </span>
+      {after && (
+        <span style={{ color: UNSUNG_GRAY, whiteSpace: "break-spaces" }}>
+          {after}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -515,15 +554,15 @@ function lineFrame(isActive: boolean, dist: number): React.CSSProperties {
     justifyContent: "center",
     fontSize: isActive ? LYRIC_ACTIVE_FS : LYRIC_DIM_FS,
     fontWeight: isActive ? 600 : 400,
-    letterSpacing: isActive ? -0.2 : 0,
-    transform: isActive ? "scale(1.02)" : "scale(0.97)",
+    letterSpacing: 0,
+    transform: "none",
     transformOrigin: "center",
-    filter: isActive ? "none" : "blur(0.2px)",
+    filter: "none",
     opacity: isActive ? 1 : Math.max(0.55, 1 - dist * 0.14),
     overflow: "visible",
     padding: "3px 12px",
     transition:
-      "transform 520ms cubic-bezier(0.22, 1, 0.36, 1), font-size 520ms cubic-bezier(0.22, 1, 0.36, 1), filter 520ms cubic-bezier(0.22, 1, 0.36, 1), opacity 520ms cubic-bezier(0.22, 1, 0.36, 1)",
+      "font-size 360ms cubic-bezier(0.22, 1, 0.36, 1), opacity 360ms cubic-bezier(0.22, 1, 0.36, 1)",
   };
 }
 
@@ -793,7 +832,7 @@ const lyricBox: React.CSSProperties = {
   marginLeft: "clamp(8px, 4vw, 24px)",
   marginRight: "clamp(8px, 4vw, 24px)",
   height: LYRIC_BOX_H,
-  overflow: "hidden",
+  overflow: "visible",
   textAlign: "center",
   position: "relative",
   // 之前在这里加过一层径向暗化 vignette 来"抠"歌词，
