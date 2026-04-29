@@ -36,9 +36,11 @@
   /* 提示合成器走 GPU 通道，避免 layout/paint */
   will-change: transform;
   pointer-events: none;
-  /* --amp / --wind-rotate 由 rAF 写入；--orb-rgb / --orb-rgb-light 由 React 写入 */
+  /* --amp / --wind-rotate / --beat 由 rAF 写入；--orb-rgb / --orb-rgb-light 由 React 写入 */
   --amp: 0;
   --wind-rotate: 0deg;
+  /* --beat 0..1：每检测到鼓点拉满，再指数衰减 —— CSS 用它做"咚"一下的视觉 punch */
+  --beat: 0;
   --orb-rgb: 155, 227, 198;
   --orb-rgb-light: 215, 245, 230;
   transition: none;
@@ -166,7 +168,11 @@
   position: absolute;
   left: 50%;
   top: 50%;
-  transform: translate(-50%, -50%);
+  /* 节拍跳动：translateY 向上 6px + scale 1→1.09。--beat 由 rAF 在每个鼓点拉满
+     后指数衰减回 0（半衰期 ~110ms），所以这里是一个"咚"完就归位的瞬时动作，
+     肉眼很容易跟上节奏。垂直方向用 -50% - beat*6 把 -50% 居中和向上跳叠加。 */
+  transform: translate(-50%, calc(-50% - var(--beat, 0) * 6px))
+    scale(calc(1 + var(--beat, 0) * 0.09));
   width: 26px;
   height: 26px;
   border-radius: 50% 48% 52% 49% / 51% 49% 50% 48%;
@@ -176,13 +182,15 @@
     inset -1.6px -2.2px 4.5px rgba(0, 0, 0, 0.32),
     inset 0.8px 1.4px 2px rgba(255, 255, 255, 0.45),
     0 2px 5px rgba(0, 0, 0, 0.45);
-  /* 不再每帧改 drop-shadow / animation-duration —— 那些是上一版"卡顿"的元凶。
-     接地阴影由静态 box-shadow 提供，amp 只调亮度/饱和。 */
-  filter: brightness(calc(0.95 + var(--amp, 0) * 0.18))
-    saturate(calc(0.95 + var(--amp, 0) * 0.28));
-  transition: filter 200ms ease;
+  /* amp 调缓慢气氛 + beat 在每拍提亮一下，让"鼓点"也跟一道闪 */
+  filter: brightness(calc(0.95 + var(--amp, 0) * 0.18 + var(--beat, 0) * 0.22))
+    saturate(calc(0.95 + var(--amp, 0) * 0.28 + var(--beat, 0) * 0.35));
+  /* transform 不走 transition —— rAF 直接写就是逐帧，加 transition 反而会糊掉鼓点。
+     filter 留 120ms 缓动，让"提亮"的视觉残留稍微长一点。 */
+  transition: filter 120ms ease;
   animation: claudioPetMorph 6.4s ease-in-out infinite;
   pointer-events: none;
+  will-change: transform, filter;
 }
 
 .claudio-pet__core-img {

@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "claudio"
-version = "0.1.3"
+version = "0.1.17"
 dependencies = [
  "aes",
  "anyhow",

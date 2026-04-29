@@ -1,8 +1,12 @@
-//! DeepSeek chat/completions 调用。
+//! OpenAI 兼容 chat/completions 调用。
 //!
-//! 走 OpenAI 兼容协议，POST `{base_url}/chat/completions`，Bearer 认证。
-//! 当前不做流式（stream=false），一次性拿 content 文本。后续要接"边生成边
-//! TTS"再升级到 SSE。
+//! 三家 provider 都是 OpenAI-compatible（DeepSeek / OpenAI / 小米 MiMo）：
+//!   - POST `{base_url}/chat/completions`
+//!   - `Authorization: Bearer <api_key>`
+//!   - body: `{ model, messages, temperature, max_tokens, stream }`
+//!
+//! 所以这里只需要一份调用逻辑，按 caller 传进来的 base_url / api_key / model 路由即可。
+//! 后续如果接 Anthropic / Gemini 这种不兼容协议的，再单独写一支。
 
 use std::time::Duration;
 
@@ -52,7 +56,7 @@ pub async fn chat(
 ) -> Result<String> {
     let key = api_key.trim();
     if key.is_empty() {
-        return Err(anyhow!("还没填 DeepSeek API key，请在设置里填上"));
+        return Err(anyhow!("还没填 API key，请在设置里填上"));
     }
 
     let url = format!(
@@ -61,7 +65,7 @@ pub async fn chat(
     );
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
 
@@ -79,21 +83,21 @@ pub async fn chat(
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow!("DeepSeek 请求失败：{e}"))?;
+        .map_err(|e| anyhow!("请求失败：{e}"))?;
 
     let status = resp.status();
     let text = resp
         .text()
         .await
-        .map_err(|e| anyhow!("读取 DeepSeek 响应体失败：{e}"))?;
+        .map_err(|e| anyhow!("读取响应体失败：{e}"))?;
 
     if !status.is_success() {
         // 给出 4xx/5xx 原文，便于用户定位（比如 401 = key 错）
-        return Err(anyhow!("DeepSeek {status}：{text}"));
+        return Err(anyhow!("{status}：{text}"));
     }
 
     let parsed: ChatResp = serde_json::from_str(&text).map_err(|e| {
-        anyhow!("DeepSeek 响应解析失败：{e} / body={text}")
+        anyhow!("响应解析失败：{e} / body={text}")
     })?;
 
     parsed
@@ -102,5 +106,5 @@ pub async fn chat(
         .next()
         .map(|c| c.message.content)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("DeepSeek 返回了 0 条内容"))
+        .ok_or_else(|| anyhow!("AI 返回了 0 条内容"))
 }

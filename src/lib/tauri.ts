@@ -101,26 +101,53 @@ export const netease = {
   isLoggedIn: () => invoke<boolean>("netease_is_logged_in"),
 };
 
-// ---------- AI (DeepSeek) ----------
+// ---------- AI (多 provider: DeepSeek / OpenAI / 小米 MiMo) ----------
+
+/** 后端固定支持的 provider id */
+export type ProviderId = "deepseek" | "openai" | "xiaomi-mimo";
 
 /**
- * 前端能拿到的 AI 配置视图 —— 永远不包含完整 key。
- * `keyPreview` 形如 "sk-a•••xyz9"，只给用户确认"这是我填的那把"。
+ * 单个 provider 的状态视图。永远不回传完整 key，只给 hasKey + 预览。
  */
-export type AiConfigPublic = {
+export type ProviderView = {
+  id: ProviderId;
+  label: string;
   hasKey: boolean;
   keyPreview: string | null;
   model: string;
   baseUrl: string;
 };
 
+export type AiConfigPublic = {
+  /** 当前激活的 provider id */
+  activeProvider: ProviderId;
+  providers: ProviderView[];
+};
+
+export type ModelOption = {
+  id: string;
+  label: string;
+};
+
 export const ai = {
   getConfig: () => invoke<AiConfigPublic>("ai_get_config"),
-  setApiKey: (key: string) => invoke<void>("ai_set_api_key", { key }),
-  clearApiKey: () => invoke<void>("ai_clear_api_key"),
-  /** 快速 ping：DeepSeek 回一句 DJ 口吻的短问候，用来验 key 能跑通 */
+  /** 拉某 provider 的已知模型列表（高 → 低排序） */
+  listModels: (provider: ProviderId) =>
+    invoke<ModelOption[]>("ai_list_models", { provider }),
+  /** 切换激活 provider —— 切完 chat/ping 自动走新 provider */
+  setProvider: (provider: ProviderId) =>
+    invoke<void>("ai_set_provider", { provider }),
+  /** 给某 provider 写 / 改 / 清 key（传空串等同 clear） */
+  setApiKey: (provider: ProviderId, key: string) =>
+    invoke<void>("ai_set_api_key", { provider, key }),
+  clearApiKey: (provider: ProviderId) =>
+    invoke<void>("ai_clear_api_key", { provider }),
+  /** 给某 provider 选模型 —— 持久化，下次启动也记得 */
+  setModel: (provider: ProviderId, model: string) =>
+    invoke<void>("ai_set_model", { provider, model }),
+  /** 快速 ping：当前激活 provider 回一句 DJ 口吻的短问候 */
   ping: () => invoke<string>("ai_ping"),
-  /** 通用 chat。system 可省；temperature / maxTokens 不给时后端默认 0.8 / 400 */
+  /** 通用 chat（走当前激活 provider）。temperature/maxTokens 不传时后端默认 0.8/400 */
   chat: (args: {
     system?: string;
     user: string;

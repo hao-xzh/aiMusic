@@ -23,7 +23,7 @@ import { Waveform } from "./Waveform";
 import { usePlayer } from "@/lib/player-state";
 import { findActiveLineIdx, type LrcLine } from "@/lib/lrc";
 import { cdn } from "@/lib/cdn";
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 
 // 兼容导出，page.tsx 里还在 import；现在永远是 "compact"。
 export type PlayerMode = "compact";
@@ -47,6 +47,7 @@ const LYRIC_BOX_H = "clamp(72px, 12vh, 120px)";
 // 激活行单独做大并加重 —— 跟 dim 行拉开 6px 字号差，避免 DotField 干扰
 const LYRIC_ACTIVE_FS = "clamp(16px, 4.2vw, 19px)";
 const LYRIC_DIM_FS = "clamp(11px, 2.8vw, 13px)";
+const COVER_TRANSITION_MS = 720;
 
 // ============== 主组件 ==============
 
@@ -129,6 +130,7 @@ function CoverBox({
   cover?: string | null;
   isPlaying: boolean;
 }) {
+  const coverUrl = cover ? cdn(cover) : null;
   return (
     <div
       data-claudio-cover
@@ -143,29 +145,57 @@ function CoverBox({
           "0 24px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04)",
         transform: isPlaying ? "scale(1.012)" : "scale(1)",
         transition: "transform 4000ms ease-in-out",
+        background:
+          "linear-gradient(135deg, rgba(155,227,198,0.10) 0%, rgba(155,227,198,0.02) 100%)",
       }}
     >
-      {cover ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          src={cdn(cover)}
-          alt=""
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            display: "block",
-          }}
-          onError={(e) => {
-            (e.target as HTMLImageElement).style.opacity = "0";
-          }}
-        />
-      ) : (
-        <div style={coverPlaceholder}>
-          <Waveform height={80} bars={28} gap={3} />
-        </div>
-      )}
+      <CoverImageLayer key={coverUrl ?? "empty-cover"} url={coverUrl} />
+      <div
+        style={{
+          ...coverPlaceholder,
+          opacity: coverUrl ? 0 : 1,
+          transition: `opacity ${COVER_TRANSITION_MS}ms cubic-bezier(0.22, 1, 0.36, 1)`,
+        }}
+      >
+        <Waveform height={80} bars={28} gap={3} />
+      </div>
     </div>
+  );
+}
+
+function CoverImageLayer({
+  url,
+}: {
+  url: string | null;
+}) {
+  const [isLoaded, setIsLoaded] = useState(false);
+  if (!url) return null;
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={url}
+      alt=""
+      style={{
+        position: "absolute",
+        inset: 0,
+        width: "100%",
+        height: "100%",
+        objectFit: "cover",
+        display: "block",
+        opacity: isLoaded ? 1 : 0,
+        transform: isLoaded ? "scale(1)" : "scale(1.018)",
+        filter: isLoaded ? "saturate(1)" : "saturate(0.92)",
+        transition:
+          `opacity ${COVER_TRANSITION_MS}ms cubic-bezier(0.22, 1, 0.36, 1), ` +
+          `transform ${COVER_TRANSITION_MS}ms cubic-bezier(0.22, 1, 0.36, 1), ` +
+          `filter ${COVER_TRANSITION_MS}ms cubic-bezier(0.22, 1, 0.36, 1)`,
+        willChange: "opacity, transform",
+      }}
+      onLoad={() => setIsLoaded(true)}
+      onError={(e) => {
+        (e.target as HTMLImageElement).style.opacity = "0";
+      }}
+    />
   );
 }
 
@@ -480,6 +510,8 @@ const trackColumn: React.CSSProperties = {
 };
 
 const coverPlaceholder: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
   width: "100%",
   height: "100%",
   display: "flex",

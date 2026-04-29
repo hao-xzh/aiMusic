@@ -32,6 +32,16 @@ export type AppContext = {
   timeSlotLabel: string;
   /** 节日名（如"清明节" / "圣诞节"），无则 null */
   holiday: string | null;
+  /**
+   * 距下一个周六还有几天。0=今天就是周末; 1=明天周末; 2-5=工作日还剩几天。
+   * 用来让 AI 说出"马上周末了""周一像没拧紧的螺丝"这类节奏提示。
+   */
+  daysUntilWeekend: number;
+  /**
+   * 7 天内即将到来的节日（不包含今天）。今天就是节日时这个字段为 null,
+   * holiday 字段会带值。让 AI 能说"还有 3 天就国庆"这种期待感。
+   */
+  upcomingHoliday: { name: string; daysAhead: number } | null;
   /** 天气可选：暂时 stub，未来从设置里接的 API 填进来 */
   weather?: { summary: string; tempC?: number };
 };
@@ -89,6 +99,9 @@ export function getAppContext(): AppContext {
 
   const holiday = LUNAR_APPROX[date] ?? SOLAR_HOLIDAYS[md] ?? null;
 
+  // 距周六: 周六(6)=0, 周日(0)=已周末→0, 周一-周五=6-dow
+  const daysUntilWeekend = dow === 0 || dow === 6 ? 0 : 6 - dow;
+
   return {
     date,
     dayOfWeek: ZH_DAYS[dow],
@@ -96,7 +109,32 @@ export function getAppContext(): AppContext {
     timeSlot: slot,
     timeSlotLabel: label,
     holiday,
+    daysUntilWeekend,
+    upcomingHoliday: findUpcomingHoliday(now, holiday !== null),
   };
+}
+
+/**
+ * 找未来 7 天内最近的下一个节日。今天本身是节日时跳过(那时 holiday 字段已经带值)。
+ * 跨年时(12 月底找 1 月节日)也工作 —— 用 Date 算实际未来日期再查表。
+ */
+function findUpcomingHoliday(
+  base: Date,
+  todayIsHoliday: boolean,
+): AppContext["upcomingHoliday"] {
+  const startOffset = todayIsHoliday ? 1 : 1; // 永远从明天开始往后找
+  for (let i = startOffset; i <= 7; i++) {
+    const future = new Date(base);
+    future.setDate(future.getDate() + i);
+    const fy = future.getFullYear();
+    const fm = future.getMonth() + 1;
+    const fd = future.getDate();
+    const fdate = `${fy}-${pad(fm)}-${pad(fd)}`;
+    const fmd = `${pad(fm)}-${pad(fd)}`;
+    const name = LUNAR_APPROX[fdate] ?? SOLAR_HOLIDAYS[fmd];
+    if (name) return { name, daysAhead: i };
+  }
+  return null;
 }
 
 /**
@@ -106,7 +144,16 @@ export function describeContext(ctx: AppContext): string {
   const parts: string[] = [];
   parts.push(`${ctx.date}（${ctx.dayOfWeek}${ctx.isWeekend ? "，周末" : ""}）`);
   parts.push(`${ctx.timeSlotLabel}时段`);
-  if (ctx.holiday) parts.push(`节日：${ctx.holiday}`);
+  if (ctx.holiday) {
+    parts.push(`今天是${ctx.holiday}`);
+  } else if (ctx.upcomingHoliday) {
+    parts.push(`再 ${ctx.upcomingHoliday.daysAhead} 天就是${ctx.upcomingHoliday.name}`);
+  }
+  // 工作日的"马上周末" 信号: 周四=2 天, 周五=1 天
+  if (!ctx.isWeekend && ctx.daysUntilWeekend <= 2 && ctx.daysUntilWeekend > 0) {
+    if (ctx.daysUntilWeekend === 1) parts.push("明天就周末");
+    else if (ctx.daysUntilWeekend === 2) parts.push("再 2 天周末");
+  }
   if (ctx.weather) {
     parts.push(
       `天气：${ctx.weather.summary}${ctx.weather.tempC !== undefined ? ` ${ctx.weather.tempC}°C` : ""}`,

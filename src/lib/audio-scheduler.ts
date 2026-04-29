@@ -271,11 +271,10 @@ export class AudioScheduler {
     live.startCtxTime = t;
     live.endCtxTime = t + (live.buffer.duration - inSeek);
 
-    // 排个 timer 在 next 真正接管时把 current 替换 + 触发 ontransition。
-    // 这只是状态标记；声音切换不依赖这个 timer，依赖的是 Web Audio 时钟。
-    const switchAt = mode === "crossfade"
-      ? cur.endCtxTime // crossfade 完成时（cur buffer 走完）
-      : t;             // gapless/hardCut: next 起点
+    // 排个 timer 在 next 真正开始发声时把 UI current 替换 + 触发 ontransition。
+    // 声音切换不依赖这个 timer，依赖 Web Audio 时钟；这里专门保证封面/歌名
+    // 跟已经进入听感的 track 对齐，避免 crossfade 期间还显示上一首。
+    const switchAt = t;
     const delayMs = Math.max(0, (switchAt - this.ctx.currentTime) * 1000);
     const swapTimer = window.setTimeout(() => {
       // 还得检查这个 next 是不是仍然有效（没被 cancelNext 干掉）

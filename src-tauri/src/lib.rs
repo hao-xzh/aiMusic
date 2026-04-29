@@ -5,8 +5,9 @@
 //! 直链塞给主窗口里一个普通 `<audio>` 元素原生播放，再接 WebAudio AnalyserNode
 //! 驱动点阵场。这样主窗口就是所有视觉 + 音频的唯一居所。
 //!
-//! AI 层通过 DeepSeek 的 OpenAI 兼容接口接入，API key 由用户在设置里自填，
-//! 本机 `ai_config.json` 持久化（unix 下 0600 权限）。
+//! AI 层支持多 provider（DeepSeek / OpenAI / 小米 MiMo），三家都走 OpenAI 兼容接口。
+//! API key 由用户在设置里自填，本机 `ai_config.json` 持久化（unix 下 0600 权限）。
+//! 切 provider 不会清掉别家的 key，方便对比。
 //!
 //! 缓存层走 SQLite（bundled），`cache.db`。歌单 / 曲目 / 歌词 / 上次播放状态
 //! 都在这里。`updateTime` 做增量比对，避免重复拉取。
@@ -51,10 +52,13 @@ pub fn run() {
             netease_song_lyric,
             netease_search,
             netease_is_logged_in,
-            // ai (deepseek)
+            // ai (multi-provider: deepseek / openai / xiaomi-mimo)
             ai_get_config,
+            ai_list_models,
+            ai_set_provider,
             ai_set_api_key,
             ai_clear_api_key,
+            ai_set_model,
             ai_ping,
             ai_chat,
             // cache

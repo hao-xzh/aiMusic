@@ -90,6 +90,15 @@ export type PlayerState = {
   mood: string | null;
 };
 
+type TrackPlaybackState = {
+  current: Track | null;
+  positionSec: number;
+  isPlaying: boolean;
+  error: string | null;
+  aiStatus: string;
+  lyric: LyricTrack | null;
+};
+
 export type PlayNeteaseOptions = {
   smooth?: boolean;
   smoothMode?: "library" | "discovery";
@@ -137,6 +146,21 @@ function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
 
+function playbackStateForTrack(
+  track: Track,
+  positionSec: number,
+  aiStatus: string,
+): TrackPlaybackState {
+  return {
+    current: track,
+    positionSec,
+    isPlaying: true,
+    error: null,
+    aiStatus,
+    lyric: null,
+  };
+}
+
 export function PlayerProvider({ children }: { children: React.ReactNode }) {
   // ---- WebAudio + 调度器（懒创建，第一次用户 gesture 才 new） ----
   const ctxRef = useRef<AudioContext | null>(null);
@@ -160,6 +184,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const schedulingForRef = useRef<number | null>(null);
   /** 每次 playNetease / 用户切歌都 ++，老的 in-flight schedule 看到不一致就 abort */
   const generationRef = useRef<number>(0);
+  /** 直接播放请求准备中时，旧曲目不能再自动排/跳下一首，避免 UI 与真实意图错位。 */
+  const pendingPlaybackGenRef = useRef<number | null>(null);
 
   const [state, setState] = useState<PlayerState>({
     current: null,
@@ -291,27 +317,45 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   //   - lossless   16-bit/44.1kHz CD 级 FLAC（黑胶 VIP 全量）
   //   - exhigh     320kbps mp3（全用户兜底）
   //
-  // 跳过 jymaster：99% 专辑没有母带版，每次空请求浪费 ~200ms RTT。
-  // 网易云 song/url v1 在请求级别不可用时通常会自动降到下一档（不是返回 null），
-  // 但保留 chain 防御少数返回 null 的边界情况。
-  const QUALITY_CHAIN = ["hires", "lossless", "exhigh"] as const;
+  // 串行: lossless → exhigh。
+  //
+  // 跳过 hires —— 99% 专辑没母带版,网易云 API 对 hires 请求会默默降级返回 mp3 url,
+  // 之前的逻辑误以为拿到 hires 就用,结果用户听到 320kbps mp3 的沙沙噪声。
+  //
+  // 不并行 —— songUrls 只是拿 URL metadata(~1KB JSON),lossless/exhigh API 响应速度
+  // 几乎一样;并行除了 VIP 用户偶尔遇到没 lossless 的歌时省一个 RTT,其它 99% 时间
+  // 是浪费 API quota(exhigh 结果会被丢弃)。VIP 用户的 lossless 命中率本身就高,
+  // 串行简单稳。
   const fetchUrl = useCallback(async (neteaseId: number): Promise<string | null> => {
-    for (const level of QUALITY_CHAIN) {
-      try {
-        const urls = await netease.songUrls([neteaseId], level);
-        const u = urls[0];
-        if (u?.url) {
-          console.debug("[claudio quality]", {
-            id: neteaseId,
-            level,
-            br: u.br,
-            sizeMB: (u.size / 1024 / 1024).toFixed(2),
-          });
-          return cdn(u.url);
-        }
-      } catch (e) {
-        console.debug(`[claudio] songUrls level=${level} 失败，尝试下一档`, e);
+    try {
+      const urls = await netease.songUrls([neteaseId], "lossless");
+      const u = urls[0];
+      if (u?.url) {
+        console.debug("[claudio quality]", {
+          id: neteaseId,
+          level: "lossless",
+          br: u.br,
+          sizeMB: (u.size / 1024 / 1024).toFixed(2),
+        });
+        return cdn(u.url);
       }
+    } catch (e) {
+      console.debug("[claudio] lossless 失败,退到 exhigh", e);
+    }
+    try {
+      const urls = await netease.songUrls([neteaseId], "exhigh");
+      const u = urls[0];
+      if (u?.url) {
+        console.debug("[claudio quality]", {
+          id: neteaseId,
+          level: "exhigh",
+          br: u.br,
+          sizeMB: (u.size / 1024 / 1024).toFixed(2),
+        });
+        return cdn(u.url);
+      }
+    } catch (e) {
+      console.debug("[claudio] exhigh 失败", e);
     }
     return null;
   }, []);
@@ -323,6 +367,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const sched = schedulerRef.current;
     const cacheRef = bufferCacheRef.current;
     if (!sched || !cacheRef) return;
+    if (pendingPlaybackGenRef.current != null) return;
 
     const { current, queue } = stateRef.current;
     if (!current || queue.length <= 1) return;
@@ -435,12 +480,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
     setState((s) => ({
       ...s,
-      current: newCur,
-      positionSec: 0,
-      isPlaying: true,
-      error: null,
-      lyric: null,
-      aiStatus: "播放中",
+      ...playbackStateForTrack(newCur, 0, "播放中"),
     }));
     cache.setState(LAST_TRACK_KEY, JSON.stringify(newCur)).catch(() => {});
     cache.setState(LAST_POSITION_KEY, "0").catch(() => {});
@@ -456,6 +496,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
   const onSchedulerEnded = useCallback((trackId: number) => {
     // 队列没下一首了或单曲循环
+    if (pendingPlaybackGenRef.current != null) {
+      setState((s) => ({ ...s, isPlaying: false, aiStatus: "正在准备下一首…" }));
+      return;
+    }
     const { current, queue } = stateRef.current;
     if (!current) return;
     if (queue.length > 1) {
@@ -541,6 +585,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
       userIntendedPlayingRef.current = true;
       generationRef.current++;
+      const gen = generationRef.current;
+      pendingPlaybackGenRef.current = gen;
       scheduledNextIdRef.current = null;
       schedulingForRef.current = null;
       pendingJudgmentRef.current = null;
@@ -552,6 +598,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       const bufCache = bufferCacheRef.current;
       if (!ctx || !sched || !bufCache) {
         setState((s) => ({ ...s, error: "音频引擎初始化失败" }));
+        if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
         return;
       }
       if (ctx.state === "suspended") {
@@ -584,18 +631,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         });
       }
 
+      const schedulerTrackId = sched.getCurrentTrackId();
+      const isReplacingAudibleTrack =
+        prior?.neteaseId != null &&
+        schedulerTrackId === prior.neteaseId &&
+        prior.neteaseId !== neteaseId;
+
       setState((s) => ({
         ...s,
-        current: track,
-        positionSec: resumeFrom,
-        isPlaying: true,
         error: null,
-        aiStatus: "正在解码…",
-        lyric: null,
+        aiStatus: isReplacingAudibleTrack ? "正在准备下一首…" : "正在解码…",
+        isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
       }));
-      lastKnownPositionRef.current = resumeFrom;
-      cache.setState(LAST_TRACK_KEY, JSON.stringify(track)).catch(() => {});
-      cache.setState(LAST_POSITION_KEY, String(resumeFrom)).catch(() => {});
 
       try {
         const url = await fetchUrl(neteaseId);
@@ -603,10 +650,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           setState((s) => ({
             ...s,
             error: "这首歌拿不到直链（可能需要 VIP 或已下架）",
-            isPlaying: false,
+            isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
             aiStatus: "—",
           }));
-          userIntendedPlayingRef.current = false;
+          if (!isReplacingAudibleTrack) userIntendedPlayingRef.current = false;
+          if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
           return;
         }
         // 后台分析（下次接歌 mix-planner 用）
@@ -614,7 +662,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
         const decoded = await bufCache.ensure(neteaseId, url);
         // 期间用户切歌了
-        if (stateRef.current.current?.neteaseId !== neteaseId) return;
+        if (gen !== generationRef.current) {
+          if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
+          return;
+        }
 
         const isCold = sched.getCurrentTrackId() == null;
         sched.play({
@@ -627,9 +678,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         });
 
         setState((s) => {
-          if (s.current?.neteaseId !== neteaseId) return s;
-          return { ...s, aiStatus: "播放中" };
+          if (gen !== generationRef.current) return s;
+          return {
+            ...s,
+            ...playbackStateForTrack(track, resumeFrom, "播放中"),
+          };
         });
+        lastKnownPositionRef.current = resumeFrom;
+        cache.setState(LAST_TRACK_KEY, JSON.stringify(track)).catch(() => {});
+        cache.setState(LAST_POSITION_KEY, String(resumeFrom)).catch(() => {});
+        if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
 
         // 异步歌词 + DJ 旁白
         void loadLyricFor(track);
@@ -637,14 +695,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       } catch (e) {
         console.debug("[claudio] playTrack 失败", e);
         setState((s) => {
-          if (s.current?.neteaseId !== neteaseId) return s;
+          if (gen !== generationRef.current) return s;
           return {
             ...s,
             error: e instanceof Error ? e.message : String(e),
-            isPlaying: false,
+            isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
             aiStatus: "—",
           };
         });
+        if (!isReplacingAudibleTrack) userIntendedPlayingRef.current = false;
+        if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
       }
     },
     [ensureAudio, fetchUrl, loadLyricFor, loadDjLineFor],
@@ -684,6 +744,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const pause = useCallback(() => {
     userIntendedPlayingRef.current = false;
     generationRef.current++;
+    pendingPlaybackGenRef.current = null;
     scheduledNextIdRef.current = null;
     schedulingForRef.current = null;
     pendingJudgmentRef.current = null;
@@ -728,6 +789,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     // 否则 rAF 检查会以为下一首"已经排好"，不会重新走预解码 + scheduleNext。
     scheduledNextIdRef.current = null;
     schedulingForRef.current = null;
+    pendingPlaybackGenRef.current = null;
     pendingJudgmentRef.current = null;
     pendingMixPlanRef.current = null;
     schedulerRef.current?.seek(Math.max(0, sec));

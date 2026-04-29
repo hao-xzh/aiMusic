@@ -1,8 +1,17 @@
-//! AI 配置持久化。
+//! AI 配置持久化（多 provider 版）。
 //!
 //! 落盘位置：`<app_config_dir>/ai_config.json`，跟 netease cookie 同目录。
 //! 写入策略：tmp + rename 原子换；unix 下把 tmp 文件 chmod 0600 再 rename。
-//! 读取策略：启动时 load 一次；运行期内改是更新内存 + 再写一次文件。
+//!
+//! 多 provider 设计：
+//!   - 每个 provider 有自己的一份 `ProviderSlot`（key + 选中的 model）
+//!   - 顶层 `provider` 字段记录当前用谁；切 provider 不会清掉别家的 key，让用户能反复切回去
+//!   - base_url 写死在 `default_base_url()`（全部 OpenAI 兼容），不暴露给用户改 ——
+//!     避免用户填错把流量打到不存在的端点
+//!
+//! 兼容老配置：
+//!   早版本只存了 `deepseek_api_key + model + base_url` 三个 flat 字段。读到老 schema
+//!   时把它当作 deepseek slot 的内容迁移进去，保留原 model 选择，避免用户掉 key。
 
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -10,33 +19,115 @@ use std::sync::RwLock;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// 用户可配置的 AI 参数。`deepseek_api_key` 为 None / 空串时视作"没配"。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AiConfig {
-    #[serde(default)]
-    pub deepseek_api_key: Option<String>,
-    #[serde(default = "default_model")]
-    pub model: String,
-    #[serde(default = "default_base_url")]
-    pub base_url: String,
+/// 当前支持的 provider。新增就加一项 + 在 default_base_url / default_model 各加一支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Provider {
+    Deepseek,
+    Openai,
+    XiaomiMimo,
 }
 
-fn default_model() -> String {
-    // 按用户指定：走 DeepSeek V4 flash（快、便宜，适合 DJ 旁白这类短 prompt）
-    "deepseek-v4-flash".to_string()
+impl Provider {
+    pub const ALL: [Provider; 3] = [Provider::Deepseek, Provider::Openai, Provider::XiaomiMimo];
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Provider::Deepseek => "deepseek",
+            Provider::Openai => "openai",
+            Provider::XiaomiMimo => "xiaomi-mimo",
+        }
+    }
 }
-fn default_base_url() -> String {
-    // DeepSeek 官方 OpenAI 兼容入口。/v1 可省可留，留着语义更清楚。
-    "https://api.deepseek.com/v1".to_string()
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSlot {
+    #[serde(default)]
+    pub api_key: Option<String>,
+    pub model: String,
+}
+
+impl ProviderSlot {
+    pub fn new(default_model: &str) -> Self {
+        Self {
+            api_key: None,
+            model: default_model.to_string(),
+        }
+    }
+}
+
+/// 用户可配置的 AI 参数。
+///
+/// 注意：base_url 不再可改 —— 走 default_base_url(provider)，前端只暴露 provider + model。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    #[serde(default = "default_provider")]
+    pub provider: Provider,
+    pub deepseek: ProviderSlot,
+    pub openai: ProviderSlot,
+    #[serde(rename = "xiaomi_mimo")]
+    pub xiaomi_mimo: ProviderSlot,
+}
+
+fn default_provider() -> Provider {
+    Provider::Deepseek
 }
 
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            deepseek_api_key: None,
-            model: default_model(),
-            base_url: default_base_url(),
+            provider: default_provider(),
+            deepseek: ProviderSlot::new(default_model(Provider::Deepseek)),
+            openai: ProviderSlot::new(default_model(Provider::Openai)),
+            xiaomi_mimo: ProviderSlot::new(default_model(Provider::XiaomiMimo)),
         }
+    }
+}
+
+/// 各家 provider 的官方 OpenAI 兼容入口。
+pub fn default_base_url(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Deepseek => "https://api.deepseek.com/v1",
+        Provider::Openai => "https://api.openai.com/v1",
+        Provider::XiaomiMimo => "https://api.xiaomimimo.com/v1",
+    }
+}
+
+/// 各家 provider 的「兜底默认模型」—— 当用户没选时用这个。
+/// 选的是性价比 / 速度均衡的中档款，不是最贵的旗舰，避免一上手就烧钱。
+pub fn default_model(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Deepseek => "deepseek-v4-flash",
+        Provider::Openai => "gpt-5.4-mini",
+        Provider::XiaomiMimo => "mimo-v2-flash",
+    }
+}
+
+/// 已知的可选模型列表（高 → 低）。前端 dropdown 用。
+///
+/// 来源：各家 2026-04 官网 / 文档（详见 issue 里的搜索记录）。
+/// 顺序刻意从「旗舰最贵」排到「速度便宜」，让用户一眼看出梯队。
+pub fn known_models(provider: Provider) -> &'static [(&'static str, &'static str)] {
+    match provider {
+        Provider::Deepseek => &[
+            ("deepseek-v4-pro", "V4 Pro · 旗舰"),
+            ("deepseek-v4-flash", "V4 Flash · 性价比"),
+            ("deepseek-chat", "V3 Chat · 旧版（2026-07 下线）"),
+            ("deepseek-reasoner", "V3 Reasoner · 旧版（2026-07 下线）"),
+        ],
+        Provider::Openai => &[
+            ("gpt-5.5-pro", "GPT-5.5 Pro · 旗舰"),
+            ("gpt-5.5", "GPT-5.5 · 旗舰"),
+            ("gpt-5.4-pro", "GPT-5.4 Pro"),
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini · 性价比"),
+            ("gpt-5.4-nano", "GPT-5.4 Nano · 速度优先"),
+        ],
+        Provider::XiaomiMimo => &[
+            ("mimo-v2-pro", "MiMo V2 Pro · 旗舰 · 1M 上下文"),
+            ("mimo-v2-omni", "MiMo V2 Omni · 多模态"),
+            ("mimo-v2-flash", "MiMo V2 Flash · 性价比"),
+        ],
     }
 }
 
@@ -50,7 +141,7 @@ impl AiConfigStore {
     pub fn load(path: PathBuf) -> Result<Self> {
         let cfg = if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(txt) => serde_json::from_str::<AiConfig>(&txt).unwrap_or_else(|e| {
+                Ok(txt) => parse_with_legacy_fallback(&txt).unwrap_or_else(|e| {
                     eprintln!(
                         "[ai] {} 解析失败，回落到 default：{e}",
                         path.display()
@@ -73,6 +164,22 @@ impl AiConfigStore {
 
     pub fn snapshot(&self) -> AiConfig {
         self.inner.read().expect("ai config poisoned").clone()
+    }
+
+    /// 当前激活 provider 的运行时三元组：(api_key, base_url, model)
+    /// chat 调用都走这个，统一一处。
+    pub fn active(&self) -> (Option<String>, &'static str, String) {
+        let cfg = self.snapshot();
+        let slot = match cfg.provider {
+            Provider::Deepseek => cfg.deepseek,
+            Provider::Openai => cfg.openai,
+            Provider::XiaomiMimo => cfg.xiaomi_mimo,
+        };
+        (
+            slot.api_key.filter(|s| !s.trim().is_empty()),
+            default_base_url(cfg.provider),
+            slot.model,
+        )
     }
 
     pub fn update<F: FnOnce(&mut AiConfig)>(&self, f: F) -> Result<()> {
@@ -109,4 +216,33 @@ impl AiConfigStore {
         })?;
         Ok(())
     }
+}
+
+/// 老 schema：`{ "deepseek_api_key": "...", "model": "...", "base_url": "..." }`
+/// 读出来当作 deepseek slot 用，不丢用户原来的 key。
+#[derive(Deserialize)]
+struct LegacyConfig {
+    #[serde(default)]
+    deepseek_api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn parse_with_legacy_fallback(txt: &str) -> Result<AiConfig> {
+    // 先按新 schema 试
+    if let Ok(c) = serde_json::from_str::<AiConfig>(txt) {
+        return Ok(c);
+    }
+    // 回落老 schema 迁移
+    let legacy: LegacyConfig = serde_json::from_str(txt)
+        .context("ai_config.json 既不是新 schema 也不是老 schema")?;
+    let mut cfg = AiConfig::default();
+    if let Some(k) = legacy.deepseek_api_key.filter(|s| !s.trim().is_empty()) {
+        cfg.deepseek.api_key = Some(k);
+    }
+    if let Some(m) = legacy.model.filter(|s| !s.trim().is_empty()) {
+        cfg.deepseek.model = m;
+    }
+    eprintln!("[ai] 检测到老版本 ai_config.json，迁移到 multi-provider schema");
+    Ok(cfg)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "claudio"
-version = "0.1.3"
+version = "0.1.17"
 description = "An AI radio distilled from your own playlists."
 edition = "2021"
 rust-version = "1.77"

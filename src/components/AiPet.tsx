@@ -28,8 +28,30 @@ import {
   generateDailyGreeting,
   shouldGreetToday,
   markGreeted,
+  commentOnTrack,
   type ChatMessage,
 } from "@/lib/pet-agent";
+import { getTrackSemanticProfile } from "@/lib/track-semantic-profile";
+
+// 空状态提示词池 —— 整体调性: 短、抽象、像真朋友一句话开场。
+// 每次开 panel 随机一句，避免每次看到一样的台词。**绝不**给"示例式提示"
+// （"工作听 / 走路听 / 陪我熬夜" 那种 —— 既冗长又像 AI 教用户怎么说话）。
+const EMPTY_HINTS = [
+  "在。说吧。",
+  "醒着呢。",
+  "嗯？",
+  "想听啥。",
+  "随便说。",
+  "说点。",
+  "嗯。",
+];
+
+// idle 状态下的副标题（没在播歌时）—— 同样调性
+const IDLE_SUBTITLES = [
+  "在",
+  "醒着",
+  "嗯",
+];
 
 export function AiPet() {
   const player = usePlayer();
@@ -41,6 +63,13 @@ export function AiPet() {
   const [pending, setPending] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
   const greetStartedRef = useRef(false);
+  // 每次组件挂载时挑一句 —— 整个 session 内稳定，避免一打开就重抽
+  const emptyHint = useRef(
+    EMPTY_HINTS[Math.floor(Math.random() * EMPTY_HINTS.length)],
+  ).current;
+  const idleSubtitle = useRef(
+    IDLE_SUBTITLES[Math.floor(Math.random() * IDLE_SUBTITLES.length)],
+  ).current;
   // 封面右下挂点（视口坐标）—— 找不到封面则回退到右下角
   const [coverHook, setCoverHook] = useState<{ x: number; y: number } | null>(
     null,
@@ -55,6 +84,27 @@ export function AiPet() {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const petBtnRef = useRef<HTMLButtonElement | null>(null);
   const closeTimerRef = useRef<number | null>(null);
+  // 单曲点评：避免对同一首歌重复评论 / 用户狂切歌时浪费 AI 调用
+  const lastCommentTrackIdRef = useRef<number | null>(null);
+  const lastTrackForCommentRef = useRef<{ title: string; artist: string } | null>(null);
+  const commentDebounceRef = useRef<number | null>(null);
+  const hintHideRef = useRef<number | null>(null);
+  // 频次自适应: 用户狂切歌时(30s 内 3+ 次切换),进入冷却期不再触发 AI 点评
+  const recentTrackChangesRef = useRef<number[]>([]);
+  const skipCooldownUntilRef = useRef<number>(0);
+
+  // 显示一次 hint 气泡，duration 后自动收。多次调用会清掉上一条 timer。
+  const showHint = useCallback((text: string, durationMs: number) => {
+    if (hintHideRef.current) {
+      clearTimeout(hintHideRef.current);
+      hintHideRef.current = null;
+    }
+    setHint(text);
+    hintHideRef.current = window.setTimeout(() => {
+      setHint(null);
+      hintHideRef.current = null;
+    }, durationMs);
+  }, []);
 
   // 退出动画：先 closing=true 跑 220ms 动画，再真正 unmount
   const requestClose = useCallback(() => {
@@ -80,22 +130,21 @@ export function AiPet() {
     document.addEventListener("mousedown", onDocDown);
     return () => document.removeEventListener("mousedown", onDocDown);
   }, [open, closing, requestClose]);
-  // 春风风场（v2）—— 弹簧-阻尼物理 + 冲量阵风
+  // 风场 + 节拍（v3）—— 让"在跟音乐摆"肉眼可见
   //
-  // 上一版用 lerp 追一个抖动的目标，每帧追不上就出现"卡顿"的视觉错觉，
-  // 加上 drop-shadow 每帧重画，渲染开销很大。本版的思路：
+  // v2 一版的问题：摆动只走 rotate，且持续风力有 60% 的固定底
+  // （`0.6 + ampSmooth * 2.6`），开关音乐对比度不够；节拍只反映在角速度上，
+  // 也很难一眼看出是"节奏"。
   //
-  //   1. 角度走真正的弹簧-阻尼系统（k=刚度 / c=阻尼），物理积分天然顺滑，
-  //      也有真实物体的"摆-回"反弹感。
-  //   2. 持续风力 = 三层低频正弦（频率非整数倍，避免规律性），振幅按平滑后的
-  //      music amp 缩放。
-  //   3. 阵风 = 一次性"冲量"加给 velocity，让弹簧自己 rebound，比"包络曲线"
-  //      自然得多。
-  //   4. amp 用 EMA 平滑（半衰期 ~150ms），避免 frame-by-frame 的 RMS 抖动
-  //      传到视觉上。
-  //   5. CSS 端只读两个变量：--amp（颜色微调）和 --wind-rotate（摆动）。
-  //      抛弃 driftX/driftY/shadow vars/动态 morph-duration，把每帧的 paint
-  //      压回到只重排 transform 一次。
+  // v3 把视觉反馈拆成三通道，互相不打架：
+  //   1. 风力摆（rotate） —— 仅音乐驱动，amp=0 时风力就是 0，没有底噪。
+  //   2. 节拍弹跳（translateY + scale） —— 检测到尖峰就给 `--beat` 拍一下
+  //      （0..1），CSS 用它做向上跳一帧 + 球体微胀，肉眼立刻能"看见鼓点"。
+  //   3. amp 颜色 —— 维持原来的 brightness/saturate 微调。
+  //
+  // amp 归一化也调了：之前 `(amp - 0.15) / 0.8` 把"静音"映成 0.125，
+  // 静音/有音乐差别本就不到 8 倍。现在 `(amp - 0.25) / 0.7` 让真静音=0，
+  // 整个静→响梯度铺满 [0,1]。
   useEffect(() => {
     let raf = 0;
     const reduceMotion = window.matchMedia(
@@ -109,7 +158,12 @@ export function AiPet() {
 
     let angle = 0; // deg
     let velocity = 0; // deg/s
-    let ampSmooth = 0.18;
+    let ampSmooth = 0;
+    // 慢速跟踪 amp 的"基准线"，用来检测瞬时尖峰 = 节拍
+    let ampSlow = 0;
+    let lastBeatAt = 0;
+    // 节拍包络 0..1：被命中后立即拉到 ~1，按指数衰减回 0
+    let beatLevel = 0;
     let lastT = performance.now();
     let nextGustAt = lastT + randomRange(1500, 3500);
 
@@ -131,55 +185,82 @@ export function AiPet() {
       const dt = Math.min(0.05, Math.max(0.001, (now - lastT) / 1000));
       lastT = now;
 
+      // 暂停 / 没歌时，player-state 把 __claudioAmp 写成 0 —— 直接归零
+      // 安静时 amp ≈ 0.25 ；音乐时 amp 在 0.25~0.95 间波动
       const rawAmp =
-        (window as unknown as { __claudioAmp?: number }).__claudioAmp ?? 0.18;
-      // [0.15, 0.95] → [0, 1]
-      const norm = Math.max(0, Math.min(1, (rawAmp - 0.15) / 0.8));
+        (window as unknown as { __claudioAmp?: number }).__claudioAmp ?? 0;
+      // [0.25, 0.95] → [0, 1] —— 真静音=0，高潮=1，整段铺满
+      const norm = Math.max(0, Math.min(1, (rawAmp - 0.25) / 0.7));
       // EMA 平滑：1 - exp(-dt/τ)；τ ≈ 0.2s 给出 ~150ms 半衰期
       const ampLerp = 1 - Math.exp(-dt / 0.2);
       ampSmooth += (norm - ampSmooth) * ampLerp;
+      // 慢通道（半衰期 ~600ms）追"基准能量"，norm 高于它就是瞬时尖峰=节拍
+      const slowLerp = 1 - Math.exp(-dt / 0.8);
+      ampSlow += (norm - ampSlow) * slowLerp;
 
       const isAttached = anchor.classList.contains("is-attached");
       const motionScale = reduceMotion ? 0.2 : isAttached ? 1 : 0.85;
 
       // 持续风力：三层低频，频率挑了非整数倍 (0.18 / 0.31 / 0.49 Hz)，
       // 看着像"风一阵阵地吹"，没有可感知的循环
+      // **关键变化**：直接乘 ampSmooth，不再有 0.6 的固定底 —— 没音乐 = 不摆
       const t = now / 1000;
       const breeze =
         (Math.sin(t * 0.18 + phaseA) * 1.0 +
           Math.sin(t * 0.31 + phaseB) * 0.55 +
           Math.sin(t * 0.49 + phaseC) * 0.3) *
-        (0.7 + ampSmooth * 1.6);
+        ampSmooth *
+        3.4;
 
-      // 阵风冲量：到时间就给 velocity 一拍，弹簧自己 rebound
+      // **节拍冲量**：检测 amp 瞬时尖峰（norm 比慢通道 ampSlow 高出阈值）
+      // 命中后两件事一起发：(a) velocity 一拍让钟摆甩出去；(b) beatLevel 拉满，
+      // CSS 用它做向上跳 + scale punch —— 这一下是肉眼看着"咚"的关键。
+      // 阈值 0.12 比 v2 的 0.18 松一些，常见 pop 鼓点更容易触发。
+      const beatExcess = norm - ampSlow;
+      if (beatExcess > 0.12 && now - lastBeatAt > 160 && ampSmooth > 0.05) {
+        const beatImpulse = (4 + beatExcess * 22) * motionScale;
+        const beatDir = (Math.random() - 0.5) * 2; // -1..1，避免老往一边歪
+        velocity += beatImpulse * beatDir;
+        // beatLevel 累计但封顶 1，连续重音不会越加越大
+        beatLevel = Math.min(1, beatLevel + 0.6 + beatExcess * 1.4);
+        lastBeatAt = now;
+      }
+      // 节拍包络指数衰减 —— 半衰期 ~110ms（短促有力，不拖泥带水）
+      const beatDecay = 1 - Math.exp(-dt / 0.16);
+      beatLevel += (0 - beatLevel) * beatDecay;
+
+      // 阵风冲量：节拍之外的"自然摆"。只在确实有音乐时才发，安静时不要乱蹦。
       if (now >= nextGustAt) {
-        const musicLift = 0.8 + ampSmooth * 1.7;
-        const impulseMag =
-          randomRange(4.5, 9.0) * musicLift * motionScale;
-        const impulseDir = Math.random() > 0.5 ? 1 : -1;
-        velocity += impulseMag * impulseDir;
+        if (ampSmooth > 0.08) {
+          const musicLift = 0.8 + ampSmooth * 1.9;
+          const impulseMag =
+            randomRange(5.0, 11.0) * musicLift * motionScale;
+          const impulseDir = Math.random() > 0.5 ? 1 : -1;
+          velocity += impulseMag * impulseDir;
+        }
         // 音乐越激情，下一拍来得越快
         nextGustAt =
-          now + randomRange(1800, 5400) - ampSmooth * 1600;
+          now + randomRange(1500, 4800) - ampSmooth * 1800;
       }
 
       // 弹簧-阻尼积分：F = k(target - x) - c·v
-      const target = breeze * motionScale * 2.0;
+      const target = breeze * motionScale * 2.8;
       const accel = (target - angle) * SPRING_K - velocity * SPRING_C;
       velocity += accel * dt;
       angle += velocity * dt;
 
-      // 物理层硬上限，防止极端冲量打飞 —— 给到 ±12° 让大风也不会甩飞
-      if (angle > 12) {
-        angle = 12;
+      // 物理层硬上限 ±18°，让节拍 punch 看得出来
+      if (angle > 18) {
+        angle = 18;
         if (velocity > 0) velocity = 0;
-      } else if (angle < -12) {
-        angle = -12;
+      } else if (angle < -18) {
+        angle = -18;
         if (velocity < 0) velocity = 0;
       }
 
       anchor.style.setProperty("--amp", ampSmooth.toFixed(3));
       anchor.style.setProperty("--wind-rotate", `${angle.toFixed(2)}deg`);
+      anchor.style.setProperty("--beat", beatLevel.toFixed(3));
 
       raf = requestAnimationFrame(tick);
     };
@@ -274,14 +355,102 @@ export function AiPet() {
       try {
         const message = await generateDailyGreeting();
         markGreeted();
-        setHint(message);
-        // 5s 后自动收
-        window.setTimeout(() => setHint(null), 5500);
+        showHint(message, 5500);
       } catch (e) {
         console.debug("[claudio] pet daily greeting 失败", e);
       }
     })();
+    // showHint 是稳定 callback —— 这里就是 once-on-mount，不订阅依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ----- 单曲点评气泡 -----
+  // 每首新歌开始播 → 1.5s 后让 Claudio 说一句"为什么放这首给 TA"。
+  // 多重护栏避免浪费 AI 调用:
+  //   1. 同一首 id 不会重复评论
+  //   2. panel 打开时跳过(气泡看不见)
+  //   3. 窗口失焦/被遮 (document.hidden) 跳过
+  //   4. 用户狂切歌(30s 内 3+ 次)进入 60s 冷却期
+  //   5. 1.5s debounce —— 用户连刷时只评最后停留的那首
+  useEffect(() => {
+    const cur = player.current;
+    if (!cur?.neteaseId) return;
+    if (lastCommentTrackIdRef.current === cur.neteaseId) return;
+    if (open) return;
+
+    // 频次护栏: 记录这次切歌时间, 30s 内累计 3+ 次就进入冷却
+    const now = Date.now();
+    const recent = recentTrackChangesRef.current;
+    recent.push(now);
+    while (recent.length > 0 && now - recent[0] > 30_000) recent.shift();
+    if (recent.length >= 3) {
+      // 用户在 shopping 模式,suspend 60s
+      skipCooldownUntilRef.current = now + 60_000;
+      console.debug("[claudio] 切歌过密, 冷却 60s 不触发点评");
+    }
+    if (now < skipCooldownUntilRef.current) {
+      lastCommentTrackIdRef.current = cur.neteaseId; // 标记已"处理"防重入
+      return;
+    }
+
+    // 窗口不可见(浏览器 tab 背后 / app 失焦)时跳过 —— 看不见气泡浪费 AI
+    if (typeof document !== "undefined" && document.hidden) {
+      lastCommentTrackIdRef.current = cur.neteaseId;
+      return;
+    }
+
+    if (commentDebounceRef.current) {
+      clearTimeout(commentDebounceRef.current);
+      commentDebounceRef.current = null;
+    }
+
+    const trackId = cur.neteaseId;
+    const trackTitle = cur.title;
+    const trackArtist = cur.artist;
+
+    commentDebounceRef.current = window.setTimeout(async () => {
+      lastCommentTrackIdRef.current = trackId;
+      try {
+        const userContext = [...messages]
+          .reverse()
+          .find((m) => m.role === "user")?.text;
+        let semantic = null;
+        try {
+          semantic = await getTrackSemanticProfile(trackId);
+        } catch {
+          /* 没有 profile 就走 track 名 + artist 兜底 */
+        }
+        const previous = lastTrackForCommentRef.current ?? undefined;
+        const comment = await commentOnTrack({
+          track: {
+            id: trackId,
+            title: trackTitle,
+            artist: trackArtist,
+            moods: semantic?.vibe.moods,
+            scenes: semantic?.vibe.scenes,
+            genres: semantic?.style.genres,
+            summary: semantic?.summary,
+          },
+          userContext,
+          previousTrack: previous,
+        });
+        lastTrackForCommentRef.current = { title: trackTitle, artist: trackArtist };
+        if (comment && !open) {
+          showHint(comment, 6000);
+        }
+      } catch (e) {
+        console.debug("[claudio] track comment 失败", e);
+      }
+    }, 1500);
+
+    return () => {
+      if (commentDebounceRef.current) {
+        clearTimeout(commentDebounceRef.current);
+        commentDebounceRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [player.current?.neteaseId, open]);
 
   // 滚到底
   useEffect(() => {
@@ -315,7 +484,8 @@ export function AiPet() {
         });
         const assistantMsg: ChatMessage = {
           role: "assistant",
-          text: res.text || (res.play ? "好，给你排一组" : "嗯。"),
+          // res.text 永远有人格 reply（pet-agent 已经保证）。极端兜底 "嗯。"
+          text: res.text || "嗯。",
           play: res.play ?? undefined,
         };
         setMessages([...next, assistantMsg]);
@@ -341,12 +511,14 @@ export function AiPet() {
 
   return (
     <>
-      {/* 招呼气泡（只在 pet 上方，自动收）—— 玻璃 + 封面色辉 */}
+      {/* 招呼气泡 —— 玻璃 + 封面色辉。位置跟宠物当前位置走（attached 时贴封面挂点,
+          否则回退到默认右下角）。气泡的"尾巴"（小圆角那一角）指向宠物。 */}
       {hint && !open && (
         <div
           style={
             {
               ...hintBubble,
+              ...computeHintBubblePosition(coverHook),
               "--orb-rgb": `${orbRgb[0]}, ${orbRgb[1]}, ${orbRgb[2]}`,
               "--orb-rgb-light": `${orbRgbLight[0]}, ${orbRgbLight[1]}, ${orbRgbLight[2]}`,
             } as CSSProperties
@@ -379,7 +551,7 @@ export function AiPet() {
                   ? "想想看…"
                   : player.isPlaying && player.current
                     ? `在听 · ${player.current.title}`
-                    : "可以直接说想听什么"}
+                    : idleSubtitle}
               </div>
             </div>
             <button
@@ -393,10 +565,7 @@ export function AiPet() {
 
           <div ref={scrollRef} style={panelScroll}>
             {messages.length === 0 && (
-              <div style={emptyHint}>
-                跟我说一句吧 ——<br />
-                "工作听，旋律抓耳不要太吵" / "陪我熬夜" / "走路的时候听"
-              </div>
+              <div style={emptyHintStyle}>{emptyHint}</div>
             )}
             {messages.map((m, i) => (
               <Bubble key={i} m={m} />
@@ -418,7 +587,7 @@ export function AiPet() {
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="想听点什么…"
+              placeholder="说点什么…"
               disabled={pending}
               style={panelInput}
               autoFocus
@@ -526,14 +695,12 @@ function randomRange(min: number, max: number) {
 
 // ============== styles ==============
 
+// 静态部分（外观）—— 位置由 computeHintBubblePosition() 单独算
 const hintBubble: CSSProperties = {
   position: "fixed",
-  right: 32,
-  bottom: 114,
   zIndex: 60,
-  maxWidth: 300,
-  padding: "11px 15px 12px",
-  borderRadius: "16px 16px 4px 16px",
+  maxWidth: 240,
+  padding: "10px 14px 11px",
   background: "rgba(20,22,28,0.62)",
   backdropFilter: "blur(28px) saturate(150%)",
   WebkitBackdropFilter: "blur(28px) saturate(150%)",
@@ -541,11 +708,54 @@ const hintBubble: CSSProperties = {
   color: "rgba(245,247,255,0.92)",
   fontSize: 13,
   letterSpacing: 0.1,
-  lineHeight: 1.55,
+  lineHeight: 1.5,
   boxShadow:
     "inset 0 1px 0 rgba(255,255,255,0.08), 0 18px 48px rgba(0,0,0,0.55), 0 6px 24px rgba(var(--orb-rgb), 0.18)",
-  animation: "claudioPetHintIn 360ms cubic-bezier(0.22, 1, 0.36, 1)",
+  animation: "claudioPetHintIn 280ms cubic-bezier(0.22, 1, 0.36, 1)",
+  whiteSpace: "nowrap",
 };
+
+/**
+ * 根据宠物挂点位置（coverHook）算气泡的位置 + 圆角朝向。
+ *
+ * **默认放右边** —— 宠物挂在封面的右下角,左边都是歌曲标题/艺人,
+ * 气泡放左边会盖住信息。只有当右边宽度真的不够时,才退到左边。
+ *
+ * - 未 attached（默认右下角浮动）: 气泡贴右下, 小圆角在右下
+ */
+function computeHintBubblePosition(
+  coverHook: { x: number; y: number } | null,
+): CSSProperties {
+  if (!coverHook) {
+    return {
+      right: 32,
+      bottom: 114,
+      borderRadius: "14px 14px 4px 14px",
+    };
+  }
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+  // 宠物按钮中心大致在 (coverHook.x, coverHook.y + 50). 顶部跟挂点齐平略上.
+  const top = Math.max(20, coverHook.y - 6);
+
+  // 右侧需要的空间: 32px 间距 + 气泡 maxWidth 240 + 16px 边缘余量 = ~290
+  const SPACE_NEEDED = 290;
+  const roomOnRight = vw - coverHook.x;
+
+  if (roomOnRight >= SPACE_NEEDED) {
+    // 默认: 气泡在宠物右侧
+    return {
+      left: coverHook.x + 32,
+      top,
+      borderRadius: "14px 14px 14px 4px", // 小角在左下指向宠物
+    };
+  }
+  // 右侧装不下了 → 退到左边
+  return {
+    right: vw - coverHook.x + 32,
+    top,
+    borderRadius: "14px 14px 4px 14px", // 小角在右下指向宠物
+  };
+}
 
 
 
@@ -618,13 +828,14 @@ const panelScroll: CSSProperties = {
   gap: 10,
 };
 
-const emptyHint: CSSProperties = {
+const emptyHintStyle: CSSProperties = {
   margin: "auto",
   textAlign: "center",
-  color: "rgba(233,239,255,0.48)",
-  fontSize: 12.5,
-  lineHeight: 1.85,
-  letterSpacing: 0.2,
+  color: "rgba(233,239,255,0.36)",
+  fontSize: 13,
+  lineHeight: 1.6,
+  letterSpacing: 0.5,
+  fontWeight: 300,
 };
 
 // 用户：玻璃深片，轻微凸起 + 顶沿微亮 —— 不抢戏，跟面板玻璃同语言

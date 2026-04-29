@@ -13,7 +13,6 @@
  * 未登录 / 出错时原地给提示，不再伪装成 mock 数据。
  */
 
-import { DotText } from "@/components/DotText";
 import { usePlayer } from "@/lib/player-state";
 import { cdn } from "@/lib/cdn";
 import {
@@ -214,24 +213,8 @@ export default function DistillPage() {
         width: "100%",
       }}
     >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "center",
-          marginTop: "clamp(12px, 3vh, 24px)",
-          marginBottom: 10,
-        }}
-      >
-        <DotText text="我的歌单" fontSize={48} grid={4} dotRadius={1.6} />
-      </div>
-      <div
-        style={{
-          textAlign: "center",
-          color: "#8a93a8",
-          marginBottom: 28,
-          fontSize: 13,
-        }}
-      >
+      <div style={pageBrand}>MY LIBRARY</div>
+      <div style={pageSubtitle}>
         {me
           ? `你好 ${me.nickname} · 挑一张歌单，点一首歌 Claudio 就会在主窗口播放`
           : "挑一张歌单，点一首歌 Claudio 就会在主窗口播放"}
@@ -419,6 +402,25 @@ function DistillBottomBar({
     </div>
   );
 }
+
+const pageBrand: React.CSSProperties = {
+  textAlign: "center",
+  fontSize: 11,
+  letterSpacing: 4,
+  color: "rgba(233,239,255,0.42)",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  marginTop: "clamp(12px, 3vh, 24px)",
+  marginBottom: 14,
+  textTransform: "uppercase",
+};
+
+const pageSubtitle: React.CSSProperties = {
+  textAlign: "center",
+  color: "#8a93a8",
+  marginBottom: "clamp(22px, 4vh, 32px)",
+  fontSize: 13,
+  lineHeight: 1.55,
+};
 
 const primaryPillBtn: React.CSSProperties = {
   padding: "8px 18px",
