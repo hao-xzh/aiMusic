@@ -40,6 +40,10 @@ url = "2"
 # `bundled` 把 sqlite3 编译进来，不依赖系统 libsqlite。
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# 原生音频解码 + 离线分析。`all-codecs` / `all-formats` 把 mp3 / flac / aac / ogg / wav
+# / m4a 全打开，跟网易云返回的格式吻合。
+symphonia = { version = "0.5", features = ["all-codecs", "all-formats", "opt-simd"] }
+
 # Windows 专用：把原生标题栏拿掉但保留右上角 min/max/close 三个按钮，
 # 让窗口呈"borderless + native traffic-light"效果。
 # macOS 用 tauri.conf.json 里 titleBarStyle: "Overlay" 已经天然支持，不需要这个。

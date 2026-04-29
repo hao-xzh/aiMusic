@@ -156,6 +156,77 @@ export const ai = {
   }) => invoke<string>("ai_chat", args),
 };
 
+// ---------- 音频磁盘缓存 ----------
+//
+// 后端会自动接管：URL 一旦走 `claudio-audio://localhost/?id=...&u=...` scheme，
+// 命中本地直接读、miss 才拉网络 + 落盘。前端只需要：
+//   1) 用 `wrapAudioUrl(trackId, neteaseUrl)` 把直链包起来
+//   2) 在设置页用下面这三个 cmd 看用量 / 改上限 / 清空
+
+export type AudioCacheStats = {
+  totalBytes: number;
+  count: number;
+  maxBytes: number;
+};
+
+/**
+ * 原生（Symphonia）解出来的声学特征。AI 选曲、画像 prompt 都吃这份 ground truth。
+ * 跟 [audio-analysis.ts](audio-analysis.ts) 里 JS 算出来的更细的"接歌信号"是两套：
+ * 这层管"歌的物理属性"，那层管"接歌的具体策略"。
+ */
+export type AudioFeatures = {
+  trackId: number;
+  durationS: number;
+  /** 60-200 BPM；解不出来 = null */
+  bpm: number | null;
+  /** 0..1 自相关主峰强度 */
+  bpmConfidence: number;
+  /** 整曲 RMS dBFS（负数） */
+  rmsDb: number;
+  /** 整曲峰值 dBFS（≤0） */
+  peakDb: number;
+  /** peak - rms，越大动态范围越大 */
+  dynamicRangeDb: number;
+  /** 头 8 秒线性能量 0..1 */
+  introEnergy: number;
+  /** 尾 8 秒线性能量 0..1 */
+  outroEnergy: number;
+  /** 谱重心（Hz）—— 音色亮度。男声 ~1500，女声 ~2500，金属 4000+ */
+  spectralCentroidHz: number;
+  /** 头部连续静音长度（秒）—— natural silence，不含编码器 padding */
+  headSilenceS: number;
+  /** 尾部连续静音长度（秒） */
+  tailSilenceS: number;
+};
+
+export const audio = {
+  cacheStats: () => invoke<AudioCacheStats>("audio_cache_stats"),
+  setCacheMaxMb: (mb: number) =>
+    invoke<void>("audio_cache_set_max_mb", { mb }),
+  clearCache: () => invoke<void>("audio_cache_clear"),
+  /** 预取：把字节灌进磁盘缓存，不返回字节。返回 true=本来就有，false=刚拉的。 */
+  prefetch: (trackId: number, url: string) =>
+    invoke<boolean>("audio_prefetch", { trackId, url }),
+  /** 拿声学特征。SQLite 命中秒回；miss 走 Symphonia 解码 + DSP，单首 ~50-200ms。 */
+  getFeatures: (trackId: number, url: string) =>
+    invoke<AudioFeatures>("audio_get_features", { trackId, url }),
+  /** 仅查缓存：已分析的拿走，没分析的 null。不发起任何网络/解码。 */
+  getCachedFeatures: (trackId: number) =>
+    invoke<AudioFeatures | null>("audio_get_cached_features", { trackId }),
+  /** 批量缓存查询。taste-profile 蒸馏时一次性拿几百首。 */
+  getCachedFeaturesBulk: (trackIds: number[]) =>
+    invoke<(AudioFeatures | null)[]>("audio_get_cached_features_bulk", { trackIds }),
+};
+
+/**
+ * 把网易云直链包成走 audio cache scheme 的 URL。
+ * trackId = neteaseId；url = 网易云原始 mp3/flac CDN URL（不要预先 cdn() 包裹，
+ * Rust 侧 referer 注入会自己处理）。
+ */
+export function wrapAudioUrl(trackId: number, url: string): string {
+  return `claudio-audio://localhost/?id=${trackId}&u=${encodeURIComponent(url)}`;
+}
+
 // ---------- 本地缓存 ----------
 //
 // 为什么要这个：

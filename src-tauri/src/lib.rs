@@ -13,7 +13,9 @@
 //! 都在这里。`updateTime` 做增量比对，避免重复拉取。
 
 pub mod ai;
+pub mod audio;
 pub mod cache;
+pub mod cdn;
 pub mod netease;
 pub mod proxy;
 
@@ -21,6 +23,8 @@ use std::sync::Arc;
 
 use ai::cmds::*;
 use ai::AiConfigStore;
+use audio::cmds::*;
+use audio::AudioCache;
 use cache::cmds::*;
 use cache::CacheDb;
 use netease::cmds::*;
@@ -33,7 +37,11 @@ pub fn run() {
         // 网易云 CDN 防盗链代理：把 claudio-cdn://localhost/?u=<encoded>
         // 转成带 Referer: music.163.com/ 的真请求。
         // 这样前端 <img src> / <audio src> 都可以透明走代理，不再 403。
-        .register_asynchronous_uri_scheme_protocol("claudio-cdn", proxy::handle_cdn);
+        .register_asynchronous_uri_scheme_protocol("claudio-cdn", proxy::handle_cdn)
+        // 音频缓存：claudio-audio://localhost/?id=<trackId>&u=<encoded_url>
+        // 命中本地文件就直接喂；miss 就拉上游 + 落盘 + LRU 淘汰。
+        // 前端只用换一处 URL 就行，<audio>/AudioBuffer 那边完全透明。
+        .register_asynchronous_uri_scheme_protocol("claudio-audio", audio::scheme::handle_audio);
 
     // Windows: 跑 decorum 在 NCCALCSIZE 层把原生标题栏拿掉，
     // 但保留右上角 min/max/close（系统画的，行为完全原生）。
@@ -70,6 +78,14 @@ pub fn run() {
             cache_save_lyric,
             cache_get_state,
             cache_set_state,
+            // audio cache
+            audio_cache_stats,
+            audio_cache_set_max_mb,
+            audio_cache_clear,
+            audio_prefetch,
+            audio_get_features,
+            audio_get_cached_features,
+            audio_get_cached_features_bulk,
         ])
         .setup(|app| {
             // 所有持久化都落在 app_config_dir（macOS: ~/Library/Application Support/claudio/）
@@ -94,8 +110,29 @@ pub fn run() {
 
             // --- cache db ---
             let cache_path = dir.join("cache.db");
-            let cache = CacheDb::open(&cache_path).expect("open cache db");
-            app.manage(Arc::new(cache));
+            let cache = Arc::new(CacheDb::open(&cache_path).expect("open cache db"));
+            app.manage(cache.clone());
+
+            // --- audio cache（磁盘缓存，原始字节）---
+            // 落在 app_cache_dir（macOS: ~/Library/Caches/claudio/）—— 是 OS 级别
+            // "可清理" 缓存目录，跟 app_config_dir（不会被清）的 cache.db 索引分开
+            let audio_root = app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| dir.clone())
+                .join("audio");
+            let audio_cache = AudioCache::init(cache, audio_root)
+                .expect("init audio cache");
+            app.manage(Arc::new(audio_cache));
+
+            // 启动时先把网易云 CDN 的 TLS 连接建好 —— 用户第一次切歌时
+            // 不用再等 TLS 握手（~150-300ms）。fire-and-forget，失败不致命。
+            tauri::async_runtime::spawn(async {
+                let url = url::Url::parse("https://music.163.com/").unwrap();
+                if let Err(e) = crate::cdn::cdn_get(&url, None, None, None).await {
+                    log::debug!("[claudio] TLS warmup skipped: {e}");
+                }
+            });
 
             // Windows: 把主窗口的原生标题栏拿掉，留下三个系统键。
             // 必须在 setup 里拿到 webview window 之后调用一次。

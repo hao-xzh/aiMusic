@@ -16,30 +16,11 @@
 //! 安全：只放行 `music.163.com` / `*.music.163.com` / `*.music.126.net`，
 //! 别变成开放代理。Range 头透传保障音频 seek。
 
-use std::sync::OnceLock;
-
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{UriSchemeContext, UriSchemeResponder, Wry};
 use url::Url;
 
-/// 官方客户端的 Referer。网易云 CDN 认这个值。
-const REFERER: &str = "https://music.163.com/";
-
-/// 和 netease client 里一致，避免 CDN 按 UA 风控。
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                  (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36";
-
-/// 全局复用的 reqwest client：连接池 + DNS 缓存跨请求复用。
-/// 每次 new 一个 Client 会重建 TLS/连接池，同首歌的 Range 续传也吃亏。
-fn cdn_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .gzip(true)
-            .build()
-            .expect("build cdn reqwest client")
-    })
-}
+use crate::cdn::{cdn_client, validate_upstream};
 
 /// Tauri 的异步 URI scheme handler 入口。
 /// 拿到 request -> 提取 `?u=` -> 远端 fetch -> 把响应塞给 responder。
@@ -78,18 +59,7 @@ async fn fetch(req: Request<Vec<u8>>) -> anyhow::Result<Response<Vec<u8>>> {
     // ---- 2) 校验域名白名单，禁止当开放代理 ----
     let upstream_url = Url::parse(&upstream)
         .map_err(|e| anyhow::anyhow!("parse upstream {upstream}: {e}"))?;
-    let host = upstream_url.host_str().unwrap_or("").to_ascii_lowercase();
-    let allowed = host == "music.163.com"
-        || host.ends_with(".music.163.com")
-        || host.ends_with(".music.126.net");
-    if !allowed {
-        anyhow::bail!("host not in allowlist: {host}");
-    }
-    // 也禁一下非 http(s) 的偷渡（data:、file: 之流）
-    match upstream_url.scheme() {
-        "http" | "https" => {}
-        other => anyhow::bail!("upstream scheme not allowed: {other}"),
-    }
+    validate_upstream(&upstream_url)?;
 
     // ---- 3) 发给上游，注入官方 Referer + UA ----
     // `<audio>` 会用 GET，也可能预检 HEAD。其它方法拒绝。
@@ -98,6 +68,9 @@ async fn fetch(req: Request<Vec<u8>>) -> anyhow::Result<Response<Vec<u8>>> {
         "HEAD" => reqwest::Method::HEAD,
         other => anyhow::bail!("method not allowed: {other}"),
     };
+    const REFERER: &str = "https://music.163.com/";
+    const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                      (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36";
     let mut upstream_req = cdn_client()
         .request(method, upstream_url.as_str())
         .header("Referer", REFERER)

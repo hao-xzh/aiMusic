@@ -119,6 +119,16 @@ impl CacheDb {
         self.conn.lock().expect("cache db poisoned")
     }
 
+    /// 让 crate 内别的模块（比如 `audio::cache`）借这一份连接 + 锁，
+    /// 避免再开第二个 Connection。返回值生命周期跟 closure 绑定。
+    pub fn with_conn<F, T>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<T>,
+    {
+        let conn = self.lock();
+        f(&conn)
+    }
+
     // ----- playlists -----
 
     pub fn get_playlists(&self, uid: i64) -> Result<Vec<CachedPlaylist>> {

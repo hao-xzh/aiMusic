@@ -2,8 +2,10 @@
 
 import {
   ai,
+  audio,
   netease,
   type AiConfigPublic,
+  type AudioCacheStats,
   type ModelOption,
   type ProviderId,
   type ProviderView,
@@ -61,6 +63,10 @@ export default function SettingsPage() {
 
       <Section title="音频分析（接歌丝滑度）">
         <AnalysisRow />
+      </Section>
+
+      <Section title="音频缓存">
+        <AudioCacheRow />
       </Section>
 
       <Section title="外观">
@@ -778,6 +784,222 @@ function AnalysisRow() {
           {err}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------- 音频磁盘缓存 ----------
+//
+// Rust 端 `claudio-audio://` URI scheme 接管所有音频请求：命中本地直接读，
+// miss 才拉网络 + 落盘 + LRU 淘汰。这里给用户三件事：看用量、调上限、清空。
+
+function AudioCacheRow() {
+  const [stats, setStats] = useState<AudioCacheStats | null>(null);
+  const [maxMbDraft, setMaxMbDraft] = useState<string>("");
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const s = await audio.cacheStats();
+      setStats(s);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const startEdit = () => {
+    if (!stats) return;
+    setMaxMbDraft(String(Math.round(stats.maxBytes / 1024 / 1024)));
+    setEditing(true);
+    setErr(null);
+  };
+
+  const saveMax = async () => {
+    const mb = parseInt(maxMbDraft, 10);
+    if (!Number.isFinite(mb) || mb < 64) {
+      setErr("上限至少 64 MB");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await audio.setCacheMaxMb(mb);
+      setEditing(false);
+      await refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearAll = async () => {
+    if (!confirm("确定要清空音频缓存吗？后续切歌会重新拉。")) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await audio.clearCache();
+      await refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fmtBytes = (b: number) => {
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+    if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
+    return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "2px 2px" }}>
+      <div>
+        <div style={{ fontWeight: 600 }}>歌曲原始字节缓存</div>
+        <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2, lineHeight: 1.55 }}>
+          切歌时优先读本地缓存的 mp3/flac，命中就不再走网络。超过上限按 last-used
+          淘汰。缓存放在系统的 cache 目录，删掉不影响歌单 / 画像数据。
+        </div>
+      </div>
+
+      {stats && (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <CacheUsageBar
+              used={stats.totalBytes}
+              max={stats.maxBytes}
+            />
+            <div
+              style={{
+                color: "#9be3c6",
+                fontSize: 12,
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {fmtBytes(stats.totalBytes)} / {fmtBytes(stats.maxBytes)}
+            </div>
+            <div
+              style={{
+                color: "#6c7489",
+                fontSize: 11,
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              }}
+            >
+              · {stats.count} 首
+            </div>
+          </div>
+
+          {/* 上限调整 + 清空 */}
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            {editing ? (
+              <>
+                <input
+                  type="number"
+                  value={maxMbDraft}
+                  onChange={(e) => setMaxMbDraft(e.target.value)}
+                  min={64}
+                  step={64}
+                  autoFocus
+                  style={{
+                    width: 110,
+                    padding: "9px 12px",
+                    borderRadius: 10,
+                    border: "1px solid rgba(233,239,255,0.15)",
+                    background: "rgba(14,18,28,0.6)",
+                    color: "#e9efff",
+                    fontSize: 13,
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                    outline: "none",
+                  }}
+                />
+                <span style={{ color: "#8a93a8", fontSize: 12 }}>MB</span>
+                <button onClick={saveMax} disabled={busy} style={primaryBtn}>
+                  {busy ? "保存中…" : "保存"}
+                </button>
+                <button onClick={() => { setEditing(false); setErr(null); }} disabled={busy} style={ghostBtn}>
+                  取消
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={startEdit} style={primaryBtn}>
+                  调上限
+                </button>
+                <button
+                  onClick={clearAll}
+                  disabled={busy || stats.totalBytes === 0}
+                  style={{
+                    ...dangerBtn,
+                    opacity: busy || stats.totalBytes === 0 ? 0.4 : 1,
+                  }}
+                >
+                  清空缓存
+                </button>
+                <button onClick={refresh} disabled={busy} style={ghostBtn}>
+                  刷新
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      {!stats && !err && (
+        <div style={{ color: "#8a93a8", fontSize: 12 }}>正在读取缓存状态…</div>
+      )}
+
+      {err && (
+        <div
+          style={{
+            padding: "8px 12px",
+            borderRadius: 10,
+            background: "rgba(255,180,180,0.08)",
+            border: "1px solid rgba(255,180,180,0.25)",
+            color: "#ffb4b4",
+            fontSize: 12,
+            lineHeight: 1.45,
+          }}
+        >
+          {err}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CacheUsageBar({ used, max }: { used: number; max: number }) {
+  const pct = max > 0 ? Math.min(100, (used / max) * 100) : 0;
+  // 接近上限给个警告色，不然走主色（薄荷绿）
+  const color = pct > 90 ? "#ffd28a" : "#9be3c6";
+  return (
+    <div
+      style={{
+        flex: 1,
+        minWidth: 140,
+        height: 6,
+        borderRadius: 999,
+        background: "rgba(233,239,255,0.08)",
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          width: `${pct}%`,
+          height: "100%",
+          background: color,
+          borderRadius: 999,
+          transition: "width 240ms ease, background 240ms ease",
+        }}
+      />
     </div>
   );
 }

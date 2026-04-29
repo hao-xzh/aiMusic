@@ -30,7 +30,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { cache, netease, type TrackInfo } from "./tauri";
+import { audio, cache, netease, wrapAudioUrl, type TrackInfo } from "./tauri";
 import { cdn } from "./cdn";
 import { parseLrc, type LrcLine } from "./lrc";
 import {
@@ -38,7 +38,7 @@ import {
   DEFAULT_JUDGMENT,
   type TransitionJudgment,
 } from "./transition-judge";
-import { getOrAnalyze, loadAnalysis } from "./audio-analysis";
+import { getOrAnalyze, loadAnalysis, mergeWithNative } from "./audio-analysis";
 import { planMix, type MixPlan } from "./mix-planner";
 import { smoothQueue } from "./smooth-queue";
 import { logBehavior } from "./behavior-log";
@@ -186,6 +186,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const generationRef = useRef<number>(0);
   /** 直接播放请求准备中时，旧曲目不能再自动排/跳下一首，避免 UI 与真实意图错位。 */
   const pendingPlaybackGenRef = useRef<number | null>(null);
+  /** 已经触发过 prefetch 的 trackId 集 —— 避免同一首反复发请求 */
+  const prefetchedSetRef = useRef<Set<number>>(new Set());
 
   const [state, setState] = useState<PlayerState>({
     current: null,
@@ -337,7 +339,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           br: u.br,
           sizeMB: (u.size / 1024 / 1024).toFixed(2),
         });
-        return cdn(u.url);
+        // 走 audio cache scheme：命中本地直接读，miss 才拉网络 + 落盘 LRU
+        return wrapAudioUrl(neteaseId, u.url);
       }
     } catch (e) {
       console.debug("[claudio] lossless 失败,退到 exhigh", e);
@@ -352,7 +355,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           br: u.br,
           sizeMB: (u.size / 1024 / 1024).toFixed(2),
         });
-        return cdn(u.url);
+        return wrapAudioUrl(neteaseId, u.url);
       }
     } catch (e) {
       console.debug("[claudio] exhigh 失败", e);
@@ -402,10 +405,25 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
       // 本地接歌判断 + mix plan
       const fromId = current.neteaseId;
-      const [fromAnalysis, toAnalysis] = await Promise.all([
+      const [fromAnalysisRaw, toAnalysisRaw, fromNative, toNative] = await Promise.all([
         fromId ? loadAnalysis(fromId).catch(() => null) : Promise.resolve(null),
         nextAnalysisPromise.catch(() => null),
+        // native features：仅查缓存，没有就 null（由后续 audio.getFeatures 异步填）
+        fromId ? audio.getCachedFeatures(fromId).catch(() => null) : Promise.resolve(null),
+        audio.getCachedFeatures(nxt.neteaseId).catch(() => null),
       ]);
+      // 把 Symphonia 算出的更准 BPM/RMS/能量合并进 JS analysis
+      const fromAnalysis = fromAnalysisRaw
+        ? mergeWithNative(fromAnalysisRaw, fromNative)
+        : null;
+      const toAnalysis = toAnalysisRaw
+        ? mergeWithNative(toAnalysisRaw, toNative)
+        : null;
+      // 后台抓一发 next 的 native features —— 当前这次 plan 拿不到没事，
+      // 下一次切歌时缓存就有了
+      if (toNative === null) {
+        void audio.getFeatures(nxt.neteaseId, url).catch(() => {});
+      }
       const judgment =
         (await judgeTransition(current, nxt, { from: fromAnalysis, to: toAnalysis }).catch(() => null)) ??
         DEFAULT_JUDGMENT;
@@ -457,6 +475,49 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }, [fetchUrl]);
+
+  // ============================================================
+  // 预测预取：把队列里 i+2 / i+3 的字节灌进磁盘缓存
+  // ============================================================
+  //
+  // maybeScheduleNext 已经在播 N 时把 N+1 解码好了；这里再多走一步，把 N+2 / N+3
+  // 的原始字节（mp3/flac）拉进 Rust 端磁盘缓存，但不解码、不占内存。
+  //
+  // 命中检测交给 Rust 端的 audio_prefetch（已缓存就立刻返回 true）。
+  // 同一 session 同一首只触发一次（prefetchedSetRef 去重），队列变更时清掉，
+  // 不浪费用户带宽在他不会听的歌上。
+  const prefetchAhead = useCallback(async () => {
+    const { current, queue } = stateRef.current;
+    if (!current || queue.length < 3) return;
+    const i = queue.findIndex((t) => t.id === current.id);
+    if (i < 0) return;
+
+    for (let offset = 2; offset <= 3; offset++) {
+      const t = queue[(i + offset) % queue.length];
+      if (!t?.neteaseId || t.id === current.id) continue;
+      if (prefetchedSetRef.current.has(t.neteaseId)) continue;
+      prefetchedSetRef.current.add(t.neteaseId);
+
+      // 不 await —— 串行节流交给 Rust 端 cdn_client 的连接池
+      void (async () => {
+        try {
+          const urls = await netease.songUrls([t.neteaseId!], "lossless");
+          const u = urls[0];
+          // VIP 限制时退到 exhigh
+          const finalUrl = u?.url
+            ? u.url
+            : (await netease.songUrls([t.neteaseId!], "exhigh"))[0]?.url;
+          if (!finalUrl) return;
+          const hit = await audio.prefetch(t.neteaseId!, finalUrl);
+          console.debug("[claudio] prefetch", t.neteaseId, hit ? "(hit)" : "(stored)");
+        } catch (e) {
+          console.debug("[claudio] prefetch failed", t.neteaseId, e);
+          // 失败时把这一项从已触发集移除，下次还能再试
+          prefetchedSetRef.current.delete(t.neteaseId!);
+        }
+      })();
+    }
+  }, []);
 
   // ============================================================
   // 调度器事件：next 接管成 current / 队列播完
@@ -941,6 +1002,20 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   // ============================================================
   // MediaSession：耳机 / 系统媒体键
   // ============================================================
+  // 当前曲目变了 → 队列后面再多 prefetch 两首字节进盘
+  // 不依赖 isPlaying，单纯跟着 current 走；用户在 UI 里翻队列时也会触发预热
+  useEffect(() => {
+    if (!state.current) return;
+    void prefetchAhead();
+  }, [state.current?.id, prefetchAhead]);
+
+  // 队列整体换了 → 清掉 prefetch 去重集（之前的歌不再相关）
+  useEffect(() => {
+    prefetchedSetRef.current.clear();
+    // 第一首 prefetch 由 current 那个 effect 触发；这里只重置
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.queue.length, state.queue[0]?.id]);
+
   useEffect(() => {
     if (typeof navigator === "undefined" || !("mediaSession" in navigator)) return;
     const ms = navigator.mediaSession;

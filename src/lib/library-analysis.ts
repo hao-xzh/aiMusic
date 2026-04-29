@@ -13,8 +13,7 @@
  */
 
 import type { TrackInfo } from "./tauri";
-import { netease } from "./tauri";
-import { cdn } from "./cdn";
+import { netease, wrapAudioUrl } from "./tauri";
 import { loadAnalysis, getOrAnalyze } from "./audio-analysis";
 
 export type BatchProgress = {
@@ -77,7 +76,8 @@ export async function analyzeLibrary(
         try {
           const urls = await netease.songUrls(slice.map((t) => t.id));
           for (const u of urls) {
-            if (u.url) idToUrl.set(u.id, cdn(u.url));
+            // 走 audio cache scheme —— 分析时拉一遍正好把磁盘缓存预热
+            if (u.url) idToUrl.set(u.id, wrapAudioUrl(u.id, u.url));
           }
         } catch (e) {
           console.debug("[claudio] batch songUrls 失败", e);

@@ -13,7 +13,7 @@
  * mix-planner 用 BPM + outroStart + drumEntry 已经能做 90% 的"丝滑接"。
  */
 
-import { cache } from "./tauri";
+import { cache, type AudioFeatures } from "./tauri";
 
 const VERSION = 3 as const;
 const KEY_PREFIX = "analysis:v3:";
@@ -110,6 +110,59 @@ export async function getOrAnalyze(
   })();
   inflight.set(trackId, promise);
   return promise;
+}
+
+// ---------- native merge ----------
+//
+// Symphonia（Rust 端）算的 BPM / RMS / 能量，比 JS 这一套更准 5-10×。
+// 结构性信号（drumEntry / vocalEntry / outroStart）只 JS 端有 ——
+// 那是给 mix-planner 选触发点用的，跟"物理属性"是两码事。
+//
+// 合并策略：
+//   - bpm 用 native 当 confidence > 0.3，否则用 JS（互补 fallback）
+//   - bpmConfidence 取较大值
+//   - rmsDb / introEnergy / outroEnergy 直接换成 native（更准）
+//   - 其它（drumEntryS / vocalEntryS / outroStartS / vocalPerSec / energyPerSec）保留 JS
+
+export function mergeWithNative(
+  js: TrackAnalysis,
+  native: AudioFeatures | null,
+): TrackAnalysis {
+  if (!native) return js;
+  const useNativeBpm =
+    native.bpm !== null && native.bpmConfidence > 0.3;
+
+  // 用 native 的 silence boundaries 校正 JS 的结构性时间点：
+  //   - tail silence > 0.5s + JS 没找到 outroStart → 用"曲尾 - tail_silence - 0.5s"当软 outro
+  //     起点。让 mix-planner 不要把 fade-out 插到那段已经静默的尾巴里。
+  //   - head silence > 0.5s + drum/vocalEntry 落在静默段里 → 推到 head_silence 之后。
+  //     避免 inSeek 把 B 起点放进静默段。
+  let outroStartS = js.outroStartS;
+  if (native.tailSilenceS > 0.5 && outroStartS === null) {
+    outroStartS = Math.max(0, js.durationS - native.tailSilenceS - 0.5);
+  }
+  let drumEntryS = js.drumEntryS;
+  let vocalEntryS = js.vocalEntryS;
+  if (native.headSilenceS > 0.5) {
+    if (drumEntryS !== null && drumEntryS < native.headSilenceS) {
+      drumEntryS = native.headSilenceS;
+    }
+    if (vocalEntryS !== null && vocalEntryS < native.headSilenceS) {
+      vocalEntryS = native.headSilenceS;
+    }
+  }
+
+  return {
+    ...js,
+    bpm: useNativeBpm ? native.bpm : js.bpm,
+    bpmConfidence: Math.max(js.bpmConfidence, native.bpmConfidence),
+    introEnergy: native.introEnergy,
+    outroEnergy: native.outroEnergy,
+    rmsDb: native.rmsDb,
+    outroStartS,
+    drumEntryS,
+    vocalEntryS,
+  };
 }
 
 // ---------- 主流程 ----------

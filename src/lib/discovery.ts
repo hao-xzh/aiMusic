@@ -120,14 +120,21 @@ async function generateSeeds(
     culturalContext: profile.culturalContext,
   });
 
+  const acousticBlock = formatAcousticBlock(profile);
+
   const user =
-    `这是用户的口味画像（JSON）：\n${profileSnippet}\n\n` +
-    `任务：为这个用户生成 ${count} 个"搜索 seed"，去网易云搜出 TA 可能喜欢但歌单里**还没有**的歌。\n` +
+    `这是用户的口味画像（JSON）：\n${profileSnippet}\n` +
+    acousticBlock +
+    `\n任务：为这个用户生成 ${count} 个"搜索 seed"，去网易云搜出 TA 可能喜欢但歌单里**还没有**的歌。\n` +
     `要求：\n` +
     `1) seed 要"窄而准"——具体艺人 + 代表专辑、或者"子流派 + 年代"、或者"情绪 + 文化语境"。\n` +
     `   反例：太宽（"流行歌曲"）、太通用（"古典音乐"）、纯英文情绪词（"sad songs"）\n` +
     `2) 优先推荐用户**没列出**的艺人 / 同流派的相邻艺人 / 那一脉的"挖宝"曲目。\n` +
     `3) seeds 可以有自然变化，但不要为了多样性刻意避开同一艺人；贴口味更重要。\n` +
+    (acousticBlock
+      ? `   特别地：声学指纹给的 BPM 区间 / 响度气质 / 音色亮度是 ground truth，` +
+        `seed 要尽量贴这份指纹（比如指纹偏慢就别推 EDM，偏暗就别推干净 pop）。\n`
+      : "") +
     `4) query 字段就是要塞进搜索框的那串字符（中英都行，看哪个更精准）。\n` +
     `5) rationale ≤30 字，说"为什么这个 seed 该推给 TA"。\n\n` +
     `严格只输出一行 JSON：{"seeds":[{"query":"...","rationale":"..."}]}\n` +
@@ -174,13 +181,18 @@ async function rankCandidates(
     moods: profile.moods,
     culturalContext: profile.culturalContext,
   });
+  const acousticBlock = formatAcousticBlock(profile);
 
   const user =
-    `用户口味画像（JSON）：\n${profileSnippet}\n\n` +
-    `这些是从网易云搜出来的候选，全部都是 TA 歌单里**没有**的歌：\n${lines}\n\n` +
+    `用户口味画像（JSON）：\n${profileSnippet}\n` +
+    acousticBlock +
+    `\n这些是从网易云搜出来的候选，全部都是 TA 歌单里**没有**的歌：\n${lines}\n\n` +
     `任务：从候选池里挑出最符合 TA 口味气质的 ≤${finalCount} 首，给个性化推荐。\n` +
     `要求：\n` +
     `1) 不是按"热门度"挑，是按"和这个画像的匹配度"。\n` +
+    (acousticBlock
+      ? `   "匹配度"明确包含声学指纹：BPM/响度/音色亮度对得上才算匹配，不只是 genre 标签。\n`
+      : "") +
     `2) 不要为了多样性刻意避开同一艺人；如果同一艺人的多首歌更贴口味，可以保留。\n` +
     `3) why ≤25 字，说"为什么是这首"，可以提风格相似度、情绪契合、文化坐标。\n` +
     `4) trackIds 必须从上面候选列表的 neteaseId 里挑，不许编。\n\n` +
@@ -211,6 +223,36 @@ async function rankCandidates(
     if (out.length >= finalCount) break;
   }
   return out;
+}
+
+// ---------- 把画像里的 acoustics 摘要拼成 prompt 块 ----------
+//
+// taste-profile 蒸馏时算了一份声学指纹存在 profile.acoustics 里。
+// 老画像（蒸馏时还没接 Symphonia）→ 没这字段，就返回空串，prompt 自动跳过那一段。
+
+function formatAcousticBlock(profile: TasteProfile): string {
+  const a = profile.acoustics;
+  if (!a || a.analyzed < 20) return "";
+  const m = a.metrics;
+  const lines: string[] = [`声学指纹（基于 ${a.analyzed} 首已分析曲目）：`];
+  if (m.bpmMedian !== null) {
+    lines.push(
+      `- BPM 中位 ${m.bpmMedian.toFixed(0)}，分布 慢 ${pct(m.bpmDistribution.slow)}` +
+        ` / 中 ${pct(m.bpmDistribution.mid)} / 快 ${pct(m.bpmDistribution.fast)}`,
+    );
+  }
+  lines.push(
+    `- 响度均值 ${m.rmsDbMean.toFixed(1)} dBFS · 动态范围 ${m.dynamicRangeDbMean.toFixed(1)} dB`,
+  );
+  lines.push(
+    `- 音色：暗 ${pct(m.centroidDistribution.dark)} / 中 ${pct(m.centroidDistribution.neutral)}` +
+      ` / 亮 ${pct(m.centroidDistribution.bright)}（谱重心 ~${(m.centroidMean / 1000).toFixed(1)}kHz）`,
+  );
+  return `\n${lines.join("\n")}\n`;
+}
+
+function pct(x: number): string {
+  return `${Math.round(x * 100)}%`;
 }
 
 // ---------- JSON 宽松解析 ----------

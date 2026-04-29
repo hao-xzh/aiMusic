@@ -13,8 +13,9 @@
  */
 
 import { parseJsonObjectLike } from "./ai-json";
-import { ai, cache, netease, type CachedPlaylistDetail, type TrackInfo } from "./tauri";
+import { ai, audio, cache, netease, type CachedPlaylistDetail, type TrackInfo } from "./tauri";
 import { readBehaviorLog, summarize } from "./behavior-log";
+import { summarizeAcoustics, type AcousticMetrics } from "./acoustic-summary";
 
 // ---------- 持久化 KV 键 ----------
 const KEY_PROFILE = "taste_profile_v1";
@@ -71,6 +72,16 @@ export type TasteProfile = {
   taglines: string[];
   /** 一句话短评：作为画像页头部 hero */
   summary: string;
+
+  /**
+   * 声学指纹（已分析曲目聚合的 BPM/响度/动态范围/音色），
+   * 蒸馏时算一份存进来，之后 discovery / 推荐都直接读，不再算第二次。
+   * 老画像没这个字段 → null，discovery 端会跳过这块 prompt。
+   */
+  acoustics?: {
+    analyzed: number;
+    metrics: AcousticMetrics;
+  } | null;
 };
 
 // ---------- 持久化 ----------
@@ -253,6 +264,23 @@ export async function distillTaste(
     })
     .join("\n");
 
+  // 声学指纹：从已分析过的曲目里聚合 BPM/响度/动态范围/音色亮度。
+  // 只看 sample（采样过的），跟 lines 对齐。库里没分析过的就跳过 ——
+  // 不强制现场分析，让蒸馏不阻塞在 I/O 上。
+  let acousticBlock = "";
+  let acousticPersist: TasteProfile["acoustics"] = null;
+  try {
+    const featuresList = await audio.getCachedFeaturesBulk(sample.map((t) => t.id));
+    const acoustic = summarizeAcoustics(featuresList);
+    if (acoustic.analyzed >= 20) {
+      // 至少 20 首才出 prompt block，否则统计太薄不靠谱
+      acousticBlock = `\n${acoustic.promptBlock}\n\n→ 画像里的 BPM 偏好、响度气质、音色亮度都要 reflect 这份指纹。\n`;
+      acousticPersist = { analyzed: acoustic.analyzed, metrics: acoustic.metrics };
+    }
+  } catch (e) {
+    console.debug("[claudio] acoustic aggregate failed", e);
+  }
+
   const playlistList = details
     .map((d) => `「${d.name}」（${d.tracks.length} 首）`)
     .join("、");
@@ -278,6 +306,7 @@ export async function distillTaste(
     `用户挑了 ${details.length} 张歌单：${playlistList}\n` +
     `合计 ${totalTracks} 首，已分层采样 ${sample.length} 首。\n` +
     behaviorBlock +
+    acousticBlock +
     `\n曲目（序号. neteaseId. 歌名 — 艺人 · 专辑）：\n${lines}\n\n` +
     `任务：基于这些曲目，画一份这个用户的"音乐口味画像"。\n` +
     `要求：\n` +
@@ -319,6 +348,7 @@ export async function distillTaste(
     sourcePlaylistIds: details.map((d) => d.id),
     sourceHash,
     ...parsed,
+    acoustics: acousticPersist,
   };
 
   // ---- 5) 持久化 ----
