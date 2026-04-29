@@ -27,6 +27,14 @@ struct ChatReq<'a> {
     temperature: f32,
     max_tokens: u32,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingReq>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinkingReq {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +83,11 @@ pub async fn chat(
         temperature,
         max_tokens,
         stream: false,
+        thinking: if base_url.trim_end_matches('/') == "https://api.deepseek.com" {
+            Some(ThinkingReq { kind: "disabled" })
+        } else {
+            None
+        },
     };
 
     let resp = client

@@ -1,6 +1,5 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "_": "Windows-only overrides — merged on top of tauri.conf.json when target is Windows. Decorations off, decorum 在运行时把原生 min/max/close 注入回来。",
   "app": {
     "windows": [
       {
