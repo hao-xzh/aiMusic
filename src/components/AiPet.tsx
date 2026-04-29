@@ -214,12 +214,21 @@ export function AiPet() {
 
       // **节拍冲量**：检测 amp 瞬时尖峰（norm 比慢通道 ampSlow 高出阈值）
       // 命中后两件事一起发：(a) velocity 一拍让钟摆甩出去；(b) beatLevel 拉满，
-      // CSS 用它做向上跳 + scale punch —— 这一下是肉眼看着"咚"的关键。
-      // 阈值 0.12 比 v2 的 0.18 松一些，常见 pop 鼓点更容易触发。
+      // CSS 用它做"咚"一下的微胀 + filter 闪。
+      //
+      // 关键改动：beatDir 不再 random —— 跟当前角速度方向走。原理跟"推秋千"一致：
+      //   如果钟摆正在向左荡(velocity<0)，那这拍也往左推，能量叠加，下一次更高
+      //   连续命中重音 → 摆动越来越大，肉眼很容易跟上鼓点
+      // 角速度太小时（接近静止）才用随机方向破对称
       const beatExcess = norm - ampSlow;
       if (beatExcess > 0.12 && now - lastBeatAt > 160 && ampSmooth > 0.05) {
-        const beatImpulse = (4 + beatExcess * 22) * motionScale;
-        const beatDir = (Math.random() - 0.5) * 2; // -1..1，避免老往一边歪
+        const beatImpulse = (5 + beatExcess * 26) * motionScale;
+        const beatDir =
+          Math.abs(velocity) > 1.5
+            ? Math.sign(velocity)
+            : Math.random() > 0.5
+              ? 1
+              : -1;
         velocity += beatImpulse * beatDir;
         // beatLevel 累计但封顶 1，连续重音不会越加越大
         beatLevel = Math.min(1, beatLevel + 0.6 + beatExcess * 1.4);

@@ -168,11 +168,11 @@
   position: absolute;
   left: 50%;
   top: 50%;
-  /* 节拍跳动：translateY 向上 6px + scale 1→1.09。--beat 由 rAF 在每个鼓点拉满
-     后指数衰减回 0（半衰期 ~110ms），所以这里是一个"咚"完就归位的瞬时动作，
-     肉眼很容易跟上节奏。垂直方向用 -50% - beat*6 把 -50% 居中和向上跳叠加。 */
-  transform: translate(-50%, calc(-50% - var(--beat, 0) * 6px))
-    scale(calc(1 + var(--beat, 0) * 0.09));
+  /* 钟摆挂在绳上 —— 主运动是父级 anchor 的 rotate，球体本身**不上下跳**
+     （上下跳和钟摆物理矛盾，三种动作叠在一起会很乱）。
+     节拍只用一个极轻微的 scale "心跳"：1 → 1.04 → 1，和 filter 闪
+     一起做"咚"的瞬时反馈，配合钟摆冲量加大的左右甩，肉眼容易看出节奏。 */
+  transform: translate(-50%, -50%) scale(calc(1 + var(--beat, 0) * 0.04));
   width: 26px;
   height: 26px;
   border-radius: 50% 48% 52% 49% / 51% 49% 50% 48%;
