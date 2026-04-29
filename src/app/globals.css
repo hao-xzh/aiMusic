@@ -62,3 +62,34 @@ button { font: inherit; }
 html[data-platform="windows"] body {
   padding-top: 32px;
 }
+
+/* decorum 三键自适应颜色：
+ * decorum 在 Windows 顶部 32px overlay 里画 min/max/close 按钮，DOM 类名是
+ * `.decorum-tb-btn`（minimize/maximize/close 各有专门 id）。
+ * 默认前景色对深色背景太深 —— 在我们这种封面驱动 + 暗化叠层的场景下经常看不见。
+ *
+ * AiPet 那边已经在按封面亮度写 --titlebar-fg / --titlebar-fg-hover 两个变量到
+ * <html>，这里把它接到按钮上：图标 SVG 的描边和填充都跟变量走，hover 单独一档。
+ *
+ * 没拿到封面（启动初期）→ fallback 用 var() 第二个参数：浅色（适配默认深底）。
+ */
+:root {
+  --titlebar-fg: rgba(245, 247, 255, 0.85);
+  --titlebar-fg-hover: rgba(245, 247, 255, 1);
+}
+
+button.decorum-tb-btn {
+  color: var(--titlebar-fg) !important;
+  transition: color 320ms ease, background 160ms ease;
+}
+button.decorum-tb-btn:hover {
+  color: var(--titlebar-fg-hover) !important;
+}
+/* SVG 图标内部用 currentColor 跟随 button color；同时强行覆盖 stroke/fill
+ * 防 decorum 自带的 inline 颜色覆盖我们 */
+button.decorum-tb-btn svg,
+button.decorum-tb-btn svg * {
+  color: currentColor !important;
+  stroke: currentColor !important;
+  fill: currentColor !important;
+}

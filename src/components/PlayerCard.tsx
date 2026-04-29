@@ -21,7 +21,8 @@
 
 import { Waveform } from "./Waveform";
 import { usePlayer } from "@/lib/player-state";
-import { findActiveLineIdx, type LrcLine } from "@/lib/lrc";
+import { type LrcLine } from "@/lib/lrc";
+import { type YrcLine } from "@/lib/yrc";
 import { cdn } from "@/lib/cdn";
 import React, { useMemo, useState } from "react";
 
@@ -111,6 +112,7 @@ export function PlayerCard() {
 
         <LyricStrip
           lines={lyric?.lines ?? []}
+          yrcLines={lyric?.yrcLines ?? []}
           positionSec={positionSec}
           meta={lyric}
         />
@@ -242,71 +244,97 @@ function Controls({
 
 // ---------- 歌词带 ----------
 //
-// Apple Music 风：5 行可视区，居中行点亮，相邻行按距离淡出。
-// 容器高度走 viewport，矮屏自动收 —— 但行高用 % 跟容器走，不写死 36px。
+// 显示策略：
+//   - 优先 yrc（逐字 / karaoke）：每个字按 (now - charStart) / charDur 算 progress，
+//     已唱完 → 白；正在唱 → 半白半灰的 wipe 渐变；还没唱 → 灰
+//   - 没有 yrc 时回退到行级 LRC + 行内插值"假逐字"：当前行从开头到下一行起点
+//     之间的进度按字符等分，扫一道高亮过去
+//   - 当前行整体 scale 略大 + 一道 box-shadow 暖光（跟 cover orb 同色系）
+//   - 容器有上下 mask 渐隐 + 当前行两端 mask "侧光"
 
-// 可视行数：3 行（上一行 / 激活行 / 下一行）—— Apple Music 大屏歌词的克制版
+// 可视行数：3 行（上一行 / 激活行 / 下一行）
 const LYRIC_ROWS = 3;
 
 function LyricStrip({
   lines,
+  yrcLines,
   positionSec,
   meta,
 }: {
   lines: LrcLine[];
+  yrcLines: YrcLine[];
   positionSec: number;
   meta:
-    | { lines: LrcLine[]; instrumental: boolean; uncollected: boolean }
+    | { lines: LrcLine[]; yrcLines: YrcLine[]; instrumental: boolean; uncollected: boolean }
     | null;
 }) {
-  // ⚠️ 所有 hooks 必须在任何 early return 之前，否则歌词从 null 变非 null
-  // 那一帧 hook 数量会从 1 跳到 2，React 立刻抛 "Rendered more hooks than..."
-  // 整个 app 就崩了。
+  // ⚠️ 所有 hooks 必须在任何 early return 之前。
 
-  const idx = useMemo(
-    () => findActiveLineIdx(lines, positionSec),
-    [lines, positionSec],
+  // 优先用 yrc；没有就降级到 LRC 行级
+  const useYrc = yrcLines.length > 0;
+  const lrcTimes = useMemo(
+    () =>
+      useYrc
+        ? yrcLines.map((y) => y.time)
+        : lines.map((l) => l.time),
+    [useYrc, lines, yrcLines],
   );
 
-  // 渲染一次，按 [lines, idx] memo —— positionSec 每 ~250ms 抖一次，
-  // 但只有 idx 变了才需要重排所有行；不 memo 的话每次 timeupdate 都把
-  // 50 行的 inline style 全拼一遍，即使值都没变也是重复活。
+  const idx = useMemo(() => {
+    // 二分找当前行
+    if (lrcTimes.length === 0) return -1;
+    let lo = 0, hi = lrcTimes.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (lrcTimes[mid] <= positionSec) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans;
+  }, [lrcTimes, positionSec]);
+
+  // 渲染所有行：lines/yrcLines 数组本身不变就不重建
+  // 但每行需要根据 positionSec 实时算字进度 —— 这一段必须每帧跑
   const renderedLines = useMemo(() => {
+    if (useYrc) {
+      return yrcLines.map((y, i) => (
+        <YrcLineView
+          key={i}
+          line={y}
+          isActive={i === idx}
+          dist={Math.abs(i - idx)}
+          positionSec={positionSec}
+        />
+      ));
+    }
     return lines.map((ln, i) => {
       const dist = Math.abs(i - idx);
       const isActive = i === idx;
+      // LRC 模式下用插值"假逐字"：当前行从其 start 到下一行 start 的时长里，
+      // 高亮按字符等分推进
+      let lineProgress = 0;
+      if (isActive) {
+        const start = ln.time;
+        const end = i + 1 < lines.length ? lines[i + 1].time : start + 5;
+        const dur = Math.max(0.4, end - start);
+        lineProgress = Math.max(0, Math.min(1, (positionSec - start) / dur));
+      } else if (i < idx) {
+        lineProgress = 1;
+      }
       return (
-        <div
+        <LrcLineView
           key={i}
-          style={{
-            height: `calc(${LYRIC_BOX_H} / ${LYRIC_ROWS})`,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: isActive ? LYRIC_ACTIVE_FS : LYRIC_DIM_FS,
-            fontWeight: isActive ? 600 : 400,
-            letterSpacing: isActive ? -0.2 : 0,
-            color: isActive
-              ? "#ffffff"
-              : `rgba(233,239,255,${Math.max(0.32, 0.58 - dist * 0.08)})`,
-            transform: isActive ? "scale(1.02)" : "scale(0.97)",
-            transformOrigin: "center",
-            filter: isActive ? "none" : "blur(0.2px)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            padding: "0 12px",
-            // 所有动效统一到 520ms + 同一条 cubic-bezier，避免字号先到位、
-            // 再颜色到位、最后位置才到位 —— 那种错位感就是"歌词不稳"。
-            transition:
-              "color 520ms cubic-bezier(0.22, 1, 0.36, 1), transform 520ms cubic-bezier(0.22, 1, 0.36, 1), font-size 520ms cubic-bezier(0.22, 1, 0.36, 1), filter 520ms cubic-bezier(0.22, 1, 0.36, 1)",
-          }}
-        >
-          {ln.text}
-        </div>
+          text={ln.text}
+          isActive={isActive}
+          dist={dist}
+          progress={lineProgress}
+        />
       );
     });
-  }, [lines, idx]);
+  }, [useYrc, lines, yrcLines, idx, positionSec]);
 
   // 早 return 必须放在所有 hooks 之后
   const placeholder = (text: string) => (
@@ -317,7 +345,7 @@ function LyricStrip({
 
   if (!meta) return placeholder("歌词加载中…");
   if (meta.instrumental) return placeholder("♪ 纯音乐 ♪");
-  if (lines.length === 0) {
+  if (lrcTimes.length === 0) {
     return placeholder(
       `这首歌没有歌词${meta.uncollected ? "（网易云收录不全）" : ""}`,
     );
@@ -326,9 +354,6 @@ function LyricStrip({
   const safeIdx = Math.max(idx, 0);
   const centerRow = Math.floor(LYRIC_ROWS / 2);
   const offset = centerRow - safeIdx;
-  // translate 必须按"容器高度的 1/ROWS 行"算，不能用 % ——
-  // translateY(%) 是相对元素自身高度，内层 stack 高度 = lines.length × 行高，
-  // 50 行的歌写 -60% 实际是 -1080px 而不是 -3 行的 -108px。
   const translateExpr = `calc(${offset} * ${LYRIC_BOX_H} / ${LYRIC_ROWS})`;
 
   return (
@@ -340,8 +365,6 @@ function LyricStrip({
           right: 0,
           top: 0,
           transform: `translate3d(0, ${translateExpr}, 0)`,
-          // 父级 translate 也对齐 520ms —— 现在外滚 + 内变化是同时启停，
-          // 视觉上就是"一整动作"而不是"先变形再滚到位"。
           transition: "transform 520ms cubic-bezier(0.22, 1, 0.36, 1)",
           willChange: "transform",
         }}
@@ -350,6 +373,164 @@ function LyricStrip({
       </div>
     </div>
   );
+}
+
+// 颜色 token —— 已唱（白）/ 未唱（淡灰）。距离当前行越远的行颜色越浅
+const SUNG_WHITE = "rgba(255,255,255,1)";
+const UNSUNG_GRAY = "rgba(233,239,255,0.42)";
+
+/**
+ * yrc 一行：每个字独立渲染，按播放进度做颜色过渡 + wipe 渐变。
+ * 字与字之间用空格 / 标点天然分隔（yrc 字段已含空格）。
+ */
+function YrcLineView({
+  line,
+  isActive,
+  dist,
+  positionSec,
+}: {
+  line: YrcLine;
+  isActive: boolean;
+  dist: number;
+  positionSec: number;
+}) {
+  return (
+    <div style={lineFrame(isActive, dist)}>
+      <div style={lineInner(isActive)}>
+        {line.chars.map((c, i) => (
+          <YrcChar key={i} c={c} positionSec={positionSec} isActive={isActive} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function YrcChar({
+  c,
+  positionSec,
+  isActive,
+}: {
+  c: { startSec: number; durSec: number; text: string };
+  positionSec: number;
+  isActive: boolean;
+}) {
+  // 已经过了字尾 → 白；还没到字头 → 灰
+  // 正好正在唱 → 用 mask-image 的线性渐变 wipe
+  let progress = 0;
+  if (positionSec >= c.startSec + c.durSec) progress = 1;
+  else if (positionSec > c.startSec) progress = (positionSec - c.startSec) / Math.max(0.001, c.durSec);
+
+  const beingSung = isActive && progress > 0 && progress < 1;
+  const sung = progress >= 1;
+
+  return (
+    <span
+      style={{
+        position: "relative",
+        display: "inline-block",
+        // 当前正被唱的字微胀一点点，跟其他字拉开层级
+        transform: beingSung ? "translateY(-1px) scale(1.04)" : "none",
+        transformOrigin: "bottom center",
+        transition: "transform 220ms cubic-bezier(0.22, 1, 0.36, 1)",
+        // 双层叠加：底层灰字 + 上层白字裁剪到 progress 宽度
+        color: sung ? SUNG_WHITE : UNSUNG_GRAY,
+        // wipe：用 background-clip text 给字一个渐变前景
+        // 白色部分从左 0% 到 progress*100%，再 fade 1px 到灰
+        backgroundImage: beingSung
+          ? `linear-gradient(90deg, ${SUNG_WHITE} 0%, ${SUNG_WHITE} ${progress * 100}%, ${UNSUNG_GRAY} ${progress * 100 + 1}%, ${UNSUNG_GRAY} 100%)`
+          : "none",
+        WebkitBackgroundClip: beingSung ? "text" : "border-box",
+        backgroundClip: beingSung ? "text" : "border-box",
+        WebkitTextFillColor: beingSung ? "transparent" : "currentColor",
+        // 已唱的字保留一点点 text-shadow 暖光，跟当前播放页主色对应
+        textShadow: sung
+          ? "0 0 14px rgba(var(--orb-rgb, 155 227 198), 0.18)"
+          : "none",
+      }}
+    >
+      {c.text}
+    </span>
+  );
+}
+
+function LrcLineView({
+  text,
+  isActive,
+  dist,
+  progress,
+}: {
+  text: string;
+  isActive: boolean;
+  dist: number;
+  progress: number;
+}) {
+  return (
+    <div style={lineFrame(isActive, dist)}>
+      <div style={lineInner(isActive)}>
+        {isActive ? (
+          // 假逐字：字符按 progress 切两段
+          <span
+            style={{
+              backgroundImage: `linear-gradient(90deg, ${SUNG_WHITE} 0%, ${SUNG_WHITE} ${progress * 100}%, ${UNSUNG_GRAY} ${progress * 100 + 1}%, ${UNSUNG_GRAY} 100%)`,
+              WebkitBackgroundClip: "text",
+              backgroundClip: "text",
+              WebkitTextFillColor: "transparent",
+              textShadow: "0 0 14px rgba(var(--orb-rgb, 155 227 198), 0.16)",
+            }}
+          >
+            {text}
+          </span>
+        ) : (
+          <span
+            style={{
+              color: dist === 0 ? SUNG_WHITE : UNSUNG_GRAY,
+              opacity: dist === 0 ? 1 : Math.max(0.4, 1 - dist * 0.18),
+            }}
+          >
+            {text}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// 行外框：负责行的高度 + scale 动画 + 上下淡入淡出（按距离）
+function lineFrame(isActive: boolean, dist: number): React.CSSProperties {
+  return {
+    height: `calc(${LYRIC_BOX_H} / ${LYRIC_ROWS})`,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: isActive ? LYRIC_ACTIVE_FS : LYRIC_DIM_FS,
+    fontWeight: isActive ? 600 : 400,
+    letterSpacing: isActive ? -0.2 : 0,
+    transform: isActive ? "scale(1.02)" : "scale(0.97)",
+    transformOrigin: "center",
+    filter: isActive ? "none" : "blur(0.2px)",
+    opacity: isActive ? 1 : Math.max(0.55, 1 - dist * 0.14),
+    overflow: "hidden",
+    padding: "0 12px",
+    transition:
+      "transform 520ms cubic-bezier(0.22, 1, 0.36, 1), font-size 520ms cubic-bezier(0.22, 1, 0.36, 1), filter 520ms cubic-bezier(0.22, 1, 0.36, 1), opacity 520ms cubic-bezier(0.22, 1, 0.36, 1)",
+  };
+}
+
+// 行内文字容器：当前行两侧加一道 mask "舞台聚光"
+function lineInner(isActive: boolean): React.CSSProperties {
+  return {
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    maxWidth: "100%",
+    // 当前行：左右 4% 渐隐到 0；非激活行不加 mask 避免文字总是看着虚
+    maskImage: isActive
+      ? "linear-gradient(90deg, transparent 0%, #000 4%, #000 96%, transparent 100%)"
+      : undefined,
+    WebkitMaskImage: isActive
+      ? "linear-gradient(90deg, transparent 0%, #000 4%, #000 96%, transparent 100%)"
+      : undefined,
+  };
 }
 
 // ---------- SVG（Apple Music 手机端风：裸 glyph，没有圆形底） ----------

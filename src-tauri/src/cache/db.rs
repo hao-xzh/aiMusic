@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS lyrics (
     track_id     INTEGER PRIMARY KEY,
     lyric        TEXT,
     translation  TEXT,
+    yrc          TEXT,           -- 逐字 yrc 原文（karaoke）
     instrumental INTEGER NOT NULL DEFAULT 0,
     uncollected  INTEGER NOT NULL DEFAULT 0,
     synced_at    INTEGER NOT NULL
@@ -110,6 +111,8 @@ impl CacheDb {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA_V1)
             .context("apply schema v1")?;
+        // 老 lyrics 表没 yrc 列；ALTER 已存在就报错忽略
+        let _ = conn.execute("ALTER TABLE lyrics ADD COLUMN yrc TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -359,24 +362,28 @@ impl CacheDb {
 
     pub fn get_lyric(&self, track_id: i64) -> Result<Option<LyricData>> {
         let conn = self.lock();
-        let row: Option<(Option<String>, Option<String>, i64, i64)> = conn
+        // yrc 是后加的列，老库可能没有这列。读不到就是 None，跟"没收录"等价。
+        let row: Option<(Option<String>, Option<String>, Option<String>, i64, i64)> = conn
             .query_row(
-                "SELECT lyric, translation, instrumental, uncollected
+                "SELECT lyric, translation, yrc, instrumental, uncollected
                  FROM lyrics WHERE track_id = ?1",
                 params![track_id],
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        // yrc 列可能不存在（老 schema），fallback to None
+                        row.get::<_, Option<String>>(2).unwrap_or(None),
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.map(|(lyric, translation, instrumental, uncollected)| LyricData {
+        Ok(row.map(|(lyric, translation, yrc, instrumental, uncollected)| LyricData {
             lyric,
             translation,
+            yrc,
             instrumental: instrumental != 0,
             uncollected: uncollected != 0,
         }))
@@ -385,11 +392,12 @@ impl CacheDb {
     pub fn save_lyric(&self, track_id: i64, ly: &LyricData) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO lyrics (track_id, lyric, translation, instrumental, uncollected, synced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO lyrics (track_id, lyric, translation, yrc, instrumental, uncollected, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(track_id) DO UPDATE SET
                lyric=excluded.lyric,
                translation=excluded.translation,
+               yrc=excluded.yrc,
                instrumental=excluded.instrumental,
                uncollected=excluded.uncollected,
                synced_at=excluded.synced_at",
@@ -397,6 +405,7 @@ impl CacheDb {
                 track_id,
                 ly.lyric,
                 ly.translation,
+                ly.yrc,
                 ly.instrumental as i64,
                 ly.uncollected as i64,
                 now_ms(),

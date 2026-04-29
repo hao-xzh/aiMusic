@@ -226,6 +226,11 @@ pub struct LyricResp {
     pub lrc: Option<LyricInner>,
     #[serde(default)]
     pub tlyric: Option<LyricInner>,
+    /// 逐字（karaoke）歌词。网易云对收录较好的主流流行歌返回，独立 / 民谣常常没有。
+    /// 格式：每行 `[lineStartMs,lineDurMs](charStartMs,charDurMs,0)char(charStartMs,charDurMs,0)char...`
+    /// 用 lyric 字段透传给前端解析。
+    #[serde(default)]
+    pub yrc: Option<LyricInner>,
     #[serde(default)]
     pub nolyric: bool,
     #[serde(default)]
@@ -242,6 +247,10 @@ pub struct LyricData {
     pub lyric: Option<String>,
     /// 译词（可能为 None 或空串）
     pub translation: Option<String>,
+    /// 逐字 yrc 原文（karaoke 时间）。冷门歌没收录，None。
+    /// 格式见 [yrc.ts](src/lib/yrc.ts) parser。
+    #[serde(default)]
+    pub yrc: Option<String>,
     /// 纯音乐（KTV 背景 / 无人声）
     pub instrumental: bool,
     /// 网易云自己标的"收录不全" —— 前端可以顺手提示一下

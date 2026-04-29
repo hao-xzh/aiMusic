@@ -13,7 +13,8 @@
  */
 
 import type { TrackInfo } from "./tauri";
-import { audio, netease, wrapAudioUrl } from "./tauri";
+import { audio, netease } from "./tauri";
+import { cdn } from "./cdn";
 import { loadAnalysis, getOrAnalyze } from "./audio-analysis";
 
 export type BatchProgress = {
@@ -67,17 +68,28 @@ export async function analyzeLibrary(
         pending.push(t);
       }
 
-      // 2) 分块批量取直链；Netease 接口一次最多几十个
-      // 直链 6h 过期，但我们只在分析时用一次，不缓存
+      // 2) 分块批量取直链。
+      //
+      // 关键决策：
+      //   - 音质用 `exhigh`（320kbps mp3）而不是 lossless：Windows WebView2
+      //     的 decodeAudioData 解 FLAC 不可靠（实测 5440 首全挂），mp3 各平台都稳
+      //   - URL 走 `cdn(u.url)` 而不是 `wrapAudioUrl(...)`：库扫描**不写**
+      //     播放缓存。否则 VIP 用户后续手动播放时 cache 命中拿到 mp3 而不是
+      //     lossless，是隐式音质回退。播放缓存只由实际播放路径填充
+      //   - 副作用：扫描完没预热到磁盘缓存，跟 phase A 之前一样，第一次手动
+      //     播放还是要现拉。但音质零回退
       const idToUrl = new Map<number, string>();
+      const idToRaw = new Map<number, string>();
       for (let i = 0; i < pending.length; i += urlBatch) {
         if (opts.signal?.aborted) break;
         const slice = pending.slice(i, i + urlBatch);
         try {
-          const urls = await netease.songUrls(slice.map((t) => t.id));
+          const urls = await netease.songUrls(slice.map((t) => t.id), "exhigh");
           for (const u of urls) {
-            // 走 audio cache scheme —— 分析时拉一遍正好把磁盘缓存预热
-            if (u.url) idToUrl.set(u.id, wrapAudioUrl(u.id, u.url));
+            if (u.url) {
+              idToUrl.set(u.id, cdn(u.url)); // JS 端走 claudio-cdn://（referer 代理，无字节缓存）
+              idToRaw.set(u.id, u.url);       // 给 native cmd 用，方便它直接拉上游
+            }
           }
         } catch (e) {
           console.debug("[claudio] batch songUrls 失败", e);
@@ -102,23 +114,31 @@ export async function analyzeLibrary(
                 opts.onProgress?.({ ...progress });
                 continue;
               }
-              try {
-                // JS 端：BPM / 鼓入点 / 人声段 / 能量曲线 —— 给 mix-planner 用
-                const a = await getOrAnalyze(t.id, url);
-                if (!a) progress.failed++;
-
-                // Rust 端 (Symphonia)：BPM / RMS / 动态范围 / 谱重心 / 头尾静默
-                // —— 给 AI 选曲 + mix-planner level match 用
-                // 失败不影响 progress.failed（结构性分析已经成功了）
-                try {
-                  await audio.getFeatures(t.id, url);
-                } catch (e) {
-                  console.debug("[claudio] native features 失败", t.id, e);
-                }
-              } catch (e) {
-                console.debug("[claudio] batch analyze 单首失败", t.id, e);
-                progress.failed++;
-              }
+              const rawUrl = idToRaw.get(t.id) ?? url;
+              // JS 和 native 各自跑各自的，互不影响：一个失败不拖累另一个的进度。
+              // 只有两边都失败 / 拉不到 url 时才计 failed。
+              const [jsOk, nativeOk] = await Promise.all([
+                (async () => {
+                  try {
+                    const a = await getOrAnalyze(t.id, url);
+                    return !!a;
+                  } catch (e) {
+                    console.debug("[claudio] JS analyze 失败", t.id, e);
+                    return false;
+                  }
+                })(),
+                (async () => {
+                  try {
+                    // cacheBytes=false：分析完字节就扔，不污染播放缓存
+                    await audio.getFeatures(t.id, rawUrl, false);
+                    return true;
+                  } catch (e) {
+                    console.debug("[claudio] native features 失败", t.id, e);
+                    return false;
+                  }
+                })(),
+              ]);
+              if (!jsOk && !nativeOk) progress.failed++;
               progress.done++;
               opts.onProgress?.({ ...progress });
             }

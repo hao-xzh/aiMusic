@@ -123,6 +123,8 @@ impl NeteaseClient {
     }
 
     pub async fn song_lyric(&self, id: i64) -> Result<LyricData> {
+        // yv: -1 → 拉逐字（karaoke）。网易云对收录较好的歌会返回 yrc 字段；
+        // 没有就照常返回（lrc 兜底，前端用插值假逐字）。
         let resp: LyricResp = self
             .weapi(
                 "song/lyric",
@@ -131,6 +133,7 @@ impl NeteaseClient {
                     "lv": -1,
                     "kv": -1,
                     "tv": -1,
+                    "yv": -1,
                 }),
             )
             .await?;
@@ -140,6 +143,7 @@ impl NeteaseClient {
         Ok(LyricData {
             lyric: resp.lrc.and_then(|l| l.lyric).filter(|s| !s.is_empty()),
             translation: resp.tlyric.and_then(|l| l.lyric).filter(|s| !s.is_empty()),
+            yrc: resp.yrc.and_then(|l| l.lyric).filter(|s| !s.is_empty()),
             instrumental: resp.nolyric,
             uncollected: resp.uncollected,
         })

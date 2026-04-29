@@ -282,6 +282,8 @@ export function AiPet() {
   useEffect(() => {
     if (!coverUrl) {
       setOrbRgb([155, 227, 198]);
+      // 没封面 = 默认深底色，Windows 三键用浅图标
+      writeTitlebarFg(false);
       return;
     }
     let cancelled = false;
@@ -291,6 +293,18 @@ export function AiPet() {
       })
       .catch(() => {
         if (!cancelled) setOrbRgb([155, 227, 198]);
+      });
+    // 顺手也把"封面主体亮度"算出来，给 Windows 三键调色用
+    sampleAvgLuminance(cdn(coverUrl))
+      .then((lum) => {
+        if (cancelled) return;
+        // 注意：底层有暗化叠层（CSS overlayStyle ≈ 0.55 black），所以
+        // 看到的"实际背景"比封面均值暗约 40%。简单 thresholding：
+        // 封面均值 > 0.65 → 大致还是亮底，三键用深色；否则用浅色
+        writeTitlebarFg(lum > 0.65);
+      })
+      .catch(() => {
+        if (!cancelled) writeTitlebarFg(false);
       });
     return () => {
       cancelled = true;
@@ -1005,6 +1019,63 @@ async function sampleVividColor(
 
 function clamp255(v: number): number {
   return Math.max(0, Math.min(255, v));
+}
+
+/**
+ * 算封面整体平均亮度（0..1，BT.709 加权）。
+ * 给 Windows decorum 三键决定用浅图标还是深图标。
+ *
+ * 不过滤"鲜活像素"，整张图均值 —— 我们要的是"画面整体是亮还是暗"，
+ * 不是主色调。
+ */
+async function sampleAvgLuminance(url: string): Promise<number> {
+  if (!url) throw new Error("empty url");
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  const loaded = new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("image load error"));
+  });
+  img.src = url;
+  await loaded;
+
+  const SIZE = 16;
+  const canvas = document.createElement("canvas");
+  canvas.width = SIZE;
+  canvas.height = SIZE;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("no 2d ctx");
+  ctx.drawImage(img, 0, 0, SIZE, SIZE);
+  const { data } = ctx.getImageData(0, 0, SIZE, SIZE);
+  let lumSum = 0;
+  let n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 200) continue;
+    // BT.709 系数对人眼亮度感最贴
+    const lum = (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+    lumSum += lum;
+    n++;
+  }
+  return n === 0 ? 0.5 : lumSum / n;
+}
+
+/**
+ * 把 Windows decorum 三键的前景色写到 <html>。CSS 端读 `--titlebar-fg`
+ * + `--titlebar-fg-hover` 两个变量去染色。
+ *
+ * isLightBg=true（封面浅）→ 用接近黑的图标
+ * isLightBg=false（默认深底）→ 用浅图标
+ */
+function writeTitlebarFg(isLightBg: boolean) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  if (isLightBg) {
+    root.style.setProperty("--titlebar-fg", "rgba(20, 22, 28, 0.78)");
+    root.style.setProperty("--titlebar-fg-hover", "rgba(20, 22, 28, 1)");
+  } else {
+    root.style.setProperty("--titlebar-fg", "rgba(245, 247, 255, 0.85)");
+    root.style.setProperty("--titlebar-fg-hover", "rgba(245, 247, 255, 1)");
+  }
 }
 
 // 把颜色往白色拉 t (0..1)。t=0 不变，t=1 全白。

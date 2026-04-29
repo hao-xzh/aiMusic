@@ -76,6 +76,12 @@ export type LyricData = {
   lyric: string | null;
   /** 译词，可空 */
   translation: string | null;
+  /**
+   * 逐字 yrc 原文（karaoke）。每行 `[lineMs,durMs](charMs,durMs,0)c(...)c` 格式。
+   * 网易云对收录较好的主流流行歌返回；冷门 / 民谣常常没有，null。
+   * 解析见 [yrc.ts](yrc.ts)。
+   */
+  yrc?: string | null;
   /** 纯音乐（网易云 `nolyric`）*/
   instrumental: boolean;
   /** 网易云自己标的"收录不全" */
@@ -207,9 +213,13 @@ export const audio = {
   /** 预取：把字节灌进磁盘缓存，不返回字节。返回 true=本来就有，false=刚拉的。 */
   prefetch: (trackId: number, url: string) =>
     invoke<boolean>("audio_prefetch", { trackId, url }),
-  /** 拿声学特征。SQLite 命中秒回；miss 走 Symphonia 解码 + DSP，单首 ~50-200ms。 */
-  getFeatures: (trackId: number, url: string) =>
-    invoke<AudioFeatures>("audio_get_features", { trackId, url }),
+  /**
+   * 拿声学特征。SQLite 命中秒回；miss 走 Symphonia 解码 + DSP，单首 ~50-200ms。
+   * `cacheBytes`：默认 true，把拉到的字节顺手落 audio_cache（playback 路径都用这个）。
+   * 库扫描场景传 false，分析完字节就扔，不污染播放缓存。
+   */
+  getFeatures: (trackId: number, url: string, cacheBytes: boolean = true) =>
+    invoke<AudioFeatures>("audio_get_features", { trackId, url, cacheBytes }),
   /** 仅查缓存：已分析的拿走，没分析的 null。不发起任何网络/解码。 */
   getCachedFeatures: (trackId: number) =>
     invoke<AudioFeatures | null>("audio_get_cached_features", { trackId }),

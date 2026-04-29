@@ -33,6 +33,7 @@ import {
 import { audio, cache, netease, wrapAudioUrl, type TrackInfo } from "./tauri";
 import { cdn } from "./cdn";
 import { parseLrc, type LrcLine } from "./lrc";
+import { parseYrc, type YrcLine } from "./yrc";
 import {
   judgeTransition,
   DEFAULT_JUDGMENT,
@@ -74,6 +75,8 @@ export type Track = {
 
 export type LyricTrack = {
   lines: LrcLine[];
+  /** 逐字时间块（如果网易云返回了 yrc）。空数组 = 没有逐字数据，前端走插值 fallback */
+  yrcLines: YrcLine[];
   instrumental: boolean;
   uncollected: boolean;
 };
@@ -582,7 +585,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const loadLyricFor = useCallback(async (track: Track) => {
     if (!track.neteaseId) return;
     const neteaseId = track.neteaseId;
-    const fail = { lyric: "", instrumental: false, uncollected: true };
+    const fail = { lyric: "", yrc: null, instrumental: false, uncollected: true };
     let data;
     try {
       const cached = await cache.getLyric(neteaseId);
@@ -598,6 +601,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         ...s,
         lyric: {
           lines: parseLrc(data!.lyric),
+          yrcLines: parseYrc(data!.yrc ?? null),
           instrumental: data!.instrumental,
           uncollected: data!.uncollected,
         },
