@@ -210,6 +210,8 @@ export const audio = {
   setCacheMaxMb: (mb: number) =>
     invoke<void>("audio_cache_set_max_mb", { mb }),
   clearCache: () => invoke<void>("audio_cache_clear"),
+  clearCacheEntry: (trackId: number) =>
+    invoke<void>("audio_cache_clear_entry", { trackId }),
   /** 预取：把字节灌进磁盘缓存，不返回字节。返回 true=本来就有，false=刚拉的。 */
   prefetch: (trackId: number, url: string) =>
     invoke<boolean>("audio_prefetch", { trackId, url }),
@@ -236,7 +238,15 @@ export const audio = {
  * Rust 侧 referer 注入会自己处理）。
  */
 export function wrapAudioUrl(trackId: number, url: string): string {
-  return `claudio-audio://localhost/?id=${trackId}&u=${encodeURIComponent(url)}`;
+  const base = isWindowsLike()
+    ? "http://claudio-audio.localhost/"
+    : "claudio-audio://localhost/";
+  return `${base}?id=${trackId}&u=${encodeURIComponent(url)}`;
+}
+
+function isWindowsLike(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Windows/i.test(navigator.userAgent);
 }
 
 // ---------- 本地缓存 ----------

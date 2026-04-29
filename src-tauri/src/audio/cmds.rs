@@ -58,6 +58,14 @@ pub fn audio_cache_clear(state: AudioCacheState<'_>) -> Result<(), String> {
     state.clear().map_err(to_err)
 }
 
+#[tauri::command]
+pub fn audio_cache_clear_entry(
+    state: AudioCacheState<'_>,
+    track_id: i64,
+) -> Result<(), String> {
+    state.clear_entry(track_id).map_err(to_err)
+}
+
 /// 预取：确保 trackId 对应的字节已经在磁盘缓存里。已命中就立即返回；
 /// 没命中走 cdn_get 拉一遍 + 落盘。
 ///

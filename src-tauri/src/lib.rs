@@ -82,6 +82,7 @@ pub fn run() {
             audio_cache_stats,
             audio_cache_set_max_mb,
             audio_cache_clear,
+            audio_cache_clear_entry,
             audio_prefetch,
             audio_get_features,
             audio_get_cached_features,

@@ -298,19 +298,28 @@ function LyricStrip({
 
   // 渲染所有行：lines/yrcLines 数组本身不变就不重建
   // 但每行需要根据 positionSec 实时算字进度 —— 这一段必须每帧跑
+  const visibleStart = Math.max(0, idx - 2);
+  const visibleEnd = useYrc
+    ? Math.min(yrcLines.length, idx + 3)
+    : Math.min(lines.length, idx + 3);
+
   const renderedLines = useMemo(() => {
     if (useYrc) {
-      return yrcLines.map((y, i) => (
-        <YrcLineView
-          key={i}
-          line={y}
-          isActive={i === idx}
-          dist={Math.abs(i - idx)}
-          positionSec={positionSec}
-        />
-      ));
+      return yrcLines.slice(visibleStart, visibleEnd).map((y, offset) => {
+        const i = visibleStart + offset;
+        return (
+          <YrcLineView
+            key={i}
+            line={y}
+            isActive={i === idx}
+            dist={Math.abs(i - idx)}
+            positionSec={positionSec}
+          />
+        );
+      });
     }
-    return lines.map((ln, i) => {
+    return lines.slice(visibleStart, visibleEnd).map((ln, offset) => {
+      const i = visibleStart + offset;
       const dist = Math.abs(i - idx);
       const isActive = i === idx;
       // LRC 模式下用插值"假逐字"：当前行从其 start 到下一行 start 的时长里，
@@ -334,7 +343,7 @@ function LyricStrip({
         />
       );
     });
-  }, [useYrc, lines, yrcLines, idx, positionSec]);
+  }, [useYrc, lines, yrcLines, idx, positionSec, visibleStart, visibleEnd]);
 
   // 早 return 必须放在所有 hooks 之后
   const placeholder = (text: string) => (
@@ -353,7 +362,7 @@ function LyricStrip({
 
   const safeIdx = Math.max(idx, 0);
   const centerRow = Math.floor(LYRIC_ROWS / 2);
-  const offset = centerRow - safeIdx;
+  const offset = centerRow - (safeIdx - visibleStart);
   const translateExpr = `calc(${offset} * ${LYRIC_BOX_H} / ${LYRIC_ROWS})`;
 
   return (
@@ -398,7 +407,12 @@ function YrcLineView({
     <div style={lineFrame(isActive, dist)}>
       <div style={lineInner(isActive)}>
         {line.chars.map((c, i) => (
-          <YrcChar key={i} c={c} positionSec={positionSec} isActive={isActive} />
+          <YrcChar
+            key={i}
+            c={c}
+            positionSec={positionSec}
+            isActive={isActive}
+          />
         ))}
       </div>
     </div>
@@ -428,10 +442,7 @@ function YrcChar({
       style={{
         position: "relative",
         display: "inline-block",
-        // 当前正被唱的字微胀一点点，跟其他字拉开层级
-        transform: beingSung ? "translateY(-1px) scale(1.04)" : "none",
-        transformOrigin: "bottom center",
-        transition: "transform 220ms cubic-bezier(0.22, 1, 0.36, 1)",
+        whiteSpace: "break-spaces",
         // 双层叠加：底层灰字 + 上层白字裁剪到 progress 宽度
         color: sung ? SUNG_WHITE : UNSUNG_GRAY,
         // wipe：用 background-clip text 给字一个渐变前景
@@ -498,7 +509,7 @@ function LrcLineView({
 // 行外框：负责行的高度 + scale 动画 + 上下淡入淡出（按距离）
 function lineFrame(isActive: boolean, dist: number): React.CSSProperties {
   return {
-    height: `calc(${LYRIC_BOX_H} / ${LYRIC_ROWS})`,
+    minHeight: `calc(${LYRIC_BOX_H} / ${LYRIC_ROWS})`,
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -509,8 +520,8 @@ function lineFrame(isActive: boolean, dist: number): React.CSSProperties {
     transformOrigin: "center",
     filter: isActive ? "none" : "blur(0.2px)",
     opacity: isActive ? 1 : Math.max(0.55, 1 - dist * 0.14),
-    overflow: "hidden",
-    padding: "0 12px",
+    overflow: "visible",
+    padding: "3px 12px",
     transition:
       "transform 520ms cubic-bezier(0.22, 1, 0.36, 1), font-size 520ms cubic-bezier(0.22, 1, 0.36, 1), filter 520ms cubic-bezier(0.22, 1, 0.36, 1), opacity 520ms cubic-bezier(0.22, 1, 0.36, 1)",
   };
@@ -519,17 +530,13 @@ function lineFrame(isActive: boolean, dist: number): React.CSSProperties {
 // 行内文字容器：当前行两侧加一道 mask "舞台聚光"
 function lineInner(isActive: boolean): React.CSSProperties {
   return {
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
+    whiteSpace: "normal",
+    overflow: "visible",
+    textOverflow: "clip",
     maxWidth: "100%",
-    // 当前行：左右 4% 渐隐到 0；非激活行不加 mask 避免文字总是看着虚
-    maskImage: isActive
-      ? "linear-gradient(90deg, transparent 0%, #000 4%, #000 96%, transparent 100%)"
-      : undefined,
-    WebkitMaskImage: isActive
-      ? "linear-gradient(90deg, transparent 0%, #000 4%, #000 96%, transparent 100%)"
-      : undefined,
+    lineHeight: 1.35,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
   };
 }
 
@@ -792,10 +799,6 @@ const lyricBox: React.CSSProperties = {
   // 之前在这里加过一层径向暗化 vignette 来"抠"歌词，
   // 但它会让歌词区的点比别处暗 —— 跟"整张图同一个背景"冲突。
   // 删掉，靠加重歌词字号 + 颜色对比让歌词自己能立住。
-  maskImage:
-    "linear-gradient(180deg, transparent 0%, #000 22%, #000 78%, transparent 100%)",
-  WebkitMaskImage:
-    "linear-gradient(180deg, transparent 0%, #000 22%, #000 78%, transparent 100%)",
 };
 
 const lyricPlaceholder: React.CSSProperties = {
