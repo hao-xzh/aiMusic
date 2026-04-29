@@ -350,8 +350,7 @@ function recallByTransition(
     const risk = transitionRisk(
       fromScored,
       { track: t, analysis: a },
-      // recall 不参考用户是否在播艺人歌单 —— 默认轻惩罚
-      { sameArtistPenalty: 0.3 },
+      { sameArtistPenalty: 0 },
     );
     // 风险越低分越高，只取风险 < 1.0 的
     if (risk >= 1.0) continue;

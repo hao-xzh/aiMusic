@@ -27,8 +27,7 @@ import {
 } from "@/lib/tauri";
 import { distillTaste, type DistillProgress } from "@/lib/taste-profile";
 import { loadLibrary, clearLibraryMemo } from "@/lib/library";
-import { analyzeLibrary } from "@/lib/library-analysis";
-import { indexLibrarySemantics } from "@/lib/semantic-indexer";
+import { startBackgroundAnalysis } from "@/lib/analysis-progress";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
@@ -95,7 +94,7 @@ export default function DistillPage() {
         onProgress: (p) => setDistillState({ kind: "running", progress: p }),
       });
 
-      // 蒸馏完跳口味页前，后台批量分析整个库的 BPM / energy / 人声段。
+      // 蒸馏完跳口味页前，只后台分析整个库的 BPM / energy / 人声段。
       // 不 await：让页面立刻跳转，分析在后台慢慢跑（cache 落盘，下次启动跳过已分析的）。
       // 宠物排歌单时能看到这些数据，排序就有依据，丝滑接歌才有可能。
       clearLibraryMemo();
@@ -103,31 +102,10 @@ export default function DistillPage() {
         try {
           const lib = await loadLibrary();
           if (lib.length === 0) return;
-          console.debug(`[claudio] 启动后台音频分析 + 语义索引：${lib.length} 首`);
-          const [analysisResult, semanticResult] = await Promise.all([
-            analyzeLibrary(lib, {
-            concurrency: 3,
-            onProgress: (p) => {
-              if (p.done % 20 === 0 || p.done === p.total) {
-                console.debug(
-                  `[claudio] 分析进度 ${p.done}/${p.total}（命中缓存 ${p.skipped}，失败 ${p.failed}）`,
-                );
-              }
-            },
-            }),
-            indexLibrarySemantics(lib, {
-              concurrency: 2,
-              onlyMissing: true,
-              onProgress: (p) => {
-                if (p.done % 20 === 0 || p.done === p.total) {
-                  console.debug(
-                    `[claudio] 语义索引进度 ${p.done}/${p.total}（命中缓存 ${p.skipped}，失败 ${p.failed}）`,
-                  );
-                }
-              },
-            }),
-          ]);
-          console.debug(`[claudio] 后台分析完成`, analysisResult, semanticResult);
+          console.debug(`[claudio] 启动后台音频分析：${lib.length} 首`);
+          // 音频分析进度走 analysis-progress 全局 store，设置页可见
+          await startBackgroundAnalysis(lib);
+          console.debug(`[claudio] 后台分析完成`);
         } catch (e) {
           console.debug("[claudio] 后台分析挂了，跳过", e);
         }

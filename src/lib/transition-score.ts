@@ -9,9 +9,9 @@
  *   - intro/outro 能量差：>0.18 开始惩罚
  *   - 人声互盖：A 尾人声 + B 头人声同时高 → 重罚
  *   - 双侧低频堆叠且 BPM 不同：避免轰头
- *   - 同艺人连排：风格疲劳，加 1.4
  *   - 同专辑：是无缝接候选，减 0.2
  *   - A 尾干净 + B 头干净：减 0.25
+ *   - fit score：把"能不能像一句乐句接上另一句乐句"作为正向奖励
  *
  * 缺分析时给中性默认值（0.28），不会强行把"未知"判成低风险。
  */
@@ -26,13 +26,19 @@ export type ScoredTrack = {
 
 export type ScoreContext = {
   /**
-   * 同艺人连排的惩罚力度。不同播放场景需要不同强度：
-   *   - 1.4：AI 推荐歌单，要"像电台一样丰富"，强避免同艺人扎堆
-   *   - 0.3：用户自己的歌单，只做轻微多样化提示，尊重用户选择
-   *   - 0：专辑/艺人精选/演唱会歌单，同艺人是常态
-   * 默认 0.3（library 场景）。
+   * 同艺人连排的惩罚力度。接歌匹配默认不惩罚同艺人：
+   * 如果两首歌能接上，就让它们接上。
    */
   sameArtistPenalty?: number;
+};
+
+export type TransitionFit = {
+  /** 0..1，越高越适合接在一起。 */
+  score: number;
+  /** 简短原因，调试/未来 UI 展示用。 */
+  reason: string;
+  /** 这对歌最适合的本地接法。 */
+  style: "hard_cut" | "tight" | "soft" | "silence_breath";
 };
 
 export function transitionRisk(
@@ -92,13 +98,121 @@ export function transitionRisk(
     risk -= 0.25;
   }
 
-  const sameArtistPenalty = ctx?.sameArtistPenalty ?? 0.3;
+  const fit = transitionFitScore(a, b);
+  risk -= fit.score * 0.85;
+
+  const sameArtistPenalty = ctx?.sameArtistPenalty ?? 0;
   if (sameArtistPenalty > 0 && sameArtist(a.track, b.track)) {
     risk += sameArtistPenalty;
   }
-  if (a.track.album?.id && a.track.album.id === b.track.album?.id) risk -= 0.2;
+  if (sameAlbum(a.track, b.track)) risk -= 0.2;
 
-  return risk;
+  return Math.max(-1.2, risk);
+}
+
+export function transitionFitScore(a: ScoredTrack, b: ScoredTrack): TransitionFit {
+  const aa = a.analysis;
+  const bb = b.analysis;
+  if (!aa || !bb) {
+    return { score: 0.25, style: "soft", reason: "缺少音频分析" };
+  }
+
+  const bpmDelta =
+    aa.bpm !== null && bb.bpm !== null
+      ? Math.abs(aa.bpm - bb.bpm)
+      : Number.POSITIVE_INFINITY;
+  const bpmReliable =
+    aa.bpm !== null &&
+    bb.bpm !== null &&
+    aa.bpmConfidence > 0.25 &&
+    bb.bpmConfidence > 0.25;
+  const energyDelta = Math.abs(aa.outroEnergy - bb.introEnergy);
+  const vocalClash = aa.outroVocalDensity * bb.introVocalDensity;
+  const lowClash = aa.outroLowEnergy * bb.introLowEnergy;
+  const cleanOutro =
+    aa.outroStartS !== null ||
+    (aa.outroVocalDensity < 0.22 && aa.outroLowEnergy < 0.052);
+  const playableIntro =
+    bb.vocalEntryS === null ||
+    bb.vocalEntryS > 1.2 ||
+    bb.introVocalDensity < 0.22;
+  const introBed =
+    (bb.drumEntryS !== null && bb.drumEntryS > 1.4) ||
+    (bb.vocalEntryS !== null && bb.vocalEntryS > 1.8) ||
+    bb.introVocalDensity < 0.18;
+
+  if (
+    sameAlbum(a.track, b.track) &&
+    cleanOutro &&
+    playableIntro &&
+    energyDelta <= 0.24 &&
+    vocalClash <= 0.08
+  ) {
+    return { score: 0.98, style: "hard_cut", reason: "同专辑边界干净" };
+  }
+
+  if (energyDelta >= 0.34 || vocalClash >= 0.2) {
+    const penalty = clamp01((energyDelta - 0.25) * 1.4 + vocalClash * 1.8);
+    return {
+      score: clamp01(0.42 - penalty * 0.25),
+      style: "silence_breath",
+      reason: "反差大，适合留白",
+    };
+  }
+
+  let score = 0.28;
+  const reasons: string[] = [];
+
+  if (bpmReliable) {
+    if (bpmDelta <= 4) {
+      score += 0.3;
+      reasons.push("BPM 很近");
+    } else if (bpmDelta <= 8) {
+      score += 0.2;
+      reasons.push("BPM 接近");
+    } else if (bpmDelta <= 14) {
+      score += 0.08;
+    } else {
+      score -= 0.18;
+    }
+  }
+
+  if (energyDelta <= 0.1) {
+    score += 0.2;
+    reasons.push("能量贴合");
+  } else if (energyDelta <= 0.2) {
+    score += 0.12;
+  } else if (energyDelta > 0.28) {
+    score -= 0.15;
+  }
+
+  if (cleanOutro && playableIntro) {
+    score += 0.18;
+    reasons.push("尾头干净");
+  } else if (cleanOutro || playableIntro) {
+    score += 0.08;
+  }
+
+  if (introBed) {
+    score += 0.1;
+    reasons.push("前奏可铺底");
+  }
+
+  if (vocalClash <= 0.06) score += 0.12;
+  else if (vocalClash > 0.14) score -= 0.2;
+
+  if (lowClash > 0.004 && (!bpmReliable || bpmDelta > 8)) score -= 0.12;
+
+  const style =
+    bpmReliable && bpmDelta <= 8 && energyDelta <= 0.22 && vocalClash <= 0.12
+      ? "tight"
+      : "soft";
+
+  return {
+    score: clamp01(score),
+    style,
+    reason: reasons.length > 0 ? reasons.join(" / ") : "普通慢溶",
+  };
 }
 
 /**
@@ -117,6 +231,17 @@ export function orderDriftPenalty(
 function sameArtist(a: TrackInfo, b: TrackInfo): boolean {
   const ids = new Set(a.artists.map((x) => x.id));
   return b.artists.some((x) => ids.has(x.id));
+}
+
+function sameAlbum(a: TrackInfo, b: TrackInfo): boolean {
+  if (a.album?.id && b.album?.id) return a.album.id === b.album.id;
+  const an = a.album?.name?.trim().toLowerCase();
+  const bn = b.album?.name?.trim().toLowerCase();
+  return Boolean(an && bn && an === bn);
+}
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
 function fallbackMeanEnergy(analysis: TrackAnalysis | null): number | null {

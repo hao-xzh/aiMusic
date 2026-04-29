@@ -3,6 +3,8 @@
 import { DotText } from "@/components/DotText";
 import { ai, netease, type AiConfigPublic, type UserProfile } from "@/lib/tauri";
 import { useAppSettings } from "@/lib/app-settings";
+import { useAnalysisProgress, startBackgroundAnalysis } from "@/lib/analysis-progress";
+import { loadLibrary } from "@/lib/library";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
@@ -49,6 +51,10 @@ export default function SettingsPage() {
 
       <Section title="音乐来源">
         <NeteaseRow me={me} err={err} />
+      </Section>
+
+      <Section title="音频分析（接歌丝滑度）">
+        <AnalysisRow />
       </Section>
 
       <Section title="外观">
@@ -396,6 +402,141 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
       )}
     </div>
   );
+}
+
+function AnalysisRow() {
+  const progress = useAnalysisProgress();
+  const [libSize, setLibSize] = useState<number | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const lib = await loadLibrary();
+        if (alive) setLibSize(lib.length);
+      } catch {
+        if (alive) setLibSize(0);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const remaining = Math.max(0, progress.total - progress.done);
+  const pct = progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : 0;
+  const eta = progress.running && remaining > 0 ? estimateEtaMin(remaining) : null;
+
+  const startResume = async () => {
+    setStarting(true);
+    setErr(null);
+    try {
+      const lib = await loadLibrary();
+      if (lib.length === 0) {
+        setErr("还没蒸馏歌单库，先去音乐来源里进我的歌单。");
+        return;
+      }
+      void startBackgroundAnalysis(lib);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "2px 2px" }}>
+      <div>
+        <div style={{ fontWeight: 600 }}>整库 BPM / 能量 / 人声段分析</div>
+        <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2, lineHeight: 1.55 }}>
+          蒸馏后台慢慢跑；分析过的歌接歌时会用 phrase 对齐 + EQ duck，跨专辑也丝滑。
+          关 app 会停，重开按"继续分析"接着跑（已分析的会跳过）。
+        </div>
+      </div>
+
+      {progress.running ? (
+        <div>
+          <div style={{
+            color: "#9be3c6",
+            fontSize: 13,
+            marginBottom: 8,
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          }}>
+            {progress.done} / {progress.total}
+            {progress.skipped > 0 && (
+              <span style={{ color: "#6c7489" }}> · 命中缓存 {progress.skipped}</span>
+            )}
+            {progress.failed > 0 && (
+              <span style={{ color: "#ffb4b4" }}> · 失败 {progress.failed}</span>
+            )}
+            {eta && <span style={{ color: "#6c7489" }}> · 约 {eta}</span>}
+          </div>
+          <div style={{
+            height: 6,
+            borderRadius: 999,
+            background: "rgba(233,239,255,0.08)",
+            overflow: "hidden",
+          }}>
+            <div style={{
+              height: "100%",
+              width: `${pct}%`,
+              background: "linear-gradient(90deg, #9be3c6, #c9f0dc)",
+              transition: "width 240ms ease",
+            }} />
+          </div>
+        </div>
+      ) : progress.lastFinishedAt ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ color: "#9be3c6", fontSize: 13 }}>
+            ✓ 已分析 {progress.done} / {progress.total}
+          </div>
+          <button onClick={startResume} disabled={starting} style={ghostBtn}>
+            {starting ? "启动中…" : "重新跑"}
+          </button>
+        </div>
+      ) : (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ color: "#8a93a8", fontSize: 13 }}>
+            {libSize == null
+              ? "正在加载库…"
+              : libSize === 0
+              ? "库是空的——先去蒸馏歌单"
+              : `库里有 ${libSize} 首，还没开始分析`}
+          </div>
+          {libSize != null && libSize > 0 && (
+            <button onClick={startResume} disabled={starting} style={primaryBtn}>
+              {starting ? "启动中…" : "继续分析"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {err && (
+        <div style={{
+          padding: "8px 12px",
+          borderRadius: 10,
+          background: "rgba(255,180,180,0.08)",
+          border: "1px solid rgba(255,180,180,0.25)",
+          color: "#ffb4b4",
+          fontSize: 12,
+          lineHeight: 1.45,
+        }}>
+          {err}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function estimateEtaMin(remaining: number): string {
+  // 经验值：concurrency=3，每首 ~6-10s（fetch FLAC + decode + JS biquad/RMS）
+  const seconds = Math.round((remaining * 8) / 3);
+  if (seconds < 60) return `${seconds}s`;
+  const min = Math.round(seconds / 60);
+  if (min < 60) return `${min}min`;
+  return `${(min / 60).toFixed(1)}h`;
 }
 
 function Toggle({

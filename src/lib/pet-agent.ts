@@ -281,7 +281,7 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
     };
   }
 
-  // smoothQueue：discovery 模式（AI 选的歌单要"丰富感"，强避免同艺人扎堆）
+  // smoothQueue：按接歌匹配分重排，不把同艺人连排当成限制。
   const smoothed =
     dedupedResolved.length > 2
       ? await smoothQueue(dedupedResolved, {
@@ -446,10 +446,10 @@ async function planPlaylist(input: PlanInput): Promise<PlannerOutput | null> {
     `1) **trackIds 必须来自候选池**，不要编 id。\n` +
     `2) 必须遵守 hardLanguages/hardRegions/hardGenres，不要选择 excludeLanguages/excludeGenres/excludeTags 命中的歌。\n` +
     `3) 你要真正理解"用户最新一句"的自然语言，不要只机械匹配示例标签；候选里的 summary/moods/scenes/textures 是为了让你判断开放表达。\n` +
-    `4) 用户没点名艺人时，不要让同一艺人占据歌单；同艺人不要连排，最多少量穿插。\n` +
+    `4) 不要为了多样性刻意避开同一艺人；如果同艺人之间更顺，就允许连排。\n` +
     `5) 如果用户要求氛围，优先看 moods/scenes/textures/summary，不要只靠歌手名。\n` +
     `6) 第一首选最贴用户当下情境的；后续按听感路径排（BPM/能量平滑）。\n` +
-    `7) BPM 差 >15 的两首不要相邻；energy 差 >0.25 的不要相邻。\n` +
+    `7) BPM 差 >15 的两首尽量不要相邻；energy 差 >0.25 的尽量不要相邻。\n` +
     `8) reason ≤20 字写给自己看的笔记，可以略干。\n` +
     `9) reply 是宠物对用户的一句话回应（${intent.replyStyle}：` +
     `silent=空字符串 / short=≤8 字 / normal=≤16 字）。不要客服腔，不要感叹号。\n` +

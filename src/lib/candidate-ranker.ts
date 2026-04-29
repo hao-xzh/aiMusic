@@ -39,7 +39,6 @@ export type RankedCandidate = Candidate & {
     freshness: number;
     recentPlayPenalty: number;
     recentRecommendationPenalty: number;
-    artistDiversityPenalty: number;
   };
 };
 
@@ -119,12 +118,10 @@ export function rankCandidates(
     const recentRecommendationPenalty = explicitlyMentioned
       ? 0
       : recentPenalty(c.track.id, options.recentRecommendation, 0.35, 0.15);
-    const artistDiversityPenalty = explicitlyMentioned ? 0 : primaryArtistPenalty(c.track.artists[0]?.name ?? "");
     const finalScore =
       baseScore -
       recentPlayPenalty -
-      recentRecommendationPenalty -
-      artistDiversityPenalty;
+      recentRecommendationPenalty;
 
     console.debug("[recommend-rank]", {
       track: c.track.name,
@@ -159,7 +156,6 @@ export function rankCandidates(
         freshness: freshnessScore,
         recentPlayPenalty,
         recentRecommendationPenalty,
-        artistDiversityPenalty,
       },
     });
   }
@@ -168,8 +164,7 @@ export function rankCandidates(
   const deduped = queryAsksForSpecificVersion(intent)
     ? ranked
     : dedupeSimilarTracks(ranked);
-  const diversified = diversifyArtists(deduped, intent, options.topN ?? DEFAULT_TOP_N);
-  return diversified.slice(0, options.topN ?? DEFAULT_TOP_N);
+  return deduped.slice(0, options.topN ?? DEFAULT_TOP_N);
 }
 
 function clamp01(x: number): number {
@@ -225,53 +220,4 @@ function rankWeights(intent: MusicIntent): {
     return { tag: 0.18, semantic: 0.34, taste: 0.16, behavior: 0.08 };
   }
   return { tag: 0.08, semantic: 0.16, taste: W_TASTE, behavior: W_BEHAVIOR };
-}
-
-function primaryArtistPenalty(name: string): number {
-  if (!name) return 0;
-  // 只做轻微全局抖动，真正的同艺人数量控制在 diversifyArtists 里。
-  return 0;
-}
-
-function diversifyArtists(
-  items: RankedCandidate[],
-  intent: MusicIntent,
-  limit: number,
-): RankedCandidate[] {
-  if (items.length <= 2) return items;
-  const allowSameArtist =
-    intent.textHints.artists.length > 0 ||
-    intent.hardConstraints.artists.length > 0 ||
-    intent.references.artists.length > 0;
-  if (allowSameArtist) return items;
-
-  const selected: RankedCandidate[] = [];
-  const remaining = [...items];
-  const artistCount = new Map<string, number>();
-
-  while (remaining.length > 0 && selected.length < limit) {
-    let bestIndex = 0;
-    let bestScore = Number.NEGATIVE_INFINITY;
-    for (let i = 0; i < remaining.length; i++) {
-      const c = remaining[i];
-      const artist = normalizeArtist(c.track.artists[0]?.name ?? "");
-      const count = artistCount.get(artist) ?? 0;
-      const penalty = count === 0 ? 0 : 0.18 + count * 0.14;
-      const adjusted = c.finalScore - penalty + Math.random() * 0.012;
-      if (adjusted > bestScore) {
-        bestScore = adjusted;
-        bestIndex = i;
-      }
-    }
-    const [picked] = remaining.splice(bestIndex, 1);
-    selected.push(picked);
-    const artist = normalizeArtist(picked.track.artists[0]?.name ?? "");
-    artistCount.set(artist, (artistCount.get(artist) ?? 0) + 1);
-  }
-
-  return selected.concat(remaining);
-}
-
-function normalizeArtist(name: string): string {
-  return name.toLowerCase().replace(/\s+/g, "");
 }

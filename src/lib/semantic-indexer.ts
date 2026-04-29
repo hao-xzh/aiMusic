@@ -21,6 +21,7 @@ export type SemanticIndexProgress = {
 };
 
 export type SemanticIndexOptions = {
+  allowAi?: boolean;
   concurrency?: number;
   onlyMissing?: boolean;
   onProgress?: (p: SemanticIndexProgress) => void;
@@ -133,6 +134,14 @@ export async function indexLibrarySemantics(
 
   inflight = (async () => {
     try {
+      if (options.allowAi !== true) {
+        progress.done = tracks.length;
+        progress.skipped = tracks.length;
+        options.onProgress?.({ ...progress });
+        console.debug("[claudio] semantic index skipped：需要显式传 allowAi=true");
+        return progress;
+      }
+
       const pending: TrackInfo[] = [];
       for (const track of tracks) {
         if (options.onlyMissing !== false && !(await needsSemanticIndex(track))) {

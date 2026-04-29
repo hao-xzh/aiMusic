@@ -5,6 +5,7 @@ import { AdaptiveDotField } from "@/components/AdaptiveDotField";
 import { Nav } from "@/components/Nav";
 import { AiPet } from "@/components/AiPet";
 import { WindowResizer } from "@/components/WindowResizer";
+import { AnalysisAutoResume } from "@/components/AnalysisAutoResume";
 
 export const metadata: Metadata = {
   title: "Claudio",
@@ -24,6 +25,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <Nav />
           <AiPet />
           <WindowResizer />
+          <AnalysisAutoResume />
           {/*
             main 吃掉 body flex 列里 Nav 之外的全部空间。
             flex:1 + minHeight:0 是经典的 "占满剩余又能被内容撑大" 组合 ——

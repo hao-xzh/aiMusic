@@ -23,6 +23,7 @@
 import { loadAnalysis } from "./audio-analysis";
 import type { TrackInfo } from "./tauri";
 import {
+  transitionFitScore,
   transitionRisk,
   orderDriftPenalty,
   type ScoredTrack,
@@ -36,10 +37,10 @@ type EnrichedTrack = ScoredTrack & {
 /**
  * 重排"意图"。决定 transition-score 里同艺人惩罚的强度。
  *
- *   - "discovery"：AI 推荐歌单 / 库外发现，同艺人惩罚 1.4，
- *      像随机电台一样追求多样。
- *   - "library"（默认）：用户自己的歌单，0.3 轻微多样化，尊重原构成。
- *      用户精选周杰伦不会被打散。
+ *   - "discovery"：AI 推荐歌单 / 库外发现。
+ *   - "library"（默认）：用户自己的歌单。
+ *
+ * 同艺人不作为接歌限制：如果两首歌能丝滑接上，就应该允许连排。
  *
  * 专辑播放：直接 `smooth: false` 跳过本模块即可，不需要单独 mode。
  */
@@ -60,10 +61,10 @@ export type SmoothQueueOptions = {
 function scoreContextFor(mode: SmoothMode | undefined): ScoreContext {
   switch (mode) {
     case "discovery":
-      return { sameArtistPenalty: 1.4 };
+      return { sameArtistPenalty: 0 };
     case "library":
     default:
-      return { sameArtistPenalty: 0.3 };
+      return { sameArtistPenalty: 0 };
   }
 }
 
@@ -108,13 +109,15 @@ export async function smoothQueue(
 
     for (let i = 0; i < remaining.length; i++) {
       const candidate = remaining[i];
+      const fit = transitionFitScore(current, candidate);
       const score =
-        transitionRisk(current, candidate, scoreCtx) +
+        transitionRisk(current, candidate, scoreCtx) * 1.35 -
+        fit.score * 0.55 +
         orderDriftPenalty(
           current.originalIndex,
           candidate.originalIndex,
           tracks.length,
-        );
+        ) * 0.35;
       if (score < bestScore) {
         bestScore = score;
         bestIndex = i;
@@ -122,6 +125,16 @@ export async function smoothQueue(
     }
 
     const [next] = remaining.splice(bestIndex, 1);
+    if (ordered.length <= 30) {
+      const fit = transitionFitScore(current, next);
+      console.debug("[claudio] transition-aware pick", {
+        from: current.track.name,
+        to: next.track.name,
+        fit: Number(fit.score.toFixed(3)),
+        style: fit.style,
+        reason: fit.reason,
+      });
+    }
     ordered.push(next);
   }
 
