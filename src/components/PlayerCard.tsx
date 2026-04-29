@@ -45,7 +45,7 @@ const SUBTITLE_FS = "clamp(12px, 3.2vw, 14px)";
 // 容器高度跟行数成比例：3 行 × 每行 ~35px ≈ 105px。
 // 之前 5 行用的 110~180，现在按 3/5 缩到 70~120，单行高度仍维持 ~30-40px。
 const LYRIC_BOX_H = "clamp(116px, 15vh, 150px)";
-const LYRIC_ROW_H = "clamp(34px, 4.8vh, 42px)";
+const LYRIC_ROW_H = "clamp(26px, 3.6vh, 32px)";
 // 激活行单独做大并加重 —— 跟 dim 行拉开 6px 字号差，避免 DotField 干扰
 const LYRIC_ACTIVE_FS = "clamp(16px, 4.2vw, 19px)";
 const LYRIC_DIM_FS = "clamp(11px, 2.8vw, 13px)";
