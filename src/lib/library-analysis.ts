@@ -13,7 +13,7 @@
  */
 
 import type { TrackInfo } from "./tauri";
-import { netease, wrapAudioUrl } from "./tauri";
+import { audio, netease, wrapAudioUrl } from "./tauri";
 import { loadAnalysis, getOrAnalyze } from "./audio-analysis";
 
 export type BatchProgress = {
@@ -103,8 +103,18 @@ export async function analyzeLibrary(
                 continue;
               }
               try {
+                // JS 端：BPM / 鼓入点 / 人声段 / 能量曲线 —— 给 mix-planner 用
                 const a = await getOrAnalyze(t.id, url);
                 if (!a) progress.failed++;
+
+                // Rust 端 (Symphonia)：BPM / RMS / 动态范围 / 谱重心 / 头尾静默
+                // —— 给 AI 选曲 + mix-planner level match 用
+                // 失败不影响 progress.failed（结构性分析已经成功了）
+                try {
+                  await audio.getFeatures(t.id, url);
+                } catch (e) {
+                  console.debug("[claudio] native features 失败", t.id, e);
+                }
               } catch (e) {
                 console.debug("[claudio] batch analyze 单首失败", t.id, e);
                 progress.failed++;

@@ -368,6 +368,19 @@ impl AudioCache {
         })
     }
 
+    /// 清空 audio_features 表 + app_state 里所有 `analysis:v3:*` JS 端缓存。
+    /// 声学特征跟 JS 结构性分析两套都洗，让"继续分析"能从干净状态重跑。
+    pub fn clear_features(&self) -> Result<()> {
+        with_conn(&self.db, |c| {
+            c.execute("DELETE FROM audio_features", [])?;
+            c.execute(
+                "DELETE FROM app_state WHERE key LIKE 'analysis:v3:%'",
+                [],
+            )?;
+            Ok(())
+        })
+    }
+
     /// 清空：删表 + 删根目录下所有文件。features 表保留 —— 它是 read-only
     /// 元数据，重新缓存这首歌时直接命中，不用再解码。
     pub fn clear(&self) -> Result<()> {

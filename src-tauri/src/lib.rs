@@ -86,6 +86,7 @@ pub fn run() {
             audio_get_features,
             audio_get_cached_features,
             audio_get_cached_features_bulk,
+            audio_clear_features,
         ])
         .setup(|app| {
             // 所有持久化都落在 app_config_dir（macOS: ~/Library/Application Support/claudio/）

@@ -85,9 +85,16 @@ impl Default for AiConfig {
 }
 
 /// 各家 provider 的官方 OpenAI 兼容入口。
+///
+/// 注意路径细节：
+///   - DeepSeek 官方 base 是 `https://api.deepseek.com`（**不带 /v1**），
+///     openai_compat::chat 会拼出 `/chat/completions`。早版本配的 /v1 在 V4 端点上
+///     直接被拒，是 ai_ping 失败的根因。
+///   - OpenAI 标准就是 `/v1`。
+///   - 小米 MiMo 用 `/v1`（官网文档示例就是 `https://api.xiaomimimo.com/v1`）。
 pub fn default_base_url(provider: Provider) -> &'static str {
     match provider {
-        Provider::Deepseek => "https://api.deepseek.com/v1",
+        Provider::Deepseek => "https://api.deepseek.com",
         Provider::Openai => "https://api.openai.com/v1",
         Provider::XiaomiMimo => "https://api.xiaomimimo.com/v1",
     }
@@ -112,8 +119,6 @@ pub fn known_models(provider: Provider) -> &'static [(&'static str, &'static str
         Provider::Deepseek => &[
             ("deepseek-v4-pro", "V4 Pro · 旗舰"),
             ("deepseek-v4-flash", "V4 Flash · 性价比"),
-            ("deepseek-chat", "V3 Chat · 旧版（2026-07 下线）"),
-            ("deepseek-reasoner", "V3 Reasoner · 旧版（2026-07 下线）"),
         ],
         Provider::Openai => &[
             ("gpt-5.5-pro", "GPT-5.5 Pro · 旗舰"),
@@ -139,7 +144,7 @@ pub struct AiConfigStore {
 
 impl AiConfigStore {
     pub fn load(path: PathBuf) -> Result<Self> {
-        let cfg = if path.exists() {
+        let mut cfg = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(txt) => parse_with_legacy_fallback(&txt).unwrap_or_else(|e| {
                     eprintln!(
@@ -156,10 +161,14 @@ impl AiConfigStore {
         } else {
             AiConfig::default()
         };
-        Ok(Self {
+        migrate_legacy_models(&mut cfg);
+        let store = Self {
             inner: RwLock::new(cfg),
             path,
-        })
+        };
+        // 迁移完落盘一次，下次启动直接干净状态
+        let _ = store.persist();
+        Ok(store)
     }
 
     pub fn snapshot(&self) -> AiConfig {
@@ -226,6 +235,18 @@ struct LegacyConfig {
     deepseek_api_key: Option<String>,
     #[serde(default)]
     model: Option<String>,
+}
+
+/// V4 上线后 deepseek-chat / deepseek-reasoner 在 API 端是 v4-flash 的兼容别名，
+/// 但前端 dropdown 里已经看不到了，会显示成"（自定义）"。统一推到 v4-flash，
+/// 让设置页里看着干净；这俩别名 V4 API 仍然接受，所以即使没被本地迁移，测试也不会挂。
+fn migrate_legacy_models(cfg: &mut AiConfig) {
+    if matches!(
+        cfg.deepseek.model.as_str(),
+        "deepseek-chat" | "deepseek-reasoner"
+    ) {
+        cfg.deepseek.model = default_model(Provider::Deepseek).to_string();
+    }
 }
 
 fn parse_with_legacy_fallback(txt: &str) -> Result<AiConfig> {

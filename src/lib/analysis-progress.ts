@@ -61,6 +61,12 @@ export function useAnalysisProgress(): AnalysisState {
   return s;
 }
 
+/** 把进度归零到 initial —— "清空历史"按钮调一下，UI 别还显示老的 N/M */
+export function resetAnalysisState(): void {
+  state = { ...initial };
+  emit();
+}
+
 export function getAnalysisState(): AnalysisState {
   return state;
 }

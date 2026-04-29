@@ -12,7 +12,11 @@ import {
   type UserProfile,
 } from "@/lib/tauri";
 import { useAppSettings } from "@/lib/app-settings";
-import { useAnalysisProgress, startBackgroundAnalysis } from "@/lib/analysis-progress";
+import {
+  useAnalysisProgress,
+  startBackgroundAnalysis,
+  resetAnalysisState,
+} from "@/lib/analysis-progress";
 import { loadLibrary } from "@/lib/library";
 import { getUserFacts, setUserFacts } from "@/lib/pet-memory";
 import Link from "next/link";
@@ -666,6 +670,7 @@ function AnalysisRow() {
   const progress = useAnalysisProgress();
   const [libSize, setLibSize] = useState<number | null>(null);
   const [starting, setStarting] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -704,12 +709,39 @@ function AnalysisRow() {
     }
   };
 
+  // 清空：洗掉 Symphonia features + JS analysis:v3:* 缓存。
+  // 不动 audio_cache（字节文件），让"清缓存"和"清分析"两个动作语义分开。
+  const clearHistory = async () => {
+    if (
+      !confirm(
+        "清空所有分析历史？\n\n" +
+          "包含：\n" +
+          "· Symphonia 算的 BPM / 响度 / 动态范围 / 音色 / 静音边界\n" +
+          "· JS 算的 BPM / 鼓入点 / 人声段 / 能量曲线\n\n" +
+          "音频字节缓存不会动，下次分析不用再重新拉。",
+      )
+    )
+      return;
+    setClearing(true);
+    setErr(null);
+    try {
+      await audio.clearFeatures();
+      // 同步把进度条 store 归零，否则界面还显示"已分析 N / M"
+      resetAnalysisState();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "2px 2px" }}>
       <div>
-        <div style={{ fontWeight: 600 }}>整库 BPM / 能量 / 人声段分析</div>
+        <div style={{ fontWeight: 600 }}>整库 BPM / 能量 / 声学特征分析</div>
         <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2, lineHeight: 1.55 }}>
-          蒸馏后台慢慢跑；分析过的歌接歌时会用 phrase 对齐 + EQ duck，跨专辑也丝滑。
+          双引擎：JS 端算结构（鼓入点/人声段/outro）给接歌用；Rust 端 Symphonia
+          算声学（BPM/响度/动态范围/音色亮度/头尾静默）给 AI 选曲 + level match 用。
           关 app 会停，重开按"继续分析"接着跑（已分析的会跳过）。
         </div>
       </div>
@@ -750,8 +782,11 @@ function AnalysisRow() {
           <div style={{ color: "#9be3c6", fontSize: 13 }}>
             ✓ 已分析 {progress.done} / {progress.total}
           </div>
-          <button onClick={startResume} disabled={starting} style={ghostBtn}>
+          <button onClick={startResume} disabled={starting || clearing} style={ghostBtn}>
             {starting ? "启动中…" : "重新跑"}
+          </button>
+          <button onClick={clearHistory} disabled={starting || clearing} style={dangerBtn}>
+            {clearing ? "清空中…" : "清空分析历史"}
           </button>
         </div>
       ) : (
@@ -764,9 +799,14 @@ function AnalysisRow() {
               : `库里有 ${libSize} 首，还没开始分析`}
           </div>
           {libSize != null && libSize > 0 && (
-            <button onClick={startResume} disabled={starting} style={primaryBtn}>
-              {starting ? "启动中…" : "继续分析"}
-            </button>
+            <>
+              <button onClick={startResume} disabled={starting || clearing} style={primaryBtn}>
+                {starting ? "启动中…" : "继续分析"}
+              </button>
+              <button onClick={clearHistory} disabled={starting || clearing} style={dangerBtn}>
+                {clearing ? "清空中…" : "清空分析历史"}
+              </button>
+            </>
           )}
         </div>
       )}

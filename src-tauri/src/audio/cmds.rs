@@ -152,3 +152,11 @@ pub fn audio_get_cached_features_bulk(
     }
     Ok(out)
 }
+
+/// 清掉**所有**声学特征 + JS 端 analysis:v3:* 缓存。
+/// 让用户能"重新开始分析"——比如想试试新版本算法、或者旧数据不准。
+/// 这条不动 audio_cache（字节文件），那是另一档生命周期。
+#[tauri::command]
+pub fn audio_clear_features(state: AudioCacheState<'_>) -> Result<(), String> {
+    state.clear_features().map_err(to_err)
+}

@@ -216,6 +216,8 @@ export const audio = {
   /** 批量缓存查询。taste-profile 蒸馏时一次性拿几百首。 */
   getCachedFeaturesBulk: (trackIds: number[]) =>
     invoke<(AudioFeatures | null)[]>("audio_get_cached_features_bulk", { trackIds }),
+  /** 清掉所有声学特征 + JS analysis:v3:* 缓存。让"继续分析"能干净重跑。 */
+  clearFeatures: () => invoke<void>("audio_clear_features"),
 };
 
 /**
