@@ -12,6 +12,9 @@ next-env.d.ts
 tsconfig.tsbuildinfo
 src-tauri/target
 src-tauri/gen
+android-native/.gradle
+android-native/**/build
+android-native/**/target
 # 任何 dist / 打包产物
 *.dmg
 *.app/
