@@ -15,6 +15,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { BackButton } from "@/components/BackButton";
 import { cache, type TrackInfo } from "@/lib/tauri";
 import { loadTasteProfile, type TasteProfile } from "@/lib/taste-profile";
 import {
@@ -56,7 +57,12 @@ export default function TastePage() {
         width: "100%",
       }}
     >
-      <div style={brand}>MUSIC PROFILE</div>
+      <div className="safe-top" style={{ display: "flex", alignItems: "center", gap: 12, paddingBottom: 8 }}>
+        <BackButton href="/distill" />
+        <div style={{ ...brand, marginTop: 0, marginBottom: 0, flex: 1 }}>
+          MUSIC PROFILE
+        </div>
+      </div>
 
       {profile === "loading" && (
         <div style={loadingStyle}>正在读取你的音乐画像…</div>

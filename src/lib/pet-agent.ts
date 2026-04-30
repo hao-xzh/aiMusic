@@ -54,6 +54,7 @@ import {
 import {
   dedupeTrackInfos,
   queryAsksForSpecificVersion,
+  songKey,
 } from "./track-dedupe";
 
 export type ChatMessage = {
@@ -289,6 +290,21 @@ export type AgentInput = {
   } | null;
 };
 
+/**
+ * 续杯式推荐源 —— 队列接近播完时,player-state 调一发拿下一批同口味的歌。
+ *
+ * - 闭包内部维护 consumed 集合(songKey 粒度),保证跨多次 fetchMore 不重复。
+ *   初始那一批的 songKey 也已经预填进 consumed,所以续杯永远不会返回同一首歌
+ *   的另一个版本。
+ * - excludeIds 是当前播放队列里已经存在的 neteaseId —— 防御性兜底,处理用户
+ *   手动加歌之类的场景。
+ * - 返回 [] 表示这一支已经榨干,player-state 看到空就摘掉这个 source,
+ *   接着按"播完了"自然结束(不再循环回第一首,这是用户明确要的体验)。
+ */
+export type ContinuousSource = {
+  fetchMore: (excludeIds: Set<number>) => Promise<TrackInfo[]>;
+};
+
 export type AgentResponse = {
   /** 给用户看的文本部分（剥掉 PLAY 块） */
   text: string;
@@ -296,6 +312,8 @@ export type AgentResponse = {
   play: PlayPlan | null;
   /** 若 play 有值，配合返回去重 + 校验过的真 TrackInfo[]（按 trackIds 顺序） */
   resolvedTracks: TrackInfo[];
+  /** 续杯式推荐：队列接近末尾时由 player-state 调用，返回下一批同口味的歌 */
+  continuous?: ContinuousSource | null;
 };
 
 /**
@@ -392,8 +410,12 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
     readRecentPlayContext().catch(() => undefined),
     readRecentRecommendationContext().catch(() => undefined),
   ]);
+  // topN 240 ≈ recall 上限,基本不裁。
+  // 续杯模式需要尽可能大的池子（reservoir 喂得越饱,fetchMore 才有得续杯）；
+  // 即使没续杯,这里多收点候选给 dedupe 之后也只用前 wanted 首,代价只是
+  // 一次本地排序，可以接受。
   const ranked = rankCandidates(candidates, intent, {
-    topN: 100,
+    topN: 240,
     recentPlay,
     recentRecommendation,
   });
@@ -406,12 +428,26 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
   }
 
   // 直接拿排序后的前 N 首 —— 不再走第二次 LLM 编排。
-  const wanted = Math.max(10, Math.min(intent.desiredCount, ranked.length));
-  const pickedTracks = ranked.slice(0, wanted).map((c) => c.track);
+  //
+  // 续杯式推荐：把整个 ranked top（~100 首）都先 dedupe 一遍，初始批切前 N 首给
+  // player 立刻播，剩下的留在闭包里给 fetchMore 慢慢喂。这样不论 fetchMore 调
+  // 多少次都不会跟初始批撞同一首歌的另一版本（VIP 重唱 / Live / Remix 等），
+  // 因为 dedupe 是在切批之前一次性做完的。
+  const allRankedTracks = ranked.map((c) => c.track);
+  const dedupedAll = queryAsksForSpecificVersion(intent)
+    ? allRankedTracks
+    : dedupeTrackInfos(allRankedTracks);
 
-  const dedupedResolved = queryAsksForSpecificVersion(intent)
-    ? pickedTracks
-    : dedupeTrackInfos(pickedTracks);
+  // 初始批刻意压短（≤15 首）—— 续杯模式下队列本来就会随播随长,
+  // 留尽量多的歌在 reservoir 里,fetchMore 才有得喂。
+  const INITIAL_BATCH_CAP = 15;
+  const wanted = Math.max(
+    10,
+    Math.min(intent.desiredCount, dedupedAll.length, INITIAL_BATCH_CAP),
+  );
+  const dedupedResolved = dedupedAll.slice(0, wanted);
+  const reservoir = dedupedAll.slice(wanted);
+
   if (dedupedResolved.length === 0) {
     // 兜底中的兜底
     const safety = ranked.slice(0, 20).map((c) => c.track);
@@ -433,6 +469,17 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
           mode: "discovery",
         }).catch(() => dedupedResolved)
       : dedupedResolved;
+
+  // 续杯式推荐源 —— 一律开启,反正用户说了"根据口味一直推荐"。
+  // 即使 reservoir 空（库小 / 过滤太紧）,closure 内部还有一道 refill：放宽
+  // hard exclude 重新跑一次 recall，把语义边邻的歌捞进来,避免循环回放。
+  const continuous: ContinuousSource = buildContinuousSource({
+    initialBatch: smoothed,
+    reservoir,
+    intent,
+    library,
+    currentTrack: currentTrackInfo,
+  });
 
   void logRecommendations(smoothed.map((t) => t.id), "pet");
 
@@ -466,7 +513,99 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
       reason: `${intent.softPreferences.moods.slice(0, 2).join(" · ")} · ${intent.queueIntent.orderStyle}`,
     },
     resolvedTracks: smoothed,
+    continuous,
   };
+}
+
+/**
+ * 构造一个 ContinuousSource。
+ *
+ * 双层池子：
+ *   - reservoir：同一次 chat() 里 ranked top 切去初始批后剩下的歌。优先消费,
+ *     口味跟初始批最贴。
+ *   - refilled：reservoir 见底后,放宽 hard exclude 再跑一次 recall + rank,把
+ *     语义边邻的歌捞进来。只 refill 一次,避免无限拉新（库就那么大,反复跑
+ *     只会得到更差的同一批结果）。
+ *
+ * 不重复保证：
+ *   - consumed 集合（songKey 粒度）跨调用累积,初始批的 songKey 也预填进去 ——
+ *     无论调多少次 fetchMore 都不会推同一首歌的另一版本。
+ *   - excludeIds 是 player 当前队列的 neteaseId 集合,作为再一道 id 级兜底
+ *     （防御性,处理用户手动加歌之类的场景）。
+ *
+ * 两层都掏空后返回 []，player-state 摘掉 source 并自然结束（不再循环回第一
+ * 首）—— 这是用户明确要求的体验。
+ */
+function buildContinuousSource(args: {
+  initialBatch: TrackInfo[];
+  reservoir: TrackInfo[];
+  intent: MusicIntent;
+  library: TrackInfo[];
+  currentTrack: TrackInfo | null;
+}): ContinuousSource {
+  const { initialBatch, reservoir, intent, library, currentTrack } = args;
+  const consumed = new Set<string>(initialBatch.map(songKey));
+  let pool: TrackInfo[] = reservoir;
+  let refillTried = false;
+
+  // 从当前 pool 里挑符合条件的下一批。pool 是只读迭代,不 splice ——
+  // 靠 consumed 跳过已经推过的,简单稳。
+  const drainPool = (excludeIds: Set<number>, want: number): TrackInfo[] => {
+    const out: TrackInfo[] = [];
+    for (const t of pool) {
+      if (out.length >= want) break;
+      const k = songKey(t);
+      if (consumed.has(k)) continue;
+      if (excludeIds.has(t.id)) continue;
+      consumed.add(k);
+      out.push(t);
+    }
+    return out;
+  };
+
+  // 放宽 hard exclude 重跑一次 recall + rank —— reservoir 见底时调一次。
+  // 不动 softPreferences / queueIntent,口味基底跟原意图一致。
+  const refillPool = async (): Promise<void> => {
+    if (refillTried) return;
+    refillTried = true;
+    try {
+      const relaxedIntent: MusicIntent = {
+        ...intent,
+        hardConstraints: {
+          ...intent.hardConstraints,
+          excludeTags: [],
+          excludeGenres: [],
+          excludeLanguages: [],
+        },
+      };
+      const candidates = await recallCandidates({
+        intent: relaxedIntent,
+        library,
+        currentTrack,
+        limit: 240,
+      });
+      const ranked = rankCandidates(candidates, relaxedIntent, { topN: 240 });
+      const fresh = ranked.map((c) => c.track);
+      // refilled pool 只放还没被 consume 的,fetchMore 内 drainPool 还会再过一遍
+      pool = fresh.filter((t) => !consumed.has(songKey(t)));
+      console.debug("[claudio] 续杯 refill", { freshCount: pool.length });
+    } catch (e) {
+      console.debug("[claudio] 续杯 refill 失败", e);
+      pool = [];
+    }
+  };
+
+  const fetchMore = async (excludeIds: Set<number>): Promise<TrackInfo[]> => {
+    const want = 8;
+    let out = drainPool(excludeIds, want);
+    if (out.length === 0) {
+      await refillPool();
+      out = drainPool(excludeIds, want);
+    }
+    return out;
+  };
+
+  return { fetchMore };
 }
 
 // ---------- 调试记录 ----------

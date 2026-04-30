@@ -37,9 +37,69 @@ body {
 
 button { font: inherit; }
 
+/* 干掉 Android / iOS WebView 的所有"原生"按下反馈：
+ *   1. -webkit-tap-highlight-color：tap 一瞬间出现的蓝色覆盖（iOS / Android Chromium WebView）
+ *   2. focus / focus-visible / focus-within outline：键盘 / tap 后留下的蓝色描边
+ *   3. :active 默认背景色 / 边框
+ *   4. user-select on buttons：按住时弹出的复制提示
+ *   5. -webkit-appearance: none：清掉 button 默认 ring / inset shadow
+ * 我们的按下反馈完全靠 transform / opacity / 颜色 transition 自己做。
+ *
+ * ⚠️ 同时写两种值 —— `transparent` 和 `rgba(0,0,0,0)`：旧版 Android WebView 偶尔
+ * 不识别 `transparent` 关键字，rgba 形式 100% 兼容；浏览器后写覆盖前写，最终生效。 */
+*, *::before, *::after {
+  -webkit-tap-highlight-color: rgba(0,0,0,0) !important;
+  -webkit-tap-highlight-color: transparent !important;
+}
+button, a, [role="button"], [tabindex] {
+  -webkit-tap-highlight-color: transparent !important;
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+*:focus, *:focus-visible, *:focus-within, *:active {
+  outline: none !important;
+  -webkit-tap-highlight-color: transparent !important;
+}
+
 @keyframes claudioPulse {
   0%, 100% { transform: scale(1); opacity: 1; }
   50% { transform: scale(1.3); opacity: 0.6; }
+}
+
+/* hero 元数据淡入：跟着轮盘 snap 到新封面时整块平移 + 渐显，
+   distance 4px、380ms 与 PlaylistFusionBg 的 600ms cross-fade 不完全同步，
+   形成"封面先变 → 文字稍后跟上"的呼吸感，而不是粗暴齐刷。 */
+@keyframes metaFade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* 列表淡入：稍长一点 + 距离 6px，让"列表换组"读起来像翻页，不是刷数据。 */
+@keyframes listFade {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* 正在播放指示器（三条 bar 跳动）—— alternate + ease-in-out 让弹性更"音乐"，
+   不是机械的方波。每根 bar 加 stagger 延迟，错峰跳动而非整体上下。 */
+@keyframes playingBar {
+  0%   { height: 3px;  opacity: 0.55; }
+  100% { height: 12px; opacity: 1; }
+}
+
+/* 路由切换入场：纯 opacity 0→1，覆盖在 app/template.tsx 上。
+   每次 client navigation Next 都会重新挂载 template，触发一次该动画。
+   原先带 translateY(6px) + 290ms cubic，被用户实测拒掉 —— 加在 mount 工作量
+   上总感知 ~500ms，跳转明显卡顿。改成 100ms linear 纯 fade：
+     - 没有 transform，合成器一帧渲完，零主线程开销
+     - 100ms 短到不会跟 mount 时间叠加成"等"的感觉
+     - 仍能盖住 unmount→mount 之间那 1-2 帧底色露出的黑闪 */
+@keyframes pageEnter {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 .glass {
@@ -50,6 +110,10 @@ button { font: inherit; }
 }
 
 .muted { color: var(--ink-dim); }
+
+/* 隐藏滚动条但保留滚动行为 —— 给 carousel / 横向贴片用。 */
+.hide-scrollbar::-webkit-scrollbar { display: none; }
+.hide-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
 
 /* ===== Windows 适配 =====
  * decorum 在 Windows 上把原生标题栏从 NCCALCSIZE 拿掉，但会用一个固定在
@@ -63,21 +127,36 @@ html[data-platform="windows"] body {
   padding-top: 32px;
 }
 
-/* ===== Android 沉浸式 =====
- * MainActivity 调了 enableEdgeToEdge + 透明状态栏/导航栏，WebView 铺到物理边缘。
- * 不加 padding —— 内容（封面 / 歌词）天然铺到屏幕边沿，跟用户期望的"全沉浸"一致。
+/* ===== 跨平台 floating 顶栏的 safe area =====
+ * .safe-top 给页面顶部 floating 按钮用，自动避开各平台的"系统占位"：
  *
- * 唯一需要手动处理的是 Nav 这种顶吸条 —— 在状态栏（约 24-44px）后面也能看见，
- * 这是想要的效果。但 Nav 内的可点击元素需要避开手势区，给它一点 safe-area 上间距，
- * 避免按钮被状态栏文字盖住。env(safe-area-inset-top) 在 Android WebView 16+ 都
- * 已经返回正确值。
- */
-html[data-platform="android"] body {
-  /* 字号略放大 0.5px：手机视距比桌面近，但 px 还是 px，1px ≈ 1dp，需要 micro adjust */
+ *   Android：状态栏 inset（fallback 28px）
+ *   Mac：左上 ~78x28 的红黄绿三键（titleBarStyle: "Overlay"）
+ *   Windows：右上 ~138x32 的 decorum min/max/close 三键
+ *
+ * 桌面 (≥720px) 上 env(safe-area-inset-*) 为 0，所以单纯的 .safe-top 不会引入
+ * 任何额外 padding —— 只有匹配 data-platform 才会注入对应方向的留白。 */
+.safe-top {
+  padding-top: max(env(safe-area-inset-top), 0px);
 }
-html[data-platform="android"] nav[data-tauri-drag-region] {
-  /* Nav 自身贴顶，但内层 padding 顶住状态栏，按钮不会被状态栏数字 / 信号图标盖住 */
-  padding-top: max(env(safe-area-inset-top), 12px);
+html[data-platform="android"] .safe-top {
+  padding-top: max(env(safe-area-inset-top), 28px);
+}
+/* settings / taste / login 这些"普通页面顶部行"用的 .safe-top 仍需要避开
+   Mac 红黄绿 / Win decorum 三键 —— 这些行不像 distill 的封面那样要全屏贴边。
+   distill 封面 + play page floating bar 自己 inline 设置 paddingLeft/Right，
+   会覆盖下面这两条规则（inline 优先级高）。 */
+html[data-platform="mac"] .safe-top {
+  padding-left: 86px;
+}
+html[data-platform="windows"] .safe-top {
+  padding-right: 152px;
+}
+.safe-bottom {
+  padding-bottom: max(env(safe-area-inset-bottom), 0px);
+}
+html[data-platform="android"] .safe-bottom {
+  padding-bottom: max(env(safe-area-inset-bottom), 16px);
 }
 
 /* decorum 三键自适应颜色：

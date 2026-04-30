@@ -12,6 +12,7 @@ import {
   type UserProfile,
 } from "@/lib/tauri";
 import { useAppSettings } from "@/lib/app-settings";
+import { BackButton } from "@/components/BackButton";
 import {
   useAnalysisProgress,
   startBackgroundAnalysis,
@@ -56,9 +57,26 @@ export default function SettingsPage() {
         width: "100%",
       }}
     >
-      <div style={brand}>SETTINGS</div>
+      {/* 三列 grid：BackButton（左 36px）/ 标题（中间 1fr，textAlign center 自然
+          落在屏幕几何中心）/ 36px 镜像占位（右）。flex + flex:1 那种写法标题中心
+          只在"BackButton 右边到屏幕右边沿"这段空间里居中，整体偏右；右边补一个
+          同宽空 div 才能让中点真正落在屏幕中线。 */}
+      <div
+        className="safe-top"
+        style={{
+          display: "grid",
+          gridTemplateColumns: "36px 1fr 36px",
+          alignItems: "center",
+          gap: 12,
+          paddingBottom: 8,
+        }}
+      >
+        <BackButton href="/" />
+        <div style={{ ...brand, marginTop: 0, marginBottom: 0 }}>SETTINGS</div>
+        <div aria-hidden />
+      </div>
       <div style={subtitle}>
-        Claudio 把你的账号状态、播放规则、AI 口吻都攒在本地。
+        Pipo 把你的账号状态、播放规则、AI 口吻都攒在本地。
       </div>
 
       <Section title="音乐来源">
@@ -98,7 +116,7 @@ export default function SettingsPage() {
       </Section>
 
       <Section title="AI 解说">
-        <Toggle label="每首歌给一段解说" desc="类似 Claudio 的那种 DJ 口吻" initial={true} />
+        <Toggle label="每首歌给一段解说" desc="类似 Pipo 的那种 DJ 口吻" initial={true} />
         <Toggle label="中文解说" desc="关闭则使用英文" initial={true} />
       </Section>
 
@@ -656,7 +674,7 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
               进入我的歌单 →
             </div>
             <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2 }}>
-              挑一张歌单，点一首歌，Claudio 会在主窗口原生播放。
+              挑一张歌单，点一首歌，Pipo 会在主窗口原生播放。
             </div>
           </div>
           <div style={{ color: "#9be3c6", fontSize: 22 }}>♪</div>
@@ -1163,14 +1181,14 @@ function UserFactsRow() {
   };
 
   const placeholder =
-    "随便写两行,告诉 Claudio 关于你的情况。例:\n" +
+    "随便写两行,告诉 Pipo 关于你的情况。例:\n" +
     "工作日 9:00-18:30,双休,法定节假日休息。\n" +
     "通勤 30 分钟。最近常熬夜。喜欢 city pop 和后摇。";
 
   return (
     <div style={{ padding: "8px 4px 4px" }}>
       <div style={{ color: "#8a93a8", fontSize: 12, marginBottom: 8, lineHeight: 1.6 }}>
-        TA 自己写的事实比 AI 从行为里推断的更准。任何工作时间 / 作息 / 习惯 / 喜好都可以塞进来,Claudio 会顺着这些回应你。
+        TA 自己写的事实比 AI 从行为里推断的更准。任何工作时间 / 作息 / 习惯 / 喜好都可以塞进来,Pipo 会顺着这些回应你。
       </div>
       <textarea
         value={text}

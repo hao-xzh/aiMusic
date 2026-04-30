@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Claudio",
+  "productName": "Pipo",
   "version": "0.1.30",
   "identifier": "app.claudio.desktop",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Claudio",
+        "title": "Pipo",
         "width": 1180,
         "height": 820,
         "minWidth": 360,

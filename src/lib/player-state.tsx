@@ -54,6 +54,123 @@ const LAST_TRACK_KEY = "last_track";
 const LAST_POSITION_KEY = "last_position_sec";
 const LAST_QUEUE_KEY = "last_queue";
 
+// ---- Android 原生 MediaSession 桥 ----
+//
+// MediaController.kt 在 WebView 启动时通过 addJavascriptInterface 把自己挂到
+// window.__ClaudioMedia。每次曲目 / 播放态 / 进度更新就把对应字段推过去，
+// Kotlin 侧把它转成 MediaSessionCompat / MediaStyle 通知，锁屏 / 通知抽屉
+// / 耳机线控全部拿到。
+//
+// 非 Android（macOS / Win / Linux Tauri、纯浏览器）下 __ClaudioMedia 不存在，
+// helper 检测后自动跳过 —— navigator.mediaSession 在这些环境本来就好用。
+//
+// ⚠️ 时序坑：MainActivity.onWebViewCreate 调 addJavascriptInterface 的时机不
+// 一定早于 React 第一次渲染（Wry 把 interface 挂到 WebView 后，JS 那边的
+// window 上要等下一次 navigation / reload 才看得见，但实际上首次加载时窗口
+// 就有；保险起见还是做下面这一层兜底）。所以我们：
+//   1) 维护一个 pending 队列，桥未到位时把 setMetadata / setState 攒着
+//   2) 启动时每 100ms 探一次 window.__ClaudioMedia.ping()，到位就一次性把
+//      最近一份 meta + state flush 过去（只 flush 最后一份，曲目刚切就 pause
+//      之类的中间态没意义）
+//   3) 之后所有调用直接走桥，不再排队
+type NativeMediaBridge = {
+  setMetadata: (json: string) => void;
+  setPlaybackState: (json: string) => void;
+  ping?: () => string;
+};
+type PendingMeta = {
+  title: string;
+  artist: string;
+  album: string;
+  coverUrl: string | null;
+  durationSec: number;
+};
+type PendingState = { playing: boolean; positionSec: number };
+let bridgeReady = false;
+let pendingMeta: PendingMeta | null = null;
+let pendingState: PendingState | null = null;
+let pollHandle: number | null = null;
+
+function getNativeBridge(): NativeMediaBridge | null {
+  if (typeof window === "undefined") return null;
+  return (window as unknown as { __ClaudioMedia?: NativeMediaBridge }).__ClaudioMedia ?? null;
+}
+function ensureBridgePolling() {
+  if (typeof window === "undefined") return;
+  if (bridgeReady || pollHandle != null) return;
+  // 没有 __ClaudioMedia 全局也起一次轮询 —— 桌面 / 浏览器环境下永远拿不到，
+  // 多跑几轮没副作用（每轮 1 个属性读取 + JSON.stringify，几乎无消耗）；
+  // 5 秒后还没就绪就放弃，认定不是 Android Tauri 环境
+  const start = Date.now();
+  pollHandle = window.setInterval(() => {
+    const b = getNativeBridge();
+    let ok = false;
+    try {
+      ok = b?.ping?.() === "1";
+    } catch {
+      ok = false;
+    }
+    if (ok && b) {
+      bridgeReady = true;
+      if (pollHandle != null) {
+        clearInterval(pollHandle);
+        pollHandle = null;
+      }
+      // flush 最近一份 metadata / state（不 flush 中间态）
+      try {
+        if (pendingMeta) b.setMetadata(JSON.stringify(pendingMeta));
+        if (pendingState) b.setPlaybackState(JSON.stringify(pendingState));
+      } catch (e) {
+        console.debug("[claudio] native bridge flush 失败", e);
+      }
+      pendingMeta = null;
+      pendingState = null;
+      console.debug("[claudio] native MediaSession bridge ready");
+    } else if (Date.now() - start > 5000) {
+      // 5 秒还没出现 = 非 Android Tauri 环境，停轮询省 CPU
+      if (pollHandle != null) {
+        clearInterval(pollHandle);
+        pollHandle = null;
+      }
+    }
+  }, 120);
+}
+function pushNativeMetadata(meta: PendingMeta | null) {
+  const safe: PendingMeta = meta ?? {
+    title: "",
+    artist: "",
+    album: "",
+    coverUrl: null,
+    durationSec: 0,
+  };
+  pendingMeta = safe;
+  if (!bridgeReady) {
+    ensureBridgePolling();
+    return;
+  }
+  const b = getNativeBridge();
+  if (!b) return;
+  try {
+    b.setMetadata(JSON.stringify(safe));
+  } catch (e) {
+    console.debug("[claudio] native setMetadata 失败", e);
+  }
+}
+function pushNativeState(playing: boolean, positionSec: number) {
+  pendingState = { playing, positionSec };
+  if (!bridgeReady) {
+    ensureBridgePolling();
+    return;
+  }
+  const b = getNativeBridge();
+  if (!b) return;
+  try {
+    b.setPlaybackState(JSON.stringify(pendingState));
+  } catch (e) {
+    console.debug("[claudio] native setPlaybackState 失败", e);
+  }
+}
+
 // ---- 调度参数 ----
 //
 // 提前多久开始解码 + 排下一首。MP3 解码 ~150-300ms + fetch 弱网最长 ~10s，
@@ -62,6 +179,9 @@ const PRELOAD_LEAD_S = 999_999;
 
 // 手动 next/prev 的短淡入淡出（防 click）。gapless 自动接歌不走这个。
 const MANUAL_CROSSFADE_S = 0.4;
+// 续杯阈值：current 后面剩 < N 首时触发续杯。3 = 至少留 2 首缓冲，
+// 给续杯异步往返时间，避免播放等待。
+const CONTINUOUS_EXTEND_THRESHOLD = 3;
 const PLAYBACK_LEVELS = ["lossless", "exhigh"] as const;
 type PlaybackLevel = (typeof PLAYBACK_LEVELS)[number];
 
@@ -104,9 +224,23 @@ type TrackPlaybackState = {
   lyric: LyricTrack | null;
 };
 
+/**
+ * 续杯式推荐源 —— 把"队列接近末尾时拉下一批同口味的歌"这件事抽象成一个回调。
+ * AI 点歌（pet-agent）会塞一支进来；用户从专辑/口味页直接点的播放就 null（不续杯）。
+ *
+ * fetchMore 收到当前队列里所有 neteaseId 作为 excludeIds，避免重复入队。
+ * 返回 [] 表示这一支已经榨干 —— 此时 player 会摘掉 source 并禁掉队尾循环，
+ * 让播放自然停在"播完了"，而不是回头放一遍听过的歌。
+ */
+export type ContinuousQueueSource = {
+  fetchMore: (excludeIds: Set<number>) => Promise<TrackInfo[]>;
+};
+
 export type PlayNeteaseOptions = {
   smooth?: boolean;
   smoothMode?: "library" | "discovery";
+  /** 队列接近末尾时由 player 调用以续杯。null/undefined 表示这一次播放不续杯 */
+  continuous?: ContinuousQueueSource | null;
 };
 
 export type PlayerAPI = PlayerState & {
@@ -195,6 +329,22 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const prefetchedSetRef = useRef<Set<number>>(new Set());
   /** 当前正在播放的 audio-cache URL；给提前排下一首时补算当前歌分析用。 */
   const currentAudioUrlRef = useRef<string | null>(null);
+  /**
+   * 续杯式推荐源（AI 点歌时由 pet-agent 塞进来）。
+   *
+   * - 队列里 current 之后剩 < EXTEND_THRESHOLD 首时调一次 fetchMore，结果 append。
+   * - fetchMore 返回 [] = 资源耗尽 → 摘掉 source 并把 noLoop 设 true,让播放自然结束。
+   * - 任何新的 playNetease 都会覆盖这个 ref（用户点别的歌单时旧 source 立刻失效）。
+   */
+  const continuousSourceRef = useRef<ContinuousQueueSource | null>(null);
+  /** 续杯调用是否在飞行中 —— 防短时间内重复触发 */
+  const fetchingMoreRef = useRef<boolean>(false);
+  /**
+   * 队尾不循环。续杯 source 耗尽后置 true → maybeScheduleNext / onSchedulerEnded
+   * 在队尾不再 wraparound 回第一首,让播放自然结束。普通模式（用户从专辑直接点）
+   * 仍然按原来的 modulo 循环行为走。
+   */
+  const noLoopRef = useRef<boolean>(false);
 
   const [state, setState] = useState<PlayerState>({
     current: null,
@@ -299,6 +449,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
               });
             } catch {}
           }
+          // Android 原生：每秒推一次进度，让锁屏 / 通知抽屉的进度条跟着走
+          pushNativeState(true, pos);
         }
 
         // 临近曲尾 → 排下一首
@@ -396,6 +548,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
     const i = queue.findIndex((t) => t.id === current.id);
     if (i < 0) return;
+    // 续杯模式资源耗尽后 noLoop=true → 队尾不再 wraparound 回头放第一首,
+    // 让播放自然停（onSchedulerEnded 会出"播完了"）。普通模式（用户从专辑直
+    // 接点）保持原行为,modulo 循环。
+    const isLast = i === queue.length - 1;
+    if (isLast && noLoopRef.current) return;
     const nxt = queue[(i + 1) % queue.length];
     if (!nxt?.neteaseId || nxt.id === current.id) return;
 
@@ -544,6 +701,55 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ============================================================
+  // 续杯：current 后面剩 <THRESHOLD 首时,从 continuousSourceRef 拉下一批 append
+  // ============================================================
+  //
+  // 触发点:onSchedulerTransition(自动接歌进入新 current)、next/prev(用户手动跳)。
+  // 不挂在 rAF 里 —— rAF 一秒走 60 次,会把 fetchMore 调成节流地狱;且队列长度
+  // 跟当前位置只有 transition 时才会真的变。
+  //
+  // 不重复保证:
+  //   - excludeIds 里塞了当前队列所有 neteaseId,fetchMore 不会返回 id 撞车的;
+  //   - 闭包内部还自己维护了 songKey 集合（pet-agent 那侧）,跨多次调用不会撞;
+  //   - fetchingMoreRef 防同一时刻多个 fetchMore 在飞,避免去重链路撕裂。
+  const maybeExtendQueue = useCallback(async () => {
+    if (fetchingMoreRef.current) return;
+    const src = continuousSourceRef.current;
+    if (!src) return;
+    const { current, queue } = stateRef.current;
+    if (!current) return;
+    const i = queue.findIndex((t) => t.id === current.id);
+    if (i < 0) return;
+    const remainingAhead = queue.length - 1 - i;
+    if (remainingAhead >= CONTINUOUS_EXTEND_THRESHOLD) return;
+
+    fetchingMoreRef.current = true;
+    try {
+      const exclude = new Set<number>();
+      for (const t of queue) {
+        if (t.neteaseId != null) exclude.add(t.neteaseId);
+      }
+      const more = await src.fetchMore(exclude);
+      if (more.length === 0) {
+        // 资源榨干 —— 摘掉 source,禁掉队尾循环,让播放自然结束。
+        continuousSourceRef.current = null;
+        noLoopRef.current = true;
+        return;
+      }
+      const appended = more.map(neteaseToTrack);
+      setState((s) => {
+        const next = { ...s, queue: [...s.queue, ...appended] };
+        cache.setState(LAST_QUEUE_KEY, JSON.stringify(next.queue)).catch(() => {});
+        return next;
+      });
+    } catch (e) {
+      console.debug("[claudio] 续杯失败", e);
+    } finally {
+      fetchingMoreRef.current = false;
+    }
+  }, []);
+
+  // ============================================================
   // 调度器事件：next 接管成 current / 队列播完
   // ============================================================
   const onSchedulerTransition = useCallback((trackId: number) => {
@@ -577,7 +783,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     // 拉新曲目歌词 + DJ 旁白
     void loadLyricFor(newCur);
     void loadDjLineFor(newCur);
-  }, []);
+
+    // 续杯检查 —— 走到新 current 时算一次"队列剩多少",不够就拉下一批
+    void maybeExtendQueue();
+  }, [maybeExtendQueue]);
 
   const onSchedulerEnded = useCallback((trackId: number) => {
     // 队列没下一首了或单曲循环
@@ -590,10 +799,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     if (queue.length > 1) {
       // 队列还有歌但没排上 —— 通常因为 fetch / decode 失败。退化到立即播下一首
       const i = queue.findIndex((t) => t.id === current.id);
-      const nxt = queue[(i + 1) % queue.length];
-      if (nxt && nxt.id !== current.id) {
-        void playTrackInternal(nxt, { manualCut: false });
-        return;
+      const isLast = i === queue.length - 1;
+      // 续杯耗尽 (noLoop) 时不再循环回第一首,让播放自然停下。
+      if (!(isLast && noLoopRef.current)) {
+        const nxt = queue[(i + 1) % queue.length];
+        if (nxt && nxt.id !== current.id) {
+          void playTrackInternal(nxt, { manualCut: false });
+          return;
+        }
       }
     }
     setState((s) => ({ ...s, isPlaying: false, aiStatus: "播完了" }));
@@ -809,6 +1022,14 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       contextQueue?: TrackInfo[],
       opts?: PlayNeteaseOptions,
     ) => {
+      // 每一次新的 playNetease 都重置续杯状态:
+      //   - 有传 continuous → 装新的 source（pet-agent 这次给了续杯能力）
+      //   - 没传 → null,普通播放（用户从专辑/口味页点的）
+      // 老的 source 不能延续到新场景下,否则口味会跨语境串味。
+      continuousSourceRef.current = opts?.continuous ?? null;
+      noLoopRef.current = false;
+      fetchingMoreRef.current = false;
+
       if (contextQueue) {
         let queueSource = contextQueue;
         if (opts?.smooth !== false && contextQueue.length > 2) {
@@ -892,9 +1113,16 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const i = queue.findIndex((t) => t.id === current.id);
+    const isLast = i === queue.length - 1;
+    if (isLast && noLoopRef.current) {
+      // 续杯耗尽且在队尾时,手动按 next 不再 wrap 到第一首
+      return;
+    }
     const nxt = queue[(i + 1) % queue.length];
     void playTrackInternal(nxt ?? current, { manualCut: true });
-  }, [playTrackInternal]);
+    // 手动跳歌也可能让队尾"剩多少"跌破阈值 —— 顺手续一杯
+    void maybeExtendQueue();
+  }, [playTrackInternal, maybeExtendQueue]);
 
   const prev = useCallback(() => {
     const { current, queue } = stateRef.current;
@@ -979,6 +1207,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           aiStatus: "已从上次回来 —— 按 ▶ 继续",
         }));
         lastKnownPositionRef.current = Number.isFinite(pos) ? pos : 0;
+        // 同步把歌词也拉回来 —— 之前只恢复了 current/queue/positionSec，
+        // lyric 仍是 null，导致重开 app 后歌词区一直显示"歌词加载中"，必须等
+        // 用户点 ▶ 触发 playTrackInternal 才会调 loadLyricFor。loadLyric 走 cache
+        // 优先（saveLyric 已经把上次拉过的 lrc/yrc 存进 IndexedDB），命中时
+        // 完全离线、零网络；没命中也只是个 GET 请求，不会阻塞或自动起播。
+        void loadLyricFor(track);
       } catch (e) {
         console.debug("[claudio] 跳过上次播放恢复", e);
       }
@@ -986,7 +1220,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     return () => {
       alive = false;
     };
-  }, []);
+    // loadLyricFor 是 useCallback([])，引用稳定；列出来满足 exhaustive-deps
+  }, [loadLyricFor]);
 
   // ============================================================
   // 前后台切换：ctx 可能被 OS suspend，focus 时 resume
@@ -1049,6 +1284,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const ms = navigator.mediaSession;
     if (!state.current) {
       ms.metadata = null;
+      pushNativeMetadata(null);
       return;
     }
     try {
@@ -1063,6 +1299,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     } catch (e) {
       console.debug("[claudio] mediaSession metadata 失败", e);
     }
+    // Android 原生桥（MediaController.kt）—— 让锁屏 / 通知抽屉的 Now Playing
+    // 卡片拿到当前曲目；非 Android Tauri 环境下 __ClaudioMedia 不存在，自动跳过
+    pushNativeMetadata({
+      title: state.current.title,
+      artist: state.current.artist,
+      album: state.current.album ?? "",
+      // 给 Kotlin 用 raw HTTPS（cdn() 那一层 claudio-cdn:// 只在 WebView 内可解析）；
+      // Kotlin 侧 HttpURLConnection 不带 Referer，正好绕开网易 CDN 防盗链
+      coverUrl: state.current.cover ?? null,
+      durationSec: state.current.durationSec || 0,
+    });
   }, [state.current]);
 
   useEffect(() => {
@@ -1099,7 +1346,53 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (typeof navigator === "undefined" || !("mediaSession" in navigator)) return;
     navigator.mediaSession.playbackState = state.isPlaying ? "playing" : "paused";
+    pushNativeState(state.isPlaying, lastKnownPositionRef.current);
   }, [state.isPlaying]);
+
+  // Android 反向桥：MediaController.kt 在锁屏 / 通知 / 耳机线控触发时调
+  // window.__claudioMediaAction(action, payload) ——
+  // 这里把它映射回项目里现成的 resume / pause / next / prev / seek 闭包。
+  // 用 ref 拿最新闭包，这样 window 上挂的入口本身只挂一次（不会因 callback 变更
+  // 频繁解绑 / 重绑），但每次调用时都拿到最新版本。
+  const mediaActionRef = useRef<{
+    resume: typeof resume;
+    pause: typeof pause;
+    next: typeof next;
+    prev: typeof prev;
+    seek: typeof seek;
+  }>({ resume, pause, next, prev, seek });
+  useEffect(() => {
+    mediaActionRef.current = { resume, pause, next, prev, seek };
+  }, [resume, pause, next, prev, seek]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const w = window as unknown as {
+      __claudioMediaAction?: (action: string, payload?: { positionSec?: number }) => void;
+    };
+    w.__claudioMediaAction = (action, payload) => {
+      const m = mediaActionRef.current;
+      switch (action) {
+        case "play":
+          void m.resume();
+          break;
+        case "pause":
+          m.pause();
+          break;
+        case "next":
+          m.next();
+          break;
+        case "prev":
+          m.prev();
+          break;
+        case "seek":
+          if (payload && typeof payload.positionSec === "number") m.seek(payload.positionSec);
+          break;
+      }
+    };
+    return () => {
+      delete w.__claudioMediaAction;
+    };
+  }, []);
 
   // ============================================================
   // 卸载清理

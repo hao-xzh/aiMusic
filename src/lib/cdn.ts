@@ -12,9 +12,10 @@
  *
  * 非网易云域名原样返回（比如 `data:` / 相对路径 / 占位图）。
  *
- * 平台差异：Tauri 2 在 macOS/Linux 下把自定义 scheme 保留为 `<scheme>://localhost/…`，
- * Windows 下翻译成 `http://<scheme>.localhost/…` 来绕开 Edge 的 scheme 黑名单，
- * Android 下走 WebViewAssetLoader 拦截 `https://<scheme>.localhost/…`。
+ * 平台差异：Tauri 2 在 macOS/Linux/iOS 下把自定义 scheme 保留为 `<scheme>://localhost/…`，
+ * Windows 和 Android 下都会被 wry 改写成 `http://<scheme>.localhost/…`
+ * （Android 经 WebViewAssetLoader 拦截，Windows 是绕 Edge 的 scheme 黑名单）。
+ * 默认 useHttpsScheme=false（见 tauri.conf.json），开成 true 才用 `https://`，
  * 这里按 UA 切换一下 base。Rust 侧三种 URI 都能解析，handler 一份就够。
  */
 export function cdn(raw: string | null | undefined): string {
@@ -45,7 +46,9 @@ export function cdn(raw: string | null | undefined): string {
 export function pickProtoBase(scheme: string): string {
   if (typeof navigator === "undefined") return `${scheme}://localhost/`;
   const ua = navigator.userAgent;
-  if (/Android/i.test(ua)) return `https://${scheme}.localhost/`;
-  if (/Windows/i.test(ua)) return `http://${scheme}.localhost/`;
+  // Android 和 Windows 都走 wry 的 work-around URI：http://<scheme>.localhost/
+  if (/Android/i.test(ua) || /Windows/i.test(ua)) {
+    return `http://${scheme}.localhost/`;
+  }
   return `${scheme}://localhost/`;
 }

@@ -20,6 +20,9 @@ import { usePlayer } from "@/lib/player-state";
 import { type LrcLine } from "@/lib/lrc";
 import { type YrcLine } from "@/lib/yrc";
 import { cdn } from "@/lib/cdn";
+import { useIsDesktop } from "@/lib/use-is-desktop";
+import { useCoverEdgeColors, computeTone } from "@/lib/cover-color";
+import Link from "next/link";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -170,18 +173,22 @@ function CompactPlayer({
             hidden={immersiveActive}
           />
 
-          <div style={titleBlock}>
-            <div style={titleTextCol}>
-              <div style={titleStyle} title={current?.title}>
-                {current?.title ?? "等你点一首"}
-              </div>
-              <div style={subtitleStyle}>
-                {current
-                  ? current.artist + (current.album ? ` · ${current.album}` : "")
-                  : "去「我的歌单」挑一张"}
+          {current ? (
+            <div style={titleBlock}>
+              <div style={titleTextCol}>
+                <div style={titleStyle} title={current.title}>
+                  {current.title}
+                </div>
+                <div style={subtitleStyle}>
+                  {current.artist + (current.album ? ` · ${current.album}` : "")}
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            // 没歌时不出占位文字 —— 整页留给封面留白和控件，跟"沉浸感拉满"一致。
+            // 顶角的 ☰ 库按钮已经隐含"去挑一首"的行为入口。
+            <div style={{ height: 8 }} />
+          )}
 
           <div style={progressWrap}>
             <ProgressBar pct={pct} />
@@ -200,24 +207,42 @@ function CompactPlayer({
             onToggle={toggle}
             onNext={next}
           />
-        </div>
 
-        <div
-          ref={compactLyricRef}
-          onClick={hasTrack ? onLyricClick : undefined}
-          style={{
-            cursor: hasTrack ? "pointer" : "default",
-            // 跟 CoverBox 同因：immersive 在屏期间它会跟正在收缩的 immersive
-            // 歌词层叠图，直接 opacity 0 让位
-            opacity: immersiveActive ? 0 : 1,
-          }}
-        >
-          <LyricStrip
-            lines={lyric?.lines ?? []}
-            yrcLines={lyric?.yrcLines ?? []}
-            positionSec={positionSec}
-            meta={lyric}
-          />
+          {/* 极简底栏：跟 controlsRow 同款三列等分网格 → 每个 nav 图标在自己
+              1/3 列里居中，跟上面 prev / play / next 的中心严格垂直对齐。
+              marginTop 跟 controlsRow.marginTop 一致 = 进度条 → 控件 = 控件 → 图标。 */}
+          <div
+            ref={compactLyricRef}
+            style={{
+              marginTop: "clamp(22px, 3.4vh, 32px)",
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr 1fr",
+              placeItems: "center",
+              paddingInline: 0,
+              opacity: immersiveActive ? 0 : 1,
+              transition: "opacity 200ms ease",
+            }}
+          >
+            <button
+              onClick={hasTrack ? onLyricClick : undefined}
+              disabled={!hasTrack}
+              aria-label="歌词"
+              title="歌词"
+              style={{
+                ...navIcon,
+                opacity: hasTrack ? 0.82 : 0.32,
+                cursor: hasTrack ? "pointer" : "not-allowed",
+              }}
+            >
+              <LyricsIcon />
+            </button>
+            <Link href="/distill" aria-label="我的歌单" title="我的歌单" style={navIcon}>
+              <ListIcon />
+            </Link>
+            <Link href="/settings" aria-label="设置" title="设置" style={navIcon}>
+              <NavGearIcon />
+            </Link>
+          </div>
         </div>
 
         {error && <div style={errorBar}>{error}</div>}
@@ -347,7 +372,7 @@ function ImmersiveLyrics({
     // CSS 默认状态保持一致
     const target = computeImmersiveTargets(layout);
 
-    // 没源 rect 就退化成纯淡入
+    // 没源 rect 就退化成纯淡入；移动端走 FLIP（120Hz 设备 hold 得住）
     if (!srcCover) {
       applyTargetImmediate(cover, target.cover);
       applyTargetImmediate(lyric, target.lyric);
@@ -451,7 +476,7 @@ function ImmersiveLyrics({
     const srcCover = sourceCoverRect();
     const srcLyric = sourceLyricRect();
 
-    // 没源 rect 就纯淡出
+    // 没源 rect 就纯淡出；移动端正常走 FLIP
     if (!srcCover) {
       backdrop.style.transition = `opacity 280ms ${CLOSE_EASE}`;
       backdrop.style.opacity = "0";
@@ -591,7 +616,20 @@ function ImmersiveLyrics({
 
       {/* 封面：尺寸 / 位置 / mask 全部由 layout 决定。
           - 手机端单向 mask（底部渐隐进歌词区）
-          - 桌面端多向 mask（intersect）：四边都柔化溶进同源模糊 backdrop */}
+          - 桌面端多向 mask（intersect）：四边都柔化溶进同源模糊 backdrop
+
+          mask 一直挂着 —— 这是唯一能让"封面底部颜色"和"歌词区背后的 backdrop"
+          视觉无缝衔接的方式（mask 让封面底部变透明，露出背后同源模糊 backdrop，
+          backdrop 是全屏的，从封面下沿一直延续到歌词区，肉眼看像一整张图）。
+          之前试过 phase 闸控 / overlay 兜底 mask 平滑过渡，效果都更差：
+            - phase 闸控：mask 在 opening 末尾 snap-on，肉眼能读到"底部一闪"
+            - overlay：用 seam 色实色画在 cover 底，跟下方真正的 backdrop 不同
+              颜色 → 封面下沿和歌词区之间出现一条硬边
+          真正的 flicker 源是另一处：opening 时 backdrop 透明度还在 0→1 爬升，
+          mask 透出的"背后"短暂是 opacity 0 的 backdrop（即播放页本体），而不是
+          模糊封面 → 封面底部那 45% 一闪就是播放页的控件区。
+          解决方案在下面 useLayoutEffect 里：opening 阶段 backdrop 直接 opacity 1，
+          不再走渐入。这样 mask 透出的从第一帧起就是同源模糊封面，颜色连续。 */}
       <div
         ref={coverRef}
         onClick={onClose}
@@ -772,10 +810,10 @@ function computeLayout(
     const top = `clamp(0px, calc(100vw - ${W}), 32px)`;
     const left = `calc((100vw - ${W}) / 2)`;
     const lyricTop = `calc(${top} + ${W} + clamp(8px, 1.6vh, 16px))`;
-    // title 横向内边距跟下方歌词区 inner padding（clamp(20px, 5vw, 36px)，
-    // 见 LyricColumn 的 innerExtraStyle）严格对齐 —— 歌名和歌词左右两边
-    // 同一条竖线，视觉上整张页面是一根脊柱
-    const titlePadX = "clamp(20px, 5vw, 36px)";
+    // title 横向内边距跟下方歌词区 inner padding 严格对齐 —— 歌名和歌词左右两边
+    // 同一条竖线，视觉上整张页面是一根脊柱。
+    // 移动端用户希望左右更"透气"，原 clamp(20, 5vw, 36) 加大 1/3 → 28-48
+    const titlePadX = "clamp(28px, 6.7vw, 48px)";
     return {
       cover: { top, left, width: W, height: W },
       title: {
@@ -927,104 +965,7 @@ function transitionFor(
 }
 
 // 根据 RGB 计算亮度（perceptual luma），决定文字用深色还是浅色
-function computeTone(rgbStr: string | null): "light" | "dark" {
-  if (!rgbStr) return "light";
-  const parts = rgbStr.split(",").map((s) => parseInt(s.trim(), 10));
-  if (parts.length < 3 || parts.some((n) => !Number.isFinite(n))) return "light";
-  const [r, g, b] = parts as [number, number, number];
-  const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-  // 145 是经验阈值：luma > 145 = bg 偏亮，文字用深色
-  return luma > 145 ? "dark" : "light";
-}
-
-// 视口宽度断点：>= 720px 走桌面 side-by-side（封面左、歌词右）；< 720 走
-// 手机 stacked（封面顶、歌词底）。SSR 默认手机布局，避免首帧错乱。
-function useIsDesktop(): boolean {
-  const [isD, setIsD] = useState(false);
-  useEffect(() => {
-    const update = () => setIsD(window.innerWidth >= 720);
-    update();
-    window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
-  }, []);
-  return isD;
-}
-
-// 采样封面边缘颜色：通过 canvas 抠出顶 / 底 / 右三边的平均 RGB。
-//   - 手机 stacked：用 top + bottom，渐隐 mask 在底部
-//   - 桌面 side-by-side：用 top + bottom + right，渐隐 mask 在右侧
-//
-// 跨域：claudio-cdn:// scheme 的 Rust handler 已经放了 ACAO:* —— 设
-// crossOrigin=anonymous 后 canvas 不会 taint，可以 getImageData。
-type EdgeColors = { top: string | null; bottom: string | null; right: string | null };
-
-function useCoverEdgeColors(url: string | null): EdgeColors {
-  const [colors, setColors] = useState<EdgeColors>({ top: null, bottom: null, right: null });
-
-  useEffect(() => {
-    if (!url) {
-      setColors({ top: null, bottom: null, right: null });
-      return;
-    }
-    let cancelled = false;
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      if (cancelled) return;
-      try {
-        const W = 32,
-          H = 32;
-        const canvas = document.createElement("canvas");
-        canvas.width = W;
-        canvas.height = H;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0, W, H);
-        const sample = (yStart: number, yEnd: number) => {
-          const data = ctx.getImageData(0, yStart, W, yEnd - yStart).data;
-          let r = 0,
-            g = 0,
-            b = 0,
-            n = 0;
-          for (let i = 0; i < data.length; i += 4) {
-            r += data[i]!;
-            g += data[i + 1]!;
-            b += data[i + 2]!;
-            n++;
-          }
-          if (n === 0) return null;
-          return `${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)}`;
-        };
-        // 横条采样（top / bottom）
-        const top = sample(0, 5);
-        const bottom = sample(H - 5, H);
-        // 竖条采样（right）：手动取右侧 5 列
-        const sampleRight = () => {
-          let r = 0, g = 0, b = 0, n = 0;
-          const data = ctx.getImageData(W - 5, 0, 5, H).data;
-          for (let i = 0; i < data.length; i += 4) {
-            r += data[i]!; g += data[i + 1]!; b += data[i + 2]!; n++;
-          }
-          if (n === 0) return null;
-          return `${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)}`;
-        };
-        const right = sampleRight();
-        if (cancelled) return;
-        setColors({ top, bottom, right });
-      } catch (e) {
-        // canvas tainted（CORS 不齐）/ 解码失败：放弃，用默认色
-        console.debug("[claudio] cover edge color sample failed", e);
-      }
-    };
-    img.onerror = () => {};
-    img.src = url;
-    return () => {
-      cancelled = true;
-    };
-  }, [url]);
-
-  return colors;
-}
+// useCoverEdgeColors / computeTone 已抽到 @/lib/cover-color，给歌词页 + 歌单页共用。
 
 function ImmersiveIconBtn({
   children,
@@ -1095,10 +1036,6 @@ const CoverBox = React.forwardRef<
         position: "relative",
         boxShadow:
           "0 24px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04)",
-        // 立即（不带 transition）切到 0/1 —— immersive 进入 / 退出动画期间，
-        // 这块封面被上层 immersive 封面完全替代显示；如果加 fade，关闭时会
-        // 出现"半透明 compact 封面 + 正在收缩的 immersive 封面"叠在一起
-        // 的轻微叠图。
         opacity: hidden ? 0 : 1,
         transform: isPlaying ? "scale(1.012)" : "scale(1)",
         transition: "transform 4000ms ease-in-out",
@@ -1311,7 +1248,9 @@ function LyricColumn({
           "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
       }}
       innerExtraStyle={{
-        padding: "clamp(20px, 4vh, 36px) clamp(20px, 5vw, 36px)",
+        // 横向 padding 跟移动端 titlePadX 同步加大 1/3：28-48；
+        // 桌面 6.7vw 的上限也是 48，比原 36 多一档透气
+        padding: "clamp(20px, 4vh, 36px) clamp(28px, 6.7vw, 48px)",
       }}
       transitionMs={560}
     >
@@ -1928,7 +1867,8 @@ const coverPlaceholder: React.CSSProperties = {
 };
 
 const titleBlock: React.CSSProperties = {
-  marginTop: "clamp(14px, 2.6vh, 22px)",
+  // 比原先 14-22 略松：2.0-3.4vh
+  marginTop: "clamp(18px, 3vh, 28px)",
   padding: 0,
 };
 
@@ -1959,14 +1899,16 @@ const subtitleStyle: React.CSSProperties = {
 };
 
 const progressWrap: React.CSSProperties = {
-  marginTop: "clamp(10px, 1.8vh, 16px)",
+  // 比原先 10-16 略松：14-22
+  marginTop: "clamp(14px, 2.4vh, 22px)",
   padding: 0,
 };
 
 const progressTrack: React.CSSProperties = {
   position: "relative",
-  height: 3,
-  background: "rgba(233,239,255,0.10)",
+  // 进度条粗一档：3 → 4
+  height: 4,
+  background: "rgba(233,239,255,0.12)",
   borderRadius: 999,
   overflow: "hidden",
 };
@@ -1996,11 +1938,15 @@ const mono: React.CSSProperties = {
 };
 
 const controlsRow: React.CSSProperties = {
-  marginTop: "clamp(18px, 3vh, 28px)",
-  display: "flex",
-  justifyContent: "center",
-  alignItems: "center",
-  gap: "clamp(36px, 12vw, 64px)",
+  marginTop: "clamp(22px, 3.4vh, 32px)",
+  // 三列等分网格 + 每格居中：prev / play / next 各自落在 1/3 列中心。
+  // 下面 nav 行用完全相同的网格 → 两行的"按钮中心"严格垂直对齐，
+  // 不受按钮宽度差影响（play 比 prev/next 大也对齐得上）。
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr 1fr",
+  placeItems: "center",
+  // 三列等分网格的列中心已经在 1/6、3/6、5/6 处，不需要再加内边距
+  paddingInline: 0,
 };
 
 const lyricBox: React.CSSProperties = {
@@ -2085,4 +2031,60 @@ const immersiveLyricFrame: React.CSSProperties = {
   inset: 0,
   overflow: "hidden",
 };
+
+// 极简底栏图标 —— 跟 distill / play page 的 floating chip 同款规格
+const navIcon: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: 36,
+  height: 36,
+  borderRadius: 999,
+  border: "none",
+  background: "transparent",
+  color: "rgba(245,247,255,0.82)",
+  cursor: "pointer",
+  textDecoration: "none",
+  filter: "drop-shadow(0 1px 6px rgba(0,0,0,0.45))",
+  transition: "transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
+};
+
+// 三个 nav 图标 strokeWidth 全部 2.2 + 尺寸 20，跟 SkipBack/Forward 的 2.2 视觉重量对齐
+function LyricsIcon() {
+  return (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <rect x="3" y="5" width="18" height="14" rx="2.5" ry="2.5" />
+      <path d="M7 10.5h6.5M7 14.5h9" />
+    </svg>
+  );
+}
+
+function ListIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3.5 6h11M3.5 12h11M3.5 18h7" />
+      <path d="M19.5 4v9" />
+      <ellipse cx="17.7" cy="14" rx="2.2" ry="1.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function NavGearIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
+}
 

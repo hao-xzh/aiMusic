@@ -53,6 +53,8 @@ pub fn run() {
             // netease
             netease_qr_start,
             netease_qr_check,
+            netease_captcha_sent,
+            netease_phone_login,
             netease_account,
             netease_user_playlists,
             netease_playlist_detail,

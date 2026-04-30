@@ -70,6 +70,15 @@ export type SongUrl = {
 export type QrStart = { key: string; qrContent: string };
 export type QrCheck = { code: number; message?: string | null; nickname?: string | null };
 
+/** 发短信结果。code=200 已发，其它如 503 = 触发风控（频繁请求），message 给前端展示。 */
+export type CaptchaSent = { code: number; message?: string | null };
+/** 验证码登录结果。code=200 = 成功，cookie 已落盘；其它附带 message。 */
+export type PhoneLogin = {
+  code: number;
+  message?: string | null;
+  nickname?: string | null;
+};
+
 /** 歌词原始包：Rust 侧从 weapi `song/lyric` 直接 shape 过来 */
 export type LyricData = {
   /** LRC 格式原词（含 `[mm:ss.xx]` 时间戳）。纯音乐 / 无歌词 = null */
@@ -93,6 +102,12 @@ export type LyricData = {
 export const netease = {
   qrStart: () => invoke<QrStart>("netease_qr_start"),
   qrCheck: (key: string) => invoke<QrCheck>("netease_qr_check", { key }),
+  /** 给手机发验证码。ctcode 不传 = 86（中国大陆）。 */
+  captchaSent: (phone: string, ctcode?: number) =>
+    invoke<CaptchaSent>("netease_captcha_sent", { phone, ctcode }),
+  /** 拿验证码换 cookie。code=200 后跟扫码登录成功一样，已自动 persist。 */
+  phoneLogin: (phone: string, captcha: string, ctcode?: number) =>
+    invoke<PhoneLogin>("netease_phone_login", { phone, captcha, ctcode }),
   account: () => invoke<UserProfile | null>("netease_account"),
   userPlaylists: (uid: number, limit?: number) =>
     invoke<PlaylistInfo[]>("netease_user_playlists", { uid, limit }),
@@ -244,13 +259,15 @@ export function wrapAudioUrl(trackId: number, url: string): string {
 
 // 跟 cdn.ts 的 pickProtoBase 同源 —— Tauri 2 在三个平台对自定义 scheme 的处理：
 //   - macOS / iOS / Linux：保留 `<scheme>://localhost/...`
-//   - Windows：翻成 `http://<scheme>.localhost/...`（绕 Edge scheme 黑名单）
-//   - Android：通过 WebViewAssetLoader 拦截 `https://<scheme>.localhost/...`
+//   - Windows / Android：wry 改写成 `http://<scheme>.localhost/...`
+//     （Android 经 WebViewAssetLoader 拦截，Windows 绕 Edge scheme 黑名单）
+//     默认 useHttpsScheme=false，要走 https 得在 tauri.conf.json 显式打开。
 function pickAudioBase(): string {
   if (typeof navigator === "undefined") return "claudio-audio://localhost/";
   const ua = navigator.userAgent;
-  if (/Android/i.test(ua)) return "https://claudio-audio.localhost/";
-  if (/Windows/i.test(ua)) return "http://claudio-audio.localhost/";
+  if (/Android/i.test(ua) || /Windows/i.test(ua)) {
+    return "http://claudio-audio.localhost/";
+  }
   return "claudio-audio://localhost/";
 }
 

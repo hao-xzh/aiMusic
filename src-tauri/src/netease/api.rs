@@ -43,6 +43,46 @@ impl NeteaseClient {
         Ok(resp)
     }
 
+    /// 给手机号发短信验证码。
+    /// `ctcode` 是国家区号，默认 86（中国大陆）。
+    /// 后端常见返回码：200 = 已发送 / 400 = 参数错误 / 503 = 频繁触发风控。
+    pub async fn captcha_sent(&self, phone: &str, ctcode: i32) -> Result<CaptchaResp> {
+        let resp: CaptchaResp = self
+            .weapi(
+                "sms/captcha/sent",
+                json!({ "ctcode": ctcode, "cellphone": phone }),
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// 验证码登录。成功后 cookie jar 里就有 MUSIC_U + __csrf，立即 persist 落盘
+    /// —— 跟 qr_check 803 一个套路，下次启动直接已登录。
+    pub async fn login_cellphone(
+        &self,
+        phone: &str,
+        captcha: &str,
+        ctcode: i32,
+    ) -> Result<CellphoneLoginResp> {
+        let resp: CellphoneLoginResp = self
+            .weapi(
+                "login/cellphone",
+                json!({
+                    "phone": phone,
+                    "countrycode": ctcode,
+                    "captcha": captcha,
+                    "rememberLogin": true,
+                }),
+            )
+            .await?;
+        if resp.code == 200 {
+            if let Err(e) = self.persist() {
+                eprintln!("[netease] cookie persist failed: {e:#}");
+            }
+        }
+        Ok(resp)
+    }
+
     pub async fn account(&self) -> Result<Option<UserProfile>> {
         let resp: AccountGetResp = self.weapi("w/nuser/account/get", json!({})).await?;
         if resp.code != 200 {

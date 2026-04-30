@@ -30,6 +30,27 @@ pub struct QrCheckResp {
 }
 
 //
+// --- 手机号验证码登录 ---
+//
+
+#[derive(Debug, Deserialize)]
+pub struct CaptchaResp {
+    pub code: i32,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CellphoneLoginResp {
+    pub code: i32,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// 200 时返回，复用 UserProfile shape（部分字段缺失也能解析）
+    #[serde(default)]
+    pub profile: Option<UserProfile>,
+}
+
+//
 // --- 用户 / 账号 ---
 //
 

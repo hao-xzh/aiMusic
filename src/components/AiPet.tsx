@@ -559,7 +559,12 @@ export function AiPet() {
         if (res.play && res.resolvedTracks.length > 0) {
           const [head, ...rest] = res.resolvedTracks;
           // pet-agent 内部已经跑过 smoothQueue，不要再来一遍
-          await player.playNetease(head, [head, ...rest], { smooth: false });
+          // 传 continuous: 队列接近末尾时 player 自己会调它续杯。
+          // null 时 player 走普通模式（modulo 循环老队列）—— 适合用户明说"排5首"那种场景
+          await player.playNetease(head, [head, ...rest], {
+            smooth: false,
+            continuous: res.continuous ?? null,
+          });
         }
       } catch (e) {
         console.warn("[claudio] pet send failed", e);
@@ -740,14 +745,12 @@ function SendArrow() {
 
 function Bubble({ m }: { m: ChatMessage }) {
   const isUser = m.role === "user";
+  // m.play 留在数据层（标记这条触发了播放,日后做调试 / 跳回历史可以用），
+  // 但不在气泡里画"已为你排 X 首"——回复本身已经是动作（"我给你放点凉爽的"），
+  // 而且续杯模式下"X 首"是个变化的数字,显示出来反而误导。
   return (
     <div style={isUser ? userBubble : assistantBubble}>
       <div>{m.text}</div>
-      {m.play && (
-        <div style={playFooter}>
-          ▶ 已为你排 {m.play.trackIds.length} 首 · {m.play.reason}
-        </div>
-      )}
     </div>
   );
 }
@@ -928,18 +931,6 @@ const assistantBubble: CSSProperties = {
   fontSize: 13.5,
   lineHeight: 1.7,
   letterSpacing: 0.15,
-};
-
-// 播放回执：从助手文字延伸的"动作回执"，颜色取自封面（跟主光点同步）
-const playFooter: CSSProperties = {
-  marginTop: 6,
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 8,
-  fontSize: 11,
-  letterSpacing: 0.4,
-  color: "rgba(var(--orb-rgb-light), 0.85)",
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
 };
 
 const panelInputRow: CSSProperties = {

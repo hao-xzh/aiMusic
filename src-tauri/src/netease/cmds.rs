@@ -56,6 +56,59 @@ pub async fn netease_qr_check(
     })
 }
 
+/// 手机号验证码登录第一步：发短信。
+/// `ctcode` 国家区号；不传默认 86（中国大陆）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptchaSentOut {
+    pub code: i32,
+    pub message: Option<String>,
+}
+
+#[tauri::command]
+pub async fn netease_captcha_sent(
+    state: NeteaseState<'_>,
+    phone: String,
+    ctcode: Option<i32>,
+) -> Result<CaptchaSentOut, String> {
+    let r = state
+        .captcha_sent(&phone, ctcode.unwrap_or(86))
+        .await
+        .map_err(to_err)?;
+    Ok(CaptchaSentOut {
+        code: r.code,
+        message: r.message,
+    })
+}
+
+/// 手机号验证码登录第二步：拿验证码换 cookie。
+/// code=200 表示登录成功，cookie 已落盘，前端可以直接走主流程。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneLoginOut {
+    pub code: i32,
+    pub message: Option<String>,
+    pub nickname: Option<String>,
+}
+
+#[tauri::command]
+pub async fn netease_phone_login(
+    state: NeteaseState<'_>,
+    phone: String,
+    captcha: String,
+    ctcode: Option<i32>,
+) -> Result<PhoneLoginOut, String> {
+    let r = state
+        .login_cellphone(&phone, &captcha, ctcode.unwrap_or(86))
+        .await
+        .map_err(to_err)?;
+    Ok(PhoneLoginOut {
+        code: r.code,
+        message: r.message,
+        nickname: r.profile.map(|p| p.nickname),
+    })
+}
+
 #[tauri::command]
 pub async fn netease_account(
     state: NeteaseState<'_>,
