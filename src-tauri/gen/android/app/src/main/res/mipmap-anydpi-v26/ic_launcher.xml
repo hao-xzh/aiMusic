@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive icon 画布是 108x108dp，但内部"安全可见区"只有 72x72dp；外圈 18dp
+  会被启动器 mask（圆 / 圆角矩形 / 水滴）任意裁切，加上系统默认还有 ~6dp 视差
+  动画缩放。我们的 ic_launcher_foreground.png 实测内容占画布 ~85%，超出安全
+  区 ~9dp，结果就是用户看到 logo 边缘被截 + 整体显得过大。
+
+  解决：用 <inset> 把 foreground PNG 在 108 画布里整体内缩 16%。最终效果：
+    - 内容尺寸 = 108 * (1 - 2*0.16) * 0.85 ≈ 62dp，安全落在 72dp 安全区里
+    - 圆形 / 圆角矩形 / 水滴 mask 都不会再切到 logo
+    - PNG 本体不动，纯 XML 修复
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <background android:drawable="@color/ic_launcher_background"/>
+  <foreground>
+    <inset
+      android:drawable="@mipmap/ic_launcher_foreground"
+      android:inset="16%" />
+  </foreground>
+</adaptive-icon>
