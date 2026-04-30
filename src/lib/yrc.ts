@@ -88,7 +88,18 @@ export function parseYrc(raw: string | null | undefined): YrcLine[] {
     });
   }
   out.sort((a, b) => a.time - b.time);
-  return out;
+
+  // 翻译行去重：网易云对带翻译的英文歌会把翻译塞进同一个 yrc 字段，表现为
+  // 下一行起点时间戳和前一行几乎相同（差 < 50ms）。这种叠加会让逐字 wipe
+  // 在原词刚结束就被翻译行的"假逐字"覆盖一遍 —— 字进度乱跳，体验很糟。
+  // 同一时间点只保留第一行（原词），翻译彻底丢掉。
+  const dedup: YrcLine[] = [];
+  for (const line of out) {
+    const prev = dedup[dedup.length - 1];
+    if (prev && Math.abs(line.time - prev.time) < 0.05) continue;
+    dedup.push(line);
+  }
+  return dedup;
 }
 
 /**

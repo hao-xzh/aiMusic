@@ -1,22 +1,18 @@
 "use client";
 
 /**
- * Claudio 主播放卡片 v5 —— Apple Music / Shopify 极简风，全屏宽响应式。
+ * Claudio 主播放卡片 v6 —— Apple Music / Shopify 极简风 + 沉浸式歌词覆盖层。
  *
  * 设计原则：
- *   - 单列，没有玻璃卡，没有边框 —— 重感全部交给排版。
- *   - 整套尺寸用 clamp() 跑：iPhone 宽 340 起，到 1180 桌面，一套布局走完。
- *   - 顶部 header（CLAUDIO 标 + status + timecode）杀了 —— Apple Music 没有这条，
- *     之前那条是干扰，砍掉以后纵向有富余给歌词，最小窗口里也不挤。
- *   - 封面是 square via aspect-ratio + max-width，和卡同宽再封顶 320。
+ *   - 默认（compact）布局完全保持 v5 的样子 —— 单列、海报、控制条、3 行歌词带。
+ *   - 点歌词带 → FLIP 动画把封面放大到屏幕上半部、铺满，下方接一大块沉浸式歌词。
+ *     点封面 → 反向 FLIP 回 compact，原始页面不掉一帧。
  *
- * 关于歌词：
- *   - 容器高度按 viewport 收缩（clamp(160px, 22vh, 220px)），矮窗里也能露至少 4 行。
- *   - 字号同样 clamp，不用 JS 测窗口。
- *
- * 之所以不再分 compact / immersive：
- *   - 两套布局意味着两套 bug 面，"歌词又看不到了"两次都是分支写崩。
- *   - 一个跑 340~1180 的单列，比两套窄宽都将就的好。
+ * 关于性能：
+ *   - 逐字 yrc 的"当前行"必须每帧重渲（计算 char wipe 进度），但其他行的 props
+ *     稳定。所有 lyric row 组件都包了 React.memo，只把 positionSec 传给当前行；
+ *     非当前行靠 memo bail-out，每帧不参与 reconcile。
+ *   - 动画全部走 transform / opacity，没有 width/height 过渡。
  */
 
 import { Waveform } from "./Waveform";
@@ -24,60 +20,155 @@ import { usePlayer } from "@/lib/player-state";
 import { type LrcLine } from "@/lib/lrc";
 import { type YrcLine } from "@/lib/yrc";
 import { cdn } from "@/lib/cdn";
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
-// 兼容导出，page.tsx 里还在 import；现在永远是 "compact"。
+// 兼容导出（page.tsx 仍 import）
 export type PlayerMode = "compact";
 export function usePlayerMode(): PlayerMode {
   return "compact";
 }
 
-// 设计 token —— 集中在这里方便整体调
-//
-// COVER_SIZE 用 min() 同时夹住 [视口宽 / 视口高 / 硬上限]：
-//   - 86vw 让手机宽（~390px）下封面填到 ~86% 屏宽，不浪费两侧
-//   - 上限 400px 是 Apple Music 桌面端的舒适大小
-//   - 50vh 兜底：极矮的窗户里海报先让步给歌词
-// 内层 column（title / progress / controls）也用同一个 token，海报和进度条天然同宽。
+// ---------- compact 设计 token（v5 沿用） ----------
 const COVER_SIZE = "min(clamp(220px, 86vw, 400px), 50vh)";
 const TITLE_FS = "clamp(17px, 4vw, 22px)";
 const SUBTITLE_FS = "clamp(12px, 3.2vw, 14px)";
-// 容器高度跟行数成比例：3 行 × 每行 ~35px ≈ 105px。
-// 之前 5 行用的 110~180，现在按 3/5 缩到 70~120，单行高度仍维持 ~30-40px。
 const LYRIC_BOX_H = "clamp(116px, 15vh, 150px)";
 const LYRIC_ROW_H = "clamp(26px, 3.6vh, 32px)";
-// 激活行单独做大并加重 —— 跟 dim 行拉开 6px 字号差，避免 DotField 干扰
 const LYRIC_ACTIVE_FS = "clamp(16px, 4.2vw, 19px)";
 const LYRIC_DIM_FS = "clamp(11px, 2.8vw, 13px)";
 const COVER_TRANSITION_MS = 720;
 
+// ---------- immersive 设计 token ----------
+//
+// 封面正方形，固定边长不变形。尺寸自适应：
+//   - 手机宽（min() 卡 100vw 上）：cover_w == 100vw → 顶部 / 左右贴满屏幕
+//   - 桌面宽（被 60vh / 480px 卡住）：居中显示，四周让屏幕级毛玻璃透出来
+//
+// 整体氛围靠：屏幕级 frost layer（backdrop-filter blur 全屏）+ 封面底部 mask
+// 平滑渐隐 → 露出 frost → 形成"封面溶进毛玻璃歌词区"的渐进模糊感。
+const IMMERSIVE_COVER_W = "min(100vw, 78vh, 700px)";
+// 公式：cover_w == 100vw 时取 0；cover_w 比 100vw 小时给 32px 的顶部留白
+const IMMERSIVE_COVER_TOP = `clamp(0px, calc(100vw - ${IMMERSIVE_COVER_W}), 32px)`;
+const IMMERSIVE_COVER_LEFT = `calc((100vw - ${IMMERSIVE_COVER_W}) / 2)`;
+// 封面边缘"色彩晕开"：纵向 + 横向两层 mask 组合（mask-composite source-in）：
+//   - 纵向：顶部 5% / 底部 30% 渐隐 → 上下沿都溶进 bg
+//   - 横向：左右 7% 渐隐 → 桌面宽下封面侧边溶进侧边毛玻璃
+const IMMERSIVE_COVER_FADE_MASK_V =
+  "linear-gradient(180deg, " +
+  "rgba(0,0,0,0) 0%, rgba(0,0,0,0.55) 2%, #000 5%, " +
+  "#000 50%, " +
+  "rgba(0,0,0,0.95) 60%, " +
+  "rgba(0,0,0,0.82) 70%, " +
+  "rgba(0,0,0,0.6) 80%, " +
+  "rgba(0,0,0,0.32) 90%, " +
+  "rgba(0,0,0,0.1) 96%, " +
+  "rgba(0,0,0,0) 100%)";
+const IMMERSIVE_COVER_FADE_MASK_H =
+  "linear-gradient(90deg, " +
+  "rgba(0,0,0,0) 0%, rgba(0,0,0,0.5) 3%, #000 8%, " +
+  "#000 92%, rgba(0,0,0,0.5) 97%, rgba(0,0,0,0) 100%)";
+// Apple Music 风：所有行同字号同字重，激活态靠对比度（opacity 1 vs 0.32）和
+// 逐字 wipe 来呈现，不靠 fontSize / fontWeight 切换。配合大行距 + 大留白。
+const IMMERSIVE_LYRIC_ROW_H = "clamp(58px, 7.4vh, 78px)";
+const IMMERSIVE_ACTIVE_FS = "clamp(22px, 3vw, 34px)";
+const IMMERSIVE_DIM_FS = IMMERSIVE_ACTIVE_FS;
+const IMMERSIVE_ROWS = 7;
+const FLIP_DURATION_MS = 620;
+const FLIP_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
+// 关闭走另一组参数：用户离场时希望"先动起来 → 落到位"的爽快感，
+// 跟开场的"慢慢settle"不一样。
+//   - 时长更短（看起来更有"撤退感"，避免回拽感）
+//   - 曲线起步更陡（cubic-bezier 第一控制点 y 提到 0.04），
+//     再衔接长尾减速（第三、四控制点保持平滑），整体像 iOS modal dismiss
+const CLOSE_DURATION_MS = 540;
+const CLOSE_EASE = "cubic-bezier(0.6, 0.04, 0.22, 1)";
+
+
 // ============== 主组件 ==============
 
 export function PlayerCard() {
-  const {
-    current,
-    isPlaying,
-    positionSec,
-    toggle,
-    next,
-    prev,
-    error,
-    lyric,
-  } = usePlayer();
+  const player = usePlayer();
+  const [lyricMode, setLyricMode] = useState<"compact" | "immersive">("compact");
+  // immersiveActive：覆盖整个 opening / open / closing 三阶段。
+  //   - lyricMode 在用户点击 onClose 那一刻就翻回 "compact"，
+  //     但 ImmersiveLyrics 内部还在跑 closing 动画 ~540ms。
+  //   - 只看 lyricMode 的话，关闭动画期间 CompactPlayer 已经被认为"该显示了"，
+  //     底下封面立刻跟正在收缩的 immersive 封面同框，出现"两张封面"重影。
+  // ImmersiveLyrics 通过 onActiveChange 在 phase != "closed" 时上报 true，
+  // 真正卸载（phase = "closed"）时才上报 false。CompactPlayer 据此把封面
+  // / 歌词带在整个动画期间隐藏，避免重影。
+  const [immersiveActive, setImmersiveActive] = useState(false);
+  const compactCoverRef = useRef<HTMLDivElement>(null);
+  const compactLyricRef = useRef<HTMLDivElement>(null);
+
+  const sourceCoverRect = useCallback(
+    () => compactCoverRef.current?.getBoundingClientRect() ?? null,
+    [],
+  );
+  const sourceLyricRect = useCallback(
+    () => compactLyricRef.current?.getBoundingClientRect() ?? null,
+    [],
+  );
+
+  const enterImmersive = useCallback(() => setLyricMode("immersive"), []);
+  const exitImmersive = useCallback(() => setLyricMode("compact"), []);
+
+  return (
+    <>
+      <CompactPlayer
+        player={player}
+        compactCoverRef={compactCoverRef}
+        compactLyricRef={compactLyricRef}
+        onLyricClick={enterImmersive}
+        immersiveActive={immersiveActive}
+      />
+      <ImmersiveLyrics
+        open={lyricMode === "immersive"}
+        sourceCoverRect={sourceCoverRect}
+        sourceLyricRect={sourceLyricRect}
+        player={player}
+        onClose={exitImmersive}
+        onActiveChange={setImmersiveActive}
+      />
+    </>
+  );
+}
+
+// ============== compact 布局（v5 原样） ==============
+
+type PlayerAPI = ReturnType<typeof usePlayer>;
+
+function CompactPlayer({
+  player,
+  compactCoverRef,
+  compactLyricRef,
+  onLyricClick,
+  immersiveActive,
+}: {
+  player: PlayerAPI;
+  compactCoverRef: React.RefObject<HTMLDivElement | null>;
+  compactLyricRef: React.RefObject<HTMLDivElement | null>;
+  onLyricClick: () => void;
+  immersiveActive: boolean;
+}) {
+  const { current, isPlaying, positionSec, toggle, next, prev, error, lyric } = player;
 
   const hasTrack = current !== null;
   const duration = current?.durationSec ?? 0;
-  const pct =
-    hasTrack && duration > 0
-      ? Math.min(1, Math.max(0, positionSec / duration))
-      : 0;
+  const pct = hasTrack && duration > 0 ? Math.min(1, Math.max(0, positionSec / duration)) : 0;
   const cover = current?.cover;
 
   return (
     <div style={shell}>
       <div style={contentLayer}>
         <div style={trackColumn}>
-          <CoverBox cover={cover} isPlaying={isPlaying} />
+          <CoverBox
+            cover={cover}
+            isPlaying={isPlaying}
+            ref={compactCoverRef}
+            hidden={immersiveActive}
+          />
 
           <div style={titleBlock}>
             <div style={titleTextCol}>
@@ -111,12 +202,23 @@ export function PlayerCard() {
           />
         </div>
 
-        <LyricStrip
-          lines={lyric?.lines ?? []}
-          yrcLines={lyric?.yrcLines ?? []}
-          positionSec={positionSec}
-          meta={lyric}
-        />
+        <div
+          ref={compactLyricRef}
+          onClick={hasTrack ? onLyricClick : undefined}
+          style={{
+            cursor: hasTrack ? "pointer" : "default",
+            // 跟 CoverBox 同因：immersive 在屏期间它会跟正在收缩的 immersive
+            // 歌词层叠图，直接 opacity 0 让位
+            opacity: immersiveActive ? 0 : 1,
+          }}
+        >
+          <LyricStrip
+            lines={lyric?.lines ?? []}
+            yrcLines={lyric?.yrcLines ?? []}
+            positionSec={positionSec}
+            meta={lyric}
+          />
+        </div>
 
         {error && <div style={errorBar}>{error}</div>}
       </div>
@@ -124,21 +226,868 @@ export function PlayerCard() {
   );
 }
 
-// ============== 子组件 ==============
+// ============== 全景歌词（沉浸式）覆盖层 ==============
+//
+// 设计核心：封面图与画面无色彩断层。
+//   1. 背景层就是同一张封面 URL，重度模糊（blur 90px）+ 升饱和度，铺满整个屏幕。
+//      整个画面拿到封面的色调氛围。
+//   2. 前景清晰封面在顶部，底部用 mask-image 线性渐变溶进背景层 ——
+//      因为是同一张图，模糊背景 / 清晰封面在边缘的颜色绝对连续，肉眼无法分辨断层。
+//   3. 歌词层无独立背景，直接坐在背景层之上，色调自然继承封面色。
+//
+// 元素的尺寸/位置变化：
+//   - 封面 / 歌词容器都用 width/height/left/top 过渡（不是 transform: scale），
+//     img 用 object-fit: cover；尺寸变了画面只裁切，绝不变形。
+//   - 入场：从 compact 海报位 / 歌词带位的 rect 直接动到 immersive 自然位。
+//   - 退场：反向动回去。
+//   - 控件（暂停 / 下一首）独立淡入并显著缩小，营造"内容容器变大、控件让位"
+//     的视觉层级。
+//
+// 性能：所有动画走 width/height/top/left/opacity，浏览器对这些属性都有自己的
+// 加速通道；元素总共 5-6 个，逐字渲染只在当前行（已 React.memo）。Tauri 自带
+// WebKit 跑得轻松。
 
-function CoverBox({
-  cover,
-  isPlaying,
+function ImmersiveLyrics({
+  open,
+  sourceCoverRect,
+  sourceLyricRect,
+  player,
+  onClose,
+  onActiveChange,
 }: {
-  cover?: string | null;
-  isPlaying: boolean;
+  open: boolean;
+  sourceCoverRect: () => DOMRect | null;
+  sourceLyricRect: () => DOMRect | null;
+  player: PlayerAPI;
+  onClose: () => void;
+  // 上报"沉浸式覆盖层是否在屏（含动画过程）"。
+  // true: phase ∈ {opening, open, closing}；false: phase = closed（已 unmount）
+  onActiveChange?: (active: boolean) => void;
 }) {
+  const [phase, setPhase] = useState<"closed" | "opening" | "open" | "closing">(
+    "closed",
+  );
+  const containerRef = useRef<HTMLDivElement>(null);
+  const backdropRef = useRef<HTMLDivElement>(null);
+  const coverRef = useRef<HTMLDivElement>(null);
+  const lyricRef = useRef<HTMLDivElement>(null);
+  const titleBarRef = useRef<HTMLDivElement>(null);
+
+  // 采样封面边缘颜色：背景层、frost 用这俩颜色染色，封面渐隐时
+  // 边缘溶到的颜色 == 背景同位置颜色 → 接缝处颜色 100% 连续，不再有色彩断层
+  const coverUrlRaw = player.current?.cover ? cdn(player.current.cover) : null;
+  const edgeColors = useCoverEdgeColors(coverUrlRaw);
+
+  // 桌面 / 手机布局切换
+  const isDesktop = useIsDesktop();
+
+  // 接缝 / 顶部 / 右侧采样色 fallback
+  const seamRgb = edgeColors.bottom ?? "8, 10, 18";
+  const topRgb = edgeColors.top ?? "8, 10, 18";
+  const rightRgb = edgeColors.right ?? seamRgb;
+
+  // 文字颜色根据 bg 亮度自适应（取 cover 底部 / 右侧色算 luma）
+  const luminanceProbe = isDesktop ? rightRgb : seamRgb;
+  const tone = computeTone(luminanceProbe);
+  const fgColor = tone === "dark" ? "rgba(0, 0, 0, 0.92)" : "rgba(255, 255, 255, 0.96)";
+  const fgDimColor = tone === "dark" ? "rgba(0, 0, 0, 0.32)" : "rgba(255, 255, 255, 0.32)";
+  // active 行里"未唱"字符的颜色：跟主色同源，仅压低 alpha 到中等亮度。
+  // 不能直接用 fgDimColor —— 那个是给非 active 行用的过暗值，
+  // 当 active 行里大部分字符还没唱到时（如刚切到下一句），会让整行看起来像
+  // 灰乎乎的旁白。Apple Music 的处理：active 行未唱字符保持中亮度，
+  // 已唱字符全亮，逐字 wipe 表现为 "中亮 → 满亮" 的渐变。
+  const fgUnsungColor = tone === "dark" ? "rgba(0, 0, 0, 0.55)" : "rgba(255, 255, 255, 0.62)";
+
+  // 一次性算出整套布局：cover/title/lyric 位置、mask 方向、bg gradient
+  const layout = useMemo(
+    () => computeLayout(isDesktop, topRgb, seamRgb, rightRgb, fgColor, fgDimColor),
+    [isDesktop, topRgb, seamRgb, rightRgb, fgColor, fgDimColor],
+  );
+
+  useEffect(() => {
+    if (open) setPhase((p) => (p === "open" ? "open" : "opening"));
+    else setPhase((p) => (p === "closed" ? "closed" : "closing"));
+  }, [open]);
+
+  // 给外部组件（AiPet 等）一个全局信号：歌词页是否打开 / 即将打开。
+  // AiPet 据此在歌词页期间从"挂封面"切到"屏幕右下角"，并跑移动动画。
+  // 用 body dataset 是为了不引入额外 store / context —— pet 是 layout 级，
+  // PlayerCard 也是；两者间最轻的传播渠道就是 DOM。
+  useEffect(() => {
+    const isOpen = phase === "opening" || phase === "open";
+    if (isOpen) {
+      document.body.dataset.claudioImmersive = "1";
+    } else {
+      delete document.body.dataset.claudioImmersive;
+    }
+    return () => {
+      delete document.body.dataset.claudioImmersive;
+    };
+  }, [phase]);
+
+  // 上报"覆盖层是否在屏"给 PlayerCard，让它在动画期间隐藏 CompactPlayer 的
+  // 封面 / 歌词带，避免下层和正在收缩的上层封面同时显出形成重影。
+  // 注意：closing 也算 active —— 用户点击关闭后 lyricMode 立刻变 compact，
+  // 但实际动画还要跑 ~540ms，这段时间下层封面必须保持隐藏。
+  useEffect(() => {
+    onActiveChange?.(phase !== "closed");
+  }, [phase, onActiveChange]);
+
+  // 入场
+  useLayoutEffect(() => {
+    if (phase !== "opening") return;
+    const ctx = getRefs();
+    if (!ctx) return;
+    const { backdrop, cover, lyric, titleBar } = ctx;
+
+    const srcCover = sourceCoverRect();
+    const srcLyric = sourceLyricRect();
+
+    // 自然 immersive 目标尺寸 —— 跟下面 render 时不带 inline width/height 时
+    // CSS 默认状态保持一致
+    const target = computeImmersiveTargets(layout);
+
+    // 没源 rect 就退化成纯淡入
+    if (!srcCover) {
+      applyTargetImmediate(cover, target.cover);
+      applyTargetImmediate(lyric, target.lyric);
+      backdrop.style.transition = "none";
+      backdrop.style.opacity = "0";
+      void backdrop.offsetWidth;
+      backdrop.style.transition = `opacity 360ms ${FLIP_EASE}`;
+      backdrop.style.opacity = "1";
+      if (titleBar) {
+        titleBar.style.opacity = "0";
+        void titleBar.offsetWidth;
+        titleBar.style.transition = `opacity 360ms ${FLIP_EASE}`;
+        titleBar.style.opacity = "1";
+      }
+      const t = window.setTimeout(() => setPhase("open"), 420);
+      return () => window.clearTimeout(t);
+    }
+
+    // 起始：封面 / 歌词都瞬移到 compact rect，背景透明，标题条隐藏
+    applyRectImmediate(cover, srcCover);
+    cover.style.borderRadius = "12px";
+    if (srcLyric) {
+      applyRectImmediate(lyric, srcLyric);
+    } else {
+      // 没拿到歌词 rect 就让歌词从封面下沿冒出
+      applyRectImmediate(lyric, {
+        left: srcCover.left,
+        top: srcCover.bottom + 12,
+        width: srcCover.width,
+        height: 100,
+      });
+    }
+    lyric.style.opacity = "0.0";
+    backdrop.style.transition = "none";
+    backdrop.style.opacity = "0";
+    if (titleBar) {
+      titleBar.style.transition = "none";
+      titleBar.style.opacity = "0";
+      titleBar.style.transform = "translate3d(0, 8px, 0)";
+    }
+    void cover.offsetWidth;
+
+    // 下一帧动到自然 immersive 目标
+    requestAnimationFrame(() => {
+      const t = transitionFor(["top", "left", "width", "height", "border-radius", "opacity"]);
+      cover.style.transition = t;
+      applyTargetCss(cover, target.cover);
+      cover.style.borderRadius = "0px";
+
+      lyric.style.transition = t;
+      applyTargetCss(lyric, target.lyric);
+      lyric.style.opacity = "1";
+
+      backdrop.style.transition = `opacity ${FLIP_DURATION_MS}ms ${FLIP_EASE}`;
+      backdrop.style.opacity = "1";
+
+      if (titleBar) {
+        // 标题条比封面晚 ~100ms 进场，给容器先到位的层级感
+        titleBar.style.transition =
+          `opacity ${Math.round(FLIP_DURATION_MS * 0.7)}ms ${FLIP_EASE} ${Math.round(FLIP_DURATION_MS * 0.18)}ms, ` +
+          `transform ${Math.round(FLIP_DURATION_MS * 0.7)}ms ${FLIP_EASE} ${Math.round(FLIP_DURATION_MS * 0.18)}ms`;
+        titleBar.style.opacity = "1";
+        titleBar.style.transform = "translate3d(0, 0, 0)";
+      }
+    });
+
+    const onEnd = (e: TransitionEvent) => {
+      if (e.target !== cover) return;
+      if (e.propertyName !== "width" && e.propertyName !== "height") return;
+      cover.removeEventListener("transitionend", onEnd);
+      setPhase("open");
+    };
+    cover.addEventListener("transitionend", onEnd);
+    const fallback = window.setTimeout(() => setPhase("open"), FLIP_DURATION_MS + 140);
+    return () => {
+      cover.removeEventListener("transitionend", onEnd);
+      window.clearTimeout(fallback);
+    };
+    // 写入闭包用到的 helpers
+    function getRefs() {
+      const backdrop = backdropRef.current;
+      const cover = coverRef.current;
+      const lyric = lyricRef.current;
+      if (!backdrop || !cover || !lyric) return null;
+      return { backdrop, cover, lyric, titleBar: titleBarRef.current };
+    }
+  }, [phase, sourceCoverRect, sourceLyricRect, layout]);
+
+  // 退场
+  useLayoutEffect(() => {
+    if (phase !== "closing") return;
+    const backdrop = backdropRef.current;
+    const cover = coverRef.current;
+    const lyric = lyricRef.current;
+    const titleBar = titleBarRef.current;
+    if (!backdrop || !cover || !lyric) {
+      setPhase("closed");
+      return;
+    }
+
+    const srcCover = sourceCoverRect();
+    const srcLyric = sourceLyricRect();
+
+    // 没源 rect 就纯淡出
+    if (!srcCover) {
+      backdrop.style.transition = `opacity 280ms ${CLOSE_EASE}`;
+      backdrop.style.opacity = "0";
+      cover.style.transition = `opacity 280ms ${CLOSE_EASE}`;
+      cover.style.opacity = "0";
+      lyric.style.transition = `opacity 280ms ${CLOSE_EASE}`;
+      lyric.style.opacity = "0";
+      const t = window.setTimeout(() => setPhase("closed"), 320);
+      return () => window.clearTimeout(t);
+    }
+
+    // close transition：cover 用全程，lyric 略快淡掉，backdrop 比 cover 提前
+    // ~25% 完成 → 后半段直接显出底层播放页，关闭感更"轻"
+    const t = transitionFor(
+      ["top", "left", "width", "height", "border-radius", "opacity"],
+      CLOSE_DURATION_MS,
+      CLOSE_EASE,
+    );
+
+    cover.style.transition = t;
+    applyRectCss(cover, srcCover);
+    cover.style.borderRadius = "12px";
+
+    if (srcLyric) {
+      // 歌词位置过渡比 cover 短一截 + 自身 opacity 在 ~60% 时淡掉，
+      // 不让长行歌词拖到最后还压在画面上
+      lyric.style.transition =
+        `top ${Math.round(CLOSE_DURATION_MS * 0.85)}ms ${CLOSE_EASE}, ` +
+        `left ${Math.round(CLOSE_DURATION_MS * 0.85)}ms ${CLOSE_EASE}, ` +
+        `width ${Math.round(CLOSE_DURATION_MS * 0.85)}ms ${CLOSE_EASE}, ` +
+        `height ${Math.round(CLOSE_DURATION_MS * 0.85)}ms ${CLOSE_EASE}, ` +
+        `opacity ${Math.round(CLOSE_DURATION_MS * 0.55)}ms ${CLOSE_EASE}`;
+      applyRectCss(lyric, srcLyric);
+    }
+    lyric.style.opacity = "0";
+
+    // backdrop 提前结束（70% 时长） —— 模糊封面背景率先淡出，
+    // 露出底层播放页，cover 还在收回但视觉上"页面已经回到主视图"
+    backdrop.style.transition = `opacity ${Math.round(CLOSE_DURATION_MS * 0.7)}ms ${CLOSE_EASE}`;
+    backdrop.style.opacity = "0";
+
+    if (titleBar) {
+      titleBar.style.transition =
+        `opacity ${Math.round(CLOSE_DURATION_MS * 0.4)}ms ${CLOSE_EASE}, ` +
+        `transform ${Math.round(CLOSE_DURATION_MS * 0.4)}ms ${CLOSE_EASE}`;
+      titleBar.style.opacity = "0";
+      titleBar.style.transform = "translate3d(0, 6px, 0)";
+    }
+
+    const onEnd = (e: TransitionEvent) => {
+      if (e.target !== cover) return;
+      if (e.propertyName !== "width" && e.propertyName !== "height") return;
+      cover.removeEventListener("transitionend", onEnd);
+      setPhase("closed");
+    };
+    cover.addEventListener("transitionend", onEnd);
+    const fallback = window.setTimeout(() => setPhase("closed"), CLOSE_DURATION_MS + 120);
+    return () => {
+      cover.removeEventListener("transitionend", onEnd);
+      window.clearTimeout(fallback);
+    };
+  }, [phase, sourceCoverRect, sourceLyricRect, layout]);
+
+  if (phase === "closed") return null;
+  if (typeof document === "undefined") return null;
+
+  const { current, isPlaying, positionSec, toggle, next, lyric } = player;
+  const coverUrl = current?.cover ? cdn(current.cover) : null;
+
+  return createPortal(
+    <div
+      ref={containerRef}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 9000,
+        overflow: "hidden",
+        // 容器本身保持透明 —— backdrop 淡入淡出时底层播放页能自然显出，
+        // 不再出现"叠一层 #05060a → 关歌词页瞬间整屏黑一下"的问题。
+        // 真正的兜底底色挪到 backdrop 那层（layout.bgGradient），跟 backdrop
+        // 一起淡入淡出。
+        background: "transparent",
+      }}
+    >
+      {/* 背景三层叠合（从下到上）：
+            1. layout.bgGradient —— 采样自封面顶/底/右沿的纯色渐变，提供主色调
+            2. 重度模糊封面（blur 140 + saturate 1.6）—— 给画面带来色彩起伏
+               高对比封面（深主体 + 浅背景）下，80px 远不够 —— 主体仍以暗块
+               形式可见。提高到 140 + 拉饱和 + brightness 1.04 后，主体轮廓
+               彻底化为色块，不再可辨认
+            3. 再叠一层 0.42 的 bgGradient —— 把模糊封面里残留的明暗 pattern
+               进一步柔化，整体趋向于纯色氛围，但保留一点色彩呼吸感
+          叠合后的 bg 在前景封面 mask 渐隐区显出的颜色仍跟前景封面色调一致
+          （都是同源），不会出现"卡进背景"的方块感。 */}
+      <div
+        ref={backdropRef}
+        aria-hidden
+        style={{
+          position: "absolute",
+          inset: 0,
+          opacity: 0,
+          overflow: "hidden",
+          background: layout.bgGradient,
+        }}
+      >
+        {coverUrl && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={coverUrl}
+            alt=""
+            style={{
+              position: "absolute",
+              top: "-25%",
+              left: "-25%",
+              width: "150%",
+              height: "150%",
+              objectFit: "cover",
+              filter: "blur(140px) saturate(1.6) brightness(1.04)",
+              opacity: 0.72,
+              transform: "translateZ(0)",
+              willChange: "transform",
+            }}
+          />
+        )}
+        {/* 顶层柔化：重新涂一遍采样色 gradient，把模糊封面的残留 pattern 压平 */}
+        <div
+          aria-hidden
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: layout.bgGradient,
+            opacity: 0.42,
+            pointerEvents: "none",
+          }}
+        />
+      </div>
+
+      {/* 封面：尺寸 / 位置 / mask 全部由 layout 决定。
+          - 手机端单向 mask（底部渐隐进歌词区）
+          - 桌面端多向 mask（intersect）：四边都柔化溶进同源模糊 backdrop */}
+      <div
+        ref={coverRef}
+        onClick={onClose}
+        style={{
+          position: "absolute",
+          ...layout.cover,
+          overflow: "hidden",
+          cursor: "pointer",
+          zIndex: 2,
+          WebkitMaskImage: layout.coverMask,
+          WebkitMaskComposite:
+            layout.coverMaskComposite === "intersect" ? "source-in" : "source-over",
+          maskImage: layout.coverMask,
+          maskComposite: layout.coverMaskComposite,
+        }}
+      >
+        {coverUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={coverUrl}
+            alt=""
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              display: "block",
+              transform: isPlaying ? "scale(1.012)" : "scale(1)",
+              transition: "transform 4000ms ease-in-out",
+              willChange: "transform",
+            }}
+          />
+        ) : (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Waveform height={120} bars={32} gap={4} />
+          </div>
+        )}
+      </div>
+
+      {/* 标题 + 控件条
+          - 手机：叠在封面下半部（封面底部 mask 让颜色淡出），独立兄弟节点不吃 mask
+          - 桌面：放在封面正下方，title / 按钮 显著放大，作为画面主体的延续 */}
+      <div
+        ref={titleBarRef}
+        style={{
+          position: "absolute",
+          left: layout.title.left,
+          width: layout.title.width,
+          top: layout.title.top,
+          display: "flex",
+          alignItems: "center",
+          gap: layout.isDesktop ? 16 : 14,
+          opacity: 0,
+          zIndex: 4,
+        }}
+      >
+        <div style={{ minWidth: 0, flex: "1 1 auto" }}>
+          <div
+            style={{
+              ...(layout.isDesktop ? immersiveTitleLarge : immersiveTitle),
+              color: layout.fgColor,
+            }}
+          >
+            {current?.title ?? "—"}
+          </div>
+          <div
+            style={{
+              ...(layout.isDesktop ? immersiveSubtitleLarge : immersiveSubtitle),
+              color: layout.fgDimColor,
+            }}
+          >
+            {current?.artist ?? ""}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: layout.isDesktop ? 10 : 8, flexShrink: 0 }}>
+          <ImmersiveIconBtn
+            onClick={(e) => {
+              e.stopPropagation();
+              toggle();
+            }}
+            aria-label={isPlaying ? "暂停" : "播放"}
+            color={layout.fgColor}
+            size={layout.isDesktop ? "large" : "small"}
+          >
+            {isPlaying ? <PauseGlyph /> : <PlayGlyph />}
+          </ImmersiveIconBtn>
+          <ImmersiveIconBtn
+            onClick={(e) => {
+              e.stopPropagation();
+              next();
+            }}
+            aria-label="下一首"
+            color={layout.fgColor}
+            size={layout.isDesktop ? "large" : "small"}
+          >
+            <SkipForward />
+          </ImmersiveIconBtn>
+        </div>
+      </div>
+
+      {/* 歌词层 —— 位置由 layout 决定（手机贴封面下沿，桌面在 cover 右侧）。
+          透明背景，bg 由 backdrop 那层填，文字颜色 luma 自适应。 */}
+      <div
+        ref={lyricRef}
+        style={{
+          position: "absolute",
+          ...layout.lyric,
+          overflow: "hidden",
+          zIndex: 5,
+        }}
+      >
+        <LyricColumn
+          lines={lyric?.lines ?? []}
+          yrcLines={lyric?.yrcLines ?? []}
+          positionSec={positionSec}
+          meta={lyric}
+          fgColor={layout.fgColor}
+          fgDimColor={layout.fgDimColor}
+          fgUnsungColor={fgUnsungColor}
+        />
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// ---- helpers ----
+
+type TargetSpec =
+  | { mode: "css"; top: string; left: string; width: string; height: string }
+  | { mode: "rect"; top: number; left: number; width: number; height: number };
+
+// ============== 沉浸式布局参数 ==============
+//
+// 根据 isDesktop 算出一整套位置 / 尺寸：cover / title / lyric 的 top/left/width/
+// height，mask 方向，背景 gradient。手机 stacked、桌面 side-by-side 两套，
+// 完全靠这一个函数切换。
+
+type Pos = { top: string; left: string; width: string; height: string };
+
+type ImmersiveLayout = {
+  cover: Pos;
+  title: { top: string; left: string; width: string };
+  lyric: Pos;
+  // 封面 mask（可能是单条或多条 linear-gradient 组合）
+  coverMask: string;
+  // 多 mask 时用 "intersect" 求交；单 mask 默认 "add"
+  coverMaskComposite: "intersect" | "add";
+  // 背景 gradient（采样色驱动，作为模糊封面 backdrop 拉不到时的兜底底色）
+  bgGradient: string;
+  // 文字色 / 弱化色（根据 bg 亮度自适应）
+  fgColor: string;
+  fgDimColor: string;
+  // 桌面 / 手机：影响 title 字号、按钮大小、布局走向
+  isDesktop: boolean;
+};
+
+function computeLayout(
+  isDesktop: boolean,
+  topRgb: string,
+  seamRgb: string,
+  rightRgb: string,
+  fgColor: string,
+  fgDimColor: string,
+): ImmersiveLayout {
+  if (!isDesktop) {
+    // ---- 手机 stacked：cover 顶 / lyric 底 ----
+    const W = "min(100vw, 78vh, 700px)";
+    const top = `clamp(0px, calc(100vw - ${W}), 32px)`;
+    const left = `calc((100vw - ${W}) / 2)`;
+    const lyricTop = `calc(${top} + ${W} + clamp(8px, 1.6vh, 16px))`;
+    // title 横向内边距跟下方歌词区 inner padding（clamp(20px, 5vw, 36px)，
+    // 见 LyricColumn 的 innerExtraStyle）严格对齐 —— 歌名和歌词左右两边
+    // 同一条竖线，视觉上整张页面是一根脊柱
+    const titlePadX = "clamp(20px, 5vw, 36px)";
+    return {
+      cover: { top, left, width: W, height: W },
+      title: {
+        top: `calc(${top} + ${W} * 0.82)`,
+        left: `calc(${left} + ${titlePadX})`,
+        width: `calc(${W} - 2 * ${titlePadX})`,
+      },
+      lyric: {
+        top: lyricTop,
+        left,
+        width: W,
+        height: `calc(100vh - (${lyricTop}) - clamp(8px, 2vh, 24px))`,
+      },
+      coverMask: "linear-gradient(to bottom, #000 55%, transparent 100%)",
+      coverMaskComposite: "add",
+      bgGradient:
+        `linear-gradient(180deg, ` +
+        `rgb(${topRgb}) 0px, ` +
+        `rgb(${topRgb}) ${top}, ` +
+        `rgb(${seamRgb}) calc(${top} + ${W}), ` +
+        `rgb(${seamRgb}) 100%)`,
+      fgColor,
+      fgDimColor,
+      isDesktop: false,
+    };
+  }
+  // ---- 桌面 side-by-side：cover 左、lyric 右 ----
+  // 把 (cover + gap + title-block) 作为一组整体在视口内垂直居中，
+  // title / 控件不再叠在封面上，而是落在封面正下方。
+  const W = "min(46vw, 70vh, 540px)";
+  const titleBlockH = "clamp(92px, 12vh, 122px)";
+  // gap 调大 —— 把 title 块整体往下推，原先 "下面留白偏多" 是因为 cover 居中
+  // 后下方空间没被用掉；加大 gap 让组合块底部更贴近视口下部，视觉重心更稳
+  const gapBelow = "clamp(36px, 5.4vh, 60px)";
+  const totalH = `calc(${W} + ${gapBelow} + ${titleBlockH})`;
+  const top = `calc((100vh - ${totalH}) / 2)`;
+  const left = "clamp(24px, 6vw, 80px)";
+  const lyricLeft = `calc(${left} + ${W} + clamp(40px, 6vw, 100px))`;
+  const lyricRight = "clamp(24px, 6vw, 80px)";
+  // title 块跟封面同宽：左边沿对齐封面左、右边沿对齐封面右。
+  //   - title 文本（左 flex-grow）天然贴封面左边
+  //   - 按钮（右 flex-shrink-0）天然落在封面右边
+  // 之前试过收窄到视觉中心，结果按钮跟着挤到中段，跟封面右边差太多 ——
+  // 用户感觉"按钮太靠左"。回到 W 同宽，title 文本不会塞满，自然有留白，
+  // 但是按钮位置稳稳压在封面右边沿，整体节奏才稳。
+  return {
+    cover: { top, left, width: W, height: W },
+    title: {
+      top: `calc(${top} + ${W} + ${gapBelow})`,
+      left,
+      width: W,
+    },
+    lyric: {
+      top: "8vh",
+      left: lyricLeft,
+      width: `calc(100vw - ${lyricLeft} - ${lyricRight})`,
+      height: "84vh",
+    },
+    // 桌面四向 mask（mask-composite: intersect）：
+    //   - 横向：左 4% / 右 35% 渐隐 → 右侧主溶进歌词区，左侧柔化进模糊 backdrop
+    //   - 纵向：上下各 5% 渐隐 → 上下边都溶进模糊 backdrop，没有矩形硬边
+    // 配合"模糊封面同源 backdrop"，渐隐区显出的颜色 == 当前像素的模糊版，
+    // 视觉上完全没有"封面卡进背景"的方块感。
+    coverMask:
+      "linear-gradient(to right, transparent 0%, #000 4%, #000 65%, transparent 100%), " +
+      "linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%)",
+    coverMaskComposite: "intersect",
+    // 桌面 bg：模糊封面拉不到时的兜底纯色 gradient（采样色驱动）
+    bgGradient:
+      `linear-gradient(90deg, ` +
+      `rgb(${topRgb}) 0px, ` +
+      `rgb(${seamRgb}) ${left}, ` +
+      `rgb(${rightRgb}) calc(${left} + ${W}), ` +
+      `rgb(${rightRgb}) 100%)`,
+    fgColor,
+    fgDimColor,
+    isDesktop: true,
+  };
+}
+
+function computeImmersiveTargets(layout: ImmersiveLayout): {
+  cover: TargetSpec;
+  lyric: TargetSpec;
+} {
+  return {
+    cover: {
+      mode: "css",
+      top: layout.cover.top,
+      left: layout.cover.left,
+      width: layout.cover.width,
+      height: layout.cover.height,
+    },
+    lyric: {
+      mode: "css",
+      top: layout.lyric.top,
+      left: layout.lyric.left,
+      width: layout.lyric.width,
+      height: layout.lyric.height,
+    },
+  };
+}
+
+function applyRectImmediate(
+  el: HTMLElement,
+  rect: { top: number; left: number; width: number; height: number },
+) {
+  el.style.transition = "none";
+  el.style.top = rect.top + "px";
+  el.style.left = rect.left + "px";
+  el.style.width = rect.width + "px";
+  el.style.height = rect.height + "px";
+}
+
+function applyRectCss(
+  el: HTMLElement,
+  rect: { top: number; left: number; width: number; height: number },
+) {
+  el.style.top = rect.top + "px";
+  el.style.left = rect.left + "px";
+  el.style.width = rect.width + "px";
+  el.style.height = rect.height + "px";
+}
+
+function applyTargetImmediate(el: HTMLElement, t: TargetSpec) {
+  el.style.transition = "none";
+  applyTargetCss(el, t);
+}
+
+function applyTargetCss(el: HTMLElement, t: TargetSpec) {
+  if (t.mode === "css") {
+    el.style.top = t.top;
+    el.style.left = t.left;
+    el.style.width = t.width;
+    el.style.height = t.height;
+  } else {
+    el.style.top = t.top + "px";
+    el.style.left = t.left + "px";
+    el.style.width = t.width + "px";
+    el.style.height = t.height + "px";
+  }
+}
+
+function transitionFor(
+  props: string[],
+  durationMs: number = FLIP_DURATION_MS,
+  ease: string = FLIP_EASE,
+): string {
+  return props.map((p) => `${p} ${durationMs}ms ${ease}`).join(", ");
+}
+
+// 根据 RGB 计算亮度（perceptual luma），决定文字用深色还是浅色
+function computeTone(rgbStr: string | null): "light" | "dark" {
+  if (!rgbStr) return "light";
+  const parts = rgbStr.split(",").map((s) => parseInt(s.trim(), 10));
+  if (parts.length < 3 || parts.some((n) => !Number.isFinite(n))) return "light";
+  const [r, g, b] = parts as [number, number, number];
+  const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+  // 145 是经验阈值：luma > 145 = bg 偏亮，文字用深色
+  return luma > 145 ? "dark" : "light";
+}
+
+// 视口宽度断点：>= 720px 走桌面 side-by-side（封面左、歌词右）；< 720 走
+// 手机 stacked（封面顶、歌词底）。SSR 默认手机布局，避免首帧错乱。
+function useIsDesktop(): boolean {
+  const [isD, setIsD] = useState(false);
+  useEffect(() => {
+    const update = () => setIsD(window.innerWidth >= 720);
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return isD;
+}
+
+// 采样封面边缘颜色：通过 canvas 抠出顶 / 底 / 右三边的平均 RGB。
+//   - 手机 stacked：用 top + bottom，渐隐 mask 在底部
+//   - 桌面 side-by-side：用 top + bottom + right，渐隐 mask 在右侧
+//
+// 跨域：claudio-cdn:// scheme 的 Rust handler 已经放了 ACAO:* —— 设
+// crossOrigin=anonymous 后 canvas 不会 taint，可以 getImageData。
+type EdgeColors = { top: string | null; bottom: string | null; right: string | null };
+
+function useCoverEdgeColors(url: string | null): EdgeColors {
+  const [colors, setColors] = useState<EdgeColors>({ top: null, bottom: null, right: null });
+
+  useEffect(() => {
+    if (!url) {
+      setColors({ top: null, bottom: null, right: null });
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      if (cancelled) return;
+      try {
+        const W = 32,
+          H = 32;
+        const canvas = document.createElement("canvas");
+        canvas.width = W;
+        canvas.height = H;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, W, H);
+        const sample = (yStart: number, yEnd: number) => {
+          const data = ctx.getImageData(0, yStart, W, yEnd - yStart).data;
+          let r = 0,
+            g = 0,
+            b = 0,
+            n = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            r += data[i]!;
+            g += data[i + 1]!;
+            b += data[i + 2]!;
+            n++;
+          }
+          if (n === 0) return null;
+          return `${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)}`;
+        };
+        // 横条采样（top / bottom）
+        const top = sample(0, 5);
+        const bottom = sample(H - 5, H);
+        // 竖条采样（right）：手动取右侧 5 列
+        const sampleRight = () => {
+          let r = 0, g = 0, b = 0, n = 0;
+          const data = ctx.getImageData(W - 5, 0, 5, H).data;
+          for (let i = 0; i < data.length; i += 4) {
+            r += data[i]!; g += data[i + 1]!; b += data[i + 2]!; n++;
+          }
+          if (n === 0) return null;
+          return `${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)}`;
+        };
+        const right = sampleRight();
+        if (cancelled) return;
+        setColors({ top, bottom, right });
+      } catch (e) {
+        // canvas tainted（CORS 不齐）/ 解码失败：放弃，用默认色
+        console.debug("[claudio] cover edge color sample failed", e);
+      }
+    };
+    img.onerror = () => {};
+    img.src = url;
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+
+  return colors;
+}
+
+function ImmersiveIconBtn({
+  children,
+  onClick,
+  "aria-label": ariaLabel,
+  color = "rgba(255,255,255,0.92)",
+  size = "small",
+}: {
+  children: React.ReactNode;
+  onClick?: (e: React.MouseEvent) => void;
+  "aria-label"?: string;
+  color?: string;
+  size?: "small" | "large";
+}) {
+  const isLarge = size === "large";
+  return (
+    <button
+      onClick={onClick}
+      aria-label={ariaLabel}
+      style={{
+        // small（手机）：跟手机 title (~16-20px) 等量级，按钮明显但不抢戏
+        // large（桌面）：跟桌面 title (~28px) 同量级，"封面 + title + 按钮"
+        //   形成一个完整视觉块
+        fontSize: isLarge ? 26 : 22,
+        width: isLarge ? 46 : 38,
+        height: isLarge ? 46 : 38,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
+        border: "none",
+        background: "transparent",
+        color,
+        padding: 0,
+        transition: "transform 120ms ease, opacity 160ms ease",
+      }}
+      onMouseDown={(e) => {
+        e.currentTarget.style.transform = "scale(0.9)";
+      }}
+      onMouseUp={(e) => {
+        e.currentTarget.style.transform = "scale(1)";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.transform = "scale(1)";
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ============== compact CoverBox（v5 原样，加 ref 转发） ==============
+
+const CoverBox = React.forwardRef<
+  HTMLDivElement,
+  { cover?: string | null; isPlaying: boolean; hidden?: boolean }
+>(function CoverBox({ cover, isPlaying, hidden = false }, ref) {
   const coverUrl = cover ? cdn(cover) : null;
   return (
     <div
+      ref={ref}
       data-claudio-cover
       style={{
-        // 父级 trackColumn 已经是 COVER_SIZE 宽，这里跟满即可
         width: "100%",
         aspectRatio: "1 / 1",
         borderRadius: 12,
@@ -146,6 +1095,11 @@ function CoverBox({
         position: "relative",
         boxShadow:
           "0 24px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04)",
+        // 立即（不带 transition）切到 0/1 —— immersive 进入 / 退出动画期间，
+        // 这块封面被上层 immersive 封面完全替代显示；如果加 fade，关闭时会
+        // 出现"半透明 compact 封面 + 正在收缩的 immersive 封面"叠在一起
+        // 的轻微叠图。
+        opacity: hidden ? 0 : 1,
         transform: isPlaying ? "scale(1.012)" : "scale(1)",
         transition: "transform 4000ms ease-in-out",
         background:
@@ -164,13 +1118,9 @@ function CoverBox({
       </div>
     </div>
   );
-}
+});
 
-function CoverImageLayer({
-  url,
-}: {
-  url: string | null;
-}) {
+function CoverImageLayer({ url }: { url: string | null }) {
   const [isLoaded, setIsLoaded] = useState(false);
   if (!url) return null;
   return (
@@ -243,18 +1193,9 @@ function Controls({
   );
 }
 
-// ---------- 歌词带 ----------
-//
-// 显示策略：
-//   - 优先 yrc（逐字 / karaoke）：每个字按 (now - charStart) / charDur 算 progress，
-//     已唱完 → 白；正在唱 → 半白半灰的 wipe 渐变；还没唱 → 灰
-//   - 没有 yrc 时回退到行级 LRC + 行内插值"假逐字"：当前行从开头到下一行起点
-//     之间的进度按字符等分，扫一道高亮过去
-//   - 当前行整体 scale 略大 + 一道 box-shadow 暖光（跟 cover orb 同色系）
-//   - 容器有上下 mask 渐隐 + 当前行两端 mask "侧光"
+// ============== 歌词带（compact，3 行） ==============
 
-// 可视行数：3 行（上一行 / 激活行 / 下一行）
-const LYRIC_ROWS = 3;
+const LYRIC_ROWS_COMPACT = 3;
 
 function LyricStrip({
   lines,
@@ -269,25 +1210,205 @@ function LyricStrip({
     | { lines: LrcLine[]; yrcLines: YrcLine[]; instrumental: boolean; uncollected: boolean }
     | null;
 }) {
-  // ⚠️ 所有 hooks 必须在任何 early return 之前。
+  const view = useLyricView({
+    lines,
+    yrcLines,
+    positionSec,
+    visibleRows: LYRIC_ROWS_COMPACT,
+    rowH: LYRIC_ROW_H,
+    activeFs: LYRIC_ACTIVE_FS,
+    dimFs: LYRIC_DIM_FS,
+  });
 
-  // 优先用 yrc；没有就降级到 LRC 行级
-  const useYrc = yrcLines.length > 0;
+  if (!meta) return <PlaceholderLyric text="歌词加载中…" mode="compact" />;
+  if (meta.instrumental) return <PlaceholderLyric text="♪ 纯音乐 ♪" mode="compact" />;
+  if (view.empty) {
+    return (
+      <PlaceholderLyric
+        text={`这首歌没有歌词${meta.uncollected ? "（网易云收录不全）" : ""}`}
+        mode="compact"
+      />
+    );
+  }
+
+  return (
+    <MeasuredLyricColumn
+      activeIdx={view.activeIdx}
+      outerStyle={lyricBox}
+      innerExtraStyle={{
+        WebkitMaskImage:
+          "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
+        maskImage:
+          "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
+      }}
+      transitionMs={520}
+    >
+      {view.rows}
+    </MeasuredLyricColumn>
+  );
+}
+
+// ============== 歌词列（immersive） ==============
+
+function LyricColumn({
+  lines,
+  yrcLines,
+  positionSec,
+  meta,
+  fgColor,
+  fgDimColor,
+  fgUnsungColor,
+}: {
+  lines: LrcLine[];
+  yrcLines: YrcLine[];
+  positionSec: number;
+  meta:
+    | { lines: LrcLine[]; yrcLines: YrcLine[]; instrumental: boolean; uncollected: boolean }
+    | null;
+  fgColor: string;
+  fgDimColor: string;
+  fgUnsungColor: string;
+}) {
+  const view = useLyricView({
+    lines,
+    yrcLines,
+    positionSec,
+    visibleRows: IMMERSIVE_ROWS,
+    rowH: IMMERSIVE_LYRIC_ROW_H,
+    activeFs: IMMERSIVE_ACTIVE_FS,
+    dimFs: IMMERSIVE_DIM_FS,
+    immersive: true,
+    fgColor,
+    fgDimColor,
+    fgUnsungColor,
+  });
+
+  if (!meta) return <PlaceholderLyric text="歌词加载中…" mode="immersive" />;
+  if (meta.instrumental) return <PlaceholderLyric text="♪ 纯音乐 ♪" mode="immersive" />;
+  if (view.empty) {
+    return (
+      <PlaceholderLyric
+        text={`这首歌没有歌词${meta.uncollected ? "（网易云收录不全）" : ""}`}
+        mode="immersive"
+      />
+    );
+  }
+
+  return (
+    <MeasuredLyricColumn
+      activeIdx={view.activeIdx}
+      outerStyle={immersiveLyricFrame}
+      innerExtraStyle={{
+        padding: "clamp(20px, 4vh, 36px) clamp(20px, 5vw, 36px)",
+        WebkitMaskImage:
+          "linear-gradient(180deg, transparent 0%, #000 12%, #000 86%, transparent 100%)",
+        maskImage:
+          "linear-gradient(180deg, transparent 0%, #000 12%, #000 86%, transparent 100%)",
+      }}
+      transitionMs={560}
+    >
+      {view.rows}
+    </MeasuredLyricColumn>
+  );
+}
+
+// ============== Measure-based 歌词容器 ==============
+//
+// 不再用"每行 = rowH"做硬编码 translate —— 实际行高随歌词字数 / 换行变化，
+// 用 ref 直接测量 active 行的 offsetTop + offsetHeight，确保激活行垂直居中
+// 在容器里。长歌词换行也不会跟下一行重叠。
+
+function MeasuredLyricColumn({
+  activeIdx,
+  outerStyle,
+  innerExtraStyle,
+  transitionMs,
+  children,
+}: {
+  activeIdx: number;
+  outerStyle: React.CSSProperties;
+  innerExtraStyle: React.CSSProperties;
+  transitionMs: number;
+  children: React.ReactNode;
+}) {
+  const outerRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const [translateY, setTranslateY] = useState(0);
+
+  useLayoutEffect(() => {
+    const outer = outerRef.current;
+    const inner = innerRef.current;
+    if (!outer || !inner) return;
+    const active = inner.querySelector<HTMLElement>('[data-active="1"]');
+    if (!active) return;
+    const containerH = outer.clientHeight;
+    const top = active.offsetTop;
+    const h = active.offsetHeight;
+    setTranslateY(containerH / 2 - top - h / 2);
+  }, [activeIdx, children]);
+
+  return (
+    <div ref={outerRef} style={outerStyle}>
+      <div
+        ref={innerRef}
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          top: 0,
+          transform: `translate3d(0, ${translateY}px, 0)`,
+          transition: `transform ${transitionMs}ms cubic-bezier(0.22, 1, 0.36, 1)`,
+          willChange: "transform",
+          ...innerExtraStyle,
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ============== shared 歌词视图逻辑 ==============
+
+type LyricViewParams = {
+  lines: LrcLine[];
+  yrcLines: YrcLine[];
+  positionSec: number;
+  visibleRows: number;
+  rowH: string;
+  activeFs: string;
+  dimFs: string;
+  immersive?: boolean;
+  // 文字颜色（active）/ 弱化色（inactive）。
+  // immersive 模式根据 bg 亮度由调用方算好传进来；compact 模式用默认（白 / 灰）
+  fgColor?: string;
+  fgDimColor?: string;
+  // active 行内 "未唱" 字符颜色（介于 fg 和 fgDim 之间的中亮度）。
+  // 不传则 fallback 到 fgDimColor。
+  fgUnsungColor?: string;
+};
+
+function useLyricView(p: LyricViewParams): {
+  empty: boolean;
+  rows: React.ReactNode;
+  translateExpr: string;
+  activeIdx: number;
+} {
+  const useYrc = p.yrcLines.length > 0;
   const lrcTimes = useMemo(
-    () =>
-      useYrc
-        ? yrcLines.map((y) => y.time)
-        : lines.map((l) => l.time),
-    [useYrc, lines, yrcLines],
+    () => (useYrc ? p.yrcLines.map((y) => y.time) : p.lines.map((l) => l.time)),
+    [useYrc, p.lines, p.yrcLines],
   );
 
+  // 二分定位当前行
   const idx = useMemo(() => {
-    // 二分找当前行
     if (lrcTimes.length === 0) return -1;
-    let lo = 0, hi = lrcTimes.length - 1, ans = -1;
+    let lo = 0,
+      hi = lrcTimes.length - 1,
+      ans = -1;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
-      if (lrcTimes[mid] <= positionSec) {
+      if (lrcTimes[mid] <= p.positionSec) {
         ans = mid;
         lo = mid + 1;
       } else {
@@ -295,125 +1416,142 @@ function LyricStrip({
       }
     }
     return ans;
-  }, [lrcTimes, positionSec]);
+  }, [lrcTimes, p.positionSec]);
 
-  // 渲染所有行：lines/yrcLines 数组本身不变就不重建
-  // 但每行需要根据 positionSec 实时算字进度 —— 这一段必须每帧跑
-  const visibleStart = Math.max(0, idx - 1);
-  const visibleEnd = useYrc
-    ? Math.min(yrcLines.length, idx + 2)
-    : Math.min(lines.length, idx + 2);
-
-  const renderedLines = useMemo(() => {
-    if (useYrc) {
-      return yrcLines.slice(visibleStart, visibleEnd).map((y, offset) => {
-        const i = visibleStart + offset;
-        return (
-          <YrcLineView
-            key={i}
-            line={y}
-            isActive={i === idx}
-            dist={Math.abs(i - idx)}
-            positionSec={positionSec}
-          />
-        );
-      });
-    }
-    return lines.slice(visibleStart, visibleEnd).map((ln, offset) => {
-      const i = visibleStart + offset;
-      const dist = Math.abs(i - idx);
-      const isActive = i === idx;
-      // LRC 模式下用插值"假逐字"：当前行从其 start 到下一行 start 的时长里，
-      // 高亮按字符等分推进
-      let lineProgress = 0;
-      if (isActive) {
-        const start = ln.time;
-        const end = i + 1 < lines.length ? lines[i + 1].time : start + 5;
-        const dur = Math.max(0.4, end - start);
-        lineProgress = Math.max(0, Math.min(1, (positionSec - start) / dur));
-      } else if (i < idx) {
-        lineProgress = 1;
-      }
-      return (
-        <LrcLineView
-          key={i}
-          text={ln.text}
-          isActive={isActive}
-          dist={dist}
-          progress={lineProgress}
-        />
-      );
-    });
-  }, [useYrc, lines, yrcLines, idx, positionSec, visibleStart, visibleEnd]);
-
-  // 早 return 必须放在所有 hooks 之后
-  const placeholder = (text: string) => (
-    <div style={lyricBox}>
-      <div style={lyricPlaceholder}>{text}</div>
-    </div>
-  );
-
-  if (!meta) return placeholder("歌词加载中…");
-  if (meta.instrumental) return placeholder("♪ 纯音乐 ♪");
   if (lrcTimes.length === 0) {
-    return placeholder(
-      `这首歌没有歌词${meta.uncollected ? "（网易云收录不全）" : ""}`,
-    );
+    return { empty: true, rows: null, translateExpr: "0px", activeIdx: -1 };
   }
 
   const safeIdx = Math.max(idx, 0);
-  const centerRow = Math.floor(LYRIC_ROWS / 2);
-  const offset = centerRow - (safeIdx - visibleStart);
-  const translateExpr = `calc(${offset} * ${LYRIC_ROW_H})`;
+  const total = useYrc ? p.yrcLines.length : p.lines.length;
 
-  return (
-    <div style={lyricBox}>
-      <div
-        style={{
-          position: "absolute",
-          left: 0,
-          right: 0,
-          top: 0,
-          transform: `translate3d(0, ${translateExpr}, 0)`,
-          transition: "transform 520ms cubic-bezier(0.22, 1, 0.36, 1)",
-          willChange: "transform",
-        }}
-      >
-        {renderedLines}
-      </div>
-    </div>
-  );
+  // 渲染所有行（不再做 sliding window 切片）。配合 column 整体 translateY，
+  // 行的位置变化由 transform 平滑过渡 —— 不会出现"上一句没收起来下一句已经
+  // 上来"的 snap 跳位现象。
+  //
+  // 性能：
+  //   - 非当前行的 props 全部稳定（isActive=false, line 引用不变, 其余常量），
+  //     React.memo 直接 bail-out。一首歌 80 行也只会真正渲染 1 行（当前行）。
+  //   - 当前行接收 positionSec 每帧重渲，其它行 positionSec=undefined 稳定。
+  //   - idx 变化时，仅"上一个 active"和"新 active"两行的 isActive 翻转，
+  //     总共 2 个真实 reconcile。
+  const fg = p.fgColor ?? "rgba(255, 255, 255, 0.96)";
+  const fgDim = p.fgDimColor ?? "rgba(168, 174, 194, 0.9)";
+  // active 行内 "未唱字符" 颜色：默认 fallback 到 fgDim（兼容旧 compact 行为），
+  // immersive 调用方会传入更亮的值（约 0.55-0.62 alpha）以避免 active 行整段灰掉。
+  const fgUnsung = p.fgUnsungColor ?? fgDim;
+  const rowEls: React.ReactNode[] = [];
+  for (let i = 0; i < total; i++) {
+    const isActive = i === safeIdx;
+    if (useYrc) {
+      const line = p.yrcLines[i]!;
+      rowEls.push(
+        <YrcRow
+          key={`y-${i}`}
+          line={line}
+          isActive={isActive}
+          positionSec={isActive ? p.positionSec : undefined}
+          rowH={p.rowH}
+          activeFs={p.activeFs}
+          dimFs={p.dimFs}
+          immersive={p.immersive ?? false}
+          fgColor={fg}
+          fgDimColor={fgDim}
+          fgUnsungColor={fgUnsung}
+        />,
+      );
+    } else {
+      const ln = p.lines[i]!;
+      let lineProgress = 0;
+      if (isActive) {
+        const start = ln.time;
+        const end = i + 1 < p.lines.length ? p.lines[i + 1]!.time : start + 5;
+        const dur = Math.max(0.4, end - start);
+        lineProgress = Math.max(0, Math.min(1, (p.positionSec - start) / dur));
+      } else if (i < safeIdx) {
+        lineProgress = 1;
+      }
+      rowEls.push(
+        <LrcRow
+          key={`l-${i}`}
+          text={ln.text}
+          isActive={isActive}
+          progress={lineProgress}
+          rowH={p.rowH}
+          activeFs={p.activeFs}
+          dimFs={p.dimFs}
+          immersive={p.immersive ?? false}
+          fgColor={fg}
+          fgDimColor={fgDim}
+          fgUnsungColor={fgUnsung}
+        />,
+      );
+    }
+  }
+
+  // column 偏移：让 safeIdx 行落在 centerRow 槽位。idx 增大时 offset 减小
+  // → column 向上平移。CSS 过渡平滑滑动。
+  const centerRow = Math.floor(p.visibleRows / 2);
+  const offset = centerRow - safeIdx;
+  const translateExpr = `calc(${offset} * ${p.rowH})`;
+
+  return {
+    empty: false,
+    rows: rowEls,
+    translateExpr,
+    activeIdx: safeIdx,
+  };
 }
 
-// 颜色 token —— 已唱（白）/ 未唱（淡灰）。距离当前行越远的行颜色越浅
-const SUNG_WHITE = "rgba(255,255,255,0.9)";
-const UNSUNG_GRAY = "rgba(168,174,194,0.9)";
+// ============== 行组件（React.memo 包，非当前行不每帧重渲） ==============
 
-/**
- * yrc 一行：每个字独立渲染，按播放进度做颜色过渡 + wipe 渐变。
- * 字与字之间用空格 / 标点天然分隔（yrc 字段已含空格）。
- */
-function YrcLineView({
+const SUNG_WHITE = "rgba(255,255,255,0.96)";
+const UNSUNG_GRAY = "rgba(168,174,194,0.9)";
+const UNSUNG_GRAY_IMMERSIVE = "rgba(255,255,255,0.32)";
+
+type RowCommon = {
+  isActive: boolean;
+  rowH: string;
+  activeFs: string;
+  dimFs: string;
+  immersive: boolean;
+  fgColor: string;
+  fgDimColor: string;
+  fgUnsungColor: string;
+};
+
+const YrcRow = React.memo(function YrcRow({
   line,
   isActive,
-  dist,
   positionSec,
-}: {
-  line: YrcLine;
-  isActive: boolean;
-  dist: number;
-  positionSec: number;
-}) {
+  rowH,
+  activeFs,
+  dimFs,
+  immersive,
+  fgColor,
+  fgDimColor,
+  fgUnsungColor,
+}: RowCommon & { line: YrcLine; positionSec?: number }) {
+  // immersive 下非 active 行用 fgColor + 容器 opacity 压暗（统一颜色 + 透明度），
+  // compact 仍用 fgDimColor（旧行为，保留视觉熟悉感）。
+  const inactiveColor = immersive ? fgColor : fgDimColor;
   return (
-    <div style={lineFrame(isActive, dist)}>
-      <div style={lineInner(isActive)}>
+    <div
+      data-active={isActive ? "1" : "0"}
+      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive)}
+    >
+      <div style={lineInner()}>
         {isActive ? (
-          <YrcActiveLine line={line} positionSec={positionSec} />
+          <YrcActiveLine
+            line={line}
+            positionSec={positionSec ?? 0}
+            fgColor={fgColor}
+            fgUnsungColor={fgUnsungColor}
+          />
         ) : (
           <span
             style={{
-              color: UNSUNG_GRAY,
-              opacity: Math.max(0.4, 1 - dist * 0.18),
+              color: inactiveColor,
               whiteSpace: "break-spaces",
             }}
           >
@@ -423,19 +1561,70 @@ function YrcLineView({
       </div>
     </div>
   );
-}
+});
+
+const LrcRow = React.memo(function LrcRow({
+  text,
+  isActive,
+  progress,
+  rowH,
+  activeFs,
+  dimFs,
+  immersive,
+  fgColor,
+  fgDimColor,
+  fgUnsungColor,
+}: RowCommon & { text: string; progress: number }) {
+  const inactiveColor = immersive ? fgColor : fgDimColor;
+  return (
+    <div
+      data-active={isActive ? "1" : "0"}
+      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive)}
+    >
+      <div style={lineInner()}>
+        {isActive ? (
+          <span
+            style={{
+              backgroundImage: `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${progress * 100}%, ${fgUnsungColor} ${progress * 100 + 1}%, ${fgUnsungColor} 100%)`,
+              WebkitBackgroundClip: "text",
+              backgroundClip: "text",
+              WebkitTextFillColor: "transparent",
+            }}
+          >
+            {text}
+          </span>
+        ) : (
+          <span
+            style={{
+              color: inactiveColor,
+            }}
+          >
+            {text}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+});
 
 function YrcActiveLine({
   line,
   positionSec,
+  fgColor,
+  fgUnsungColor,
 }: {
   line: YrcLine;
   positionSec: number;
+  fgColor: string;
+  // 未唱字符颜色 —— 介于 fg 和 fgDim 之间的"中亮度"。Apple Music 思路：
+  // 即便整行都还没唱到（刚切到下一句），这一行依然明显比其它非 active 行亮，
+  // 因为它的字符颜色是中亮度而非 fgDim。
+  fgUnsungColor: string;
 }) {
   const chars = line.chars;
   if (chars.length === 0) {
     return (
-      <span style={{ color: SUNG_WHITE, whiteSpace: "break-spaces" }}>
+      <span style={{ color: fgColor, whiteSpace: "break-spaces" }}>
         {line.text}
       </span>
     );
@@ -444,7 +1633,7 @@ function YrcActiveLine({
   const currentIdx = chars.findIndex((c) => positionSec < c.startSec + c.durSec);
   if (currentIdx === -1) {
     return (
-      <span style={{ color: SUNG_WHITE, whiteSpace: "break-spaces" }}>
+      <span style={{ color: fgColor, whiteSpace: "break-spaces" }}>
         {line.text}
       </span>
     );
@@ -456,11 +1645,10 @@ function YrcActiveLine({
   for (let i = 0; i < currentIdx; i++) before += chars[i]!.text;
   for (let i = currentIdx + 1; i < chars.length; i++) after += chars[i]!.text;
 
-  // 已经过了字尾 → 白；还没到字头 → 灰
-  // 正好正在唱 → 用 mask-image 的线性渐变 wipe
   let progress = 0;
   if (positionSec >= current.startSec + current.durSec) progress = 1;
-  else if (positionSec > current.startSec) progress = (positionSec - current.startSec) / Math.max(0.001, current.durSec);
+  else if (positionSec > current.startSec)
+    progress = (positionSec - current.startSec) / Math.max(0.001, current.durSec);
 
   const beingSung = progress > 0 && progress < 1;
   const sung = progress >= 1;
@@ -468,35 +1656,28 @@ function YrcActiveLine({
   return (
     <>
       {before && (
-        <span style={{ color: SUNG_WHITE, whiteSpace: "break-spaces" }}>
+        <span style={{ color: fgColor, whiteSpace: "break-spaces" }}>
           {before}
         </span>
       )}
       <span
-      style={{
-        position: "relative",
-        display: "inline-block",
-        whiteSpace: "break-spaces",
-        // 双层叠加：底层灰字 + 上层白字裁剪到 progress 宽度
-        color: sung ? SUNG_WHITE : UNSUNG_GRAY,
-        // wipe：用 background-clip text 给字一个渐变前景
-        // 白色部分从左 0% 到 progress*100%，再 fade 1px 到灰
-        backgroundImage: beingSung
-          ? `linear-gradient(90deg, ${SUNG_WHITE} 0%, ${SUNG_WHITE} ${progress * 100}%, ${UNSUNG_GRAY} ${progress * 100 + 1}%, ${UNSUNG_GRAY} 100%)`
-          : "none",
-        WebkitBackgroundClip: beingSung ? "text" : "border-box",
-        backgroundClip: beingSung ? "text" : "border-box",
-        WebkitTextFillColor: beingSung ? "transparent" : "currentColor",
-        // 已唱的字保留一点点 text-shadow 暖光，跟当前播放页主色对应
-        textShadow: sung
-          ? "0 0 14px rgba(var(--orb-rgb, 155 227 198), 0.18)"
-          : "none",
-      }}
-    >
+        style={{
+          position: "relative",
+          display: "inline-block",
+          whiteSpace: "break-spaces",
+          color: sung ? fgColor : fgUnsungColor,
+          backgroundImage: beingSung
+            ? `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${progress * 100}%, ${fgUnsungColor} ${progress * 100 + 1}%, ${fgUnsungColor} 100%)`
+            : "none",
+          WebkitBackgroundClip: beingSung ? "text" : "border-box",
+          backgroundClip: beingSung ? "text" : "border-box",
+          WebkitTextFillColor: beingSung ? "transparent" : "currentColor",
+        }}
+      >
         {current.text}
       </span>
       {after && (
-        <span style={{ color: UNSUNG_GRAY, whiteSpace: "break-spaces" }}>
+        <span style={{ color: fgUnsungColor, whiteSpace: "break-spaces" }}>
           {after}
         </span>
       )}
@@ -504,71 +1685,50 @@ function YrcActiveLine({
   );
 }
 
-function LrcLineView({
-  text,
-  isActive,
-  dist,
-  progress,
-}: {
-  text: string;
-  isActive: boolean;
-  dist: number;
-  progress: number;
-}) {
-  return (
-    <div style={lineFrame(isActive, dist)}>
-      <div style={lineInner(isActive)}>
-        {isActive ? (
-          // 假逐字：字符按 progress 切两段
-          <span
-            style={{
-              backgroundImage: `linear-gradient(90deg, ${SUNG_WHITE} 0%, ${SUNG_WHITE} ${progress * 100}%, ${UNSUNG_GRAY} ${progress * 100 + 1}%, ${UNSUNG_GRAY} 100%)`,
-              WebkitBackgroundClip: "text",
-              backgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-              textShadow: "0 0 14px rgba(var(--orb-rgb, 155 227 198), 0.16)",
-            }}
-          >
-            {text}
-          </span>
-        ) : (
-          <span
-            style={{
-              color: dist === 0 ? SUNG_WHITE : UNSUNG_GRAY,
-              opacity: dist === 0 ? 1 : Math.max(0.4, 1 - dist * 0.18),
-            }}
-          >
-            {text}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
+function lineFrame(
+  isActive: boolean,
+  rowH: string,
+  activeFs: string,
+  dimFs: string,
+  immersive: boolean,
+): React.CSSProperties {
+  // transition 写在"目标态"上，进 / 出 active 用不同时间窗。
+  // immersive 不再变 fontSize（active/inactive 同号），但仍保留 transition
+  // 兼容 compact 模式以及未来重新启用尺寸切换的可能。
+  const transition = isActive
+    ? "font-size 280ms cubic-bezier(0.22, 1, 0.36, 1) 80ms, opacity 360ms cubic-bezier(0.22, 1, 0.36, 1) 40ms, color 320ms cubic-bezier(0.22, 1, 0.36, 1)"
+    : "font-size 200ms cubic-bezier(0.4, 0, 0.6, 1), opacity 280ms cubic-bezier(0.4, 0, 0.6, 1), color 280ms cubic-bezier(0.4, 0, 0.6, 1)";
 
-// 行外框：负责行的高度 + scale 动画 + 上下淡入淡出（按距离）
-function lineFrame(isActive: boolean, dist: number): React.CSSProperties {
   return {
-    minHeight: LYRIC_ROW_H,
+    // 用 minHeight 而非 height —— 长歌词换行后行高自然增长，不会跟下一行重叠。
+    // 容器 translate 由 LyricColumn / LyricStrip 通过 ref 测量 active 行的
+    // offsetTop 决定，所以行高变化不影响居中。
+    minHeight: rowH,
+    boxSizing: "border-box",
     display: "flex",
     alignItems: "center",
-    justifyContent: "center",
-    fontSize: isActive ? LYRIC_ACTIVE_FS : LYRIC_DIM_FS,
-    fontWeight: isActive ? 600 : 400,
-    letterSpacing: 0,
-    transform: "none",
-    transformOrigin: "center",
+    justifyContent: immersive ? "flex-start" : "center",
+    fontSize: isActive ? activeFs : dimFs,
+    // immersive: 所有行同字重（Heavy）—— 跟 Apple Music 一致，激活态全靠
+    //   "色彩对比 + 逐字 wipe" 凸显，不靠字重切换。
+    // compact: 仍保持 active 加粗 / inactive 细体，节省竖向空间。
+    fontWeight: immersive ? 700 : isActive ? 600 : 400,
+    // 大字号 + Heavy 配紧字距，避免字符间空气感稀释主体
+    letterSpacing: immersive ? "-0.012em" : 0,
+    lineHeight: immersive ? 1.32 : undefined,
+    transformOrigin: "left center",
     filter: "none",
-    opacity: isActive ? 1 : Math.max(0.55, 1 - dist * 0.14),
+    // 非 active 行：immersive 显著压暗（0.32）形成强对比；compact 保留较亮
+    // （0.42）让 3 行带子整体可读。
+    opacity: isActive ? 1 : immersive ? 0.32 : 0.42,
     overflow: "visible",
-    padding: "3px 12px",
-    transition:
-      "font-size 360ms cubic-bezier(0.22, 1, 0.36, 1), opacity 360ms cubic-bezier(0.22, 1, 0.36, 1)",
+    padding: immersive ? "10px 4px" : "2px 12px",
+    textAlign: immersive ? "left" : "center",
+    transition,
   };
 }
 
-// 行内文字容器：当前行两侧加一道 mask "舞台聚光"
-function lineInner(isActive: boolean): React.CSSProperties {
+function lineInner(): React.CSSProperties {
   return {
     whiteSpace: "normal",
     overflow: "visible",
@@ -580,14 +1740,33 @@ function lineInner(isActive: boolean): React.CSSProperties {
   };
 }
 
-// ---------- SVG（Apple Music 手机端风：裸 glyph，没有圆形底） ----------
-//
-// PlayGlyph / PauseGlyph 是大字号的中央按钮；SkipBack / SkipForward 是双三角。
-// 高度全部用 1em，按钮的 fontSize 控制图标实际显示尺寸 —— 这样字号一改全部跟着缩放。
+function PlaceholderLyric({ text, mode }: { text: string; mode: "compact" | "immersive" }) {
+  if (mode === "immersive") {
+    return (
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "rgba(255,255,255,0.45)",
+          fontSize: 15,
+          fontStyle: "italic",
+        }}
+      >
+        {text}
+      </div>
+    );
+  }
+  return (
+    <div style={lyricBox}>
+      <div style={lyricPlaceholder}>{text}</div>
+    </div>
+  );
+}
 
-// 圆角技巧：fill 和 stroke 都用 currentColor，再加 stroke-linejoin="round"，
-// 三角尖角和直角拐点都会被磨成圆角，几何还是原 path —— 比手画 cubic 路径稳。
-// stroke-width 决定圆角"半径"，2.4 大约 ≈ 1.2px 视觉圆角，跟 Apple Music 接近。
+// ============== SVG glyph（v5 原样） ==============
 
 function PlayGlyph() {
   return (
@@ -613,7 +1792,6 @@ function PauseGlyph() {
     </svg>
   );
 }
-// 双三角 + 竖线 —— 同样 stroke 圆角法，让三角尖部不刺眼
 function SkipBack() {
   return (
     <svg
@@ -651,12 +1829,6 @@ function SkipForward() {
   );
 }
 
-/**
- * 裸 glyph 按钮 —— 没有圆形底色、没有 box-shadow、没有 hover 背景。
- * hover/press 全靠 opacity 和 scale 反馈，跟 Apple Music 一致。
- *
- * `large` 控制中央播放/暂停的字号；prev/next 用默认。
- */
 function FlatBtn({
   children,
   onClick,
@@ -676,7 +1848,6 @@ function FlatBtn({
       disabled={disabled}
       aria-label={ariaLabel}
       style={{
-        // fontSize 决定 glyph（1em）的实际显示尺寸
         fontSize: large ? "clamp(46px, 11vw, 56px)" : "clamp(32px, 7.6vw, 38px)",
         width: large ? "clamp(58px, 14vw, 72px)" : "clamp(44px, 10vw, 56px)",
         height: large ? "clamp(58px, 14vw, 72px)" : "clamp(44px, 10vw, 56px)",
@@ -717,11 +1888,10 @@ function fmt(s: number) {
 const shell: React.CSSProperties = {
   position: "relative",
   width: "100%",
-  // 上限 600 —— 给 400 封面 + 两边各 ~100 的歌词外延留出来。
-  // 手机宽下 width:100% 自动跟随，桌面宽下 600 封顶不至于"宽到没边"。
   maxWidth: 600,
   margin: "0 auto",
-  padding: "0 clamp(8px, 2vw, 20px)",
+  // 手机端 padding ×2：原 8/2vw/20 视觉上太贴边，封面跟标题都顶到屏幕
+  padding: "0 clamp(16px, 4vw, 40px)",
 };
 
 const contentLayer: React.CSSProperties = {
@@ -729,7 +1899,6 @@ const contentLayer: React.CSSProperties = {
   zIndex: 1,
 };
 
-// 海报 + 标题 + 进度 + 控制 同宽列。宽度走 COVER_SIZE，居中。
 const trackColumn: React.CSSProperties = {
   width: COVER_SIZE,
   margin: "0 auto",
@@ -827,18 +1996,14 @@ const controlsRow: React.CSSProperties = {
 };
 
 const lyricBox: React.CSSProperties = {
-  // 控制条 → 歌词的纵向间距收紧一档（之前 14~24，现在 6~14），
-  // 让歌词区跟控制条视觉上更近，符合 Apple Music 那种"歌词紧跟在播控下面"的节奏
   marginTop: "clamp(6px, 1.2vh, 14px)",
   marginLeft: "clamp(8px, 4vw, 24px)",
   marginRight: "clamp(8px, 4vw, 24px)",
   height: LYRIC_BOX_H,
-  overflow: "visible",
+  // 现在所有行都渲染，靠 overflow + mask 限定可见窗 —— 否则歌词会撑出容器
+  overflow: "hidden",
   textAlign: "center",
   position: "relative",
-  // 之前在这里加过一层径向暗化 vignette 来"抠"歌词，
-  // 但它会让歌词区的点比别处暗 —— 跟"整张图同一个背景"冲突。
-  // 删掉，靠加重歌词字号 + 颜色对比让歌词自己能立住。
 };
 
 const lyricPlaceholder: React.CSSProperties = {
@@ -848,7 +2013,6 @@ const lyricPlaceholder: React.CSSProperties = {
   alignItems: "center",
   justifyContent: "center",
   fontSize: 13,
-  // 0.42 在 DotField 波峰下完全看不见，提到 0.7
   color: "rgba(233,239,255,0.7)",
   fontStyle: "italic",
 };
@@ -864,3 +2028,53 @@ const errorBar: React.CSSProperties = {
   lineHeight: 1.5,
   textAlign: "center",
 };
+
+// ---------- immersive styles ----------
+
+const immersiveTitle: React.CSSProperties = {
+  fontSize: "clamp(16px, 4.4vw, 20px)",
+  fontWeight: 700,
+  letterSpacing: "-0.005em",
+  color: "rgba(255,255,255,0.96)",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const immersiveSubtitle: React.CSSProperties = {
+  marginTop: 5,
+  fontSize: "clamp(12px, 3.2vw, 14px)",
+  fontWeight: 500,
+  color: "rgba(255,255,255,0.62)",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+// 桌面版：title 落在封面正下方，没有 mask 干扰，可以放心放大
+const immersiveTitleLarge: React.CSSProperties = {
+  fontSize: "clamp(20px, 2.2vw, 28px)",
+  fontWeight: 700,
+  letterSpacing: "-0.01em",
+  color: "rgba(255,255,255,0.96)",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const immersiveSubtitleLarge: React.CSSProperties = {
+  marginTop: 6,
+  fontSize: "clamp(13px, 1.3vw, 16px)",
+  fontWeight: 500,
+  color: "rgba(255,255,255,0.62)",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const immersiveLyricFrame: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  overflow: "hidden",
+};
+

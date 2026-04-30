@@ -70,10 +70,21 @@ export function AiPet() {
   const idleSubtitle = useRef(
     IDLE_SUBTITLES[Math.floor(Math.random() * IDLE_SUBTITLES.length)],
   ).current;
-  // 封面右下挂点（视口坐标）—— 找不到封面则回退到右下角
-  const [coverHook, setCoverHook] = useState<{ x: number; y: number } | null>(
-    null,
-  );
+  // 锚点位置（视口坐标）+ 模式
+  //   - "attached": 找到封面时，锚点 = 封面右下角内侧；绳子从挂点垂下
+  //   - "free":     未找到封面 / 歌词页打开时，锚点 = 屏幕右下角附近；无绳
+  // 跟旧版 coverHook 的不同：永远是值（不会 null），让 inline left/top 永远生效，
+  // 配合 CSS transition 就能在 attached ↔ free 之间跑平滑移动动画。
+  const [anchorPos, setAnchorPos] = useState<{
+    x: number;
+    y: number;
+    mode: "attached" | "free";
+  } | null>(null);
+  // 兼容旧字段：组件内仍有几处依赖 coverHook 形状（气泡定位 / class 切换）。
+  // 由 anchorPos 派生：只有 attached 模式才向下游传 hook 信息。
+  const coverHook = anchorPos?.mode === "attached"
+    ? { x: anchorPos.x, y: anchorPos.y }
+    : null;
   // 跟封面取色出来的"水珠主色"（rgb 三元组），默认薄荷绿
   const [orbRgb, setOrbRgb] = useState<[number, number, number]>([
     155, 227, 198,
@@ -315,25 +326,49 @@ export function AiPet() {
   useEffect(() => {
     let lastX = -1;
     let lastY = -1;
+    let lastMode: "attached" | "free" | "" = "";
+    // free 模式（默认右下角）的锚点视口坐标。
+    // 几何对应：anchor 自身 (0,0) → 内部 .claudio-pet 在 (-22, +14) → 球
+    // 左上角 (anchor.x - 22, anchor.y + 14)，球 44×44 → 球右下角
+    // (anchor.x + 22, anchor.y + 58)。要让球右下角对齐 (vw - 36, vh - 56) →
+    //   anchor.x = vw - 58, anchor.y = vh - 114.
+    const freePos = () => ({
+      x: window.innerWidth - 58,
+      y: window.innerHeight - 114,
+    });
+    const apply = (x: number, y: number, mode: "attached" | "free") => {
+      // 对每帧节流：差距太小不重设，避免 React re-render 风暴
+      if (
+        mode === lastMode &&
+        Math.abs(x - lastX) < 0.5 &&
+        Math.abs(y - lastY) < 0.5
+      ) {
+        return;
+      }
+      lastX = x;
+      lastY = y;
+      lastMode = mode;
+      setAnchorPos({ x, y, mode });
+    };
     const measure = () => {
+      // 歌词页打开时，宠物退到默认右下角，CSS transition 会自动跑移动动画
+      const immersiveOpen =
+        document.body.dataset.claudioImmersive === "1";
+      if (immersiveOpen) {
+        const p = freePos();
+        apply(p.x, p.y, "free");
+        return;
+      }
       const cover = document.querySelector<HTMLElement>("[data-claudio-cover]");
       if (!cover) {
-        if (lastX !== -1 || lastY !== -1) {
-          lastX = -1;
-          lastY = -1;
-          setCoverHook(null);
-        }
+        const p = freePos();
+        apply(p.x, p.y, "free");
         return;
       }
       const r = cover.getBoundingClientRect();
       if (r.width < 4 || r.height < 4) return;
       // 挂在封面右下角内侧 14px、底边线上 —— 让绳子从封面下边框右侧出来
-      const x = r.right - 14;
-      const y = r.bottom;
-      if (Math.abs(x - lastX) < 0.5 && Math.abs(y - lastY) < 0.5) return;
-      lastX = x;
-      lastY = y;
-      setCoverHook({ x, y });
+      apply(r.right - 14, r.bottom, "attached");
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -352,6 +387,13 @@ export function AiPet() {
     };
     reobserve();
     mo.observe(document.body, { childList: true, subtree: true });
+    // 监听 body 的 data-claudio-immersive 属性切换 —— PlayerCard 进入 / 退出
+    // 沉浸式歌词时会改这个 flag。靠这个观察器直接触发 measure，避免依赖 250ms
+    // 兜底定时器带来的 lag（不然宠物会比歌词页晚 ~250ms 才开始移动）
+    mo.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["data-claudio-immersive"],
+    });
     window.addEventListener("resize", measure);
     window.addEventListener("scroll", measure, true);
     // 封面有 4s 的 scale 1↔1.012 缓动，靠定时拍打跟住
@@ -628,20 +670,18 @@ export function AiPet() {
       )}
 
       {/* pet 浮窗 —— 液态光点：anchor 是一个挂点，从这里垂下绳子 + 光点。
-          有封面时 anchor 贴到封面右下角；否则回退到屏幕右下角。
+          - attached 模式（找到封面 + 不在歌词页）：anchor 贴到封面右下角
+          - free 模式（无封面 / 歌词页）：anchor 在屏幕右下角附近
+          两种模式共用 left/top inline + CSS transition，模式切换时跑平滑移动动画。
           钟摆围绕 anchor 自身（绳子顶端）做缓慢摆动。 */}
       <div
         className={`claudio-pet-anchor${coverHook ? " is-attached" : ""}`}
         style={
           {
-            ...(coverHook
-              ? {
-                  left: coverHook.x,
-                  top: coverHook.y,
-                  right: "auto",
-                  bottom: "auto",
-                }
-              : null),
+            // anchorPos 在 mount 后第一次 measure 才有值，第一帧用 fallback
+            // 避免视觉上闪烁
+            left: anchorPos?.x ?? -9999,
+            top: anchorPos?.y ?? -9999,
             "--orb-rgb": `${orbRgb[0]}, ${orbRgb[1]}, ${orbRgb[2]}`,
             "--orb-rgb-light": `${orbRgbLight[0]}, ${orbRgbLight[1]}, ${orbRgbLight[2]}`,
           } as CSSProperties
@@ -721,7 +761,8 @@ function randomRange(min: number, max: number) {
 // 静态部分（外观）—— 位置由 computeHintBubblePosition() 单独算
 const hintBubble: CSSProperties = {
   position: "fixed",
-  zIndex: 60,
+  // 跟 .claudio-pet-anchor 同步：高于沉浸式歌词覆盖层
+  zIndex: 9101,
   maxWidth: 240,
   padding: "10px 14px 11px",
   background: "rgba(20,22,28,0.62)",

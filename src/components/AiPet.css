@@ -24,17 +24,24 @@
  */
 .claudio-pet-anchor {
   position: fixed;
-  right: 36px;
-  bottom: 56px;
-  width: 44px;
-  height: 44px;
-  z-index: 60;
-  transform-origin: 50% -36px;
+  /* left / top 由 React 用 inline style 写入（视口坐标）。
+     attached 模式：贴封面右下；free 模式：屏幕右下角推算位置。
+     两种模式共用一套几何：anchor 自身 0×0、transform-origin: 0 0、
+     内部 .claudio-pet 始终位于 (-22, +14)。模式切换只改 left/top，
+     CSS transition 把过程平滑插值出来 → 跨页面移动动画。 */
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  /* 高于沉浸式歌词覆盖层（PlayerCard 的 z-index: 9000），
+     这样宠物在歌词页也能看见 / 点击 */
+  z-index: 9100;
+  transform-origin: 0 0;
   /* 摆动只走 rotate —— anchor 旋转时，下面的光点天然按 transform-origin
      做钟摆轨迹；之前额外叠的 translate3d 是冗余且造成"双层位移"假象。 */
   transform: rotate(var(--wind-rotate, 0deg));
   /* 提示合成器走 GPU 通道，避免 layout/paint */
-  will-change: transform;
+  will-change: transform, left, top;
   pointer-events: none;
   /* --amp / --wind-rotate / --beat 由 rAF 写入；--orb-rgb / --orb-rgb-light 由 React 写入 */
   --amp: 0;
@@ -43,7 +50,21 @@
   --beat: 0;
   --orb-rgb: 155, 227, 198;
   --orb-rgb-light: 215, 245, 230;
-  transition: none;
+  /* 跨页面移动动画：left/top 平滑过渡。曲线跟 PlayerCard 的 close 同源
+     （cubic-bezier(0.6, 0.04, 0.22, 1)），保证宠物移动跟封面收回的节奏一致。
+     时长 540ms 也跟 close 对齐。
+     注意：这条 transition 不影响 transform（rotate / wind） —— 那条仍由 rAF
+     每帧写，不会被 transition 拖慢。 */
+  transition:
+    left 540ms cubic-bezier(0.6, 0.04, 0.22, 1),
+    top 540ms cubic-bezier(0.6, 0.04, 0.22, 1);
+}
+
+/* 内部光点：始终相对 anchor 偏移 (-22, 14) —— anchor=绳子顶端，球挂在下面 */
+.claudio-pet-anchor .claudio-pet {
+  position: absolute;
+  left: -22px;
+  top: 14px;
 }
 
 /* 默认模式（无封面）下不挂绳 —— 没有挂点，绳子就该不存在 */
@@ -76,15 +97,9 @@
   pointer-events: none;
 }
 
-/* ----- 半停靠：挂在封面右下角 ----- */
-.claudio-pet-anchor.is-attached {
-  /* 由 inline style 写入 left/top，覆盖默认 right/bottom */
-  width: 0;
-  height: 0;
-  /* 钟摆原点 = 自身 (0,0) = 绳子顶端 = 封面右下内侧 */
-  transform-origin: 0 0;
-  /* 光点离挂点更远，rAF 会自动给 attached 更完整的春风幅度 */
-}
+/* ----- 半停靠：挂在封面右下角 -----
+ * 几何已经在基类里统一（0×0 + 0,0 origin + 内部 -22,14），这里只补
+ * "attached 才需要的视觉差异"：绳索可见。 */
 
 /* 绳索（attached）：从挂点 (0,0) 垂下 ——
  * 顶端不放结点，第一段半透明渐入，看起来像从封面后面挂出来。
@@ -107,14 +122,6 @@
   );
   filter: blur(0.4px) brightness(calc(0.92 + var(--amp, 0) * 0.22))
     saturate(calc(0.95 + var(--amp, 0) * 0.3));
-}
-
-/* attached 模式下，光点在 anchor 内部相对挂点垂下来（短绳） */
-.claudio-pet-anchor.is-attached .claudio-pet {
-  position: absolute;
-  /* 按钮 44×44 → -22 水平居中；垂直 14px 让绳子末端潜入光晕 */
-  left: -22px;
-  top: 14px;
 }
 
 /* ---------- 光点本体 ----------
@@ -280,7 +287,8 @@
   bottom: 114px;
   width: min(360px, calc(100vw - 44px));
   height: min(480px, calc(100vh - 160px));
-  z-index: 60;
+  /* 跟 anchor 同步抬高，保证歌词页打开时点宠物弹的 chat 浮层也在覆盖层之上 */
+  z-index: 9101;
   display: flex;
   flex-direction: column;
   border-radius: 22px;
