@@ -13,8 +13,9 @@
  * 非网易云域名原样返回（比如 `data:` / 相对路径 / 占位图）。
  *
  * 平台差异：Tauri 2 在 macOS/Linux 下把自定义 scheme 保留为 `<scheme>://localhost/…`，
- * Windows 下翻译成 `http://<scheme>.localhost/…` 来绕开 Edge 的 scheme 黑名单。
- * 这里按 UA 切换一下 base。Rust 侧两种 URI 都能解析，handler 一份就够。
+ * Windows 下翻译成 `http://<scheme>.localhost/…` 来绕开 Edge 的 scheme 黑名单，
+ * Android 下走 WebViewAssetLoader 拦截 `https://<scheme>.localhost/…`。
+ * 这里按 UA 切换一下 base。Rust 侧三种 URI 都能解析，handler 一份就够。
  */
 export function cdn(raw: string | null | undefined): string {
   if (!raw) return "";
@@ -34,13 +35,17 @@ export function cdn(raw: string | null | undefined): string {
     host.endsWith(".music.126.net");
   if (!isNetease) return raw;
 
-  const base = isWindowsLike()
-    ? "http://claudio-cdn.localhost/"
-    : "claudio-cdn://localhost/";
+  const base = pickProtoBase("claudio-cdn");
   return `${base}?u=${encodeURIComponent(raw)}`;
 }
 
-function isWindowsLike(): boolean {
-  if (typeof navigator === "undefined") return false;
-  return /Windows/i.test(navigator.userAgent);
+/**
+ * 按平台返回自定义 scheme 的 base URL。给 audio scheme 也用上。
+ */
+export function pickProtoBase(scheme: string): string {
+  if (typeof navigator === "undefined") return `${scheme}://localhost/`;
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) return `https://${scheme}.localhost/`;
+  if (/Windows/i.test(ua)) return `http://${scheme}.localhost/`;
+  return `${scheme}://localhost/`;
 }

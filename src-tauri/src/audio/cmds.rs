@@ -161,9 +161,17 @@ pub async fn audio_get_features(
                 .path
         } else {
             // 不落 audio_cache —— 写一个临时文件，分析完删掉。
-            // 不直接在内存里 decode 因为 Symphonia 要 MediaSource，反正写到 cache_dir 也很快。
-            let tmp = std::env::temp_dir()
-                .join(format!("claudio_analyze_{track_id}.{}", format.as_deref().unwrap_or("bin")));
+            // Android: std::env::temp_dir() 返回 /data/local/tmp，不可写。
+            // 用 audio cache 自己的 root（app_cache_dir/audio）做 scratch space —— 这块
+            // 在所有平台都是 app 沙箱内可写目录。文件名加 .tmp 避免被 cache 扫描器
+            // 误当成已 cache 的字节。
+            let scratch_dir = state.root().join("scratch");
+            std::fs::create_dir_all(&scratch_dir)
+                .map_err(|e| format!("mkdir scratch: {e}"))?;
+            let tmp = scratch_dir.join(format!(
+                "claudio_analyze_{track_id}.{}.tmp",
+                format.as_deref().unwrap_or("bin"),
+            ));
             std::fs::write(&tmp, &resp.body)
                 .map_err(|e| format!("write tmp: {e}"))?;
             tmp

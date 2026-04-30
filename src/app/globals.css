@@ -63,6 +63,23 @@ html[data-platform="windows"] body {
   padding-top: 32px;
 }
 
+/* ===== Android 沉浸式 =====
+ * MainActivity 调了 enableEdgeToEdge + 透明状态栏/导航栏，WebView 铺到物理边缘。
+ * 不加 padding —— 内容（封面 / 歌词）天然铺到屏幕边沿，跟用户期望的"全沉浸"一致。
+ *
+ * 唯一需要手动处理的是 Nav 这种顶吸条 —— 在状态栏（约 24-44px）后面也能看见，
+ * 这是想要的效果。但 Nav 内的可点击元素需要避开手势区，给它一点 safe-area 上间距，
+ * 避免按钮被状态栏文字盖住。env(safe-area-inset-top) 在 Android WebView 16+ 都
+ * 已经返回正确值。
+ */
+html[data-platform="android"] body {
+  /* 字号略放大 0.5px：手机视距比桌面近，但 px 还是 px，1px ≈ 1dp，需要 micro adjust */
+}
+html[data-platform="android"] nav[data-tauri-drag-region] {
+  /* Nav 自身贴顶，但内层 padding 顶住状态栏，按钮不会被状态栏数字 / 信号图标盖住 */
+  padding-top: max(env(safe-area-inset-top), 12px);
+}
+
 /* decorum 三键自适应颜色：
  * decorum 在 Windows 顶部 32px overlay 里画 min/max/close 按钮，DOM 类名是
  * `.decorum-tb-btn`（minimize/maximize/close 各有专门 id）。

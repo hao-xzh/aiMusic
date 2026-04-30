@@ -238,15 +238,20 @@ export const audio = {
  * Rust 侧 referer 注入会自己处理）。
  */
 export function wrapAudioUrl(trackId: number, url: string): string {
-  const base = isWindowsLike()
-    ? "http://claudio-audio.localhost/"
-    : "claudio-audio://localhost/";
+  const base = pickAudioBase();
   return `${base}?id=${trackId}&u=${encodeURIComponent(url)}`;
 }
 
-function isWindowsLike(): boolean {
-  if (typeof navigator === "undefined") return false;
-  return /Windows/i.test(navigator.userAgent);
+// 跟 cdn.ts 的 pickProtoBase 同源 —— Tauri 2 在三个平台对自定义 scheme 的处理：
+//   - macOS / iOS / Linux：保留 `<scheme>://localhost/...`
+//   - Windows：翻成 `http://<scheme>.localhost/...`（绕 Edge scheme 黑名单）
+//   - Android：通过 WebViewAssetLoader 拦截 `https://<scheme>.localhost/...`
+function pickAudioBase(): string {
+  if (typeof navigator === "undefined") return "claudio-audio://localhost/";
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) return "https://claudio-audio.localhost/";
+  if (/Windows/i.test(ua)) return "http://claudio-audio.localhost/";
+  return "claudio-audio://localhost/";
 }
 
 // ---------- 本地缓存 ----------

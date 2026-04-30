@@ -1234,13 +1234,16 @@ function LyricStrip({
   return (
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
-      outerStyle={lyricBox}
-      innerExtraStyle={{
+      outerStyle={{
+        ...lyricBox,
+        // mask 必须挂在 outer（视口） —— 挂在 inner（滚动列）会跟着 translate
+        // 一起平移，效果只在歌词列首尾两行出现，中段滚动看不到边缘渐隐
         WebkitMaskImage:
           "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
         maskImage:
           "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
       }}
+      innerExtraStyle={{}}
       transitionMs={520}
     >
       {view.rows}
@@ -1297,13 +1300,18 @@ function LyricColumn({
   return (
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
-      outerStyle={immersiveLyricFrame}
+      outerStyle={{
+        ...immersiveLyricFrame,
+        // mask 挂在 outer：歌词列怎么滚动，渐隐区都钉在视口顶 / 底，
+        // 边界附近的歌词永远是淡出状态，不再有"看到容器硬切"的感觉。
+        // 渐隐区放大到 18% 和 82%（约 1-2 行），跟 Apple Music 一致。
+        WebkitMaskImage:
+          "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
+        maskImage:
+          "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
+      }}
       innerExtraStyle={{
         padding: "clamp(20px, 4vh, 36px) clamp(20px, 5vw, 36px)",
-        WebkitMaskImage:
-          "linear-gradient(180deg, transparent 0%, #000 12%, #000 86%, transparent 100%)",
-        maskImage:
-          "linear-gradient(180deg, transparent 0%, #000 12%, #000 86%, transparent 100%)",
       }}
       transitionMs={560}
     >

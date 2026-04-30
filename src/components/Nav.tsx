@@ -31,14 +31,18 @@ const TABS: Array<{ href: string; label: string; Icon: () => React.ReactElement 
 
 export function Nav() {
   const pathname = usePathname();
-  // Windows 下：在 <html> 上挂 data-platform="windows"，让 globals.css 给
-  // body 留出 32px 顶部边距，避开 decorum 的 32px 标题栏 overlay 区域。
+  // 在 <html> 上挂 data-platform，让 globals.css 按平台调整。
+  //   - Windows：留 32px 顶部，避开 decorum 标题栏 overlay
+  //   - Android：状态栏/导航栏全部沉浸（背景一路铺到屏幕物理边缘），
+  //     不留任何顶部 padding —— 用户明确要求"全沉浸"。
+  //   - macOS：traffic-light 由 Tauri overlay 模式处理，不需要前端干预。
   // 检测放在 useEffect 里，避免 SSR/CSR 不一致。
   useEffect(() => {
-    if (
-      typeof navigator !== "undefined" &&
-      /Windows/i.test(navigator.userAgent)
-    ) {
+    if (typeof navigator === "undefined") return;
+    const ua = navigator.userAgent;
+    if (/Android/i.test(ua)) {
+      document.documentElement.dataset.platform = "android";
+    } else if (/Windows/i.test(ua)) {
       document.documentElement.dataset.platform = "windows";
     }
   }, []);
