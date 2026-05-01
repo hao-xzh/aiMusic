@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -480,18 +481,26 @@ private fun AppleMusicLyricRow(
 }
 
 /**
- * 活动行渲染 —— **单个 Text + AnnotatedString**，跟 inactive 行用完全一样的
- * Text composable 和排版 paragraph，所以两态切换时零位移。
+ * 活动行渲染 —— **底层 Text + overlay 跳动词** 双层结构。
  *
- * 颜色变化 = 词内逐字母（CJK：逐字）平滑插值。每个字符算一个 "letter-local"
- * 子进度 letterT = (wordP - letterStart) / (1/N) ∈ (0, 1)，颜色 lerp(fgUnsung, fg, letterT)。
- * 多字母 ASCII 词得到清晰的 L→R 流光感（"hello" 5 个字依次着色）。
- * 单字 token（CJK / 单字符词）就是该字的 progress 平滑插值。
+ * 为什么不能直接在 SpanStyle 上加 baselineShift 做跳动：
+ *   - SpanStyle.baselineShift 改变该 span 的 effective ascent
+ *   - 同一行其它没 shift 的 span 都基于行的 max ascent 重新定位 baseline
+ *   - 结果：活动词每帧 baselineShift 变化 → 整行 baseline 跟着变 → 同行所有
+ *     字一起跳。多行歌词里只有第一行（含活动词那行）有这毛病，2/3 行不动
+ *     —— 跟用户实测的现象完全对应
  *
- * 之前用 Brush.horizontalGradient on SpanStyle 不工作 —— Compose 的 SpanStyle.brush
- * 取的是整段 Text 的 bounds，不是单 span 的 bounds，所以 sweep 切分点不对，
- * 看起来像"没动"。改成"逐字符 SpanStyle(color)" 是稳定的：每个字母独立颜色，
- * 整段 paragraph 没有任何不可控的 brush 行为。
+ * 解法：
+ *   1) 底层 Text(annotated) —— 全行用 SpanStyle(color) 着色，活动词那段填
+ *      Color.Transparent，留出"洞"
+ *   2) 用 onTextLayout 拿 TextLayoutResult，找出活动词在屏幕上的 bounding box
+ *   3) 在那个位置叠加一个 overlay Text，只画活动词，graphicsLayer.translationY
+ *      做 bounce —— overlay 跟底层 paragraph 完全独立，不参与行度量计算
+ *   4) overlay 自己也用 per-letter 着色做 L→R sweep
+ *
+ * 副作用：第 1 帧 onTextLayout 还没回来时 overlay 不显示，看起来活动词"消失
+ * 一帧"。但 LazyColumn item 进场就触发 onTextLayout，第 2 帧起 overlay 就位，
+ * 60Hz 下肉眼几乎看不见。
  */
 @Composable
 private fun AppleMusicActiveLyricRow(
@@ -501,15 +510,33 @@ private fun AppleMusicActiveLyricRow(
     fgUnsung: Color,
     style: TextStyle,
 ) {
+    // 找活动词（progress 在 (0, 1) 之间）的字符范围 + 自己的 progress
+    var activeStart = -1
+    var activeEnd = -1
+    var activeText = ""
+    var activeP = 0f
+    var charIdx = 0
+    for (token in chars) {
+        val p = token.progress(positionMs)
+        if (p > 0f && p < 1f && activeStart < 0) {
+            activeStart = charIdx
+            activeEnd = charIdx + token.text.length
+            activeText = token.text
+            activeP = p
+        }
+        charIdx += token.text.length
+    }
+
+    // 底层 Text —— 全行 per-letter 着色，活动词字符范围 = Color.Transparent
     val annotated = androidx.compose.ui.text.buildAnnotatedString {
-        var charIndex = 0
+        var idx = 0
         for (token in chars) {
             val p = token.progress(positionMs)
             val text = token.text
-            val start = charIndex
+            val start = idx
             append(text)
             val end = start + text.length
-            charIndex = end
+            idx = end
             when {
                 p >= 1f -> addStyle(
                     androidx.compose.ui.text.SpanStyle(color = fg),
@@ -519,51 +546,73 @@ private fun AppleMusicActiveLyricRow(
                     androidx.compose.ui.text.SpanStyle(color = fgUnsung),
                     start, end,
                 )
-                else -> {
-                    // token 正在唱：
-                    //   1) 颜色 —— 多字母按 L→R 分配子进度，逐字母 lerp；单字直接 lerp
-                    //   2) 跳动 —— 整个 token 加 baselineShift 抬一下，跟着 bounceCurve
-                    //      （p≈0.18 时达峰）。
-                    //
-                    // ⚠ 关键：lift × fontSize 必须 < (lineHeight - fontSize) / 2 = 8sp，
-                    //   否则 paragraph 在"当前词上抬"时 ascent 增高 → 整行高度变 → 相邻
-                    //   词被推动，视觉上像"所有词都在跳"。lift = 0.10 → max = 2.8sp << 8sp，
-                    //   配合 lineHeight=44sp 完全够 buffer，整行高度跨帧不变。
-                    val lift = bounceCurve(p) * 0.10f
-                    addStyle(
-                        androidx.compose.ui.text.SpanStyle(
-                            baselineShift = androidx.compose.ui.text.style.BaselineShift(lift),
-                        ),
-                        start, end,
-                    )
-                    val n = text.length
+                else -> addStyle(
+                    androidx.compose.ui.text.SpanStyle(color = Color.Transparent),
+                    start, end,
+                )
+            }
+        }
+    }
+
+    var layoutResult by remember {
+        androidx.compose.runtime.mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null)
+    }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+
+    Box {
+        Text(
+            text = annotated,
+            style = style,
+            onTextLayout = { layoutResult = it },
+        )
+
+        if (activeStart >= 0 && layoutResult != null) {
+            val l = layoutResult!!
+            // 活动词的左上角作为 overlay anchor
+            val anchorBox = l.getBoundingBox(activeStart)
+            val liftPx = with(density) {
+                bounceCurve(activeP) * 0.18f * style.fontSize.toPx()
+            }
+            Box(
+                modifier = Modifier
+                    .offset {
+                        androidx.compose.ui.unit.IntOffset(
+                            anchorBox.left.toInt(),
+                            anchorBox.top.toInt(),
+                        )
+                    }
+                    .graphicsLayer { translationY = -liftPx },
+            ) {
+                // overlay 里渲染同一段文字，per-letter 颜色 sweep
+                val overlayAnnotated = androidx.compose.ui.text.buildAnnotatedString {
+                    append(activeText)
+                    val n = activeText.length
                     if (n == 1) {
                         addStyle(
                             androidx.compose.ui.text.SpanStyle(
-                                color = androidx.compose.ui.graphics.lerp(fgUnsung, fg, p),
+                                color = androidx.compose.ui.graphics.lerp(fgUnsung, fg, activeP),
                             ),
-                            start, end,
+                            0, 1,
                         )
                     } else {
-                        // multi-letter 词（英文 / 数字）：逐字母线性 → L→R sweep
                         for (i in 0 until n) {
                             val letterStart = i.toFloat() / n
                             val letterEnd = (i + 1f) / n
-                            val letterT = ((p - letterStart) / (letterEnd - letterStart))
+                            val letterT = ((activeP - letterStart) / (letterEnd - letterStart))
                                 .coerceIn(0f, 1f)
                             val letterColor =
                                 androidx.compose.ui.graphics.lerp(fgUnsung, fg, letterT)
                             addStyle(
                                 androidx.compose.ui.text.SpanStyle(color = letterColor),
-                                start + i, start + i + 1,
+                                i, i + 1,
                             )
                         }
                     }
                 }
+                Text(text = overlayAnnotated, style = style)
             }
         }
     }
-    Text(text = annotated, style = style)
 }
 
 /**
