@@ -431,15 +431,27 @@ private fun AppleMusicLyricRow(
         label = "lyricAlpha",
     )
     // Apple Music：28sp Black，letter-spacing -0.5sp。
-    // lineHeight 提到 44sp（之前 34sp）—— 为 baselineShift bounce 留出 vertical slack：
-    // 28sp 字 × 16% lift = 4.48sp，要在 lineHeight 减 fontSize 的 leading（44-28=16sp）
-    // 范围内才不会让 paragraph ascent 跨帧变化。否则当前词上抬时整行 ascent 增高 →
-    // 相邻词看起来也"跟着浮动"。这是 SpanStyle.baselineShift 的经典坑。
+    //
+    // 锁死行高 + 锁死 baseline 在行内的位置 ——
+    // 仅靠 lineHeight = 44sp 还不够：Compose paragraph 在 baselineShift 变化时会把
+    // 基线在 lineHeight 块内重新定位（基线位置 = top + max ascent），这会把同行其它词
+    // 一起带上下挪。把 LineHeightStyle 锁死 + includeFontPadding=false 一起用，
+    // 基线在每帧的位置不再随 baselineShift 漂移：
+    //   - Alignment.Center：基线相对块顶居中（= 固定的 lineHeight/2 偏移）
+    //   - Trim.None：不裁前后 leading
+    //   - includeFontPadding=false：去掉 Android 平台默认的字体 padding 影响
     val style = TextStyle(
         fontSize = 28.sp,
         fontWeight = FontWeight.Black,
         lineHeight = 44.sp,
         letterSpacing = (-0.5).sp,
+        lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
+            alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
+            trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
+        ),
+        platformStyle = androidx.compose.ui.text.PlatformTextStyle(
+            includeFontPadding = false,
+        ),
     )
 
     Box(
