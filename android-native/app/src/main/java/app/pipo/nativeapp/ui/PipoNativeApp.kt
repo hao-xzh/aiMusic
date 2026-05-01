@@ -95,9 +95,9 @@ fun PipoNativeApp() {
 
                 // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
                 // lyricLeadMs：把 positionMs 提前一点喂给歌词，因为人眼接收 highlight 到歌手实际
-                // 唱出来之间有一段感知延迟。120ms 偏小听起来"歌词跟不上"，280ms 更接近 Apple Music
-                // 那种"嘴还没张高亮已经跳上去"的体感。
-                val lyricPositionMs = viewModel.state.positionMs + 280L
+                // 唱出来之间有一段感知延迟。280ms 偏小听起来"颜色跟不上"，380ms 更接近
+                // Apple Music 那种"嘴还没张色彩已经先扫过去"的体感。
+                val lyricPositionMs = viewModel.state.positionMs + 380L
                 val activeLyricIndex = viewModel.state.lyrics
                     .indexOfLast { line -> lyricPositionMs >= line.startMs }
                     .coerceAtLeast(0)

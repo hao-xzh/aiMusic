@@ -103,9 +103,11 @@ fun pickFg(tone: Tone): Color =
 fun pickFgDim(tone: Tone): Color =
     if (tone == Tone.Dark) Color(0x8C000000) else Color(0x9EFFFFFF)
 
-/** 未唱字符色：active 行里中亮度过渡到满亮 */
+/** 未唱字符色：active 行里要明显比已唱字段暗一档，但保留可读性。
+ *  之前 0x8C/0x9E（α 0.55/0.62）跟已唱字对比不够，看起来"全行差不多色"。
+ *  调到 0x59/0x66（α 0.35/0.40）—— 已唱跟未唱对比更清晰。 */
 fun pickFgUnsung(tone: Tone): Color =
-    if (tone == Tone.Dark) Color(0x8C000000) else Color(0x9EFFFFFF)
+    if (tone == Tone.Dark) Color(0x59000000) else Color(0x66FFFFFF)
 
 fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback

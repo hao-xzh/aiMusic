@@ -74,7 +74,9 @@ fun PlayerScreen(
         while (true) {
             viewModel.refreshPosition()
             if (!state.isPlaying) Amp.set(0f)
-            delay(if (state.isPlaying) 80L else 420L)
+            // 33ms ≈ 30Hz —— 之前 80ms 让歌词的 per-letter 颜色 sweep 显得分级不连续
+            // （短词 200ms 内只有 2~3 帧）。30Hz 让 sweep 视觉连贯。
+            delay(if (state.isPlaying) 33L else 420L)
         }
     }
 
