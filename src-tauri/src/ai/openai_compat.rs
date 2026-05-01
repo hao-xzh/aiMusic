@@ -121,3 +121,80 @@ pub async fn chat(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("AI 返回了 0 条内容"))
 }
+
+// ---------------- embeddings ----------------
+
+#[derive(Debug, Serialize)]
+struct EmbedReq<'a> {
+    model: &'a str,
+    input: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedResp {
+    #[serde(default)]
+    data: Vec<EmbedData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedData {
+    #[serde(default)]
+    embedding: Vec<f32>,
+    #[serde(default)]
+    index: usize,
+}
+
+/// 调用 `{base_url}/embeddings` 拿向量。
+///
+/// 协议是 OpenAI 标准（`{model, input: [strings]}` → `{data: [{embedding, index}]}`），
+/// OpenAI / 兼容方都按这个出。DeepSeek 目前不提供 embedding 端点 —— 调用方应该用
+/// OpenAI / Xiaomi MiMo provider 才能拿到结果。
+///
+/// 上限 1024 条 input：批量调用时切片由调用方负责，本函数只发一次。
+pub async fn embeddings(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("还没填 API key，请在设置里填上"));
+    }
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
+
+    let body = EmbedReq { model, input: inputs };
+    let resp = client
+        .post(&url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("请求失败：{e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| anyhow!("读取响应体失败：{e}"))?;
+    if !status.is_success() {
+        return Err(anyhow!("{status}：{text}"));
+    }
+
+    let parsed: EmbedResp = serde_json::from_str(&text)
+        .map_err(|e| anyhow!("响应解析失败：{e} / body={text}"))?;
+
+    // 按 index 排回原顺序——OpenAI 实际返回是按 input 顺序，但保险起见显式排
+    let mut indexed: Vec<(usize, Vec<f32>)> = parsed
+        .data
+        .into_iter()
+        .map(|d| (d.index, d.embedding))
+        .collect();
+    indexed.sort_by_key(|(i, _)| *i);
+    Ok(indexed.into_iter().map(|(_, v)| v).collect())
+}

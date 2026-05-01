@@ -293,6 +293,35 @@ fn dispatch(command: &str, args: Value) -> String {
                 Ok(json!(reply))
             })
         }
+        "ai_embed" => {
+            // 输入：{ "inputs": [..字符串..] }
+            // 输出：[[f32..], [f32..], ...]，按输入顺序对齐
+            let inputs: Vec<String> = args
+                .get("inputs")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            run_json(async move {
+                let cfg = ai_store().snapshot();
+                let provider = cfg.provider;
+                let embed_model = ai::config::default_embedding_model(provider).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "当前 provider 不支持 embedding，请切到 OpenAI 后再试"
+                    )
+                })?;
+                let (key, base_url, _chat_model) = ai_store().active();
+                let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
+                if inputs.is_empty() {
+                    return Ok(json!([]));
+                }
+                let vectors = ai::openai_compat::embeddings(&key, base_url, embed_model, &inputs).await?;
+                Ok(serde_json::to_value(vectors)?)
+            })
+        }
         other => error_json(format!("unknown command: {other}")),
     }
 }

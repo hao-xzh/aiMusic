@@ -8,6 +8,7 @@ import app.pipo.nativeapp.data.RustBridgeRepository
 class PipoApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        PipoGraph.installContext(this)
         installRustBridgeWhenPackaged()
     }
 

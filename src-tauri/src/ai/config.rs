@@ -110,6 +110,18 @@ pub fn default_model(provider: Provider) -> &'static str {
     }
 }
 
+/// 各家 provider 的 embedding 模型。
+///   - DeepSeek 不提供 embedding endpoint —— 返回 None，调用方需要让用户切到 OpenAI
+///   - OpenAI 用 `text-embedding-3-small`（1536 维，$0.02 / 1M token，性价比首选）
+///   - 小米 MiMo 暂没公开 embedding API —— None
+pub fn default_embedding_model(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Deepseek => None,
+        Provider::Openai => Some("text-embedding-3-small"),
+        Provider::XiaomiMimo => None,
+    }
+}
+
 /// 已知的可选模型列表（高 → 低）。前端 dropdown 用。
 ///
 /// 来源：各家 2026-04 官网 / 文档（详见 issue 里的搜索记录）。

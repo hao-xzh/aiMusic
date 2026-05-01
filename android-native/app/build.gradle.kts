@@ -13,13 +13,28 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.0-native"
+        versionName = "0.1.0"
+        // 小米 17 Ultra（骁龙 8 Elite Gen 5）= arm64-v8a，其他架构不打入 APK 减体积
+        ndk {
+            abiFilters.clear()
+            abiFilters.add("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("../keystore/pipo-release.jks")
+            storePassword = "pipopipo"
+            keyAlias = "pipo"
+            keyPassword = "pipopipo"
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -28,6 +43,20 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+        }
+    }
+
+    // 仅 arm64-v8a 一个 APK，禁掉 splits（小米 17 Ultra 不需要 universal）
+    splits {
+        abi {
+            isEnable = false
+        }
+    }
+
+    packaging {
+        // 已经 strip 过的 .so 二进制就别再 strip 一遍 —— 部分 NDK 27 老 .so 会报错
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 

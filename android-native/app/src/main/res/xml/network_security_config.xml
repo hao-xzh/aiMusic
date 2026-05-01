@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 网易云封面 / 直链有 http://*.music.126.net 域名，必须放行 cleartext -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">music.126.net</domain>
+        <domain includeSubdomains="true">163.com</domain>
+        <domain includeSubdomains="true">126.net</domain>
+    </domain-config>
+</network-security-config>

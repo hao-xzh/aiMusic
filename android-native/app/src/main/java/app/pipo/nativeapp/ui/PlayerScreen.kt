@@ -1,19 +1,15 @@
 package app.pipo.nativeapp.ui
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -25,487 +21,415 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.SkipNext
-import androidx.compose.material.icons.rounded.SkipPrevious
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.playback.PlayerViewModel
-import coil.compose.AsyncImage
+import app.pipo.nativeapp.runtime.Amp
 import kotlinx.coroutines.delay
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.sin
 
+/**
+ * 主播放卡片 —— 镜像 src/components/PlayerCard.tsx 的 compact 布局，按 React clamp() 1:1。
+ */
 @Composable
-fun PlayerScreen(viewModel: PlayerViewModel = viewModel()) {
+fun PlayerScreen(
+    onOpenLyrics: () -> Unit,
+    onOpenDistill: () -> Unit,
+    onOpenSettings: () -> Unit,
+    immersiveActive: Boolean,
+    viewModel: PlayerViewModel = viewModel(),
+) {
     val state = viewModel.state
-    var immersiveLyrics by remember { mutableStateOf(false) }
+    // 读用户的"隐藏点阵"开关
+    val settings by app.pipo.nativeapp.data.PipoGraph.repository.settings
+        .collectAsState(initial = app.pipo.nativeapp.data.NativeSettings())
 
     LaunchedEffect(state.isPlaying) {
         while (true) {
             viewModel.refreshPosition()
-            delay(if (state.isPlaying) 250L else 900L)
+            if (!state.isPlaying) Amp.set(0f)
+            delay(if (state.isPlaying) 200L else 800L)
         }
     }
 
     val progress = if (state.durationMs > 0) {
         (state.positionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
-    } else {
-        0f
-    }
+    } else 0f
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(PipoColors.Background),
-    ) {
-        AmbientNativeField(isPlaying = state.isPlaying)
-        Column(
+    val hideAlpha by animateFloatAsState(
+        targetValue = if (immersiveActive) 0f else 1f,
+        animationSpec = tween(200),
+        label = "hideAlpha",
+    )
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        // 全局背景（封面驱动 blur + DotField + 切歌 cross-fade）
+        AdaptiveDotField(
+            coverUrl = state.artworkUrl,
+            isPlaying = state.isPlaying,
+            showDots = !settings.hideDotPattern,
+        )
+
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .padding(horizontal = 24.dp, vertical = 18.dp)
-                .padding(bottom = 72.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+                .padding(top = 28.dp, bottom = 12.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            Spacer(modifier = Modifier.weight(0.38f))
-            NativeCover(
-                artworkUrl = state.artworkUrl,
-                isPlaying = state.isPlaying,
-            )
-            Spacer(modifier = Modifier.height(26.dp))
-            Text(
-                text = state.title,
-                color = PipoColors.Text,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "${state.artist} - ${state.album}",
-                color = PipoColors.TextMuted,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(modifier = Modifier.height(30.dp))
-            Slider(
-                value = progress,
-                onValueChange = viewModel::seekTo,
-                colors = SliderDefaults.colors(
-                    thumbColor = Color(0xFFE9EFFF),
-                    activeTrackColor = Color(0xFFE9EFFF),
-                    inactiveTrackColor = Color(0x33E9EFFF),
-                ),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+            val viewportW = maxWidth
+            val viewportH = maxHeight
+            val coverSize = clampDp(220.dp, viewportW * 0.86f, 400.dp).coerceAtMost(viewportH * 0.5f)
+            val shellPad = clampDp(16.dp, viewportW * 0.04f, 40.dp)
+            val titleFs = clampSp(17, viewportW.value * 0.04f, 22)
+            val subtitleFs = clampSp(12, viewportW.value * 0.032f, 14)
+            // 标题块到封面 / 到进度条的距离相等 —— 都用 titleGap
+            // 用户要求加高 1/2（×1.5）让封面 / 标题 / 进度条不再挤
+            // 标题 → 副标题之间（titleSubGap）保持 6dp 不动
+            val titleGap = clampDp(21.dp, viewportH * 0.033f, 30.dp)
+            val controlsMarginTop = clampDp(22.dp, viewportH * 0.034f, 32.dp)
+            val navMarginTop = controlsMarginTop
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = shellPad)
+                    .widthIn(max = 600.dp), // shell maxWidth
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                TimeText(state.positionMs)
-                TimeText((state.durationMs - state.positionMs).coerceAtLeast(0L), prefix = "-")
-            }
-            Spacer(modifier = Modifier.height(24.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceEvenly,
-            ) {
-                TransportButton(onClick = viewModel::previous) {
-                    Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous")
-                }
-                IconButton(
-                    onClick = viewModel::toggle,
+                Column(
                     modifier = Modifier
-                        .size(74.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFFE9EFFF)),
+                        .width(coverSize) // trackColumn width = COVER_SIZE
+                        .align(Alignment.CenterHorizontally),
                 ) {
-                    Icon(
-                        imageVector = if (state.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                        contentDescription = if (state.isPlaying) "Pause" else "Play",
-                        tint = Color(0xFF080B10),
-                        modifier = Modifier.size(38.dp),
+                    CompactCover(
+                        coverUrl = state.artworkUrl,
+                        isPlaying = state.isPlaying,
+                        hidden = immersiveActive,
+                    )
+
+                    Spacer(modifier = Modifier.height(titleGap))
+                    if (state.title.isNotBlank()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .alpha(hideAlpha),
+                        ) {
+                            Text(
+                                text = state.title,
+                                color = Color(0xFFF5F7FF),
+                                style = TextStyle(
+                                    fontSize = titleFs,
+                                    fontWeight = FontWeight.SemiBold,
+                                    letterSpacing = (-0.4).sp,
+                                    lineHeight = (titleFs.value * 1.25f).sp,
+                                ),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = buildString {
+                                    append(state.artist)
+                                    if (state.album.isNotBlank()) append(" · ${state.album}")
+                                },
+                                color = Color(0x8CE9EFFF),
+                                style = TextStyle(
+                                    fontSize = subtitleFs,
+                                    fontWeight = FontWeight.Medium,
+                                ),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    Spacer(modifier = Modifier.height(titleGap))
+                    PipoProgressBar(
+                        progress = progress,
+                        onSeek = viewModel::seekTo,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        MonoTime(state.positionMs, color = Color(0xB8E9EFFF))
+                        MonoTime(
+                            (state.durationMs - state.positionMs).coerceAtLeast(0L),
+                            color = Color(0x6BE9EFFF),
+                            prefix = "-",
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(controlsMarginTop))
+                    TriCol(
+                        a = {
+                            FlatBtn(
+                                onClick = viewModel::previous,
+                                enabled = state.queue.isNotEmpty(),
+                                size = clampDp(50.dp, viewportW * 0.115f, 64.dp),
+                            ) {
+                                SkipBackGlyph(modifier = Modifier.size(clampDp(32.dp, viewportW * 0.085f, 44.dp)))
+                            }
+                        },
+                        b = {
+                            FlatBtn(
+                                onClick = viewModel::toggle,
+                                enabled = state.queue.isNotEmpty(),
+                                size = clampDp(64.dp, viewportW * 0.155f, 80.dp),
+                            ) {
+                                if (state.isPlaying) PauseGlyph(modifier = Modifier.size(clampDp(44.dp, viewportW * 0.12f, 60.dp)))
+                                else PlayGlyph(modifier = Modifier.size(clampDp(44.dp, viewportW * 0.12f, 60.dp)))
+                            }
+                        },
+                        c = {
+                            FlatBtn(
+                                onClick = viewModel::next,
+                                enabled = state.queue.isNotEmpty(),
+                                size = clampDp(50.dp, viewportW * 0.115f, 64.dp),
+                            ) {
+                                SkipForwardGlyph(modifier = Modifier.size(clampDp(32.dp, viewportW * 0.085f, 44.dp)))
+                            }
+                        },
+                    )
+
+                    Spacer(modifier = Modifier.height(navMarginTop))
+                    TriCol(
+                        modifier = Modifier.alpha(hideAlpha),
+                        a = {
+                            NavIconBtn(onClick = onOpenLyrics, enabled = state.lyrics.isNotEmpty()) {
+                                LyricsIcon(modifier = Modifier.size(24.dp))
+                            }
+                        },
+                        b = {
+                            NavIconBtn(onClick = onOpenDistill) { ListIcon(modifier = Modifier.size(24.dp)) }
+                        },
+                        c = {
+                            NavIconBtn(onClick = onOpenSettings) { GearIcon(modifier = Modifier.size(24.dp)) }
+                        },
                     )
                 }
-                TransportButton(onClick = viewModel::next) {
-                    Icon(Icons.Rounded.SkipNext, contentDescription = "Next")
-                }
             }
-            Spacer(modifier = Modifier.height(26.dp))
-            LyricStrip(
-                line = state.lyrics.getOrNull(state.activeLyricIndex)?.text
-                    ?: "Let the next track find the room",
-                nextLine = state.lyrics.getOrNull(state.activeLyricIndex + 1)?.text
-                    ?: "while Pipo keeps the fade breathing",
-                onClick = { immersiveLyrics = true },
-            )
-            QueueStrip(
-                queue = state.queue.map { it.title },
-                currentIndex = state.currentIndex,
-            )
-            Spacer(modifier = Modifier.weight(0.62f))
-        }
-        ImmersiveLyricsOverlay(
-            visible = immersiveLyrics,
-            title = state.title,
-            artist = state.artist,
-            artworkUrl = state.artworkUrl,
-            isPlaying = state.isPlaying,
-            lyrics = state.lyrics,
-            activeLyricIndex = state.activeLyricIndex,
-            positionMs = state.positionMs,
-            onClose = { immersiveLyrics = false },
-        )
-    }
-}
-
-@Composable
-private fun QueueStrip(
-    queue: List<String>,
-    currentIndex: Int,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 14.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        queue.take(3).forEachIndexed { index, title ->
-            val active = index == currentIndex
-            Text(
-                text = title,
-                color = if (active) PipoColors.Background else PipoColors.TextDim,
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(CircleShape)
-                    .background(if (active) PipoColors.Text else Color(0x10FFFFFF))
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                textAlign = TextAlign.Center,
-            )
         }
     }
 }
 
 @Composable
-private fun TransportButton(onClick: () -> Unit, icon: @Composable () -> Unit) {
-    IconButton(
-        onClick = onClick,
-        modifier = Modifier
-            .size(58.dp)
-            .clip(CircleShape)
-            .background(Color(0x14FFFFFF)),
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            icon()
-        }
-    }
-}
-
-@Composable
-private fun NativeCover(
-    artworkUrl: String?,
-    isPlaying: Boolean,
-) {
-    val pulse by rememberInfiniteTransition(label = "coverPulse").animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = if (isPlaying) 4200 else 7000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "coverPulseValue",
+private fun CompactCover(coverUrl: String?, isPlaying: Boolean, hidden: Boolean) {
+    val hideAlpha by animateFloatAsState(
+        targetValue = if (hidden) 0f else 1f,
+        animationSpec = tween(200),
+        label = "coverHide",
     )
-
+    val playScale by animateFloatAsState(
+        targetValue = if (isPlaying) 1.012f else 1f,
+        animationSpec = tween(4000),
+        label = "playScale",
+    )
     Box(
         modifier = Modifier
-            .fillMaxWidth(0.86f)
+            .fillMaxWidth()
             .aspectRatio(1f)
-            .clip(RoundedCornerShape(28.dp))
+            .reportCoverRect()
+            // React boxShadow: 0 24px 64px rgba(0,0,0,0.5)
+            // Compose shadow elevation 不能直接给 offset/blur，elevation=24dp 是
+            // 视觉上最接近的近似（自带 alpha 0.5 的黑色 spotShadow）。
+            .shadow(
+                elevation = 24.dp,
+                shape = RoundedCornerShape(PipoDimens.CompactCornerDp),
+                clip = false,
+                ambientColor = Color.Black.copy(alpha = 0.5f),
+                spotColor = Color.Black.copy(alpha = 0.5f),
+            )
+            // 0 0 0 1px rgba(255,255,255,0.04) ring
+            .border(
+                width = 1.dp,
+                color = Color(0x0AFFFFFF),
+                shape = RoundedCornerShape(PipoDimens.CompactCornerDp),
+            )
+            .clip(RoundedCornerShape(PipoDimens.CompactCornerDp))
             .background(
                 Brush.linearGradient(
                     colors = listOf(
-                        Color(0xFF8EF0C3),
-                        Color(0xFF7FA7FF),
-                        Color(0xFFF1C46C),
+                        Color(0x1A9BE3C6),
+                        Color(0x059BE3C6),
                     ),
-                    start = Offset(200f * sin(pulse * PI.toFloat()), 0f),
-                    end = Offset(800f, 900f * cos(pulse * PI.toFloat())),
                 ),
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        if (artworkUrl != null) {
-            AsyncImage(
-                model = artworkUrl,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
             )
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0x33000000)),
-        )
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            drawNativeCoverMarks(pulse)
-        }
-        Text(
-            text = "Pipo",
-            color = Color(0xE60A0D12),
-            style = MaterialTheme.typography.displaySmall,
-            fontWeight = FontWeight.Bold,
-        )
-    }
-}
-
-@Composable
-private fun LyricStrip(
-    line: String,
-    nextLine: String,
-    onClick: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(22.dp))
-            .clickable(onClick = onClick)
-            .background(Color(0x12FFFFFF))
-            .padding(horizontal = 18.dp, vertical = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
+            .alpha(hideAlpha),
     ) {
-        Text(
-            text = line,
-            color = PipoColors.Text,
-            style = MaterialTheme.typography.titleMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            text = nextLine,
-            color = PipoColors.TextDim,
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-}
-
-@Composable
-private fun ImmersiveLyricsOverlay(
-    visible: Boolean,
-    title: String,
-    artist: String,
-    artworkUrl: String?,
-    isPlaying: Boolean,
-    lyrics: List<PipoLyricLine>,
-    activeLyricIndex: Int,
-    positionMs: Long,
-    onClose: () -> Unit,
-) {
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn(animationSpec = tween(180)),
-        exit = fadeOut(animationSpec = tween(160)),
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(PipoColors.Background)
-                .clickable(onClick = onClose),
-        ) {
-            AmbientNativeField(isPlaying = isPlaying)
-            Column(
+        if (coverUrl != null) {
+            CrossfadeCoverImage(
+                url = coverUrl,
                 modifier = Modifier
                     .fillMaxSize()
-                    .statusBarsPadding()
-                    .navigationBarsPadding()
-                    .padding(horizontal = 24.dp, vertical = 26.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                NativeCover(
-                    artworkUrl = artworkUrl,
-                    isPlaying = isPlaying,
-                )
-                Spacer(modifier = Modifier.height(28.dp))
-                Text(
-                    text = title,
-                    color = PipoColors.Text,
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = artist,
-                    color = PipoColors.TextMuted,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(modifier = Modifier.height(38.dp))
-                val safeLyrics = lyrics.ifEmpty { fallbackLyrics() }
-                safeLyrics.forEachIndexed { index, line ->
-                    ImmersiveLyricLine(
-                        line = line,
-                        active = index == activeLyricIndex,
-                        positionMs = positionMs,
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ImmersiveLyricLine(
-    line: PipoLyricLine,
-    active: Boolean = false,
-    positionMs: Long,
-) {
-    if (active && line.chars.isNotEmpty()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 10.dp),
-        ) {
-            line.chars.forEach { char ->
-                val done = positionMs >= char.startMs + char.durationMs
-                val current = positionMs in char.startMs..(char.startMs + char.durationMs)
-                Text(
-                    text = char.text,
-                    color = when {
-                        done -> PipoColors.Text
-                        current -> PipoColors.Mint
-                        else -> PipoColors.Text.copy(alpha = 0.34f)
+                    .graphicsLayer {
+                        scaleX = playScale
+                        scaleY = playScale
                     },
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-        }
-    } else {
-        Text(
-            text = line.text,
-            color = if (active) PipoColors.Text else PipoColors.Text.copy(alpha = 0.34f),
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 10.dp),
-            textAlign = TextAlign.Start,
-        )
-    }
-}
-
-private fun fallbackLyrics(): List<PipoLyricLine> {
-    return listOf(
-        PipoLyricLine(0, 2800, "Let the next track find the room"),
-        PipoLyricLine(2800, 2600, "and leave the noise outside"),
-        PipoLyricLine(5400, 3200, "one sample into another"),
-        PipoLyricLine(8600, 3000, "no gap, no rush, just motion"),
-    )
-}
-
-private fun DrawScope.drawNativeCoverMarks(pulse: Float) {
-    val lineColor = Color(0x66090B10)
-    val w = size.width
-    val h = size.height
-    for (i in 0 until 9) {
-        val y = h * (0.2f + i * 0.075f)
-        val wave = sin((pulse * 2f * PI + i * 0.55f).toFloat()) * w * 0.045f
-        drawRoundRect(
-            color = lineColor,
-            topLeft = Offset(w * 0.18f + wave, y),
-            size = Size(w * (0.64f - i * 0.018f), 5.dp.toPx()),
-            cornerRadius = CornerRadius(10.dp.toPx()),
-        )
-    }
-}
-
-@Composable
-private fun AmbientNativeField(isPlaying: Boolean) {
-    val drift by rememberInfiniteTransition(label = "field").animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = if (isPlaying) 9000 else 15000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "fieldValue",
-    )
-
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val colors = listOf(Color(0x228EF0C3), Color(0x227FA7FF), Color(0x18F1C46C))
-        colors.forEachIndexed { idx, color ->
-            val a = drift * 2f * PI.toFloat() + idx * 2.1f
-            drawCircle(
-                color = color,
-                radius = size.minDimension * (0.34f + idx * 0.08f),
-                center = Offset(
-                    x = size.width * (0.5f + cos(a) * 0.28f),
-                    y = size.height * (0.42f + sin(a * 0.8f) * 0.24f),
-                ),
+                contentScale = ContentScale.Crop,
+                durationMs = 720, // COVER_TRANSITION_MS
             )
         }
     }
 }
 
+/**
+ * 自绘进度条 —— 4dp 实心圆角条，无 thumb，按下任意位置跳到对应进度。
+ *   - 轨道：rgba(233,239,255,0.12)
+ *   - 填充：rgba(245,247,255,0.92)
+ *   - 跟 React `progressFill { transition: width 120ms linear }` 同款
+ */
 @Composable
-private fun TimeText(ms: Long, prefix: String = "") {
+private fun PipoProgressBar(progress: Float, onSeek: (Float) -> Unit) {
+    val animated by animateFloatAsState(
+        targetValue = progress.coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 120),
+        label = "progress",
+    )
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(4.dp)
+            .clip(RoundedCornerShape(50))
+            .background(Color(0x1FE9EFFF))
+            .pointerInput(Unit) {
+                detectTapGestures { offset ->
+                    onSeek((offset.x / size.width.toFloat()).coerceIn(0f, 1f))
+                }
+            },
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(fraction = animated)
+                .height(4.dp)
+                .clip(RoundedCornerShape(50))
+                .background(Color(0xEBF5F7FF)),
+        )
+    }
+}
+
+@Composable
+private fun MonoTime(ms: Long, color: Color, prefix: String = "") {
+    val total = (ms / 1000).coerceAtLeast(0)
+    val m = total / 60
+    val s = total % 60
     Text(
-        text = prefix + formatTime(ms),
-        color = Color(0x99E9EFFF),
-        style = MaterialTheme.typography.labelMedium,
+        text = "$prefix${m}:${s.toString().padStart(2, '0')}",
+        color = color,
+        style = TextStyle(
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+        ),
     )
 }
 
-private fun formatTime(ms: Long): String {
-    val total = (ms / 1000).coerceAtLeast(0)
-    val minutes = total / 60
-    val seconds = total % 60
-    return "%d:%02d".format(minutes, seconds)
+@Composable
+private fun TriCol(
+    modifier: Modifier = Modifier,
+    a: @Composable () -> Unit,
+    b: @Composable () -> Unit,
+    c: @Composable () -> Unit,
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { a() }
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { b() }
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { c() }
+    }
+}
+
+@Composable
+private fun FlatBtn(
+    onClick: () -> Unit,
+    enabled: Boolean,
+    size: Dp = PipoDimens.SkipButtonSize,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(RoundedCornerShape(50))
+            .clickable(
+                enabled = enabled,
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+            )
+            .alpha(if (enabled) 1f else 0.32f),
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun NavIconBtn(
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .clip(RoundedCornerShape(50))
+            .clickable(
+                enabled = enabled,
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+            )
+            .alpha(if (enabled) 0.82f else 0.32f),
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
+    }
+}
+
+// ---------- clamp 工具 ----------
+
+/** CSS clamp(min, prefer, max) 在 dp 上的等价 */
+private fun clampDp(min: Dp, prefer: Dp, max: Dp): Dp {
+    return when {
+        prefer < min -> min
+        prefer > max -> max
+        else -> prefer
+    }
+}
+
+private fun clampSp(min: Int, preferDp: Float, max: Int): androidx.compose.ui.unit.TextUnit {
+    val v = preferDp.coerceIn(min.toFloat(), max.toFloat())
+    return v.sp
 }

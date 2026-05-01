@@ -2,7 +2,6 @@ package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import app.pipo.nativeapp.model.NativeTrack
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -242,6 +241,20 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             .put("temperature", temperature)
             .put("maxTokens", maxTokens)
         return parseJsonString(callRaw("ai_chat", args))
+    }
+
+    override suspend fun aiEmbed(inputs: List<String>): List<FloatArray> {
+        if (inputs.isEmpty()) return emptyList()
+        val args = JSONObject().put("inputs", JSONArray(inputs))
+        val arr = callArray("ai_embed", args)
+        val out = ArrayList<FloatArray>(arr.length())
+        for (i in 0 until arr.length()) {
+            val vec = arr.optJSONArray(i) ?: continue
+            val f = FloatArray(vec.length())
+            for (j in 0 until vec.length()) f[j] = vec.optDouble(j).toFloat()
+            out.add(f)
+        }
+        return out
     }
 
     private suspend fun callObject(command: String, args: JSONObject = JSONObject()): JSONObject {
