@@ -97,8 +97,10 @@ fun computeTone(rgb: IntArray?): Tone {
     return if (luma > 145f) Tone.Dark else Tone.Light
 }
 
+/** 已唱字符色：full opaque，灰底封面下也能拉开对比度。
+ *  之前 0xEB / 0xF5（α 0.92 / 0.96）在 luma ≈ 145 的灰封面上对比不够 → 高亮看不清 */
 fun pickFg(tone: Tone): Color =
-    if (tone == Tone.Dark) Color(0xEB000000) else Color(0xF5FFFFFF)
+    if (tone == Tone.Dark) Color(0xFF000000) else Color(0xFFFFFFFF)
 
 fun pickFgDim(tone: Tone): Color =
     if (tone == Tone.Dark) Color(0x8C000000) else Color(0x9EFFFFFF)

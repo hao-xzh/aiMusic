@@ -454,10 +454,20 @@ private fun AppleMusicLyricRow(
     //   inactive 所有字同色 → Compose 合并成 1 个 run → letter-spacing 在 N-1 个间隙
     //   都生效（紧凑）。Active 第一个字符颜色一变 → run 数增多 → run 间不应用 letter-spacing
     //   → 整行变宽几像素，看起来"右边抖一下"。letterSpacing = 0 让两态宽度一致。
+    // Tone-aware 投影：白字配黑投影 / 黑字配白投影 —— 灰色封面下给字形多一道边缘，
+    // 高亮色的对比度立起来。投影是 paint-time 效果，不影响 layout。
+    val isLight = fg == Color(0xFFFFFFFF)
+    val textShadow = androidx.compose.ui.graphics.Shadow(
+        color = if (isLight) Color.Black.copy(alpha = 0.35f)
+                else Color.White.copy(alpha = 0.45f),
+        offset = androidx.compose.ui.geometry.Offset(0f, 1f),
+        blurRadius = 6f,
+    )
     val style = TextStyle(
         fontSize = 28.sp,
         fontWeight = FontWeight.Black,
         lineHeight = 44.sp,
+        shadow = textShadow,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
             trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
