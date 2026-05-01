@@ -543,6 +543,11 @@ private fun DistillLibrary(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
+                                        // 整条 row 可点 —— 不再仅 icon 触发，符合"点哪首播哪首"的直觉
+                                        .clickable {
+                                            playerVm.playTrack(t, tracks)
+                                            onBack?.invoke()
+                                        }
                                         .padding(start = 24.dp, end = 16.dp, top = 9.dp, bottom = 9.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
@@ -562,14 +567,9 @@ private fun DistillLibrary(
                                             overflow = TextOverflow.Ellipsis,
                                         )
                                     }
+                                    // 右侧 play 图标只是视觉提示，整条 row 已经响应点击
                                     Box(
-                                        modifier = Modifier
-                                            .size(36.dp)
-                                            .clip(CircleShape)
-                                            .clickable {
-                                                playerVm.playTrack(t, tracks)
-                                                onBack?.invoke()
-                                            },
+                                        modifier = Modifier.size(36.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         PlayGlyph(
