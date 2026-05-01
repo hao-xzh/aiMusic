@@ -461,13 +461,6 @@ private fun AppleMusicLyricRow(
     var layout by remember(line.text) {
         androidx.compose.runtime.mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null)
     }
-    val sweepX = if (isActive && line.chars.isNotEmpty() && layout != null) {
-        computeSweepX(line.chars, positionMs, layout!!)
-    } else if (isPast) {
-        Float.POSITIVE_INFINITY  // 已唱完整行都显示 fg
-    } else {
-        0f                       // 未唱：上层一点都不露
-    }
 
     Box(
         modifier = Modifier
@@ -482,23 +475,15 @@ private fun AppleMusicLyricRow(
             style = style,
             onTextLayout = { layout = it },
         )
-        // 上层：sung 色，clip 到 sweepX
-        if (isActive && line.chars.isNotEmpty()) {
+        // 上层：sung 色，per-line clip 到当前进度
+        val cur = layout
+        if (isActive && line.chars.isNotEmpty() && cur != null) {
             Text(
                 text = line.text,
                 color = fg,
                 style = style,
                 modifier = Modifier.drawWithContent {
-                    val clipRight = sweepX.coerceAtLeast(0f).coerceAtMost(size.width)
-                    if (clipRight <= 0f) return@drawWithContent
-                    clipRect(
-                        left = 0f,
-                        top = 0f,
-                        right = clipRight,
-                        bottom = size.height,
-                    ) {
-                        this@drawWithContent.drawContent()
-                    }
+                    drawSungReveal(cur, line.chars, positionMs)
                 },
             )
         }
@@ -506,49 +491,71 @@ private fun AppleMusicLyricRow(
 }
 
 /**
- * 算"已唱"边界的 x 坐标。基于 line.chars 的 token 时间戳 + TextLayoutResult。
- *
- *   - 当前 positionMs 在某个 token 的窗口内：
- *       token 起始 x + (token 内进度 × token 宽度)
- *   - positionMs 已经超过所有 token：返回行宽（全部唱完）
- *   - positionMs 还没到第一个 token：返回 0
+ * 多行 per-line clip：已经唱完的行整行 reveal，正在唱的那行 reveal 到当前 sweep x，
+ * 还没唱到的行不 reveal。这样多行歌词不会一刀切把后续行也染上色。
  */
-private fun computeSweepX(
+private fun androidx.compose.ui.graphics.drawscope.ContentDrawScope.drawSungReveal(
+    layout: androidx.compose.ui.text.TextLayoutResult,
     chars: List<PipoLyricChar>,
     positionMs: Long,
-    layout: androidx.compose.ui.text.TextLayoutResult,
-): Float {
-    if (chars.isEmpty()) return 0f
-    val totalWidth = layout.size.width.toFloat()
-
-    // 找当前正在唱的 token（progress in [0, 1]），同时累计 char idx
-    var charIdx = 0
+) {
+    // 找当前 sweep 位置：(charIdx, partialT) — 当前应当画到第 charIdx 个字符的 partialT 处
+    var charIdxBeforeActive = 0
+    var activeToken: PipoLyricChar? = null
+    var activeProgress = 0f
     for (token in chars) {
         val p = token.progress(positionMs)
-        val tokenStart = charIdx
-        val tokenEnd = charIdx + token.text.length
         when {
-            p >= 1f -> {
-                // 这个 token 已唱完，继续找下一个
-                charIdx = tokenEnd
-                continue
-            }
+            p >= 1f -> charIdxBeforeActive += token.text.length
             p <= 0f -> {
-                // 还没轮到这个 token —— 返回它起点的 x
-                return if (tokenStart == 0) 0f
-                else layout.getBoundingBox(tokenStart - 1).right
+                activeToken = null
+                break
             }
             else -> {
-                // 正在唱这个 token：在 [tokenStart, tokenEnd] 之间按 p 插值
-                val startX = if (tokenStart == 0) 0f
-                else layout.getBoundingBox(tokenStart - 1).right
-                val endX = layout.getBoundingBox(tokenEnd - 1).right
-                return startX + (endX - startX) * p
+                activeToken = token
+                activeProgress = p
+                break
             }
         }
     }
-    // 所有 token 都唱完了
-    return totalWidth
+    val allDone = activeToken == null && charIdxBeforeActive == chars.sumOf { it.text.length }
+    if (charIdxBeforeActive == 0 && activeToken == null && !allDone) return  // 还没开始
+
+    // 算当前 sweep 在哪一行 + 行内 x 坐标
+    val (currentLine, sweepXOnLine) = if (allDone) {
+        // 整行唱完
+        val lastLine = (layout.lineCount - 1).coerceAtLeast(0)
+        lastLine to layout.getLineRight(lastLine)
+    } else if (activeToken != null) {
+        val tokenEnd = charIdxBeforeActive + activeToken.text.length
+        val tokenStartIdx = charIdxBeforeActive
+        // token 起点 x：要么是 line 起点（如果 token 是该行第一个字），要么是前一字的 right
+        val tokenLine = layout.getLineForOffset(tokenStartIdx)
+        val startX = if (tokenStartIdx == layout.getLineStart(tokenLine)) {
+            layout.getLineLeft(tokenLine)
+        } else {
+            layout.getBoundingBox(tokenStartIdx - 1).right
+        }
+        val endX = layout.getBoundingBox(tokenEnd - 1).right
+        tokenLine to (startX + (endX - startX) * activeProgress)
+    } else {
+        // activeToken null 但有些 char 已唱完
+        val lastSungIdx = charIdxBeforeActive - 1
+        val l = layout.getLineForOffset(lastSungIdx)
+        l to layout.getBoundingBox(lastSungIdx).right
+    }
+
+    // per-line clip：lines [0, currentLine-1] 整行 reveal，currentLine 截到 sweepXOnLine
+    for (lineIdx in 0..currentLine) {
+        val left = layout.getLineLeft(lineIdx)
+        val top = layout.getLineTop(lineIdx)
+        val bottom = layout.getLineBottom(lineIdx)
+        val right = if (lineIdx == currentLine) sweepXOnLine else layout.getLineRight(lineIdx)
+        if (right <= left) continue
+        clipRect(left = left, top = top, right = right, bottom = bottom) {
+            this@drawSungReveal.drawContent()
+        }
+    }
 }
 
 
