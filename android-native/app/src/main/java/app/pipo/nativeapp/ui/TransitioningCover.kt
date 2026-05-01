@@ -83,18 +83,21 @@ fun TransitioningCover(
             .drawWithContent {
                 drawContent()
                 if (maskStrength > 0.001f) {
-                    // 底部从 55% 开始就慢慢溶进背景（之前 68% 才开始，过渡只剩 32%
-                    // 视觉上像"硬边 + 一小段模糊带"）；现在 45% 的渐隐带 + 顶部
-                    // 也加一点入溶，整张图融化得更自然。
+                    // 底部从 45% 开始溶解（更早起步），最末端**彻底归 0**——
+                    // 之前残留的 2% alpha 在亮色封面 + 浅色背景下肉眼可见，
+                    // 形成一条"几乎看不见但确实在"的轮廓。Color.Transparent 收尾才彻底没缝。
                     drawRect(
                         brush = Brush.verticalGradient(
                             colorStops = arrayOf(
                                 0f to Color.Black.copy(alpha = 1f - 0.45f * maskStrength),
                                 0.06f to Color.Black,
-                                0.55f to Color.Black,
-                                0.72f to Color.Black.copy(alpha = 1f - 0.45f * maskStrength),
-                                0.86f to Color.Black.copy(alpha = 1f - 0.80f * maskStrength),
-                                1f to Color.Black.copy(alpha = 1f - 0.98f * maskStrength),
+                                0.45f to Color.Black,
+                                0.65f to Color.Black.copy(alpha = 1f - 0.50f * maskStrength),
+                                0.82f to Color.Black.copy(alpha = 1f - 0.85f * maskStrength),
+                                0.95f to Color.Black.copy(
+                                    alpha = (1f - maskStrength).coerceAtLeast(0f),
+                                ),
+                                1f to Color.Transparent,
                             ),
                         ),
                         blendMode = BlendMode.DstIn,
