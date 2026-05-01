@@ -430,11 +430,15 @@ private fun AppleMusicLyricRow(
         animationSpec = tween(380),
         label = "lyricAlpha",
     )
-    // Apple Music：28sp Black，letter-spacing -0.5sp，line-height ~1.2
+    // Apple Music：28sp Black，letter-spacing -0.5sp。
+    // lineHeight 提到 44sp（之前 34sp）—— 为 baselineShift bounce 留出 vertical slack：
+    // 28sp 字 × 16% lift = 4.48sp，要在 lineHeight 减 fontSize 的 leading（44-28=16sp）
+    // 范围内才不会让 paragraph ascent 跨帧变化。否则当前词上抬时整行 ascent 增高 →
+    // 相邻词看起来也"跟着浮动"。这是 SpanStyle.baselineShift 的经典坑。
     val style = TextStyle(
         fontSize = 28.sp,
         fontWeight = FontWeight.Black,
-        lineHeight = 34.sp,
+        lineHeight = 44.sp,
         letterSpacing = (-0.5).sp,
     )
 
@@ -515,9 +519,13 @@ private fun AppleMusicActiveLyricRow(
                     // token 正在唱：
                     //   1) 颜色 —— 多字母按 L→R 分配子进度，逐字母 lerp；单字直接 lerp
                     //   2) 跳动 —— 整个 token 加 baselineShift 抬一下，跟着 bounceCurve
-                    //      （p≈0.18 时达峰）。SpanStyle.baselineShift 不影响 paragraph
-                    //      宽度，每个字母仍在原地，只是整词向上"颠"一下，符合"那个词在跳"的视觉。
-                    val lift = bounceCurve(p) * 0.16f  // 最高抬到 16% font size，实测明显但不撞线
+                    //      （p≈0.18 时达峰）。
+                    //
+                    // ⚠ 关键：lift × fontSize 必须 < (lineHeight - fontSize) / 2 = 8sp，
+                    //   否则 paragraph 在"当前词上抬"时 ascent 增高 → 整行高度变 → 相邻
+                    //   词被推动，视觉上像"所有词都在跳"。lift = 0.10 → max = 2.8sp << 8sp，
+                    //   配合 lineHeight=44sp 完全够 buffer，整行高度跨帧不变。
+                    val lift = bounceCurve(p) * 0.10f
                     addStyle(
                         androidx.compose.ui.text.SpanStyle(
                             baselineShift = androidx.compose.ui.text.style.BaselineShift(lift),
