@@ -561,16 +561,12 @@ function ImmersiveLyrics({
         background: "transparent",
       }}
     >
-      {/* 背景三层叠合（从下到上）：
-            1. layout.bgGradient —— 采样自封面顶/底/右沿的纯色渐变，提供主色调
-            2. 重度模糊封面（blur 140 + saturate 1.6）—— 给画面带来色彩起伏
-               高对比封面（深主体 + 浅背景）下，80px 远不够 —— 主体仍以暗块
-               形式可见。提高到 140 + 拉饱和 + brightness 1.04 后，主体轮廓
-               彻底化为色块，不再可辨认
-            3. 再叠一层 0.42 的 bgGradient —— 把模糊封面里残留的明暗 pattern
-               进一步柔化，整体趋向于纯色氛围，但保留一点色彩呼吸感
-          叠合后的 bg 在前景封面 mask 渐隐区显出的颜色仍跟前景封面色调一致
-          （都是同源），不会出现"卡进背景"的方块感。 */}
+      {/* 背景：Apple Music 风的"色彩云"。
+            做法：取封面顶/底/右沿的采样色，在屏幕三个不同位置画 radial gradient
+            互相叠加。结果是封面色调温柔铺满整屏，没有可见的图样残留。
+            *关键差异*：不再用 blur 过的封面图当背景层 —— 之前 blur(140px) 即使再
+            重也带 pattern 残留，跟前景 sharp 封面拼一起总有"两张图叠"的视觉断层。
+            纯色 radial 叠合 + 前景封面边缘 fade 到透明，浑然一体（跟 Android 端一致）。 */}
       <div
         ref={backdropRef}
         aria-hidden
@@ -579,36 +575,24 @@ function ImmersiveLyrics({
           inset: 0,
           opacity: 0,
           overflow: "hidden",
-          background: layout.bgGradient,
+          // 三个 radial 叠加：top-left 主色 + top-right 主色 + bottom-center 接缝色。
+          // CSS 多层 background 从上往下渲染，最后一项是底层。无 blur，无 pattern。
+          background: [
+            `radial-gradient(120% 110% at 20% 18%, rgba(${topRgb},0.95), rgba(${topRgb},0) 65%)`,
+            `radial-gradient(110% 100% at 85% 30%, rgba(${rightRgb},0.85), rgba(${rightRgb},0) 60%)`,
+            `radial-gradient(140% 130% at 50% 95%, rgba(${seamRgb},0.95), rgba(${seamRgb},0) 70%)`,
+            `rgb(8, 10, 18)`,  // 兜底纯色，避免 radial 之间有未染色死角
+          ].join(", "),
         }}
       >
-        {coverUrl && (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={coverUrl}
-            alt=""
-            style={{
-              position: "absolute",
-              top: "-25%",
-              left: "-25%",
-              width: "150%",
-              height: "150%",
-              objectFit: "cover",
-              filter: "blur(140px) saturate(1.6) brightness(1.04)",
-              opacity: 0.72,
-              transform: "translateZ(0)",
-              willChange: "transform",
-            }}
-          />
-        )}
-        {/* 顶层柔化：重新涂一遍采样色 gradient，把模糊封面的残留 pattern 压平 */}
+        {/* 顶层柔化：再涂一遍采样色 gradient，把 radial 之间的色彩断层进一步柔化 */}
         <div
           aria-hidden
           style={{
             position: "absolute",
             inset: 0,
             background: layout.bgGradient,
-            opacity: 0.42,
+            opacity: 0.18,
             pointerEvents: "none",
           }}
         />
@@ -827,7 +811,18 @@ function computeLayout(
         width: W,
         height: `calc(100vh - (${lyricTop}) - clamp(8px, 2vh, 24px))`,
       },
-      coverMask: "linear-gradient(to bottom, #000 55%, transparent 100%)",
+      // 多 stop 平滑底部溶解（跟 Android TransitioningCover 同曲线）：
+      //   0..45% 全亮 → 65% α0.5 → 82% α0.15 → 95% ~0 → 100% 彻底透明
+      // 之前 #000 55%, transparent 100% 是单段线性，过渡比较"硬"；
+      // 多 stop 配上长 fade band 让底部完全融进色彩云背景，没有可见接缝
+      coverMask:
+        "linear-gradient(to bottom, " +
+        "rgba(0,0,0,1) 0%, " +
+        "rgba(0,0,0,1) 45%, " +
+        "rgba(0,0,0,0.5) 65%, " +
+        "rgba(0,0,0,0.15) 82%, " +
+        "rgba(0,0,0,0.02) 95%, " +
+        "transparent 100%)",
       coverMaskComposite: "add",
       bgGradient:
         `linear-gradient(180deg, ` +
