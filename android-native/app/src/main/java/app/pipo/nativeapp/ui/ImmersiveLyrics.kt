@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.ui
 
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -53,8 +55,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.progress
-import kotlin.math.PI
-import kotlin.math.sin
 
 /**
  * 沉浸式歌词层 —— 镜像 src/components/PlayerCard.tsx ImmersiveLyrics 的非封面部分。
@@ -274,23 +274,56 @@ private fun AppleMusicLyricColumn(
     // translationY 不生效，活动行进到第 8 行后就出可视区。LazyColumn 只渲染可视窗口，
     // 没有这个问题。
     //
-    // contentPadding.top = 容器高度 30%：让活动行在 animateScrollToItem 后落在 30% 偏上位置。
-    // contentPadding.bottom = 70%：让最后几行也能滚到 30% 位置（否则会被 LazyColumn 限位）。
+    // contentPadding.top = 容器高度 18%：活动行落在偏上一点的位置（更接近 Apple Music
+    // 那种"焦点行靠上 1/4"的视觉重心），上方 fade 区给得更狠。
     val density = LocalDensity.current
     val rowHeightDp = 60.dp
     var containerHeightPx by remember { mutableStateOf(0) }
 
     val listState = rememberLazyListState()
 
-    // 活动行变化 → 平滑滚动到它，让它停在 30% 位置
-    LaunchedEffect(activeLyricIndex) {
-        if (activeLyricIndex in lines.indices) {
-            listState.animateScrollToItem(activeLyricIndex)
+    // ---- 关键升级：预滚动 ----
+    // 用 + lookaheadMs 计算"应当被滚到焦点的行"——比当前在唱的那行 / 待唱的那行
+    // 更早一拍切换，下一句**在唱响之前**已经平滑滚到焦点位置。
+    // 这接近 Apple Music："new line slides in 0.5–0.7s before its first word"。
+    val scrollLookaheadMs = 600L
+    val scrollTargetIdx = remember(positionMs, lines) {
+        if (lines.isEmpty()) 0
+        else lines.indexOfLast { line -> positionMs + scrollLookaheadMs >= line.startMs }
+            .coerceAtLeast(0)
+    }
+
+    // ---- Apple Music 风滚动：~720ms FastOutSlowIn，CSS ease 同曲线 ----
+    // animateScrollToItem 默认是 spring，对长歌词来说太弹；这里手写 tween 让滚动更线性 + 后段缓收。
+    LaunchedEffect(scrollTargetIdx, containerHeightPx) {
+        if (scrollTargetIdx !in lines.indices || containerHeightPx == 0) return@LaunchedEffect
+        // 焦点位置：容器顶 18%
+        val focusOffsetPx = (containerHeightPx * 0.18f).toInt()
+        val info = listState.layoutInfo
+        val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == scrollTargetIdx }
+        if (visibleHit == null) {
+            // 不在可视区：先 snap 到大致位置，避免跨太大段做长动画
+            listState.scrollToItem(scrollTargetIdx, scrollOffset = -focusOffsetPx)
+            return@LaunchedEffect
+        }
+        val delta = (visibleHit.offset - focusOffsetPx).toFloat()
+        if (kotlin.math.abs(delta) <= 1f) return@LaunchedEffect
+        // tween 720ms FastOutSlowIn 跑增量积分：每帧给 LazyListState 一个 scrollBy(d-prev)
+        var prev = 0f
+        animate(
+            initialValue = 0f,
+            targetValue = delta,
+            animationSpec = tween(durationMillis = 720, easing = FastOutSlowInEasing),
+        ) { value, _ ->
+            val step = value - prev
+            prev = value
+            // suspend 不能直接调，但 listState.dispatchRawDelta 是同步的
+            listState.dispatchRawDelta(step)
         }
     }
 
-    val topPadDp = with(density) { (containerHeightPx * 0.30f).toDp() }
-    val bottomPadDp = with(density) { (containerHeightPx * 0.70f).toDp() }
+    val topPadDp = with(density) { (containerHeightPx * 0.18f).toDp() }
+    val bottomPadDp = with(density) { (containerHeightPx * 0.82f).toDp() }
 
     Box(
         modifier = modifier
@@ -298,12 +331,15 @@ private fun AppleMusicLyricColumn(
             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
             .drawWithContent {
                 drawContent()
+                // 顶部 fade 段加宽到 22%，且更早进入接近全透明 —— 老句子悄悄退场，
+                // 不再"还能看清楚一行"那种半透明，给焦点行留更多视觉重量
                 drawRect(
                     brush = Brush.verticalGradient(
                         colorStops = arrayOf(
                             0f to Color.Transparent,
-                            0.04f to Color.Black.copy(alpha = 0.5f),
-                            0.10f to Color.Black,
+                            0.10f to Color.Black.copy(alpha = 0.10f),
+                            0.18f to Color.Black.copy(alpha = 0.55f),
+                            0.26f to Color.Black,
                             0.80f to Color.Black,
                             0.94f to Color.Black.copy(alpha = 0.4f),
                             1f to Color.Transparent,
@@ -419,25 +455,54 @@ private fun AppleMusicActiveLyricRow(
     ) {
         line.chars.forEach { char ->
             val p = char.progress(positionMs)
-            val lift = if (p > 0f && p < 1f) sin(p * PI.toFloat()).coerceAtLeast(0f) else 0f
-            val glow = smoothStep(p)
+            // 词内左→右颜色 sweep —— 镜像 Mac 的
+            //   linear-gradient(90deg, fg 0%, fg progress%, fgUnsung progress+1%, fgUnsung 100%)
+            //   + background-clip: text
+            // Compose 等效：TextStyle(brush = Brush.horizontalGradient(...))。
+            // progress 在 word duration 内线性 0→1，所以 sweep 速度跟唱歌速度对齐。
+            val sweepBrush = remember(p, fg, fgUnsung) {
+                if (p >= 1f) Brush.horizontalGradient(0f to fg, 1f to fg)
+                else if (p <= 0f) Brush.horizontalGradient(0f to fgUnsung, 1f to fgUnsung)
+                else Brush.horizontalGradient(
+                    colorStops = arrayOf(
+                        0f to fg,
+                        p to fg,
+                        (p + 0.01f).coerceAtMost(1f) to fgUnsung,
+                        1f to fgUnsung,
+                    ),
+                )
+            }
+            // 跳动曲线（lift）保留：在词刚开始（p≈0.18）时一记轻微抬起，模拟"重音"
+            val lift = bounceCurve(p)
+            // 整个词的 alpha：唱过的字段 alpha 跟着推进；用 sweep 已经显示完整对比，
+            // alpha 只做轻微强调（0.85 → 1.0）
+            val alpha = 0.85f + p.coerceIn(0f, 1f) * 0.15f
             Text(
                 text = char.text,
-                color = lerp(fgUnsung, fg, glow),
-                style = style,
+                style = style.copy(brush = sweepBrush),
                 modifier = Modifier.graphicsLayer {
-                    alpha = 0.72f + glow * 0.28f
-                    scaleX = 1f + lift * 0.035f
-                    scaleY = 1f + lift * 0.035f
-                    translationY = -lift * 5f
+                    this.alpha = alpha
+                    scaleX = 1f + lift * 0.045f
+                    scaleY = 1f + lift * 0.045f
+                    translationY = -lift * 6f
                 },
             )
         }
     }
 }
 
-private fun smoothStep(value: Float): Float {
-    val t = value.coerceIn(0f, 1f)
-    return t * t * (3f - 2f * t)
+/**
+ * 单词跳动曲线 —— 在词刚开始（p≈0.18）时达峰，迅速回落，跟"嘴一张就一记重音"对齐。
+ *
+ * 用 t * (1-t)^2 经放缩，使峰值时机前移；峰值 t≈0.18，幅度归一到 1.0。
+ */
+private fun bounceCurve(p: Float): Float {
+    val t = p.coerceIn(0f, 1f)
+    if (t <= 0f || t >= 1f) return 0f
+    val raw = t * (1f - t) * (1f - t)  // 峰在 t = 1/3
+    // 让峰再前移：用 sqrt 缩短前半段
+    val skewed = kotlin.math.sqrt(t.toDouble()).toFloat() * (1f - t) * (1f - t) * 1.6f
+    // 选幅度更大的一支
+    return kotlin.math.max(raw * 6.75f, skewed).coerceIn(0f, 1f)
 }
 

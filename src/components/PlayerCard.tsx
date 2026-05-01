@@ -1171,6 +1171,7 @@ function LyricStrip({
   return (
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
+      scrollIdx={view.scrollIdx}
       outerStyle={{
         ...lyricBox,
         // mask 必须挂在 outer（视口） —— 挂在 inner（滚动列）会跟着 translate
@@ -1237,22 +1238,25 @@ function LyricColumn({
   return (
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
+      scrollIdx={view.scrollIdx}
+      // 焦点行落在容器顶 22%（Apple Music 风的"焦点偏上"），不再 50% 居中
+      focusFraction={0.22}
       outerStyle={{
         ...immersiveLyricFrame,
-        // mask 挂在 outer：歌词列怎么滚动，渐隐区都钉在视口顶 / 底，
-        // 边界附近的歌词永远是淡出状态，不再有"看到容器硬切"的感觉。
-        // 渐隐区放大到 18% 和 82%（约 1-2 行），跟 Apple Music 一致。
+        // 顶部 fade 加狠：0..26% 渐进透明 → 全亮，老句子退场时几乎看不见。
+        // 底部保留 18% 渐隐（不像顶部那么狠，因为下面是"还没唱到"的预览，需要可读）。
         WebkitMaskImage:
-          "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
+          "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.10) 10%, rgba(0,0,0,0.55) 18%, #000 26%, #000 82%, transparent 100%)",
         maskImage:
-          "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)",
+          "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.10) 10%, rgba(0,0,0,0.55) 18%, #000 26%, #000 82%, transparent 100%)",
       }}
       innerExtraStyle={{
         // 横向 padding 跟移动端 titlePadX 同步加大 1/3：28-48；
         // 桌面 6.7vw 的上限也是 48，比原 36 多一档透气
         padding: "clamp(20px, 4vh, 36px) clamp(28px, 6.7vw, 48px)",
       }}
-      transitionMs={560}
+      // 720ms FastOutSlowIn ≈ cubic-bezier(0.4, 0, 0.2, 1)，更接近 Apple Music
+      transitionMs={720}
     >
       {view.rows}
     </MeasuredLyricColumn>
@@ -1267,12 +1271,17 @@ function LyricColumn({
 
 function MeasuredLyricColumn({
   activeIdx,
+  scrollIdx,
+  /** 焦点行落在容器纵向多少位置（0..1）。compact = 0.5（居中），immersive = 0.22（偏上） */
+  focusFraction = 0.5,
   outerStyle,
   innerExtraStyle,
   transitionMs,
   children,
 }: {
   activeIdx: number;
+  scrollIdx?: number;
+  focusFraction?: number;
   outerStyle: React.CSSProperties;
   innerExtraStyle: React.CSSProperties;
   transitionMs: number;
@@ -1286,13 +1295,16 @@ function MeasuredLyricColumn({
     const outer = outerRef.current;
     const inner = innerRef.current;
     if (!outer || !inner) return;
-    const active = inner.querySelector<HTMLElement>('[data-active="1"]');
-    if (!active) return;
+    // 优先用 scroll-target（含 lookahead）；找不到时回退 active
+    const target =
+      inner.querySelector<HTMLElement>('[data-scroll-target="1"]') ??
+      inner.querySelector<HTMLElement>('[data-active="1"]');
+    if (!target) return;
     const containerH = outer.clientHeight;
-    const top = active.offsetTop;
-    const h = active.offsetHeight;
-    setTranslateY(containerH / 2 - top - h / 2);
-  }, [activeIdx, children]);
+    const top = target.offsetTop;
+    const h = target.offsetHeight;
+    setTranslateY(containerH * focusFraction - top - h / 2);
+  }, [activeIdx, scrollIdx, children, focusFraction]);
 
   return (
     <div ref={outerRef} style={outerStyle}>
@@ -1304,7 +1316,9 @@ function MeasuredLyricColumn({
           right: 0,
           top: 0,
           transform: `translate3d(0, ${translateY}px, 0)`,
-          transition: `transform ${transitionMs}ms cubic-bezier(0.22, 1, 0.36, 1)`,
+          // FastOutSlowIn / Material standard ≈ cubic-bezier(0.4, 0, 0.2, 1)
+          // 比之前 (0.22, 1, 0.36, 1) 更接近 Apple Music"沉沉落到位"的体感
+          transition: `transform ${transitionMs}ms cubic-bezier(0.4, 0, 0.2, 1)`,
           willChange: "transform",
           ...innerExtraStyle,
         }}
@@ -1340,6 +1354,9 @@ function useLyricView(p: LyricViewParams): {
   rows: React.ReactNode;
   translateExpr: string;
   activeIdx: number;
+  /** 应当被滚到焦点位置的行 —— 比 activeIdx 早 ~600ms 切换，
+   *  让下一句在唱响**之前**已经平滑滚到焦点（Apple Music 风的"预滚动"） */
+  scrollIdx: number;
 } {
   const useYrc = p.yrcLines.length > 0;
   const lrcTimes = useMemo(
@@ -1347,7 +1364,7 @@ function useLyricView(p: LyricViewParams): {
     [useYrc, p.lines, p.yrcLines],
   );
 
-  // 二分定位当前行
+  // 二分定位当前行（actually active = 已经在唱的那行）
   const idx = useMemo(() => {
     if (lrcTimes.length === 0) return -1;
     let lo = 0,
@@ -1365,11 +1382,33 @@ function useLyricView(p: LyricViewParams): {
     return ans;
   }, [lrcTimes, p.positionSec]);
 
+  // 预滚动：用 positionSec + 0.6s 二分，得到"600ms 后会激活的那行"
+  // 这一行不会因此被 wipe，但会被滚到焦点位置 → 下一句"在唱响前"已经到位
+  const scrollLookaheadSec = 0.6;
+  const scrollIdx = useMemo(() => {
+    if (lrcTimes.length === 0) return -1;
+    const probe = p.positionSec + scrollLookaheadSec;
+    let lo = 0,
+      hi = lrcTimes.length - 1,
+      ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (lrcTimes[mid] <= probe) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans;
+  }, [lrcTimes, p.positionSec]);
+
   if (lrcTimes.length === 0) {
-    return { empty: true, rows: null, translateExpr: "0px", activeIdx: -1 };
+    return { empty: true, rows: null, translateExpr: "0px", activeIdx: -1, scrollIdx: -1 };
   }
 
   const safeIdx = Math.max(idx, 0);
+  const safeScrollIdx = Math.max(scrollIdx, safeIdx);
   const total = useYrc ? p.yrcLines.length : p.lines.length;
 
   // 渲染所有行（不再做 sliding window 切片）。配合 column 整体 translateY，
@@ -1390,6 +1429,7 @@ function useLyricView(p: LyricViewParams): {
   const rowEls: React.ReactNode[] = [];
   for (let i = 0; i < total; i++) {
     const isActive = i === safeIdx;
+    const isScrollTarget = i === safeScrollIdx;
     if (useYrc) {
       const line = p.yrcLines[i]!;
       rowEls.push(
@@ -1397,6 +1437,7 @@ function useLyricView(p: LyricViewParams): {
           key={`y-${i}`}
           line={line}
           isActive={isActive}
+          isScrollTarget={isScrollTarget}
           positionSec={isActive ? p.positionSec : undefined}
           rowH={p.rowH}
           activeFs={p.activeFs}
@@ -1423,6 +1464,7 @@ function useLyricView(p: LyricViewParams): {
           key={`l-${i}`}
           text={ln.text}
           isActive={isActive}
+          isScrollTarget={isScrollTarget}
           progress={lineProgress}
           rowH={p.rowH}
           activeFs={p.activeFs}
@@ -1436,10 +1478,10 @@ function useLyricView(p: LyricViewParams): {
     }
   }
 
-  // column 偏移：让 safeIdx 行落在 centerRow 槽位。idx 增大时 offset 减小
-  // → column 向上平移。CSS 过渡平滑滑动。
+  // column 偏移：让 safeScrollIdx 行落在 centerRow 槽位（注意：用 scroll target，不是 active）。
+  // 这样下一句在唱响前的 600ms 已经平滑滚到焦点位置，唱响时直接开始 wipe。
   const centerRow = Math.floor(p.visibleRows / 2);
-  const offset = centerRow - safeIdx;
+  const offset = centerRow - safeScrollIdx;
   const translateExpr = `calc(${offset} * ${p.rowH})`;
 
   return {
@@ -1447,6 +1489,7 @@ function useLyricView(p: LyricViewParams): {
     rows: rowEls,
     translateExpr,
     activeIdx: safeIdx,
+    scrollIdx: safeScrollIdx,
   };
 }
 
@@ -1458,6 +1501,9 @@ const UNSUNG_GRAY_IMMERSIVE = "rgba(255,255,255,0.32)";
 
 type RowCommon = {
   isActive: boolean;
+  /** 是否是"该被滚到焦点位置"的行 —— 通常等于 isActive，但在 lookahead 窗口内
+   *  会比 active 早一行打 true，让 column 提前滚动 */
+  isScrollTarget: boolean;
   rowH: string;
   activeFs: string;
   dimFs: string;
@@ -1470,6 +1516,7 @@ type RowCommon = {
 const YrcRow = React.memo(function YrcRow({
   line,
   isActive,
+  isScrollTarget,
   positionSec,
   rowH,
   activeFs,
@@ -1485,6 +1532,7 @@ const YrcRow = React.memo(function YrcRow({
   return (
     <div
       data-active={isActive ? "1" : "0"}
+      data-scroll-target={isScrollTarget ? "1" : "0"}
       style={lineFrame(isActive, rowH, activeFs, dimFs, immersive)}
     >
       <div style={lineInner()}>
@@ -1513,6 +1561,7 @@ const YrcRow = React.memo(function YrcRow({
 const LrcRow = React.memo(function LrcRow({
   text,
   isActive,
+  isScrollTarget,
   progress,
   rowH,
   activeFs,
@@ -1526,6 +1575,7 @@ const LrcRow = React.memo(function LrcRow({
   return (
     <div
       data-active={isActive ? "1" : "0"}
+      data-scroll-target={isScrollTarget ? "1" : "0"}
       style={lineFrame(isActive, rowH, activeFs, dimFs, immersive)}
     >
       <div style={lineInner()}>

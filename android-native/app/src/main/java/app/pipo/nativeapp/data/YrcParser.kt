@@ -74,10 +74,13 @@ object YrcParser {
 }
 
 /**
- * 把 yrc token 切成"视觉字符"。规则：
+ * 把 yrc token 切成"视觉字符 / 视觉单词"。规则：
  *   - 中日韩 (CJK) 字符：每个独立成字
- *   - ASCII 字母 / 数字：连续的当一个 word（不切）
+ *   - ASCII 字母 / 数字：连续的当**一个 word**整体（不切！）—— 让英文按单词跳动而不是逐字母
  *   - 空白和标点：附着到它前一个 char 上（不单独成字，避免高亮闪烁）
+ *
+ * 之前 bug：注释说"不切"，代码却 startNew(c) 每个字母都新起一个，
+ * 导致 "hello" 被切成 h/e/l/l/o 五块，每个独立 bounce 起伏 → 用户报"逐字母跳"。
  */
 fun splitIntoVisualChars(text: String): List<String> {
     if (text.isEmpty()) return emptyList()
@@ -88,19 +91,24 @@ fun splitIntoVisualChars(text: String): List<String> {
     fun appendToLast(c: Char) {
         if (out.isEmpty()) startNew(c) else out.last().append(c)
     }
+    var lastWasAsciiWord = false
     for (c in text) {
         val isCjk = c in '一'..'鿿' || c in '぀'..'ヿ' || c in '가'..'힣'
         val isAsciiWord = (c in 'a'..'z') || (c in 'A'..'Z') || (c in '0'..'9')
         when {
             isCjk -> {
                 startNew(c)
+                lastWasAsciiWord = false
             }
             isAsciiWord -> {
-                startNew(c)
+                // 关键修复：连续 ASCII 字母 / 数字合并到上一个单元 → 一个英文单词整体跳
+                if (lastWasAsciiWord) appendToLast(c) else startNew(c)
+                lastWasAsciiWord = true
             }
             else -> {
                 // 空白 / 标点：附在前一个字符上，不单独成字
                 appendToLast(c)
+                lastWasAsciiWord = false
             }
         }
     }
