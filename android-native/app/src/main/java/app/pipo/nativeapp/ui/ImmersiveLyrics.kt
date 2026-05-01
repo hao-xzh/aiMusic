@@ -34,7 +34,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
@@ -78,22 +77,63 @@ fun ImmersiveBackdrop(
 ) {
     if (progress <= 0.001f) return
     val edges = useCoverEdgeColors(coverUrl)
-    val seamColor = rgbToColor(edges.bottom, fallback = PipoColors.Bg1)
     val topColor = rgbToColor(edges.top, fallback = PipoColors.Bg1)
+    val rightColor = rgbToColor(edges.right, fallback = PipoColors.Bg1)
+    val seamColor = rgbToColor(edges.bottom, fallback = PipoColors.Bg1)
+    // Apple Music 的"封面就是页"做法：根本不用 blur，靠从封面边缘采样的多个色块
+    // 在屏幕上形成"色彩云"。封面 sharp 边缘 fade 进色彩里就完成了"图融化进页"。
+    //
+    //   底层：bg color cloud —— 多个 radialGradient 叠出 mesh-like 效果
+    //     · 屏幕左上：topColor 半径 70% → 淡掉
+    //     · 屏幕右上：rightColor 半径 65% → 淡掉
+    //     · 屏幕底中：seamColor 半径 80% → 淡掉
+    //   这三个 radial 叠加 + 互相填补，结果是封面色调温柔铺满整屏，没有可见的图样。
+    //
+    //   不再叠 blurred cover：blur 出来的图永远有 pattern 残留，跟 sharp 封面拼一起
+    //   总有"两张图叠在一起"的视觉断层。Apple Music 的诀窍就是直接用 SOLID color，
+    //   没有第二张图，所以 sharp 封面边缘 fade 时直接溶进色彩本身，浑然一体。
+    // 用 drawBehind 直接画圆（中心 = 屏幕分数坐标 × 尺寸），避免 Brush.radialGradient
+    // 的 center 必须是 px 坐标的繁琐
     Box(
         modifier = Modifier
             .fillMaxSize()
             .graphicsLayer { alpha = progress }
-            .background(PipoColors.Bg0),
-    ) {
-        BackdropBlurredCover(coverUrl)
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Brush.verticalGradient(colors = listOf(topColor, seamColor)))
-                .alpha(0.42f),
-        )
-    }
+            .background(PipoColors.Bg0)  // 纯黑兜底，渐变叠到上面
+            .drawWithContent {
+                drawContent()
+                val w = size.width
+                val h = size.height
+                val maxDim = kotlin.math.max(w, h) * 1.4f
+                // 三个色块叠合形成 mesh-like 色彩云
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(topColor.copy(alpha = 0.95f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(w * 0.20f, h * 0.18f),
+                        radius = maxDim * 0.85f,
+                    ),
+                    radius = maxDim,
+                    center = androidx.compose.ui.geometry.Offset(w * 0.20f, h * 0.18f),
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(rightColor.copy(alpha = 0.85f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(w * 0.85f, h * 0.30f),
+                        radius = maxDim * 0.80f,
+                    ),
+                    radius = maxDim,
+                    center = androidx.compose.ui.geometry.Offset(w * 0.85f, h * 0.30f),
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(seamColor.copy(alpha = 0.95f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(w * 0.50f, h * 0.95f),
+                        radius = maxDim * 0.95f,
+                    ),
+                    radius = maxDim,
+                    center = androidx.compose.ui.geometry.Offset(w * 0.50f, h * 0.95f),
+                )
+            },
+    )
 }
 
 @Composable
@@ -201,26 +241,8 @@ fun ImmersiveLyricsOverlay(
     }
 }
 
-@Composable
-private fun BackdropBlurredCover(coverUrl: String?) {
-    if (coverUrl == null) return
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .alpha(0.54f)
-            .blur(36.dp)
-            .graphicsLayer {
-                scaleX = 1.22f
-                scaleY = 1.22f
-            },
-    ) {
-        CrossfadeCoverImage(
-            url = coverUrl,
-            modifier = Modifier.fillMaxSize(),
-            durationMs = 760,
-        )
-    }
-}
+// BackdropBlurredCover 已删除：换成 ImmersiveBackdrop 里 drawBehind 多个 radialGradient
+// 的"色彩云"做法，没有 blurred image 这第二层贴图，跟 Apple Music 的视觉一致。
 
 @Composable
 private fun ImmersiveIconButton(onClick: () -> Unit, content: @Composable () -> Unit) {

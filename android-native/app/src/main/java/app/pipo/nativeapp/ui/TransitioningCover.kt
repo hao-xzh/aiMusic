@@ -67,8 +67,8 @@ fun TransitioningCover(
     val heightDp = with(density) { h.toDp() }
 
     // 底部 fade mask 跟 progress 同步：compact 时不做 mask（封面完整显示）；
-    // immersive 时底部 12% 渐隐到透明，让封面"溶进"下方歌词区。
-    // 顶部也轻微渐隐 4%，跟 React IMMERSIVE_COVER_FADE_MASK_V 顶部 0.55 段对齐。
+    // immersive 时底部大段渐隐到透明，让封面"溶进"下方同源重模糊背景，
+    // 跟 Mac PlayerCard 那种"封面和背景是一张图"的整体感一致。
     val maskStrength = progress
 
     // ⚠ .background 必须在 .graphicsLayer { Offscreen } 之"内"才能跟 mask 一起被裁。
@@ -83,13 +83,17 @@ fun TransitioningCover(
             .drawWithContent {
                 drawContent()
                 if (maskStrength > 0.001f) {
+                    // 底部从 55% 开始就慢慢溶进背景（之前 68% 才开始，过渡只剩 32%
+                    // 视觉上像"硬边 + 一小段模糊带"）；现在 45% 的渐隐带 + 顶部
+                    // 也加一点入溶，整张图融化得更自然。
                     drawRect(
                         brush = Brush.verticalGradient(
                             colorStops = arrayOf(
-                                0f to Color.Black.copy(alpha = 1f - 0.40f * maskStrength),
-                                0.04f to Color.Black,
-                                0.68f to Color.Black,
-                                0.84f to Color.Black.copy(alpha = 1f - 0.70f * maskStrength),
+                                0f to Color.Black.copy(alpha = 1f - 0.45f * maskStrength),
+                                0.06f to Color.Black,
+                                0.55f to Color.Black,
+                                0.72f to Color.Black.copy(alpha = 1f - 0.45f * maskStrength),
+                                0.86f to Color.Black.copy(alpha = 1f - 0.80f * maskStrength),
                                 1f to Color.Black.copy(alpha = 1f - 0.98f * maskStrength),
                             ),
                         ),
