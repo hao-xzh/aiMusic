@@ -394,6 +394,7 @@ private fun AppleMusicLyricColumn(
                     AppleMusicLyricRow(
                         line = line,
                         isActive = idx == activeLyricIndex,
+                        isPast = idx < activeLyricIndex,
                         distance = distance,
                         positionMs = positionMs,
                         fg = fg,
@@ -409,6 +410,7 @@ private fun AppleMusicLyricColumn(
 private fun AppleMusicLyricRow(
     line: PipoLyricLine,
     isActive: Boolean,
+    isPast: Boolean,    // idx < activeLyricIndex —— 已唱完的行
     distance: Int,
     positionMs: Long,
     fg: Color,
@@ -454,23 +456,26 @@ private fun AppleMusicLyricRow(
         ),
     )
 
-    // ⚠ 关键：active 和 inactive 都走相同的 Text(annotated, style) 渲染路径。
-    //   之前 inactive = Text(line.text, color = fg) vs active = Text(annotated)
-    //   两条路径的 paragraph layout 在亚像素级有细微差别，切换瞬间字符微移
-    //   ——用户报"快要唱时左右抖一下"。现在统一用 annotated，inactive 就是
-    //   一段单 SpanStyle 全 fg；切换无 layout 变化，无抖动。
+    // ⚠ 关键：active 和 inactive 都用**完全相同的 SpanStyle 数量**（per-char）。
+    //
+    // 为什么：letterSpacing(-0.5sp) + FontWeight.Black 在 single-run（inactive 单 span）
+    // 和 multi-run（active per-char span）下文本 shape 出来宽度不一样——
+    // 切换瞬间整行向右偏移几 px，用户报"快要唱时整句往右抖一下"。
+    //
+    // 解法：两态都 per-char SpanStyle —— run 结构 100% 一致，layout 完全相同，
+    // 唯一变化是颜色值。N 个 per-char SpanStyle 对一行 20-50 字的歌词性能没问题。
+    // 颜色策略 —— 让"激活瞬间"完全无色变 flicker：
+    //   未唱（future）：每字 fgUnsung —— 跟 active 状态下"还没唱到的字"颜色一致
+    //   已唱（past）：每字 fg —— 跟 active 状态下"刚唱完的字"颜色一致
+    //   active：per-char gradient
+    // 切换 future → active 时未唱字保持 fgUnsung（无变），切 active → past 时已唱字
+    // 保持 fg（无变），整个生命周期颜色都不闪。
     val annotated = androidx.compose.ui.text.buildAnnotatedString {
         if (isActive && line.chars.isNotEmpty()) {
-            // YRC: per-letter L→R sweep
             buildActiveAnnotated(line.chars, positionMs, fg, fgUnsung)
         } else {
-            // 非活动 / LRC：整行单 SpanStyle 全 fg。透明度交给 row alpha 处理，
-            // 不在字符颜色上做花样 —— 用户明确说"上一句要消失了，没必要动它颜色"
-            append(line.text)
-            addStyle(
-                androidx.compose.ui.text.SpanStyle(color = fg),
-                0, line.text.length,
-            )
+            val color = if (isPast) fg else fgUnsung
+            buildInactiveAnnotated(line.text, color)
         }
     }
 
@@ -484,7 +489,26 @@ private fun AppleMusicLyricRow(
     }
 }
 
-/** 给 buildAnnotatedString 复用的 helper —— 计算活动行的 per-letter spans */
+/** inactive 行的 per-char 渲染 —— 颜色由调用方决定（past = fg, future = fgUnsung）。
+ *  用 per-char SpanStyle 跟 active 路径 run 数完全对齐，避免切换抖动 */
+private fun androidx.compose.ui.text.AnnotatedString.Builder.buildInactiveAnnotated(
+    text: String,
+    color: Color,
+) {
+    append(text)
+    for (i in text.indices) {
+        addStyle(
+            androidx.compose.ui.text.SpanStyle(color = color),
+            i, i + 1,
+        )
+    }
+}
+
+/**
+ * active 行 —— **每字符一个 SpanStyle**，不再按 token 粒度。
+ * 这样跟 buildInactiveAnnotated 的 N 个 per-char SpanStyle 对齐，run 数一致，
+ * shape 出来宽度一致，切换无 layout 抖动。
+ */
 private fun androidx.compose.ui.text.AnnotatedString.Builder.buildActiveAnnotated(
     chars: List<PipoLyricChar>,
     positionMs: Long,
@@ -495,43 +519,29 @@ private fun androidx.compose.ui.text.AnnotatedString.Builder.buildActiveAnnotate
     for (token in chars) {
         val p = token.progress(positionMs)
         val text = token.text
-        val start = idx
+        val tokenStart = idx
         append(text)
-        val end = start + text.length
-        idx = end
-        when {
-            p >= 1f -> addStyle(
-                androidx.compose.ui.text.SpanStyle(color = fg),
-                start, end,
-            )
-            p <= 0f -> addStyle(
-                androidx.compose.ui.text.SpanStyle(color = fgUnsung),
-                start, end,
-            )
-            else -> {
-                val n = text.length
-                if (n == 1) {
-                    addStyle(
-                        androidx.compose.ui.text.SpanStyle(
-                            color = lerp(fgUnsung, fg, p),
-                        ),
-                        start, end,
-                    )
-                } else {
-                    for (i in 0 until n) {
-                        val letterStart = i.toFloat() / n
-                        val letterEnd = (i + 1f) / n
-                        val letterT = ((p - letterStart) / (letterEnd - letterStart))
-                            .coerceIn(0f, 1f)
-                        addStyle(
-                            androidx.compose.ui.text.SpanStyle(
-                                color = lerp(fgUnsung, fg, letterT),
-                            ),
-                            start + i, start + i + 1,
-                        )
-                    }
+        idx += text.length
+        val n = text.length
+        // 每个字母都加一个 SpanStyle —— 颜色按字母在 token 内的子进度算
+        for (i in 0 until n) {
+            val letterColor = when {
+                p >= 1f -> fg                                // 整 token 唱过了
+                p <= 0f -> fgUnsung                          // 整 token 还没唱
+                n == 1 -> lerp(fgUnsung, fg, p)              // 单字 token 整段 lerp
+                else -> {
+                    // 多字母 token：第 i 个字母按 L→R 子进度
+                    val letterStart = i.toFloat() / n
+                    val letterEnd = (i + 1f) / n
+                    val letterT = ((p - letterStart) / (letterEnd - letterStart))
+                        .coerceIn(0f, 1f)
+                    lerp(fgUnsung, fg, letterT)
                 }
             }
+            addStyle(
+                androidx.compose.ui.text.SpanStyle(color = letterColor),
+                tokenStart + i, tokenStart + i + 1,
+            )
         }
     }
 }
