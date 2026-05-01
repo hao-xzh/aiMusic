@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -532,51 +531,18 @@ private fun AppleMusicActiveLyricRow(
         }
     }
 
-    var layoutResult by remember {
-        androidx.compose.runtime.mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null)
-    }
-    val density = androidx.compose.ui.platform.LocalDensity.current
+    val floatingAnnotated = buildFloatingLineText(
+        frames = tokenFrames,
+        fg = fg,
+        fgUnsung = fgUnsung,
+    )
 
     Box {
         Text(
             text = annotated,
             style = style,
-            onTextLayout = { layoutResult = it },
         )
-
-        if (layoutResult != null) {
-            val l = layoutResult!!
-            tokenFrames
-                .filter { it.progress > 0f && it.start < it.end }
-                .forEach { frame ->
-                    // Anchor each started token at its laid-out text position.
-                    val anchorBox = l.getBoundingBox(frame.start)
-                    val liftPx = with(density) {
-                        // Tiny lift: enough to feel buoyant, not enough to read as a jump.
-                        lyricFloatRise(frame.progress) * 0.08f * style.fontSize.toPx()
-                    }
-                    Box(
-                        modifier = Modifier
-                            .offset {
-                                androidx.compose.ui.unit.IntOffset(
-                                    anchorBox.left.toInt(),
-                                    anchorBox.top.toInt(),
-                                )
-                            }
-                            .graphicsLayer { translationY = -liftPx },
-                    ) {
-                        Text(
-                            text = buildFloatingTokenText(
-                                text = frame.text,
-                                progress = frame.progress,
-                                fg = fg,
-                                fgUnsung = fgUnsung,
-                            ),
-                            style = style,
-                        )
-                    }
-                }
-        }
+        Text(text = floatingAnnotated, style = style)
     }
 }
 
@@ -614,35 +580,48 @@ private fun buildLyricTokenFrames(
     }
 }
 
-private fun buildFloatingTokenText(
-    text: String,
-    progress: Float,
+private fun buildFloatingLineText(
+    frames: List<LyricTokenFrame>,
     fg: Color,
     fgUnsung: Color,
 ) = androidx.compose.ui.text.buildAnnotatedString {
-    append(text)
-    val n = text.length
-    if (n <= 1 || progress >= 1f) {
-        addStyle(
-            androidx.compose.ui.text.SpanStyle(
-                color = if (progress >= 1f) fg else lerp(fgUnsung, fg, progress),
-            ),
-            0,
-            n,
-        )
-        return@buildAnnotatedString
-    }
+    for (frame in frames) {
+        val start = length
+        append(frame.text)
+        val end = length
+        val lift = lyricFloatRise(frame.progress) * 0.08f
 
-    for (i in 0 until n) {
-        val letterStart = i.toFloat() / n
-        val letterEnd = (i + 1f) / n
-        val letterT = ((progress - letterStart) / (letterEnd - letterStart))
-            .coerceIn(0f, 1f)
-        addStyle(
-            androidx.compose.ui.text.SpanStyle(color = lerp(fgUnsung, fg, letterT)),
-            i,
-            i + 1,
-        )
+        when {
+            frame.progress <= 0f -> addStyle(
+                androidx.compose.ui.text.SpanStyle(color = Color.Transparent),
+                start,
+                end,
+            )
+            frame.progress >= 1f || frame.text.length <= 1 -> addStyle(
+                androidx.compose.ui.text.SpanStyle(
+                    color = if (frame.progress >= 1f) fg else lerp(fgUnsung, fg, frame.progress),
+                    baselineShift = androidx.compose.ui.text.style.BaselineShift(lift),
+                ),
+                start,
+                end,
+            )
+            else -> {
+                for (i in frame.text.indices) {
+                    val letterStart = i.toFloat() / frame.text.length
+                    val letterEnd = (i + 1f) / frame.text.length
+                    val letterT = ((frame.progress - letterStart) / (letterEnd - letterStart))
+                        .coerceIn(0f, 1f)
+                    addStyle(
+                        androidx.compose.ui.text.SpanStyle(
+                            color = lerp(fgUnsung, fg, letterT),
+                            baselineShift = androidx.compose.ui.text.style.BaselineShift(lift),
+                        ),
+                        start + i,
+                        start + i + 1,
+                    )
+                }
+            }
+        }
     }
 }
 
