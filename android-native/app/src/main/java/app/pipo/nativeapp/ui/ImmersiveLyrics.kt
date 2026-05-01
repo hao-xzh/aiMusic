@@ -510,45 +510,23 @@ private fun AppleMusicActiveLyricRow(
     fgUnsung: Color,
     style: TextStyle,
 ) {
-    // 找活动词（progress 在 (0, 1) 之间）的字符范围 + 自己的 progress
-    var activeStart = -1
-    var activeEnd = -1
-    var activeText = ""
-    var activeP = 0f
-    var charIdx = 0
-    for (token in chars) {
-        val p = token.progress(positionMs)
-        if (p > 0f && p < 1f && activeStart < 0) {
-            activeStart = charIdx
-            activeEnd = charIdx + token.text.length
-            activeText = token.text
-            activeP = p
-        }
-        charIdx += token.text.length
+    // Track every timed token so sung words can remain gently lifted together.
+    val tokenFrames = remember(chars, positionMs) {
+        buildLyricTokenFrames(chars, positionMs)
     }
 
-    // 底层 Text —— 全行 per-letter 着色，活动词字符范围 = Color.Transparent
+    // Base text keeps layout stable. Started words are drawn by lifted overlays.
     val annotated = androidx.compose.ui.text.buildAnnotatedString {
-        var idx = 0
-        for (token in chars) {
-            val p = token.progress(positionMs)
-            val text = token.text
-            val start = idx
-            append(text)
-            val end = start + text.length
-            idx = end
+        for (frame in tokenFrames) {
+            append(frame.text)
             when {
-                p >= 1f -> addStyle(
-                    androidx.compose.ui.text.SpanStyle(color = fg),
-                    start, end,
-                )
-                p <= 0f -> addStyle(
+                frame.progress <= 0f -> addStyle(
                     androidx.compose.ui.text.SpanStyle(color = fgUnsung),
-                    start, end,
+                    frame.start, frame.end,
                 )
                 else -> addStyle(
                     androidx.compose.ui.text.SpanStyle(color = Color.Transparent),
-                    start, end,
+                    frame.start, frame.end,
                 )
             }
         }
@@ -566,74 +544,106 @@ private fun AppleMusicActiveLyricRow(
             onTextLayout = { layoutResult = it },
         )
 
-        if (activeStart >= 0 && layoutResult != null) {
+        if (layoutResult != null) {
             val l = layoutResult!!
-            // 活动词的左上角作为 overlay anchor
-            val anchorBox = l.getBoundingBox(activeStart)
-            val liftPx = with(density) {
-                // 高度只 6%× 字号 ≈ 1.7sp，跟 Apple Music 那种"轻轻悬浮"对齐，
-                // 不再是重音猛跳一下。
-                bounceCurve(activeP) * 0.06f * style.fontSize.toPx()
-            }
-            Box(
-                modifier = Modifier
-                    .offset {
-                        androidx.compose.ui.unit.IntOffset(
-                            anchorBox.left.toInt(),
-                            anchorBox.top.toInt(),
-                        )
+            tokenFrames
+                .filter { it.progress > 0f && it.start < it.end }
+                .forEach { frame ->
+                    // Anchor each started token at its laid-out text position.
+                    val anchorBox = l.getBoundingBox(frame.start)
+                    val liftPx = with(density) {
+                        // Tiny lift: enough to feel buoyant, not enough to read as a jump.
+                        lyricFloatRise(frame.progress) * 0.08f * style.fontSize.toPx()
                     }
-                    .graphicsLayer { translationY = -liftPx },
-            ) {
-                // overlay 里渲染同一段文字，per-letter 颜色 sweep
-                val overlayAnnotated = androidx.compose.ui.text.buildAnnotatedString {
-                    append(activeText)
-                    val n = activeText.length
-                    if (n == 1) {
-                        addStyle(
-                            androidx.compose.ui.text.SpanStyle(
-                                color = androidx.compose.ui.graphics.lerp(fgUnsung, fg, activeP),
+                    Box(
+                        modifier = Modifier
+                            .offset {
+                                androidx.compose.ui.unit.IntOffset(
+                                    anchorBox.left.toInt(),
+                                    anchorBox.top.toInt(),
+                                )
+                            }
+                            .graphicsLayer { translationY = -liftPx },
+                    ) {
+                        Text(
+                            text = buildFloatingTokenText(
+                                text = frame.text,
+                                progress = frame.progress,
+                                fg = fg,
+                                fgUnsung = fgUnsung,
                             ),
-                            0, 1,
+                            style = style,
                         )
-                    } else {
-                        for (i in 0 until n) {
-                            val letterStart = i.toFloat() / n
-                            val letterEnd = (i + 1f) / n
-                            val letterT = ((activeP - letterStart) / (letterEnd - letterStart))
-                                .coerceIn(0f, 1f)
-                            val letterColor =
-                                androidx.compose.ui.graphics.lerp(fgUnsung, fg, letterT)
-                            addStyle(
-                                androidx.compose.ui.text.SpanStyle(color = letterColor),
-                                i, i + 1,
-                            )
-                        }
                     }
                 }
-                Text(text = overlayAnnotated, style = style)
-            }
         }
     }
 }
 
 /**
- * 悬浮曲线（Apple Music 风）—— 只有"缓升"，没有"缓落"。
- *
- * 节奏：词刚开始唱时从基线缓缓升起，30% 进度时升到峰值，之后一直**保持在峰值**
- * 直到这词唱完。下一个词激活时换它升起，前一个词的"维持"由底层 paragraph 接管
- * （此时是 sung 状态的 fg 全色，自然落回基线但没有缓落动画——是切换瞬间的视觉
- * 接力，不是缓落）。
- *
- *   0..0.30：smoothstep 0 → 1（升起，速度跟语速绑定 —— 词唱得快，升起也快）
- *   0.30..1.00：1（一直悬浮）
+ * Apple Music style float: the word eases upward across its own sung window,
+ * then stays lifted while later words in the same line catch up.
  */
-private fun bounceCurve(p: Float): Float {
+private fun lyricFloatRise(p: Float): Float {
     val t = p.coerceIn(0f, 1f)
-    if (t <= 0f) return 0f
-    if (t >= 0.30f) return 1f
-    val u = t / 0.30f
-    return u * u * (3f - 2f * u)  // smoothstep ease-in-out 0→1
+    return t * t * (3f - 2f * t)
+}
+
+private data class LyricTokenFrame(
+    val start: Int,
+    val end: Int,
+    val text: String,
+    val progress: Float,
+)
+
+private fun buildLyricTokenFrames(
+    chars: List<PipoLyricChar>,
+    positionMs: Long,
+): List<LyricTokenFrame> {
+    var start = 0
+    return chars.map { token ->
+        val end = start + token.text.length
+        LyricTokenFrame(
+            start = start,
+            end = end,
+            text = token.text,
+            progress = token.progress(positionMs),
+        ).also {
+            start = end
+        }
+    }
+}
+
+private fun buildFloatingTokenText(
+    text: String,
+    progress: Float,
+    fg: Color,
+    fgUnsung: Color,
+) = androidx.compose.ui.text.buildAnnotatedString {
+    append(text)
+    val n = text.length
+    if (n <= 1 || progress >= 1f) {
+        addStyle(
+            androidx.compose.ui.text.SpanStyle(
+                color = if (progress >= 1f) fg else lerp(fgUnsung, fg, progress),
+            ),
+            0,
+            n,
+        )
+        return@buildAnnotatedString
+    }
+
+    for (i in 0 until n) {
+        val letterStart = i.toFloat() / n
+        val letterEnd = (i + 1f) / n
+        val letterT = ((progress - letterStart) / (letterEnd - letterStart))
+            .coerceIn(0f, 1f)
+        addStyle(
+            androidx.compose.ui.text.SpanStyle(color = lerp(fgUnsung, fg, letterT)),
+            i,
+            i + 1,
+        )
+    }
 }
 
 
