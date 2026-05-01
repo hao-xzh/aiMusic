@@ -7,11 +7,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -298,7 +296,8 @@ private fun AppleMusicLyricColumn(
     LaunchedEffect(scrollTargetIdx, containerHeightPx) {
         if (scrollTargetIdx !in lines.indices || containerHeightPx == 0) return@LaunchedEffect
         // 焦点位置：容器顶 18%
-        val focusOffsetPx = (containerHeightPx * 0.18f).toInt()
+        // 焦点位置：容器顶 11%，正好让活动行上方只露出 1 句历史歌词
+        val focusOffsetPx = (containerHeightPx * 0.11f).toInt()
         val info = listState.layoutInfo
         val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == scrollTargetIdx }
         if (visibleHit == null) {
@@ -322,8 +321,9 @@ private fun AppleMusicLyricColumn(
         }
     }
 
-    val topPadDp = with(density) { (containerHeightPx * 0.18f).toDp() }
-    val bottomPadDp = with(density) { (containerHeightPx * 0.82f).toDp() }
+    // 上方留 11%（约 1 行 + 少量呼吸空间），让活动行上方只露出 1 句历史歌词
+    val topPadDp = with(density) { (containerHeightPx * 0.11f).toDp() }
+    val bottomPadDp = with(density) { (containerHeightPx * 0.89f).toDp() }
 
     Box(
         modifier = modifier
@@ -331,15 +331,15 @@ private fun AppleMusicLyricColumn(
             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
             .drawWithContent {
                 drawContent()
-                // 顶部 fade 段加宽到 22%，且更早进入接近全透明 —— 老句子悄悄退场，
-                // 不再"还能看清楚一行"那种半透明，给焦点行留更多视觉重量
+                // 焦点行落在 11% —— 上方只露 1 句历史歌词，那一句要狠狠淡出。
+                // fade band 收紧到 0..14%，恰好覆盖那 1 句的范围。
                 drawRect(
                     brush = Brush.verticalGradient(
                         colorStops = arrayOf(
                             0f to Color.Transparent,
-                            0.10f to Color.Black.copy(alpha = 0.10f),
-                            0.18f to Color.Black.copy(alpha = 0.55f),
-                            0.26f to Color.Black,
+                            0.05f to Color.Black.copy(alpha = 0.10f),
+                            0.10f to Color.Black.copy(alpha = 0.50f),
+                            0.14f to Color.Black,
                             0.80f to Color.Black,
                             0.94f to Color.Black.copy(alpha = 0.4f),
                             1f to Color.Transparent,
@@ -440,7 +440,19 @@ private fun AppleMusicLyricRow(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+/**
+ * 活动行渲染 —— **单个 Text + AnnotatedString**，跟 inactive 行用完全一样的
+ * Text composable 和排版 paragraph，所以两态切换时**零位移、零跳变**。
+ *
+ * 三段式着色（镜像 Mac 的 before / current / after 三个 span）：
+ *   - 已唱字 (progress = 1)：SpanStyle(color = fg)
+ *   - 正在唱的字 (0 < progress < 1)：SpanStyle(brush = Brush.horizontalGradient)
+ *     —— brush 在该字的 layout 范围内做 L→R sweep，分割点 = 该字的 progress
+ *   - 还没唱的字 (progress = 0)：SpanStyle(color = fgUnsung)
+ *
+ * 跳动 (graphicsLayer scale) 完全去掉了：之前用每字 scale 会让 layout 微微推搡，
+ * 跟当前要求的"零跳变"冲突。色彩 sweep 已经足够强表达"在唱这个词"。
+ */
 @Composable
 private fun AppleMusicActiveLyricRow(
     line: PipoLyricLine,
@@ -449,60 +461,42 @@ private fun AppleMusicActiveLyricRow(
     fgUnsung: Color,
     style: TextStyle,
 ) {
-    FlowRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Start,
-    ) {
-        line.chars.forEach { char ->
+    val annotated = androidx.compose.ui.text.buildAnnotatedString {
+        var charIndex = 0
+        for (char in line.chars) {
             val p = char.progress(positionMs)
-            // 词内左→右颜色 sweep —— 镜像 Mac 的
-            //   linear-gradient(90deg, fg 0%, fg progress%, fgUnsung progress+1%, fgUnsung 100%)
-            //   + background-clip: text
-            // Compose 等效：TextStyle(brush = Brush.horizontalGradient(...))。
-            // progress 在 word duration 内线性 0→1，所以 sweep 速度跟唱歌速度对齐。
-            val sweepBrush = remember(p, fg, fgUnsung) {
-                if (p >= 1f) Brush.horizontalGradient(0f to fg, 1f to fg)
-                else if (p <= 0f) Brush.horizontalGradient(0f to fgUnsung, 1f to fgUnsung)
-                else Brush.horizontalGradient(
-                    colorStops = arrayOf(
-                        0f to fg,
-                        p to fg,
-                        (p + 0.01f).coerceAtMost(1f) to fgUnsung,
-                        1f to fgUnsung,
-                    ),
+            val text = char.text
+            val start = charIndex
+            append(text)
+            val end = start + text.length
+            charIndex = end
+            when {
+                p >= 1f -> addStyle(
+                    androidx.compose.ui.text.SpanStyle(color = fg),
+                    start, end,
                 )
+                p <= 0f -> addStyle(
+                    androidx.compose.ui.text.SpanStyle(color = fgUnsung),
+                    start, end,
+                )
+                else -> {
+                    // 词内 L→R sweep：分割点正好 = 这个 token 的 progress
+                    val sweep = Brush.horizontalGradient(
+                        colorStops = arrayOf(
+                            0f to fg,
+                            p to fg,
+                            (p + 0.01f).coerceAtMost(1f) to fgUnsung,
+                            1f to fgUnsung,
+                        ),
+                    )
+                    addStyle(
+                        androidx.compose.ui.text.SpanStyle(brush = sweep),
+                        start, end,
+                    )
+                }
             }
-            // 跳动曲线（lift）保留：在词刚开始（p≈0.18）时一记轻微抬起，模拟"重音"
-            val lift = bounceCurve(p)
-            // 整个词的 alpha：唱过的字段 alpha 跟着推进；用 sweep 已经显示完整对比，
-            // alpha 只做轻微强调（0.85 → 1.0）
-            val alpha = 0.85f + p.coerceIn(0f, 1f) * 0.15f
-            Text(
-                text = char.text,
-                style = style.copy(brush = sweepBrush),
-                modifier = Modifier.graphicsLayer {
-                    this.alpha = alpha
-                    scaleX = 1f + lift * 0.045f
-                    scaleY = 1f + lift * 0.045f
-                    translationY = -lift * 6f
-                },
-            )
         }
     }
-}
-
-/**
- * 单词跳动曲线 —— 在词刚开始（p≈0.18）时达峰，迅速回落，跟"嘴一张就一记重音"对齐。
- *
- * 用 t * (1-t)^2 经放缩，使峰值时机前移；峰值 t≈0.18，幅度归一到 1.0。
- */
-private fun bounceCurve(p: Float): Float {
-    val t = p.coerceIn(0f, 1f)
-    if (t <= 0f || t >= 1f) return 0f
-    val raw = t * (1f - t) * (1f - t)  // 峰在 t = 1/3
-    // 让峰再前移：用 sqrt 缩短前半段
-    val skewed = kotlin.math.sqrt(t.toDouble()).toFloat() * (1f - t) * (1f - t) * 1.6f
-    // 选幅度更大的一支
-    return kotlin.math.max(raw * 6.75f, skewed).coerceIn(0f, 1f)
+    Text(text = annotated, style = style)
 }
 
