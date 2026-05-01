@@ -480,26 +480,18 @@ private fun AppleMusicLyricRow(
 }
 
 /**
- * 活动行渲染 —— **底层 Text + overlay 跳动词** 双层结构。
+ * 活动行渲染 —— 单个 Text + AnnotatedString，**只做颜色变化，不做位置动画**。
  *
- * 为什么不能直接在 SpanStyle 上加 baselineShift 做跳动：
- *   - SpanStyle.baselineShift 改变该 span 的 effective ascent
- *   - 同一行其它没 shift 的 span 都基于行的 max ascent 重新定位 baseline
- *   - 结果：活动词每帧 baselineShift 变化 → 整行 baseline 跟着变 → 同行所有
- *     字一起跳。多行歌词里只有第一行（含活动词那行）有这毛病，2/3 行不动
- *     —— 跟用户实测的现象完全对应
+ * 颜色规则：
+ *   - 已唱字 (progress = 1)：fg
+ *   - 还没唱的字 (progress = 0)：fgUnsung
+ *   - 正在唱的 token：
+ *       · CJK / 单字符词：lerp(fgUnsung, fg, p) 整段平滑过渡
+ *       · 多字母 ASCII 词："hello" 5 个字母 → 每字按 L→R 子进度 lerp，
+ *         得到清晰的 L→R 流光感
  *
- * 解法：
- *   1) 底层 Text(annotated) —— 全行用 SpanStyle(color) 着色，活动词那段填
- *      Color.Transparent，留出"洞"
- *   2) 用 onTextLayout 拿 TextLayoutResult，找出活动词在屏幕上的 bounding box
- *   3) 在那个位置叠加一个 overlay Text，只画活动词，graphicsLayer.translationY
- *      做 bounce —— overlay 跟底层 paragraph 完全独立，不参与行度量计算
- *   4) overlay 自己也用 per-letter 着色做 L→R sweep
- *
- * 副作用：第 1 帧 onTextLayout 还没回来时 overlay 不显示，看起来活动词"消失
- * 一帧"。但 LazyColumn item 进场就触发 onTextLayout，第 2 帧起 overlay 就位，
- * 60Hz 下肉眼几乎看不见。
+ * 不再做任何 baselineShift / translationY / overlay —— 之前的位置动画都跟
+ * paragraph 度量纠缠不清，且用户反馈时间对不准。颜色本身已经足够表达"在唱这词"。
  */
 @Composable
 private fun AppleMusicActiveLyricRow(
@@ -509,120 +501,53 @@ private fun AppleMusicActiveLyricRow(
     fgUnsung: Color,
     style: TextStyle,
 ) {
-    // Track every timed token so sung words can remain gently lifted together.
-    val tokenFrames = remember(chars, positionMs) {
-        buildLyricTokenFrames(chars, positionMs)
-    }
-
-    // Base text keeps layout stable. Started words are drawn by lifted overlays.
     val annotated = androidx.compose.ui.text.buildAnnotatedString {
-        for (frame in tokenFrames) {
-            append(frame.text)
+        var idx = 0
+        for (token in chars) {
+            val p = token.progress(positionMs)
+            val text = token.text
+            val start = idx
+            append(text)
+            val end = start + text.length
+            idx = end
             when {
-                frame.progress <= 0f -> addStyle(
+                p >= 1f -> addStyle(
+                    androidx.compose.ui.text.SpanStyle(color = fg),
+                    start, end,
+                )
+                p <= 0f -> addStyle(
                     androidx.compose.ui.text.SpanStyle(color = fgUnsung),
-                    frame.start, frame.end,
+                    start, end,
                 )
-                else -> addStyle(
-                    androidx.compose.ui.text.SpanStyle(color = Color.Transparent),
-                    frame.start, frame.end,
-                )
-            }
-        }
-    }
-
-    val floatingAnnotated = buildFloatingLineText(
-        frames = tokenFrames,
-        fg = fg,
-        fgUnsung = fgUnsung,
-    )
-
-    Box {
-        Text(
-            text = annotated,
-            style = style,
-        )
-        Text(text = floatingAnnotated, style = style)
-    }
-}
-
-/**
- * Apple Music style float: the word eases upward across its own sung window,
- * then stays lifted while later words in the same line catch up.
- */
-private fun lyricFloatRise(p: Float): Float {
-    val t = p.coerceIn(0f, 1f)
-    return t * t * (3f - 2f * t)
-}
-
-private data class LyricTokenFrame(
-    val start: Int,
-    val end: Int,
-    val text: String,
-    val progress: Float,
-)
-
-private fun buildLyricTokenFrames(
-    chars: List<PipoLyricChar>,
-    positionMs: Long,
-): List<LyricTokenFrame> {
-    var start = 0
-    return chars.map { token ->
-        val end = start + token.text.length
-        LyricTokenFrame(
-            start = start,
-            end = end,
-            text = token.text,
-            progress = token.progress(positionMs),
-        ).also {
-            start = end
-        }
-    }
-}
-
-private fun buildFloatingLineText(
-    frames: List<LyricTokenFrame>,
-    fg: Color,
-    fgUnsung: Color,
-) = androidx.compose.ui.text.buildAnnotatedString {
-    for (frame in frames) {
-        val start = length
-        append(frame.text)
-        val end = length
-        val lift = lyricFloatRise(frame.progress) * 0.08f
-
-        when {
-            frame.progress <= 0f -> addStyle(
-                androidx.compose.ui.text.SpanStyle(color = Color.Transparent),
-                start,
-                end,
-            )
-            frame.progress >= 1f || frame.text.length <= 1 -> addStyle(
-                androidx.compose.ui.text.SpanStyle(
-                    color = if (frame.progress >= 1f) fg else lerp(fgUnsung, fg, frame.progress),
-                    baselineShift = androidx.compose.ui.text.style.BaselineShift(lift),
-                ),
-                start,
-                end,
-            )
-            else -> {
-                for (i in frame.text.indices) {
-                    val letterStart = i.toFloat() / frame.text.length
-                    val letterEnd = (i + 1f) / frame.text.length
-                    val letterT = ((frame.progress - letterStart) / (letterEnd - letterStart))
-                        .coerceIn(0f, 1f)
-                    addStyle(
-                        androidx.compose.ui.text.SpanStyle(
-                            color = lerp(fgUnsung, fg, letterT),
-                            baselineShift = androidx.compose.ui.text.style.BaselineShift(lift),
-                        ),
-                        start + i,
-                        start + i + 1,
-                    )
+                else -> {
+                    val n = text.length
+                    if (n == 1) {
+                        addStyle(
+                            androidx.compose.ui.text.SpanStyle(
+                                color = lerp(fgUnsung, fg, p),
+                            ),
+                            start, end,
+                        )
+                    } else {
+                        // 多字母：逐字母 L→R 着色 sweep
+                        for (i in 0 until n) {
+                            val letterStart = i.toFloat() / n
+                            val letterEnd = (i + 1f) / n
+                            val letterT = ((p - letterStart) / (letterEnd - letterStart))
+                                .coerceIn(0f, 1f)
+                            addStyle(
+                                androidx.compose.ui.text.SpanStyle(
+                                    color = lerp(fgUnsung, fg, letterT),
+                                ),
+                                start + i, start + i + 1,
+                            )
+                        }
+                    }
                 }
             }
         }
     }
+    Text(text = annotated, style = style)
 }
 
 
