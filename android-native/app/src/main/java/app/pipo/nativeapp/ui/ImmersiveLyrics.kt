@@ -571,7 +571,9 @@ private fun AppleMusicActiveLyricRow(
             // 活动词的左上角作为 overlay anchor
             val anchorBox = l.getBoundingBox(activeStart)
             val liftPx = with(density) {
-                bounceCurve(activeP) * 0.18f * style.fontSize.toPx()
+                // 高度只 6%× 字号 ≈ 1.7sp，跟 Apple Music 那种"轻轻悬浮"对齐，
+                // 不再是重音猛跳一下。
+                bounceCurve(activeP) * 0.06f * style.fontSize.toPx()
             }
             Box(
                 modifier = Modifier
@@ -616,15 +618,22 @@ private fun AppleMusicActiveLyricRow(
 }
 
 /**
- * 跳动曲线 —— 在 token 刚开始（p≈0.18）时达峰，迅速回落。
- * 给活动行一个"嘴一张就一记重音"的呼吸感。
+ * 悬浮曲线（Apple Music 风）—— 只有"缓升"，没有"缓落"。
+ *
+ * 节奏：词刚开始唱时从基线缓缓升起，30% 进度时升到峰值，之后一直**保持在峰值**
+ * 直到这词唱完。下一个词激活时换它升起，前一个词的"维持"由底层 paragraph 接管
+ * （此时是 sung 状态的 fg 全色，自然落回基线但没有缓落动画——是切换瞬间的视觉
+ * 接力，不是缓落）。
+ *
+ *   0..0.30：smoothstep 0 → 1（升起，速度跟语速绑定 —— 词唱得快，升起也快）
+ *   0.30..1.00：1（一直悬浮）
  */
 private fun bounceCurve(p: Float): Float {
     val t = p.coerceIn(0f, 1f)
-    if (t <= 0f || t >= 1f) return 0f
-    val raw = t * (1f - t) * (1f - t)
-    val skewed = kotlin.math.sqrt(t.toDouble()).toFloat() * (1f - t) * (1f - t) * 1.6f
-    return kotlin.math.max(raw * 6.75f, skewed).coerceIn(0f, 1f)
+    if (t <= 0f) return 0f
+    if (t >= 0.30f) return 1f
+    val u = t / 0.30f
+    return u * u * (3f - 2f * u)  // smoothstep ease-in-out 0→1
 }
 
 
