@@ -436,19 +436,29 @@ private fun AppleMusicLyricRow(
         letterSpacing = (-0.5).sp,
     )
 
+    // 整行 scale 脉动 —— 跟着"当前正在唱的 token"的 bounce 曲线起伏，
+    // 给活动行一点"活的"动效。是 row 级 graphicsLayer，不影响布局。
+    val livePulse = if (!isActive) 0f else {
+        val current = line.chars.firstOrNull { ch ->
+            val p = ch.progress(positionMs)
+            p > 0f && p < 1f
+        }
+        current?.let { bounceCurve(it.progress(positionMs)) } ?: 0f
+    }
+    val pulseScale = 1f + livePulse * 0.03f  // 最大 +3%，足够看见但不抢戏
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .graphicsLayer {
                 alpha = rowAlpha
+                scaleX = pulseScale
+                scaleY = pulseScale
                 transformOrigin = TransformOrigin(0f, 0.5f)
             }
             .padding(vertical = 8.dp),
     ) {
         if (isActive && line.chars.isNotEmpty()) {
-            // 平滑的字符级 wipe：每个字根据 charProgress 的 0..1 插值颜色，
-            // 不再是 binary "已唱/未唱"。配合 YrcParser 把 token 切到字级，
-            // 视觉上是真正的 karaoke 流光，不是一段一段闪。
             AppleMusicActiveLyricRow(
                 line = line,
                 positionMs = positionMs,
@@ -464,16 +474,17 @@ private fun AppleMusicLyricRow(
 
 /**
  * 活动行渲染 —— **单个 Text + AnnotatedString**，跟 inactive 行用完全一样的
- * Text composable 和排版 paragraph，所以两态切换时**零位移、零跳变**。
+ * Text composable 和排版 paragraph，所以两态切换时零位移。
  *
- * 三段式着色（镜像 Mac 的 before / current / after 三个 span）：
- *   - 已唱字 (progress = 1)：SpanStyle(color = fg)
- *   - 正在唱的字 (0 < progress < 1)：SpanStyle(brush = Brush.horizontalGradient)
- *     —— brush 在该字的 layout 范围内做 L→R sweep，分割点 = 该字的 progress
- *   - 还没唱的字 (progress = 0)：SpanStyle(color = fgUnsung)
+ * 颜色变化 = 词内逐字母（CJK：逐字）平滑插值。每个字符算一个 "letter-local"
+ * 子进度 letterT = (wordP - letterStart) / (1/N) ∈ (0, 1)，颜色 lerp(fgUnsung, fg, letterT)。
+ * 多字母 ASCII 词得到清晰的 L→R 流光感（"hello" 5 个字依次着色）。
+ * 单字 token（CJK / 单字符词）就是该字的 progress 平滑插值。
  *
- * 跳动 (graphicsLayer scale) 完全去掉了：之前用每字 scale 会让 layout 微微推搡，
- * 跟当前要求的"零跳变"冲突。色彩 sweep 已经足够强表达"在唱这个词"。
+ * 之前用 Brush.horizontalGradient on SpanStyle 不工作 —— Compose 的 SpanStyle.brush
+ * 取的是整段 Text 的 bounds，不是单 span 的 bounds，所以 sweep 切分点不对，
+ * 看起来像"没动"。改成"逐字符 SpanStyle(color)" 是稳定的：每个字母独立颜色，
+ * 整段 paragraph 没有任何不可控的 brush 行为。
  */
 @Composable
 private fun AppleMusicActiveLyricRow(
@@ -502,23 +513,46 @@ private fun AppleMusicActiveLyricRow(
                     start, end,
                 )
                 else -> {
-                    // 词内 L→R sweep：分割点正好 = 这个 token 的 progress
-                    val sweep = Brush.horizontalGradient(
-                        colorStops = arrayOf(
-                            0f to fg,
-                            p to fg,
-                            (p + 0.01f).coerceAtMost(1f) to fgUnsung,
-                            1f to fgUnsung,
-                        ),
-                    )
-                    addStyle(
-                        androidx.compose.ui.text.SpanStyle(brush = sweep),
-                        start, end,
-                    )
+                    // token 正在唱：把 token 内每个字母按 L→R 分配子进度
+                    val n = text.length
+                    if (n == 1) {
+                        addStyle(
+                            androidx.compose.ui.text.SpanStyle(
+                                color = androidx.compose.ui.graphics.lerp(fgUnsung, fg, p),
+                            ),
+                            start, end,
+                        )
+                    } else {
+                        // multi-letter 词（英文 / 数字）：逐字母线性
+                        for (i in 0 until n) {
+                            val letterStart = i.toFloat() / n
+                            val letterEnd = (i + 1f) / n
+                            val letterT = ((p - letterStart) / (letterEnd - letterStart))
+                                .coerceIn(0f, 1f)
+                            val letterColor =
+                                androidx.compose.ui.graphics.lerp(fgUnsung, fg, letterT)
+                            addStyle(
+                                androidx.compose.ui.text.SpanStyle(color = letterColor),
+                                start + i, start + i + 1,
+                            )
+                        }
+                    }
                 }
             }
         }
     }
     Text(text = annotated, style = style)
+}
+
+/**
+ * 跳动曲线 —— 在 token 刚开始（p≈0.18）时达峰，迅速回落。
+ * 给活动行一个"嘴一张就一记重音"的呼吸感。
+ */
+private fun bounceCurve(p: Float): Float {
+    val t = p.coerceIn(0f, 1f)
+    if (t <= 0f || t >= 1f) return 0f
+    val raw = t * (1f - t) * (1f - t)
+    val skewed = kotlin.math.sqrt(t.toDouble()).toFloat() * (1f - t) * (1f - t) * 1.6f
+    return kotlin.math.max(raw * 6.75f, skewed).coerceIn(0f, 1f)
 }
 
