@@ -40,7 +40,6 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalConfiguration
@@ -415,13 +414,15 @@ private fun AppleMusicLyricRow(
     fg: Color,
     fgUnsung: Color,
 ) {
-    // 距离活动行越远 alpha 越低
+    // 距离活动行越远 alpha 越低。
+    // distance-1（刚唱完那行）从 0.50 提到 0.70 —— 之前 alpha 1.0 → 0.5 衰减过大，
+    // 看起来像"色变"。0.70 让上一句保留视觉重量，跟焦点行的过渡更顺滑。
     val targetAlpha = when (distance) {
         0 -> 1.0f
-        1 -> 0.50f
-        2 -> 0.28f
-        3 -> 0.16f
-        4 -> 0.10f
+        1 -> 0.70f
+        2 -> 0.40f
+        3 -> 0.22f
+        4 -> 0.12f
         else -> 0.06f
     }
     val rowAlpha by animateFloatAsState(
@@ -453,101 +454,89 @@ private fun AppleMusicLyricRow(
         ),
     )
 
+    // ⚠ 关键：active 和 inactive 都走相同的 Text(annotated, style) 渲染路径。
+    //   之前 inactive = Text(line.text, color = fg) vs active = Text(annotated)
+    //   两条路径的 paragraph layout 在亚像素级有细微差别，切换瞬间字符微移
+    //   ——用户报"快要唱时左右抖一下"。现在统一用 annotated，inactive 就是
+    //   一段单 SpanStyle 全 fg；切换无 layout 变化，无抖动。
+    val annotated = androidx.compose.ui.text.buildAnnotatedString {
+        if (isActive && line.chars.isNotEmpty()) {
+            // YRC: per-letter L→R sweep
+            buildActiveAnnotated(line.chars, positionMs, fg, fgUnsung)
+        } else {
+            // 非活动 / LRC：整行单 SpanStyle 全 fg。透明度交给 row alpha 处理，
+            // 不在字符颜色上做花样 —— 用户明确说"上一句要消失了，没必要动它颜色"
+            append(line.text)
+            addStyle(
+                androidx.compose.ui.text.SpanStyle(color = fg),
+                0, line.text.length,
+            )
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .graphicsLayer {
-                alpha = rowAlpha
-                transformOrigin = TransformOrigin(0f, 0.5f)
-            }
+            .graphicsLayer { alpha = rowAlpha }
             .padding(vertical = 8.dp),
     ) {
-        if (isActive && line.chars.isNotEmpty()) {
-            // YRC：有真实的逐词时间戳 → 走精细动画（per-letter L→R 着色 + 当前词跳动）
-            AppleMusicActiveLyricRow(
-                chars = line.chars,
-                positionMs = positionMs,
-                fg = fg,
-                fgUnsung = fgUnsung,
-                style = style,
-            )
-        } else {
-            // LRC：只有行级时间戳，强行均分给每个字会跟实际唱速错位 —— 保持
-            // "整行同色"的简洁体验更对。inactive 行也走这条。
-            Text(text = line.text, color = fg, style = style)
-        }
+        Text(text = annotated, style = style)
     }
 }
 
-/**
- * 活动行渲染 —— 单个 Text + AnnotatedString，**只做颜色变化，不做位置动画**。
- *
- * 颜色规则：
- *   - 已唱字 (progress = 1)：fg
- *   - 还没唱的字 (progress = 0)：fgUnsung
- *   - 正在唱的 token：
- *       · CJK / 单字符词：lerp(fgUnsung, fg, p) 整段平滑过渡
- *       · 多字母 ASCII 词："hello" 5 个字母 → 每字按 L→R 子进度 lerp，
- *         得到清晰的 L→R 流光感
- *
- * 不再做任何 baselineShift / translationY / overlay —— 之前的位置动画都跟
- * paragraph 度量纠缠不清，且用户反馈时间对不准。颜色本身已经足够表达"在唱这词"。
- */
-@Composable
-private fun AppleMusicActiveLyricRow(
+/** 给 buildAnnotatedString 复用的 helper —— 计算活动行的 per-letter spans */
+private fun androidx.compose.ui.text.AnnotatedString.Builder.buildActiveAnnotated(
     chars: List<PipoLyricChar>,
     positionMs: Long,
     fg: Color,
     fgUnsung: Color,
-    style: TextStyle,
 ) {
-    val annotated = androidx.compose.ui.text.buildAnnotatedString {
-        var idx = 0
-        for (token in chars) {
-            val p = token.progress(positionMs)
-            val text = token.text
-            val start = idx
-            append(text)
-            val end = start + text.length
-            idx = end
-            when {
-                p >= 1f -> addStyle(
-                    androidx.compose.ui.text.SpanStyle(color = fg),
-                    start, end,
-                )
-                p <= 0f -> addStyle(
-                    androidx.compose.ui.text.SpanStyle(color = fgUnsung),
-                    start, end,
-                )
-                else -> {
-                    val n = text.length
-                    if (n == 1) {
+    var idx = 0
+    for (token in chars) {
+        val p = token.progress(positionMs)
+        val text = token.text
+        val start = idx
+        append(text)
+        val end = start + text.length
+        idx = end
+        when {
+            p >= 1f -> addStyle(
+                androidx.compose.ui.text.SpanStyle(color = fg),
+                start, end,
+            )
+            p <= 0f -> addStyle(
+                androidx.compose.ui.text.SpanStyle(color = fgUnsung),
+                start, end,
+            )
+            else -> {
+                val n = text.length
+                if (n == 1) {
+                    addStyle(
+                        androidx.compose.ui.text.SpanStyle(
+                            color = lerp(fgUnsung, fg, p),
+                        ),
+                        start, end,
+                    )
+                } else {
+                    for (i in 0 until n) {
+                        val letterStart = i.toFloat() / n
+                        val letterEnd = (i + 1f) / n
+                        val letterT = ((p - letterStart) / (letterEnd - letterStart))
+                            .coerceIn(0f, 1f)
                         addStyle(
                             androidx.compose.ui.text.SpanStyle(
-                                color = lerp(fgUnsung, fg, p),
+                                color = lerp(fgUnsung, fg, letterT),
                             ),
-                            start, end,
+                            start + i, start + i + 1,
                         )
-                    } else {
-                        // 多字母：逐字母 L→R 着色 sweep
-                        for (i in 0 until n) {
-                            val letterStart = i.toFloat() / n
-                            val letterEnd = (i + 1f) / n
-                            val letterT = ((p - letterStart) / (letterEnd - letterStart))
-                                .coerceIn(0f, 1f)
-                            addStyle(
-                                androidx.compose.ui.text.SpanStyle(
-                                    color = lerp(fgUnsung, fg, letterT),
-                                ),
-                                start + i, start + i + 1,
-                            )
-                        }
                     }
                 }
             }
         }
     }
-    Text(text = annotated, style = style)
 }
+
+// AppleMusicActiveLyricRow 已删除 —— 改成 AppleMusicLyricRow 直接 buildAnnotatedString
+// + 调用 buildActiveAnnotated helper，active / inactive 共用同一个 Text 渲染路径。
 
 
