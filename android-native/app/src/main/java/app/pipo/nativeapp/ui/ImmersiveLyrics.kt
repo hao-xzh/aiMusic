@@ -158,6 +158,9 @@ fun ImmersiveLyricsOverlay(
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
+    // 灰封面（luma 接近 145 阈值）字色和 bg 对比不足。只对这一段中性色启动 scrim 拉对比，
+    // 浅色 / 深色封面 scrim 透明 → 视觉完全不变
+    val contrastScrim = pickContrastScrim(edges.bottom)
 
     // 切歌淡出淡入：title 变了就 fade 0 → 1。封面和背景由外层 TransitioningCover /
     // ImmersiveBackdrop 自己处理过渡，这里只管标题 + 歌词的内容层。
@@ -249,6 +252,7 @@ fun ImmersiveLyricsOverlay(
             fg = fg,
             fgDim = fgDim,
             fgUnsung = fgUnsung,
+            scrimColor = contrastScrim,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
@@ -287,6 +291,7 @@ private fun AppleMusicLyricColumn(
     fg: Color,
     fgDim: Color,
     fgUnsung: Color,
+    scrimColor: Color = Color.Transparent,
     modifier: Modifier = Modifier,
 ) {
     if (lines.isEmpty()) {
@@ -368,6 +373,20 @@ private fun AppleMusicLyricColumn(
             .onSizeChanged { containerHeightPx = it.height }
             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
             .drawWithContent {
+                // 灰封面对比补偿 scrim：仅 luma 接近 145 阈值时非透明，把歌词列底色拉离字色。
+                // 用一个垂直渐变让 scrim 在中段最强、上下与 mask fade 同步淡出，避免硬边。
+                if (scrimColor.alpha > 0f) {
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            colorStops = arrayOf(
+                                0f to Color.Transparent,
+                                0.18f to scrimColor,
+                                0.85f to scrimColor,
+                                1f to Color.Transparent,
+                            ),
+                        ),
+                    )
+                }
                 drawContent()
                 // 焦点行落在 11% —— 上方只露 1 句历史歌词，那一句要狠狠淡出。
                 // fade band 收紧到 0..14%，恰好覆盖那 1 句的范围。
@@ -454,20 +473,10 @@ private fun AppleMusicLyricRow(
     //   inactive 所有字同色 → Compose 合并成 1 个 run → letter-spacing 在 N-1 个间隙
     //   都生效（紧凑）。Active 第一个字符颜色一变 → run 数增多 → run 间不应用 letter-spacing
     //   → 整行变宽几像素，看起来"右边抖一下"。letterSpacing = 0 让两态宽度一致。
-    // Tone-aware 投影：白字配黑投影 / 黑字配白投影 —— 灰色封面下给字形多一道边缘，
-    // 高亮色的对比度立起来。投影是 paint-time 效果，不影响 layout。
-    val isLight = fg == Color(0xFFFFFFFF)
-    val textShadow = androidx.compose.ui.graphics.Shadow(
-        color = if (isLight) Color.Black.copy(alpha = 0.35f)
-                else Color.White.copy(alpha = 0.45f),
-        offset = androidx.compose.ui.geometry.Offset(0f, 1f),
-        blurRadius = 6f,
-    )
     val style = TextStyle(
         fontSize = 28.sp,
         fontWeight = FontWeight.Black,
         lineHeight = 44.sp,
-        shadow = textShadow,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
             trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,

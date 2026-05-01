@@ -115,3 +115,29 @@ fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback
     return Color(red = rgb[0] / 255f, green = rgb[1] / 255f, blue = rgb[2] / 255f)
 }
+
+/**
+ * 灰封面"看不清"补偿：只在 sampled 边缘色 luma 接近 tone 阈值（145）时启动，
+ * 其他色调返回完全透明，不影响视觉。
+ *
+ *   - luma 远离 145（>210 / <80）→ Transparent，浅色 / 深色封面完全不动
+ *   - luma 接近 145 → 输出一个对比 scrim：
+ *       · luma > 145（黑字 tone=Dark）→ 浅色 scrim 把歌词区 bg 进一步拉亮，黑字更清
+ *       · luma ≤ 145（白字 tone=Light）→ 深色 scrim 把歌词区 bg 进一步压暗，白字更清
+ *   - alpha 按距 145 的远近线性插值，最强 0.42
+ */
+fun pickContrastScrim(rgb: IntArray?): Color {
+    if (rgb == null || rgb.size < 3) return Color.Transparent
+    val luma = 0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2]
+    val dangerCenter = 145f
+    val dangerWidth = 65f
+    val dist = kotlin.math.abs(luma - dangerCenter)
+    if (dist >= dangerWidth) return Color.Transparent
+    val intensity = 1f - dist / dangerWidth
+    val alpha = intensity * 0.42f
+    return if (luma > dangerCenter) {
+        Color(1f, 1f, 1f, alpha)
+    } else {
+        Color(0f, 0f, 0f, alpha)
+    }
+}
