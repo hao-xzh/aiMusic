@@ -94,10 +94,11 @@ fun PipoNativeApp() {
                 )
 
                 // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
-                // lyricLeadMs：把 positionMs 提前一点喂给歌词，因为人眼接收 highlight 到歌手实际
-                // 唱出来之间有一段感知延迟。280ms 偏小听起来"颜色跟不上"，380ms 更接近
-                // Apple Music 那种"嘴还没张色彩已经先扫过去"的体感。
-                val lyricPositionMs = viewModel.state.positionMs + 380L
+                // lyricLeadMs：把 positionMs 提前喂给歌词。600ms 是综合：
+                //   - MediaController 通过 IPC 拿 ExoPlayer 位置，本身可能延迟 ~50-100ms
+                //   - 网易 YRC 时间戳本身就偏晚于实际唱速 ~100-200ms
+                //   - 人眼"看到颜色变 → 听到那个字唱出来"之间约 100ms 感知阈值
+                val lyricPositionMs = viewModel.state.positionMs + 600L
                 val activeLyricIndex = viewModel.state.lyrics
                     .indexOfLast { line -> lyricPositionMs >= line.startMs }
                     .coerceAtLeast(0)
