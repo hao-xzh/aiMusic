@@ -36,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -432,21 +433,16 @@ private fun AppleMusicLyricRow(
         animationSpec = tween(380),
         label = "lyricAlpha",
     )
-    // Apple Music：28sp Black，letter-spacing -0.5sp。
+    // Apple Music 28sp Black 风格。
     //
-    // 锁死行高 + 锁死 baseline 在行内的位置 ——
-    // 仅靠 lineHeight = 44sp 还不够：Compose paragraph 在 baselineShift 变化时会把
-    // 基线在 lineHeight 块内重新定位（基线位置 = top + max ascent），这会把同行其它词
-    // 一起带上下挪。把 LineHeightStyle 锁死 + includeFontPadding=false 一起用，
-    // 基线在每帧的位置不再随 baselineShift 漂移：
-    //   - Alignment.Center：基线相对块顶居中（= 固定的 lineHeight/2 偏移）
-    //   - Trim.None：不裁前后 leading
-    //   - includeFontPadding=false：去掉 Android 平台默认的字体 padding 影响
+    // ⚠ 不能用负 letterSpacing —— Compose 的 letter-spacing 是 per-glyph-run 应用的：
+    //   inactive 所有字同色 → Compose 合并成 1 个 run → letter-spacing 在 N-1 个间隙
+    //   都生效（紧凑）。Active 第一个字符颜色一变 → run 数增多 → run 间不应用 letter-spacing
+    //   → 整行变宽几像素，看起来"右边抖一下"。letterSpacing = 0 让两态宽度一致。
     val style = TextStyle(
         fontSize = 28.sp,
         fontWeight = FontWeight.Black,
         lineHeight = 44.sp,
-        letterSpacing = (-0.5).sp,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
             trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
@@ -456,27 +452,21 @@ private fun AppleMusicLyricRow(
         ),
     )
 
-    // ⚠ 关键：active 和 inactive 都用**完全相同的 SpanStyle 数量**（per-char）。
-    //
-    // 为什么：letterSpacing(-0.5sp) + FontWeight.Black 在 single-run（inactive 单 span）
-    // 和 multi-run（active per-char span）下文本 shape 出来宽度不一样——
-    // 切换瞬间整行向右偏移几 px，用户报"快要唱时整句往右抖一下"。
-    //
-    // 解法：两态都 per-char SpanStyle —— run 结构 100% 一致，layout 完全相同，
-    // 唯一变化是颜色值。N 个 per-char SpanStyle 对一行 20-50 字的歌词性能没问题。
-    // 颜色策略 —— 让"激活瞬间"完全无色变 flicker：
-    //   未唱（future）：每字 fgUnsung —— 跟 active 状态下"还没唱到的字"颜色一致
-    //   已唱（past）：每字 fg —— 跟 active 状态下"刚唱完的字"颜色一致
-    //   active：per-char gradient
-    // 切换 future → active 时未唱字保持 fgUnsung（无变），切 active → past 时已唱字
-    // 保持 fg（无变），整个生命周期颜色都不闪。
-    val annotated = androidx.compose.ui.text.buildAnnotatedString {
-        if (isActive && line.chars.isNotEmpty()) {
-            buildActiveAnnotated(line.chars, positionMs, fg, fgUnsung)
-        } else {
-            val color = if (isPast) fg else fgUnsung
-            buildInactiveAnnotated(line.text, color)
-        }
+    // 简单到极致：两层完全一样的 Text，唯一区别是颜色 + 上层做横向 clip。
+    //   底层：line.text 全 fgUnsung
+    //   上层：line.text 全 fg，用 drawWithContent 把 x > sweepX 的部分裁掉
+    // 没有 SpanStyle 切分，没有 letter-spacing 跨 run 问题，没有 paragraph 度量变化。
+    // sweepX 跟着 positionMs 平滑增长 —— 这就是"颜色变化"的全部。
+    val finalColor = if (isPast) fg else fgUnsung
+    var layout by remember(line.text) {
+        androidx.compose.runtime.mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null)
+    }
+    val sweepX = if (isActive && line.chars.isNotEmpty() && layout != null) {
+        computeSweepX(line.chars, positionMs, layout!!)
+    } else if (isPast) {
+        Float.POSITIVE_INFINITY  // 已唱完整行都显示 fg
+    } else {
+        0f                       // 未唱：上层一点都不露
     }
 
     Box(
@@ -485,68 +475,80 @@ private fun AppleMusicLyricRow(
             .graphicsLayer { alpha = rowAlpha }
             .padding(vertical = 8.dp),
     ) {
-        Text(text = annotated, style = style)
-    }
-}
-
-/** inactive 行的 per-char 渲染 —— 颜色由调用方决定（past = fg, future = fgUnsung）。
- *  用 per-char SpanStyle 跟 active 路径 run 数完全对齐，避免切换抖动 */
-private fun androidx.compose.ui.text.AnnotatedString.Builder.buildInactiveAnnotated(
-    text: String,
-    color: Color,
-) {
-    append(text)
-    for (i in text.indices) {
-        addStyle(
-            androidx.compose.ui.text.SpanStyle(color = color),
-            i, i + 1,
+        // 底层：unsung 色，整个一行画好
+        Text(
+            text = line.text,
+            color = if (isActive) fgUnsung else finalColor,
+            style = style,
+            onTextLayout = { layout = it },
         )
-    }
-}
-
-/**
- * active 行 —— **每字符一个 SpanStyle**，不再按 token 粒度。
- * 这样跟 buildInactiveAnnotated 的 N 个 per-char SpanStyle 对齐，run 数一致，
- * shape 出来宽度一致，切换无 layout 抖动。
- */
-private fun androidx.compose.ui.text.AnnotatedString.Builder.buildActiveAnnotated(
-    chars: List<PipoLyricChar>,
-    positionMs: Long,
-    fg: Color,
-    fgUnsung: Color,
-) {
-    var idx = 0
-    for (token in chars) {
-        val p = token.progress(positionMs)
-        val text = token.text
-        val tokenStart = idx
-        append(text)
-        idx += text.length
-        val n = text.length
-        // 每个字母都加一个 SpanStyle —— 颜色按字母在 token 内的子进度算
-        for (i in 0 until n) {
-            val letterColor = when {
-                p >= 1f -> fg                                // 整 token 唱过了
-                p <= 0f -> fgUnsung                          // 整 token 还没唱
-                n == 1 -> lerp(fgUnsung, fg, p)              // 单字 token 整段 lerp
-                else -> {
-                    // 多字母 token：第 i 个字母按 L→R 子进度
-                    val letterStart = i.toFloat() / n
-                    val letterEnd = (i + 1f) / n
-                    val letterT = ((p - letterStart) / (letterEnd - letterStart))
-                        .coerceIn(0f, 1f)
-                    lerp(fgUnsung, fg, letterT)
-                }
-            }
-            addStyle(
-                androidx.compose.ui.text.SpanStyle(color = letterColor),
-                tokenStart + i, tokenStart + i + 1,
+        // 上层：sung 色，clip 到 sweepX
+        if (isActive && line.chars.isNotEmpty()) {
+            Text(
+                text = line.text,
+                color = fg,
+                style = style,
+                modifier = Modifier.drawWithContent {
+                    val clipRight = sweepX.coerceAtLeast(0f).coerceAtMost(size.width)
+                    if (clipRight <= 0f) return@drawWithContent
+                    clipRect(
+                        left = 0f,
+                        top = 0f,
+                        right = clipRight,
+                        bottom = size.height,
+                    ) {
+                        this@drawWithContent.drawContent()
+                    }
+                },
             )
         }
     }
 }
 
-// AppleMusicActiveLyricRow 已删除 —— 改成 AppleMusicLyricRow 直接 buildAnnotatedString
-// + 调用 buildActiveAnnotated helper，active / inactive 共用同一个 Text 渲染路径。
+/**
+ * 算"已唱"边界的 x 坐标。基于 line.chars 的 token 时间戳 + TextLayoutResult。
+ *
+ *   - 当前 positionMs 在某个 token 的窗口内：
+ *       token 起始 x + (token 内进度 × token 宽度)
+ *   - positionMs 已经超过所有 token：返回行宽（全部唱完）
+ *   - positionMs 还没到第一个 token：返回 0
+ */
+private fun computeSweepX(
+    chars: List<PipoLyricChar>,
+    positionMs: Long,
+    layout: androidx.compose.ui.text.TextLayoutResult,
+): Float {
+    if (chars.isEmpty()) return 0f
+    val totalWidth = layout.size.width.toFloat()
+
+    // 找当前正在唱的 token（progress in [0, 1]），同时累计 char idx
+    var charIdx = 0
+    for (token in chars) {
+        val p = token.progress(positionMs)
+        val tokenStart = charIdx
+        val tokenEnd = charIdx + token.text.length
+        when {
+            p >= 1f -> {
+                // 这个 token 已唱完，继续找下一个
+                charIdx = tokenEnd
+                continue
+            }
+            p <= 0f -> {
+                // 还没轮到这个 token —— 返回它起点的 x
+                return if (tokenStart == 0) 0f
+                else layout.getBoundingBox(tokenStart - 1).right
+            }
+            else -> {
+                // 正在唱这个 token：在 [tokenStart, tokenEnd] 之间按 p 插值
+                val startX = if (tokenStart == 0) 0f
+                else layout.getBoundingBox(tokenStart - 1).right
+                val endX = layout.getBoundingBox(tokenEnd - 1).right
+                return startX + (endX - startX) * p
+            }
+        }
+    }
+    // 所有 token 都唱完了
+    return totalWidth
+}
 
 
