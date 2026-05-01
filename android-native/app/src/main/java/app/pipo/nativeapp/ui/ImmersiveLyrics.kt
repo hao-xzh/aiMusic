@@ -53,7 +53,6 @@ import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.progress
-import app.pipo.nativeapp.data.splitIntoVisualChars
 
 /**
  * 沉浸式歌词层 —— 镜像 src/components/PlayerCard.tsx ImmersiveLyrics 的非封面部分。
@@ -463,25 +462,18 @@ private fun AppleMusicLyricRow(
             }
             .padding(vertical = 8.dp),
     ) {
-        if (isActive) {
-            // YRC 歌：line.chars 已经是 per-word/per-char tokens
-            // LRC 歌：没有词级时间戳 —— 用 splitIntoVisualChars 把 line.text 合成 token 列表，
-            //         均分 line.durationMs 给每个 token；这样 LRC 跟 YRC 视觉一致：逐字母
-            //         L→R 着色 + 当前 token 跳动。不用关心是哪种格式。
-            val activeChars = if (line.chars.isNotEmpty()) line.chars
-            else synthesizeCharsFromLrc(line)
-            if (activeChars.isNotEmpty()) {
-                AppleMusicActiveLyricRow(
-                    chars = activeChars,
-                    positionMs = positionMs,
-                    fg = fg,
-                    fgUnsung = fgUnsung,
-                    style = style,
-                )
-            } else {
-                Text(text = line.text, color = fg, style = style)
-            }
+        if (isActive && line.chars.isNotEmpty()) {
+            // YRC：有真实的逐词时间戳 → 走精细动画（per-letter L→R 着色 + 当前词跳动）
+            AppleMusicActiveLyricRow(
+                chars = line.chars,
+                positionMs = positionMs,
+                fg = fg,
+                fgUnsung = fgUnsung,
+                style = style,
+            )
         } else {
+            // LRC：只有行级时间戳，强行均分给每个字会跟实际唱速错位 —— 保持
+            // "整行同色"的简洁体验更对。inactive 行也走这条。
             Text(text = line.text, color = fg, style = style)
         }
     }
@@ -586,32 +578,4 @@ private fun bounceCurve(p: Float): Float {
     return kotlin.math.max(raw * 6.75f, skewed).coerceIn(0f, 1f)
 }
 
-/**
- * 把 LRC 行（只有行级时间戳）合成跟 YRC 一致的 token 序列。
- *   - 用 splitIntoVisualChars（CJK 单字 / ASCII 词）划分
- *   - 行总时长按 token 长度比例分配（中文每字一份，英文 "hello" 按 5 字符占 5 份）
- *   - 这样 LRC 行也走 AppleMusicActiveLyricRow 的逐 token 路径，
- *     视觉上跟 YRC 行一致：逐字母 L→R 着色 + 当前 token 跳动
- */
-private fun synthesizeCharsFromLrc(line: PipoLyricLine): List<PipoLyricChar> {
-    val tokens = splitIntoVisualChars(line.text)
-    if (tokens.isEmpty() || line.durationMs <= 0L) return emptyList()
-    // 按字符长度加权（多字母词得更多时间，单字得更少），更接近真实唱速
-    val totalWeight = tokens.sumOf { it.length }.coerceAtLeast(1)
-    val out = ArrayList<PipoLyricChar>(tokens.size)
-    var elapsed = 0L
-    for ((idx, t) in tokens.withIndex()) {
-        val dur = if (idx == tokens.lastIndex) line.durationMs - elapsed
-        else (line.durationMs * t.length / totalWeight)
-        out.add(
-            PipoLyricChar(
-                startMs = line.startMs + elapsed,
-                durationMs = dur,
-                text = t,
-            ),
-        )
-        elapsed += dur
-    }
-    return out
-}
 
