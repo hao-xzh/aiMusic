@@ -60,8 +60,8 @@ object PipoTypography {
 
 object PipoMotion {
     // 沉浸式 FLIP 曲线 / 时长（PlayerCard.tsx）
-    val FlipDurationMs = 620
-    val CloseDurationMs = 540
+    val FlipDurationMs = 460
+    val CloseDurationMs = 360
     // cubic-bezier(0.32, 0.72, 0, 1)
     val FlipEase: Easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
     // cubic-bezier(0.6, 0.04, 0.22, 1)

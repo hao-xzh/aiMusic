@@ -94,14 +94,18 @@ fun PipoNativeApp() {
                 )
 
                 // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
+                val lyricPositionMs = viewModel.state.positionMs + 120L
+                val activeLyricIndex = viewModel.state.lyrics
+                    .indexOfLast { line -> lyricPositionMs >= line.startMs }
+                    .coerceAtLeast(0)
                 ImmersiveLyricsOverlay(
                     progress = coverProgress,
                     coverUrl = viewModel.state.artworkUrl,
                     title = viewModel.state.title,
                     artist = viewModel.state.artist,
                     lyrics = viewModel.state.lyrics,
-                    activeLyricIndex = viewModel.state.activeLyricIndex,
-                    positionMs = viewModel.state.positionMs,
+                    activeLyricIndex = activeLyricIndex,
+                    positionMs = lyricPositionMs,
                     isPlaying = viewModel.state.isPlaying,
                     onClose = { immersive = false },
                     onToggle = viewModel::toggle,

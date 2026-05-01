@@ -88,8 +88,8 @@ fun TransitioningCover(
                             colorStops = arrayOf(
                                 0f to Color.Black.copy(alpha = 1f - 0.40f * maskStrength),
                                 0.04f to Color.Black,
-                                0.78f to Color.Black,
-                                0.88f to Color.Black.copy(alpha = 1f - 0.55f * maskStrength),
+                                0.68f to Color.Black,
+                                0.84f to Color.Black.copy(alpha = 1f - 0.70f * maskStrength),
                                 1f to Color.Black.copy(alpha = 1f - 0.98f * maskStrength),
                             ),
                         ),
@@ -105,7 +105,7 @@ fun TransitioningCover(
                     .fillMaxSize()
                     .background(Color(0xFF11151D)),  // 兜底色在 offscreen 层之内，跟 mask 一起裁
                 contentScale = ContentScale.Crop,
-                durationMs = 720,
+                durationMs = 520,
             )
         }
     }

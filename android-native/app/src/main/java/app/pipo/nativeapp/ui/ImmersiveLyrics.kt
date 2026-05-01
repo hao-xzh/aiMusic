@@ -5,9 +5,11 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,12 +26,9 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.layout.positionInParent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -38,26 +37,24 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.progress
+import kotlin.math.PI
+import kotlin.math.sin
 
 /**
  * 沉浸式歌词层 —— 镜像 src/components/PlayerCard.tsx ImmersiveLyrics 的非封面部分。
@@ -212,27 +209,18 @@ private fun BackdropBlurredCover(coverUrl: String?) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .alpha(0.62f)
-            .blur(25.dp),
+            .alpha(0.54f)
+            .blur(36.dp)
+            .graphicsLayer {
+                scaleX = 1.22f
+                scaleY = 1.22f
+            },
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .blur(25.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .blur(25.dp)
-                    .graphicsLayer { scaleX = 1.5f; scaleY = 1.5f },
-            ) {
-                CrossfadeCoverImage(
-                    url = coverUrl,
-                    modifier = Modifier.fillMaxSize(),
-                    durationMs = 1100,
-                )
-            }
-        }
+        CrossfadeCoverImage(
+            url = coverUrl,
+            modifier = Modifier.fillMaxSize(),
+            durationMs = 760,
+        )
     }
 }
 
@@ -403,17 +391,53 @@ private fun AppleMusicLyricRow(
             // 平滑的字符级 wipe：每个字根据 charProgress 的 0..1 插值颜色，
             // 不再是 binary "已唱/未唱"。配合 YrcParser 把 token 切到字级，
             // 视觉上是真正的 karaoke 流光，不是一段一段闪。
-            val annotated = buildAnnotatedString {
-                line.chars.forEach { c ->
-                    val p = c.progress(positionMs)
-                    val color = androidx.compose.ui.graphics.lerp(fgUnsung, fg, p)
-                    withStyle(SpanStyle(color = color)) { append(c.text) }
-                }
-            }
-            Text(text = annotated, style = style)
+            AppleMusicActiveLyricRow(
+                line = line,
+                positionMs = positionMs,
+                fg = fg,
+                fgUnsung = fgUnsung,
+                style = style,
+            )
         } else {
             Text(text = line.text, color = fg, style = style)
         }
     }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AppleMusicActiveLyricRow(
+    line: PipoLyricLine,
+    positionMs: Long,
+    fg: Color,
+    fgUnsung: Color,
+    style: TextStyle,
+) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start,
+    ) {
+        line.chars.forEach { char ->
+            val p = char.progress(positionMs)
+            val lift = if (p > 0f && p < 1f) sin(p * PI.toFloat()).coerceAtLeast(0f) else 0f
+            val glow = smoothStep(p)
+            Text(
+                text = char.text,
+                color = lerp(fgUnsung, fg, glow),
+                style = style,
+                modifier = Modifier.graphicsLayer {
+                    alpha = 0.72f + glow * 0.28f
+                    scaleX = 1f + lift * 0.035f
+                    scaleY = 1f + lift * 0.035f
+                    translationY = -lift * 5f
+                },
+            )
+        }
+    }
+}
+
+private fun smoothStep(value: Float): Float {
+    val t = value.coerceIn(0f, 1f)
+    return t * t * (3f - 2f * t)
 }
 

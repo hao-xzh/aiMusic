@@ -88,23 +88,19 @@ fun splitIntoVisualChars(text: String): List<String> {
     fun appendToLast(c: Char) {
         if (out.isEmpty()) startNew(c) else out.last().append(c)
     }
-    var prevWasLetter = false
     for (c in text) {
         val isCjk = c in '一'..'鿿' || c in '぀'..'ヿ' || c in '가'..'힣'
         val isAsciiWord = (c in 'a'..'z') || (c in 'A'..'Z') || (c in '0'..'9')
         when {
             isCjk -> {
                 startNew(c)
-                prevWasLetter = false
             }
             isAsciiWord -> {
-                if (prevWasLetter) appendToLast(c) else startNew(c)
-                prevWasLetter = true
+                startNew(c)
             }
             else -> {
                 // 空白 / 标点：附在前一个字符上，不单独成字
                 appendToLast(c)
-                prevWasLetter = false
             }
         }
     }

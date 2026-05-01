@@ -74,7 +74,7 @@ fun PlayerScreen(
         while (true) {
             viewModel.refreshPosition()
             if (!state.isPlaying) Amp.set(0f)
-            delay(if (state.isPlaying) 200L else 800L)
+            delay(if (state.isPlaying) 80L else 420L)
         }
     }
 
@@ -84,7 +84,7 @@ fun PlayerScreen(
 
     val hideAlpha by animateFloatAsState(
         targetValue = if (immersiveActive) 0f else 1f,
-        animationSpec = tween(200),
+        animationSpec = tween(140),
         label = "hideAlpha",
     )
 
@@ -248,12 +248,12 @@ fun PlayerScreen(
 private fun CompactCover(coverUrl: String?, isPlaying: Boolean, hidden: Boolean) {
     val hideAlpha by animateFloatAsState(
         targetValue = if (hidden) 0f else 1f,
-        animationSpec = tween(200),
+        animationSpec = tween(140),
         label = "coverHide",
     )
     val playScale by animateFloatAsState(
         targetValue = if (isPlaying) 1.012f else 1f,
-        animationSpec = tween(4000),
+        animationSpec = tween(2800),
         label = "playScale",
     )
     Box(
