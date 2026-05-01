@@ -159,6 +159,21 @@ fun ImmersiveLyricsOverlay(
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
 
+    // 切歌淡出淡入：title 变了就 fade 0 → 1。封面和背景由外层 TransitioningCover /
+    // ImmersiveBackdrop 自己处理过渡，这里只管标题 + 歌词的内容层。
+    var lastTitle by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    val contentFade = remember { androidx.compose.animation.core.Animatable(1f) }
+    androidx.compose.runtime.LaunchedEffect(title) {
+        if (lastTitle != null && lastTitle != title) {
+            contentFade.snapTo(0f)
+            contentFade.animateTo(
+                1f,
+                animationSpec = androidx.compose.animation.core.tween(360),
+            )
+        }
+        lastTitle = title
+    }
+
     // 计算封面占据屏幕顶部的高度（跟 TransitioningCover 同步）
     val configuration = LocalConfiguration.current
     val screenWDp = configuration.screenWidthDp.dp
@@ -167,8 +182,8 @@ fun ImmersiveLyricsOverlay(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            // 容器根据 progress 从透明 fade 到不透明（标题/歌词跟着浮现）
-            .graphicsLayer { alpha = progress }
+            // progress 控制 immersive 进出整体透明度，contentFade 控制切歌时内容淡入淡出
+            .graphicsLayer { alpha = progress * contentFade.value }
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
