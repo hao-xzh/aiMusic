@@ -2,8 +2,11 @@ package app.pipo.nativeapp.playback
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -83,7 +86,35 @@ class PipoPlaybackService : MediaSessionService() {
             .setSeekForwardIncrementMs(10_000)
             .build()
             .apply {
-                repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+                repeatMode = Player.REPEAT_MODE_ALL
+                // 关键：保持 CPU + WiFi 醒着 —— 默认 ExoPlayer 不持锁
+                // 屏幕熄灭 ~30s 后 doze/idle，CPU 睡 → 网络 socket 关 →
+                // 当前缓冲耗尽就停（"放着放着自动停止"的根因）
+                setWakeMode(C.WAKE_MODE_NETWORK)
+
+                addListener(object : Player.Listener {
+                    override fun onPlayerError(error: PlaybackException) {
+                        // 网络抖动 / 解码瞬时失败 → 自动 prepare 重试，比让用户手动恢复体验好
+                        Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
+                        val recoverable = when (error.errorCode) {
+                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+                            PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+                            PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+                            PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
+                            else -> false
+                        }
+                        if (recoverable) {
+                            // 同首歌 head 处重连；如果 1.5s 内还失败 ，下次再走 next
+                            seekToDefaultPosition()
+                            prepare()
+                        } else if (mediaItemCount > 1) {
+                            // 不可恢复（解码 / DRM）→ 跳下一首避免卡死
+                            seekToNext()
+                            prepare()
+                        }
+                    }
+                })
             }
 
         // 通知栏 / 锁屏的"点击区"指回主 Activity —— 没有这条，状态栏播放卡片被
@@ -105,6 +136,21 @@ class PipoPlaybackService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
         return mediaSession
+    }
+
+    /**
+     * 用户从最近任务划掉 app 时调用。
+     *
+     * 默认行为是：如果当前没在播 → stopSelf()。但 MediaSessionService 父类会在播放时
+     * **保留** service。我们显式实现这条逻辑：只有在确实空闲时才 stopSelf，正在播继续。
+     * —— 否则部分 ROM（小米/华为定制）会把整个服务连同前台通知一起干掉，"放着放着停了"。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val player = mediaSession?.player
+        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
+            stopSelf()
+        }
+        // 在播 → 不调 stopSelf, 让前台 service 继续吃通知活
     }
 
     override fun onDestroy() {

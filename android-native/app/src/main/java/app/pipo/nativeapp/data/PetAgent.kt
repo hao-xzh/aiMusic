@@ -75,6 +75,12 @@ class PetAgent(
 
         // 1) 本地库 → 多路召回 → 排序
         val localTracks = runCatching { library.library() }.getOrDefault(emptyList())
+
+        // 1a) 命名歌曲 PIN —— 用户在话里明确点过的歌（"放七百年后"、"陈奕迅 浮夸"），
+        //     直接钉到队首；recall 只是"补差"，不是"覆盖用户明示意图"。
+        //     之前 hardTracks 字段在 recall 里完全没人用，textTracks 也只是 +0.6 分
+        //     完全可能被 audio/semantic/behavior 几路压下去 —— 这是 bug 不是 feature。
+        val pinnedNamed = resolvePinnedTracks(intent, localTracks)
         val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
         val recentPlay = runCatching { behaviorLog.recentPlay() }.getOrDefault(BehaviorLog.RecentPlay(emptySet(), emptySet()))
         val recentRec = runCatching { recommendationLog.recentContext() }.getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
@@ -117,8 +123,12 @@ class PetAgent(
             ).take(desired)
         } else emptyList()
 
-        // 2) 本地不够 → netease 搜索补
-        val final = if (localRanked.size >= 6) {
+        // 2) 命名歌曲补全 —— 用户点过名但本地没有的，去网易兜一首
+        val pinnedOnline = resolvePinnedFromOnline(intent, pinnedNamed)
+        val pinnedAll = mergeUnique(pinnedNamed, pinnedOnline)
+
+        // 3) 本地不够 → netease 搜索补
+        val recallMerged = if (localRanked.size >= 6) {
             localRanked
         } else {
             val queries = intent.toSearchQueries(userText)
@@ -132,7 +142,16 @@ class PetAgent(
             for (t in online) {
                 if (seenKeys.add(TrackDedupe.songKey(t))) merged.add(t)
             }
-            merged.take(desired)
+            merged
+        }
+
+        // 4) 把 pinned 钉到队首，然后是 recall 结果（去重）
+        val final = if (pinnedAll.isEmpty()) {
+            recallMerged.take(desired)
+        } else {
+            val pinnedKeys = pinnedAll.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+            val rest = recallMerged.filter { TrackDedupe.songKey(it) !in pinnedKeys }
+            (pinnedAll + rest).take(desired)
         }
 
         if (final.isEmpty()) {
@@ -159,6 +178,101 @@ class PetAgent(
             initialBatch = initialBatch,
             continuous = makeContinuousSource(reservoir, intent.toSearchQueries(userText)),
         )
+    }
+
+    // ---------- 命名歌曲解析 ----------
+
+    /**
+     * 把全/半角空格、各种连接符、标点都擦掉。"七百年后"、"七 百 年 後"、"七百年-后"
+     * 都归一到同一个 key。注意保留中文字符本身的差异（後 ≠ 后）—— 这是用户书写差异
+     * 不是本质相同。
+     */
+    private fun normalizeForMatch(s: String): String =
+        s.lowercase().replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？()（）\\[\\]【】《》<>&/]+"), "")
+
+    /**
+     * 在本地库里找用户点名的歌。匹配优先级：
+     *   1) 标题归一化完全相等 + 任一艺人也命中（陈奕迅 + 七百年后 → 钉那一首）
+     *   2) 标题归一化完全相等（同名翻唱也认）
+     *   3) 标题归一化包含/被包含（"七百年后" ↔ "七百年后 (Live)"）
+     * 返回结果按用户在话里的顺序，去重。
+     */
+    private fun resolvePinnedTracks(intent: PetIntent, library: List<NativeTrack>): List<NativeTrack> {
+        if (library.isEmpty()) return emptyList()
+        val titles = (intent.hardTracks + intent.textTracks).map { it.trim() }.filter { it.isNotEmpty() }
+        if (titles.isEmpty()) return emptyList()
+        val artistKeys = (intent.hardArtists + intent.textArtists)
+            .map(::normalizeForMatch).filter { it.isNotEmpty() }.toSet()
+
+        val out = LinkedHashMap<String, NativeTrack>()
+        for (rawTitle in titles.distinct()) {
+            val titleKey = normalizeForMatch(rawTitle)
+            if (titleKey.isEmpty()) continue
+
+            // 第 1 档：标题精确 + 艺人命中
+            val exactWithArtist = if (artistKeys.isEmpty()) null else library.firstOrNull { t ->
+                normalizeForMatch(t.title) == titleKey &&
+                    t.artist.split('/', '&', ',', '、').any { a ->
+                        normalizeForMatch(a) in artistKeys
+                    }
+            }
+            // 第 2 档：标题精确（无艺人约束 / 艺人不命中也接受）
+            val exactOnly = library.firstOrNull { normalizeForMatch(it.title) == titleKey }
+            // 第 3 档：标题包含/被包含
+            val partial = library.firstOrNull {
+                val tk = normalizeForMatch(it.title)
+                tk.isNotEmpty() && (titleKey in tk || tk in titleKey)
+            }
+
+            val pick = exactWithArtist ?: exactOnly ?: partial ?: continue
+            val key = TrackDedupe.songKey(pick)
+            if (key !in out) out[key] = pick
+        }
+        return out.values.toList()
+    }
+
+    /**
+     * 用户点名的歌本地没有 → 网易搜「title artist」补一首。
+     * 仅给"已点名但 pin 不上"的标题做补，避免把用户根本没点的歌灌进队首。
+     */
+    private suspend fun resolvePinnedFromOnline(
+        intent: PetIntent,
+        alreadyPinned: List<NativeTrack>,
+    ): List<NativeTrack> {
+        val titles = (intent.hardTracks + intent.textTracks).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (titles.isEmpty()) return emptyList()
+
+        val pinnedTitleKeys = alreadyPinned.mapTo(HashSet()) { normalizeForMatch(it.title) }
+        val missing = titles.filter { normalizeForMatch(it) !in pinnedTitleKeys }
+        if (missing.isEmpty()) return emptyList()
+
+        val artistHint = (intent.hardArtists + intent.textArtists).firstOrNull()?.trim().orEmpty()
+        return coroutineScope {
+            val deferred = missing.map { title ->
+                async {
+                    val q = if (artistHint.isNotEmpty()) "$title $artistHint" else title
+                    runCatching { repository.searchTracks(q, limit = 3) }.getOrDefault(emptyList())
+                        .firstOrNull { hit ->
+                            // 只接受标题 fuzzy 命中的，避免搜索引擎乱推不相干的
+                            val tk = normalizeForMatch(hit.title)
+                            val want = normalizeForMatch(title)
+                            tk.isNotEmpty() && (tk == want || want in tk || tk in want)
+                        }
+                }
+            }
+            deferred.mapNotNull { it.await() }
+        }
+    }
+
+    /** 按 songKey 去重保序合并 */
+    private fun mergeUnique(a: List<NativeTrack>, b: List<NativeTrack>): List<NativeTrack> {
+        if (a.isEmpty()) return b
+        if (b.isEmpty()) return a
+        val seen = HashSet<String>()
+        val out = ArrayList<NativeTrack>(a.size + b.size)
+        for (t in a) if (seen.add(TrackDedupe.songKey(t))) out.add(t)
+        for (t in b) if (seen.add(TrackDedupe.songKey(t))) out.add(t)
+        return out
     }
 
     /** 用一组查询词跑并行 netease 搜索，去重后返回 */
@@ -389,6 +503,12 @@ USER 部分会带"时段"、可能含"明天就周末"/"再 3 天就国庆"/"今
 
 5) "你知道火星哥吗" →
 {"reply":"Bruno Mars。给你来一组。","action":"play","queryText":"你知道火星哥吗","textHints":{"artists":["Bruno Mars"]},"hardConstraints":{"artists":["Bruno Mars"]}}
+
+5b) "想听陈奕迅，从七百年后开始" →
+{"reply":"行。先开七百年后。","action":"play","queryText":"想听陈奕迅，从七百年后开始","textHints":{"artists":["陈奕迅"],"tracks":["七百年后"]},"hardConstraints":{"artists":["陈奕迅"],"tracks":["七百年后"]}}
+
+5c) "放浮夸" →
+{"reply":"开浮夸。","action":"play","queryText":"放浮夸","textHints":{"tracks":["浮夸"]},"hardConstraints":{"tracks":["浮夸"]}}
 
 6) "谢谢" →
 {"reply":"嗯。","action":"chat","queryText":"谢谢"}

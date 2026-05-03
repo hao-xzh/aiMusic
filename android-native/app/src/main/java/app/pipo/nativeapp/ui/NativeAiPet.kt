@@ -1,15 +1,24 @@
 package app.pipo.nativeapp.ui
 
 import android.content.Context
+import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateIntOffsetAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -17,7 +26,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -27,9 +38,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.TransformOrigin
@@ -41,13 +57,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -60,10 +76,13 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -71,6 +90,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.runtime.Amp
@@ -206,8 +226,17 @@ fun NativeAiPet(
     var pending by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf("") }
     var hint by remember { mutableStateOf<String?>(null) }
+    // 最新一条助手回复（贴在底部输入条上方，6s 后自动消散）
+    var latestReply by remember { mutableStateOf<String?>(null) }
     val emptyHint = remember { EMPTY_HINTS.random() }
-    val scroll = rememberScrollState()
+
+    // latestReply 的自动消散
+    LaunchedEffect(latestReply) {
+        if (latestReply != null) {
+            delay(6000)
+            latestReply = null
+        }
+    }
 
     // 锚点：cover rect 在 → attached 模式（贴封面右下内侧）；不在 → free（屏幕右下）
     val anchor = LocalCoverAnchor.current
@@ -309,9 +338,6 @@ fun NativeAiPet(
     val orbScale = pulseScale.floatValue
     val haloPhaseValue = haloPulse.floatValue
 
-    LaunchedEffect(messages.size, pending) {
-        scroll.animateScrollTo(scroll.maxValue)
-    }
 
     // 每日首开招呼
     LaunchedEffect(Unit) {
@@ -445,63 +471,105 @@ fun NativeAiPet(
         label = "petAnchor",
     )
 
+    val keyboard = LocalSoftwareKeyboardController.current
+
     Box(modifier = modifier) {
-        // ---- Panel / 气泡 跟随 orb 当前锚点 ----
-        // 用 Modifier.layout 把右下角钉到 (orb.right, orb.top - gap)，让面板/气泡
-        // 始终浮在 orb 头顶。orb 在 attached / free 模式间补间时，面板/气泡跟着滑过去。
+        // ---- 透明点击捕获层：panel 打开时点空白处 = 收起 ----
+        // 不画 scrim（用户明确拒绝过遮罩），但仍要让用户能"点空白处关闭"
+        // —— 这是 iOS / 小爱 / 微信 浮层的通用心智
         if (open) {
             Box(
-                modifier = Modifier.layout { measurable, _ ->
-                    val placeable = measurable.measure(androidx.compose.ui.unit.Constraints())
-                    layout(placeable.width, placeable.height) {
-                        val gap = with(density) { 12.dp.toPx() }
-                        val anchorRight = (animatedOffset.x + petSizePx).toInt()
-                        val anchorBottom = (animatedOffset.y - gap).toInt()
-                        placeable.placeRelative(
-                            x = (anchorRight - placeable.width).coerceAtLeast(0),
-                            y = (anchorBottom - placeable.height).coerceAtLeast(0),
-                        )
-                    }
-                },
-            ) {
-                PetPanel(
-                    messages = messages,
-                    pending = pending,
-                    input = input,
-                    emptyHint = emptyHint,
-                    onInputChange = { input = it },
-                    onClose = { open = false },
-                    onSend = {
-                        val text = input.trim()
-                        if (text.isEmpty()) return@PetPanel
-                        input = ""
-                        messages += PetMessage(fromUser = true, text = text)
-                        // 让接下来的 commentOnTrack 能引用 TA 这句话（模块级，跨进出播放页持久）
-                        PetBubbleState.lastUserContext = text
-                        // 跨 session 持久化用户原话 —— 让 Claudio 不再每次启动失忆
-                        runCatching { PipoGraph.petMemory.recordUtterance(text) }
-                        pending = true
-                        scope.launch {
-                            val agent = app.pipo.nativeapp.data.PetAgent(repository)
-                            val response = agent.chat(
-                                userText = text,
-                                history = messages.map { it.fromUser to it.text },
-                                currentTrack = currentTrack,
-                                userFacts = settings.userFacts,
-                            )
-                            messages += PetMessage(fromUser = false, text = response.reply)
-                            if (response.action == app.pipo.nativeapp.data.PetAgent.Action.Play &&
-                                response.initialBatch.isNotEmpty()) {
-                                onPlayFromAgent(response.initialBatch, response.continuous)
-                            }
-                            pending = false
-                        }
-                    },
-                    scrollModifier = Modifier.verticalScroll(scroll),
-                )
-            }
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {
+                            keyboard?.hide()
+                            open = false
+                        },
+                    ),
+            )
         }
 
+        // ---- 助手回复浮气泡：贴在底部输入条正上方，6s 自动消散，新回复来覆盖旧的 ----
+        // 不遮播放器，跟系统通知一样飘在角上
+        AnimatedVisibility(
+            visible = open && latestReply != null,
+            enter = fadeIn(tween(220)) + slideInVertically(
+                animationSpec = tween(220, easing = PipoMotion.FlipEase),
+                initialOffsetY = { it / 3 },
+            ),
+            exit = fadeOut(tween(180)) + slideOutVertically(
+                animationSpec = tween(180),
+                targetOffsetY = { it / 3 },
+            ),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(horizontal = 14.dp)
+                // 输入条高 ~52dp + nav bar inset + 输入条与气泡间距 8dp
+                .padding(bottom = 70.dp)
+                .imePadding()
+                .navigationBarsPadding(),
+        ) {
+            ReplyBubble(text = latestReply.orEmpty(), tint = rgbToColor(useCoverEdgeColors(coverUrl).right, fallback = PipoColors.Mint))
+        }
+
+        // ---- 底部命令条：横贯屏宽 + 钉到底部，输入永远在拇指区 ----
+        // imePadding() 让条本身随键盘弹起浮在键盘上方，整个 activity 不再 pan/resize
+        // —— 解决了"键盘收起后顶部残留封面"的视觉残影（Edge-to-Edge + 默认 IME 行为
+        //    会让系统介入做 pan，pan 复位时偶发留下封面 stale frame）
+        AnimatedVisibility(
+            visible = open,
+            enter = slideInVertically(
+                animationSpec = tween(durationMillis = 280, easing = PipoMotion.FlipEase),
+                initialOffsetY = { fullHeight -> fullHeight },
+            ) + fadeIn(tween(180)),
+            exit = slideOutVertically(
+                animationSpec = tween(durationMillis = 220, easing = PipoMotion.CloseEase),
+                targetOffsetY = { fullHeight -> fullHeight },
+            ) + fadeOut(tween(140)),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .imePadding()
+                .navigationBarsPadding(),
+        ) {
+            PetCommandBar(
+                coverUrl = coverUrl,
+                input = input,
+                pending = pending,
+                hintText = if (messages.isEmpty()) emptyHint else "说点什么…",
+                onInputChange = { input = it },
+                onClose = { open = false },
+                onSend = {
+                    val text = input.trim()
+                    if (text.isEmpty()) return@PetCommandBar
+                    input = ""
+                    messages += PetMessage(fromUser = true, text = text)
+                    PetBubbleState.lastUserContext = text
+                    runCatching { PipoGraph.petMemory.recordUtterance(text) }
+                    pending = true
+                    scope.launch {
+                        val agent = app.pipo.nativeapp.data.PetAgent(repository)
+                        val response = agent.chat(
+                            userText = text,
+                            history = messages.map { it.fromUser to it.text },
+                            currentTrack = currentTrack,
+                            userFacts = settings.userFacts,
+                        )
+                        messages += PetMessage(fromUser = false, text = response.reply)
+                        latestReply = response.reply
+                        if (response.action == app.pipo.nativeapp.data.PetAgent.Action.Play &&
+                            response.initialBatch.isNotEmpty()) {
+                            onPlayFromAgent(response.initialBatch, response.continuous)
+                        }
+                        pending = false
+                    }
+                },
+            )
+        }
+
+        // ---- Hint 气泡：仍贴 orb（panel 关闭状态下才显示）----
         AnimatedVisibility(
             visible = hint != null && !open,
             enter = fadeIn(tween(200)) + scaleIn(tween(220), initialScale = 0.92f),
@@ -522,17 +590,14 @@ fun NativeAiPet(
             HintBubble(hint.orEmpty())
         }
 
-        // ---- Orb：自己单独 layout，attached/free 之间补间 ----
+        // ---- Orb：常驻挂在封面右下，是命令条的开关 ----
         Box(
             modifier = Modifier
                 .layout { measurable, _ ->
-                    // 用 wrapContentSize 让 orb 自己决定大小，不用 minWidth/Height
                     val placeable = measurable.measure(
                         androidx.compose.ui.unit.Constraints(),
                     )
                     layout(placeable.width, placeable.height) {
-                        // animatedOffset.x/y 现在表示 "orb 右下角" 的目标位置（视口坐标）
-                        // 改成右下角对齐：placeable.x = anchor.x - width；placeable.y = anchor.y - height
                         val anchorRight = (animatedOffset.x + petSizePx).toInt()
                         val anchorBottom = (animatedOffset.y + petSizePx).toInt()
                         placeable.placeRelative(
@@ -557,12 +622,22 @@ fun NativeAiPet(
 @Composable
 private fun HintBubble(text: String) {
     if (text.isBlank()) return
+    // 跟新面板同语言：玻璃 + 顶沿微亮 + 一根头发丝边框（不再用扁平深色块）
     Box(
         modifier = Modifier
             .padding(bottom = 8.dp, end = 4.dp)
             .widthIn(max = 240.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xEE10151D))
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xCC0A0D14))
+            .drawBehind {
+                // 头发丝顶沿高光
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(Color(0x18FFFFFF), Color.Transparent),
+                        startY = 0f, endY = 18f,
+                    ),
+                )
+            }
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text(
@@ -573,95 +648,252 @@ private fun HintBubble(text: String) {
     }
 }
 
+/**
+ * 助手回复浮气泡 —— 跟系统通知同语言：贴底部输入条上方，6s 自动消散，新回复覆盖旧的。
+ * 玻璃 + 顶沿微亮 + 封面色边线（让"是谁说的"和音乐有关联，不像系统通知那么冷）。
+ */
 @Composable
-private fun PetPanel(
-    messages: List<PetMessage>,
-    pending: Boolean,
+private fun ReplyBubble(text: String, tint: Color) {
+    if (text.isBlank()) return
+    Box(
+        modifier = Modifier
+            .widthIn(max = 320.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(Color(0xE60A0D14))
+            .drawBehind {
+                // 顶沿 + 左边沿一道封面色光，让气泡看起来"是从音乐里说出来的"
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(tint.copy(alpha = 0.22f), Color.Transparent),
+                        startY = 0f, endY = 24f,
+                    ),
+                )
+            }
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+    ) {
+        Text(
+            text = text,
+            color = Color(0xF2F5F7FF),
+            style = TextStyle(
+                fontSize = 14.sp,
+                lineHeight = 20.sp,
+                letterSpacing = 0.15.sp,
+            ),
+        )
+    }
+}
+
+/**
+ * 底部命令条 —— 小爱同学风：横贯屏宽 + 钉到底部，只有一根胶囊。
+ *
+ * 不再是覆盖整屏的对话框 —— 播放器永远露脸，不被遮。所以：
+ *   - 高 ~52dp，左右各 12dp 屏边距，顶/底圆角全 999dp 胶囊
+ *   - 容器：玻璃黑 + 封面色描边 + 头发丝顶沿光
+ *   - 内布局：[Pipo 小笑脸 24dp] [输入框 weight=1] [发送 32dp] [关闭 ×]
+ *   - 输入条本身永远不滚动消息列表 —— 历史回复在上方做浮气泡，6s 自动消散
+ *
+ * 这种形态的好处：拇指原生区、不打断音乐 / 歌词、跟手机系统输入条同高度，符合用户心智。
+ */
+@Composable
+private fun PetCommandBar(
+    coverUrl: String?,
     input: String,
-    emptyHint: String,
+    pending: Boolean,
+    hintText: String,
     onInputChange: (String) -> Unit,
     onClose: () -> Unit,
     onSend: () -> Unit,
-    scrollModifier: Modifier,
 ) {
-    Column(
+    val edges = useCoverEdgeColors(coverUrl)
+    val tintColor = rgbToColor(edges.right, fallback = PipoColors.Mint)
+    val tintTop = rgbToColor(edges.top, fallback = PipoColors.Mint)
+    val canSend = input.isNotBlank() && !pending
+
+    Row(
         modifier = Modifier
-            .padding(bottom = 12.dp)
-            // PlayerCard.tsx React 端面板 ~360x500
-            .widthIn(min = 300.dp, max = 360.dp)
-            .heightIn(max = 500.dp)
-            .clip(RoundedCornerShape(22.dp))
-            .background(Color(0xEE10151D))
-            .padding(14.dp),
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .heightIn(min = 52.dp)
+            .clip(RoundedCornerShape(28.dp))
+            .background(Color(0xE60A0D14))
+            // 容器内浅光 + 封面色微辉，做出"小爱那种鲜活胶囊"的感觉，但克制 ——
+            // 不抢主屏，也跟整体玻璃语言对齐
+            .drawBehind {
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        colors = listOf(
+                            tintTop.copy(alpha = 0.14f),
+                            Color.Transparent,
+                            tintColor.copy(alpha = 0.14f),
+                        ),
+                    ),
+                )
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(Color(0x1FFFFFFF), Color.Transparent),
+                        startY = 0f, endY = 16f,
+                    ),
+                )
+            }
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Pipo", color = PipoColors.Ink, fontWeight = FontWeight.SemiBold)
-                Text(
-                    text = if (pending) "想想…" else "在",
-                    color = PipoColors.TextDim,
-                    style = TextStyle(fontSize = 12.sp),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            IconButton(onClick = onClose) {
-                Icon(Icons.Rounded.Close, contentDescription = "关闭", tint = PipoColors.TextDim)
-            }
-        }
+        // ---- 左侧 Pipo 小笑脸（视觉锚点，告诉用户这是 AI 在听）----
+        PetFaceMini(
+            modifier = Modifier.size(32.dp),
+            pending = pending,
+        )
 
-        Column(
+        // ---- 输入框 ----
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 120.dp, max = 320.dp)
-                .then(scrollModifier)
-                .padding(vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+                .weight(1f)
+                .padding(vertical = 4.dp),
+            contentAlignment = Alignment.CenterStart,
         ) {
-            if (messages.isEmpty()) {
-                Text(emptyHint, color = PipoColors.TextDim, style = TextStyle(fontSize = 13.sp))
-            }
-            messages.forEach { message ->
-                Text(
-                    text = message.text,
-                    color = if (message.fromUser) PipoColors.Mint else PipoColors.Ink,
-                    style = TextStyle(fontSize = 14.sp, lineHeight = 20.sp),
-                    modifier = Modifier
-                        .align(if (message.fromUser) Alignment.End else Alignment.Start)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(if (message.fromUser) Color(0x22245F4B) else Color.Transparent)
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                )
-            }
-            if (pending) {
-                Text("…", color = PipoColors.TextDim)
-            }
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedTextField(
+            BasicTextField(
                 value = input,
                 onValueChange = onInputChange,
                 singleLine = true,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("说点什么", color = PipoColors.TextDim) },
+                textStyle = LocalTextStyle.current.copy(
+                    color = PipoColors.Ink,
+                    fontSize = 14.sp,
+                    letterSpacing = 0.15.sp,
+                ),
+                cursorBrush = SolidColor(tintColor.copy(alpha = 0.85f)),
+                // 软键盘右下角显示"发送"按钮，按下 = 直接 send
+                // 物理键盘的 Enter 由 singleLine=true 自动转成 IME action
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(
+                    onSend = { if (input.isNotBlank() && !pending) onSend() },
+                ),
+                modifier = Modifier.fillMaxWidth(),
+                decorationBox = { innerTextField ->
+                    if (input.isEmpty()) {
+                        Text(
+                            text = hintText,
+                            color = Color(0x80FFFFFF),
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                letterSpacing = 0.15.sp,
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    innerTextField()
+                },
             )
-            TextButton(
-                enabled = input.isNotBlank() && !pending,
-                onClick = onSend,
-            ) {
-                Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "发送", tint = PipoColors.Mint)
-            }
+        }
+
+        // ---- 发送钮（封面色填充） ----
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .background(
+                    if (canSend) tintColor.copy(alpha = 0.85f)
+                    else Color(0x14FFFFFF),
+                )
+                .clickable(
+                    enabled = canSend,
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onSend,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.ArrowUpward,
+                contentDescription = "发送",
+                tint = if (canSend) Color(0xFF0A0D14) else Color(0x99FFFFFF),
+                modifier = Modifier.size(18.dp),
+            )
+        }
+
+        // ---- 收起 ×（拇指可达；orb 也能再点一下收起） ----
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(CircleShape)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClose,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.Close,
+                contentDescription = "收起",
+                tint = Color(0x99FFFFFF),
+                modifier = Modifier.size(18.dp),
+            )
         }
     }
 }
+
+/**
+ * 命令条左侧的 Pipo 小笑脸 —— 简化版的 PetOrb，没有绳子、没有摆动、没有 halo。
+ * 静态笑脸：奶白底 + 黑眼 + 笑嘴。pending 时眼睛眨一下（待办）。
+ */
+@Composable
+private fun PetFaceMini(modifier: Modifier = Modifier, pending: Boolean = false) {
+    val faceCream = Color(0xFFE0D9C4)
+    val faceInk = Color(0xFF1B1815)
+    Box(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(faceCream),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            val s = size.minDimension
+            val eyeW = s * 0.10f
+            val eyeH = if (pending) s * 0.04f else s * 0.16f
+            val eyeY = h * 0.38f
+            drawOval(
+                color = faceInk,
+                topLeft = Offset(w * 0.34f - eyeW / 2, eyeY - eyeH / 2),
+                size = Size(eyeW, eyeH),
+            )
+            drawOval(
+                color = faceInk,
+                topLeft = Offset(w * 0.66f - eyeW / 2, eyeY - eyeH / 2),
+                size = Size(eyeW, eyeH),
+            )
+            val mouthY = h * 0.62f
+            val xL = w * 0.22f
+            val xR = w * 0.78f
+            val smile = Path().apply {
+                moveTo(xL, mouthY + s * 0.02f)
+                cubicTo(
+                    w * 0.30f, mouthY + s * 0.13f,
+                    w * 0.42f, mouthY + s * 0.16f,
+                    w * 0.54f, mouthY + s * 0.07f,
+                )
+                cubicTo(
+                    w * 0.62f, mouthY - s * 0.01f,
+                    w * 0.72f, mouthY - s * 0.04f,
+                    xR, mouthY + s * 0.01f,
+                )
+            }
+            drawPath(
+                path = smile,
+                color = faceInk,
+                style = Stroke(
+                    width = s * 0.075f,
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round,
+                ),
+            )
+        }
+    }
+}
+
 
 /**
  * Pipo 笑脸 —— 1:1 还原 src/app/icon.png 的图形：
