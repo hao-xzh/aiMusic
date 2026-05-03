@@ -158,9 +158,6 @@ fun ImmersiveLyricsOverlay(
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
-    // 灰封面（luma 接近 145 阈值）字色和 bg 对比不足。只对这一段中性色启动 scrim 拉对比，
-    // 浅色 / 深色封面 scrim 透明 → 视觉完全不变
-    val contrastScrim = pickContrastScrim(edges.bottom)
 
     // 切歌淡出淡入：title 变了就 fade 0 → 1。封面和背景由外层 TransitioningCover /
     // ImmersiveBackdrop 自己处理过渡，这里只管标题 + 歌词的内容层。
@@ -252,7 +249,6 @@ fun ImmersiveLyricsOverlay(
             fg = fg,
             fgDim = fgDim,
             fgUnsung = fgUnsung,
-            scrimColor = contrastScrim,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
@@ -291,7 +287,6 @@ private fun AppleMusicLyricColumn(
     fg: Color,
     fgDim: Color,
     fgUnsung: Color,
-    scrimColor: Color = Color.Transparent,
     modifier: Modifier = Modifier,
 ) {
     if (lines.isEmpty()) {
@@ -373,20 +368,6 @@ private fun AppleMusicLyricColumn(
             .onSizeChanged { containerHeightPx = it.height }
             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
             .drawWithContent {
-                // 灰封面对比补偿 scrim：仅 luma 接近 145 阈值时非透明，把歌词列底色拉离字色。
-                // 用一个垂直渐变让 scrim 在中段最强、上下与 mask fade 同步淡出，避免硬边。
-                if (scrimColor.alpha > 0f) {
-                    drawRect(
-                        brush = Brush.verticalGradient(
-                            colorStops = arrayOf(
-                                0f to Color.Transparent,
-                                0.18f to scrimColor,
-                                0.85f to scrimColor,
-                                1f to Color.Transparent,
-                            ),
-                        ),
-                    )
-                }
                 drawContent()
                 // 焦点行落在 11% —— 上方只露 1 句历史歌词，那一句要狠狠淡出。
                 // fade band 收紧到 0..14%，恰好覆盖那 1 句的范围。
@@ -491,7 +472,18 @@ private fun AppleMusicLyricRow(
     //   上层：line.text 全 fg，用 drawWithContent 把 x > sweepX 的部分裁掉
     // 没有 SpanStyle 切分，没有 letter-spacing 跨 run 问题，没有 paragraph 度量变化。
     // sweepX 跟着 positionMs 平滑增长 —— 这就是"颜色变化"的全部。
-    val finalColor = if (isPast) fg else fgUnsung
+    //
+    // LRC 行（无词级时间戳）拿不到 sweep 数据，没有上层覆盖。这种情况下底层颜色直接
+    // 跟随 active 状态（active = fg 亮、past = fg 亮、future = fgUnsung 暗），
+    // 颜色变化就发生在"行变 active 的瞬间"——之前是变 past 才亮，给人"播放期间没动画
+    // 等到变上一句才看到"的错觉。
+    val isYrc = line.chars.isNotEmpty()
+    val baseColor = when {
+        isPast -> fg
+        isActive && !isYrc -> fg          // LRC active：直接给亮色，让进入 active 就能看到变化
+        isActive && isYrc -> fgUnsung     // YRC active：底 dim，上层 sweep 到 fg
+        else -> fgUnsung                   // future
+    }
     var layout by remember(line.text) {
         androidx.compose.runtime.mutableStateOf<androidx.compose.ui.text.TextLayoutResult?>(null)
     }
@@ -502,16 +494,15 @@ private fun AppleMusicLyricRow(
             .graphicsLayer { alpha = rowAlpha }
             .padding(vertical = 8.dp),
     ) {
-        // 底层：unsung 色，整个一行画好
         Text(
             text = line.text,
-            color = if (isActive) fgUnsung else finalColor,
+            color = baseColor,
             style = style,
             onTextLayout = { layout = it },
         )
-        // 上层：sung 色，per-line clip 到当前进度
+        // YRC active：上层 sweep 揭示 fg
         val cur = layout
-        if (isActive && line.chars.isNotEmpty() && cur != null) {
+        if (isActive && isYrc && cur != null) {
             Text(
                 text = line.text,
                 color = fg,
