@@ -248,7 +248,14 @@ class PlayerViewModel(
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun toggle() {
         val player = controller ?: return
-        if (player.isPlaying) player.pause() else player.play()
+        if (player.isPlaying) {
+            player.pause()
+        } else {
+            // STATE_IDLE/ENDED 时 play() 也是 no-op，按播放键无反应 → 重启 app 才行。
+            // ensurePlayerLive 把 player 拉回可用态再 play
+            ensurePlayerLive(player)
+            player.play()
+        }
         syncFrom(player)
     }
 
@@ -376,7 +383,12 @@ class PlayerViewModel(
                 if (pct < 0.5f) BehaviorType.Skipped else BehaviorType.ManualCut,
                 completionPctOverride = pct,
             )
+            // STATE_IDLE/ENDED 下 seekToNextMediaItem 是 no-op —— 之前会出现
+            // "播完一首停了，按 next 没反应，要重启 app" 的死状态。
+            // 这里在跳之前先 prepare 把 player 拉回 READY/BUFFERING 态，并保证 play()
+            ensurePlayerLive(p)
             p.seekToNextMediaItem()
+            if (!p.playWhenReady) p.play()
         }
     }
 
@@ -384,7 +396,28 @@ class PlayerViewModel(
     fun previous() {
         controller?.let { p ->
             logEventForCurrent(BehaviorType.ManualCut, completionPctOverride = currentCompletionPct())
+            ensurePlayerLive(p)
             p.seekToPreviousMediaItem()
+            if (!p.playWhenReady) p.play()
+        }
+    }
+
+    /**
+     * Player 在 IDLE / ENDED 状态下，seek/next/prev 都是 no-op。
+     * 调用 prepare 把 player 拉回可用态（IDLE 时） 或 seek 到 default position（ENDED 时）。
+     * 没有副作用 —— 已经在 READY/BUFFERING 的 player 调 prepare 也安全。
+     */
+    private fun ensurePlayerLive(p: Player) {
+        when (p.playbackState) {
+            Player.STATE_IDLE -> p.prepare()
+            Player.STATE_ENDED -> {
+                // ENDED + REPEAT_MODE_OFF 时 hasNextMediaItem=false → seekToNext no-op。
+                // 强制开循环 + seek 回首项让 next 也能"绕回去"
+                p.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+                p.seekToDefaultPosition(0)
+                p.prepare()
+            }
+            else -> { /* READY / BUFFERING — 啥都不用做 */ }
         }
     }
 
@@ -475,8 +508,13 @@ class PlayerViewModel(
                 val excludeIds = queue.mapNotNull { it.neteaseId }.toSet()
                 val more = source.fetchMore(excludeIds)
                 if (more.isEmpty()) {
-                    noLoop = true
-                    player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_OFF
+                    // source 跑空了 —— 不关闭循环。
+                    // 之前这里 setRepeatMode(OFF) + noLoop=true，导致：当前队列播完
+                    // → STATE_ENDED → seekToNextMediaItem 是 no-op → 用户感觉
+                    // "播完就停，next 也按不动，要重启 app"。
+                    // 现在改成：拆掉 source（不再尝试续杯）但保留 REPEAT_MODE_ALL，
+                    // 让现有队列继续循环，至少能听。
+                    continuousSource = null
                     return@launch
                 }
                 val resolved = resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }

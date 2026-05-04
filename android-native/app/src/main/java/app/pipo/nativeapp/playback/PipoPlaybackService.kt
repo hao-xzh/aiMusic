@@ -94,7 +94,9 @@ class PipoPlaybackService : MediaSessionService() {
 
                 addListener(object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
-                        // 网络抖动 / 解码瞬时失败 → 自动 prepare 重试，比让用户手动恢复体验好
+                        // 网络抖动 / 解码失败 → 自动 prepare 重试，比让用户手动恢复体验好。
+                        // 关键：所有分支都必须以 prepare() + play() 收尾，否则 player 会留在
+                        // STATE_IDLE → 用户后续按 next/play 都没反应（手机端被报过的 bug）
                         Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
                         val recoverable = when (error.errorCode) {
                             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
@@ -105,14 +107,17 @@ class PipoPlaybackService : MediaSessionService() {
                             else -> false
                         }
                         if (recoverable) {
-                            // 同首歌 head 处重连；如果 1.5s 内还失败 ，下次再走 next
+                            // 同首歌 head 处重连
                             seekToDefaultPosition()
-                            prepare()
-                        } else if (mediaItemCount > 1) {
+                        } else if (mediaItemCount > 1 && hasNextMediaItem()) {
                             // 不可恢复（解码 / DRM）→ 跳下一首避免卡死
                             seekToNext()
-                            prepare()
+                        } else {
+                            // 单歌失败：抹掉 position，让 prepare 后再次试同一项
+                            seekToDefaultPosition()
                         }
+                        prepare()
+                        play()
                     }
                 })
             }

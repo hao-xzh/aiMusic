@@ -12,8 +12,8 @@ android {
         applicationId = "app.pipo.nativeapp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "0.2.0"
+        versionCode = 12
+        versionName = "0.2.1"
         // 小米 17 Ultra（骁龙 8 Elite Gen 5）= arm64-v8a，其他架构不打入 APK 减体积
         ndk {
             abiFilters.clear()
