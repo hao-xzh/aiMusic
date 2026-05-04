@@ -304,6 +304,10 @@ class PetAgent(
         val consumed = mutableSetOf<Long>().apply {
             reservoir.forEach { it.neteaseId?.let(::add) }
         }
+        // 同一首歌的 Live/Karaoke/Acoustic 多版本归一到同 songKey —— 续杯不能再灌进重复版本
+        val consumedSongKeys = HashSet<String>().apply {
+            reservoir.forEach { add(TrackDedupe.songKey(it)) }
+        }
         var refillTried = false
 
         return ContinuousQueueSource { excludeIds ->
@@ -314,6 +318,9 @@ class PetAgent(
                 val id = t.neteaseId
                 iter.remove()
                 if (id == null || id in excludeIds) continue
+                val k = TrackDedupe.songKey(t)
+                if (k in consumedSongKeys) continue
+                consumedSongKeys.add(k)
                 drained.add(t)
             }
             if (drained.isNotEmpty()) {
@@ -329,7 +336,10 @@ class PetAgent(
                     for (t in hits) {
                         val id = t.neteaseId ?: continue
                         if (id in excludeIds || id in consumed) continue
+                        val k = TrackDedupe.songKey(t)
+                        if (k in consumedSongKeys) continue
                         consumed.add(id)
+                        consumedSongKeys.add(k)
                         collected.add(t)
                         if (collected.size >= 12) break
                     }
