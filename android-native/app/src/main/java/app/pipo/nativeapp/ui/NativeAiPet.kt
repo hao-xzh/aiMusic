@@ -541,7 +541,6 @@ fun NativeAiPet(
                 pending = pending,
                 hintText = if (messages.isEmpty()) emptyHint else "说点什么…",
                 onInputChange = { input = it },
-                onClose = { open = false },
                 onSend = {
                     val text = input.trim()
                     if (text.isEmpty()) return@PetCommandBar
@@ -616,7 +615,6 @@ fun NativeAiPet(
         ) {
             PetOrb(
                 haloPulse = haloPhaseValue,
-                isOpen = open,
                 sway = swayDeg,
                 pulseScale = orbScale,
                 attached = (coverRect != null),
@@ -708,7 +706,6 @@ private fun PetCommandBar(
     pending: Boolean,
     hintText: String,
     onInputChange: (String) -> Unit,
-    onClose: () -> Unit,
     onSend: () -> Unit,
 ) {
     val edges = useCoverEdgeColors(coverUrl)
@@ -819,25 +816,8 @@ private fun PetCommandBar(
             )
         }
 
-        // ---- 收起 ×（拇指可达；orb 也能再点一下收起） ----
-        Box(
-            modifier = Modifier
-                .size(32.dp)
-                .clip(CircleShape)
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onClose,
-                ),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                Icons.Rounded.Close,
-                contentDescription = "收起",
-                tint = Color(0x99FFFFFF),
-                modifier = Modifier.size(18.dp),
-            )
-        }
+        // 收起入口：点 orb 一下 / 点空白处。命令条上不再放 × 按钮，
+        // 让胶囊更窄、视觉更克制。
     }
 }
 
@@ -913,7 +893,6 @@ private fun PetFaceMini(modifier: Modifier = Modifier, pending: Boolean = false)
 @Composable
 private fun PetOrb(
     haloPulse: Float,
-    isOpen: Boolean,
     sway: Float,
     pulseScale: Float,
     attached: Boolean,
@@ -921,7 +900,9 @@ private fun PetOrb(
 ) {
     val haloScale = 1f + haloPulse * 0.3f
     val haloAlpha = 0.4f + (1f - haloPulse) * 0.6f
-    val orbSize = if (isOpen) 42.dp else 36.dp
+    // 固定 36dp —— 之前 open 时放大到 42dp 会让绳子下端跟着位移，视觉上"orb 整个跳了一下"。
+    // 用户反馈不喜欢这个变化；保持稳定大小，open/close 全靠下方命令条 + scrim 表达
+    val orbSize = 36.dp
     val ropeHeight = 14.dp
     val faceCream = Color(0xFFE0D9C4)
     val faceInk = Color(0xFF1B1815)
