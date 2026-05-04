@@ -52,6 +52,9 @@ object PipoGraph {
     @Volatile
     private var distillCoord: DistillCoordinator? = null
 
+    @Volatile
+    private var recEngine: RecommendEngine? = null
+
     val repository: PipoRepository
         get() = overrideRepository ?: emptyRepository
 
@@ -101,6 +104,17 @@ object PipoGraph {
     val distillCoordinator: DistillCoordinator
         get() = distillCoord ?: DistillCoordinator(distillEngine).also { distillCoord = it }
 
+    /** 业界主流多路召回 + 排序 + 多样性 rerank 的推荐引擎。default 续杯走它。 */
+    val recommendEngine: RecommendEngine
+        get() = recEngine ?: RecommendEngine(
+            library = library,
+            featuresStore = audioFeaturesStore,
+            behaviorLog = behaviorLog,
+            tasteProfileStore = tasteProfileStore,
+            recommendationLog = recommendationLog,
+            repository = repository,
+        ).also { recEngine = it }
+
     /** Bridge 还没装配前的空仓库——所有页面走 React 端的"空状态"分支。 */
     private val emptyRepository: PipoRepository by lazy { EmptyPipoRepository() }
 
@@ -111,6 +125,7 @@ object PipoGraph {
         libraryLoader = null
         libraryAnalysis = null
         embedIndexer = null
+        recEngine = null
     }
 
     fun installContext(context: Context) {

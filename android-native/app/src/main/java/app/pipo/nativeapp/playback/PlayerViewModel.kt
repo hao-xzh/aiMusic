@@ -74,29 +74,18 @@ class PlayerViewModel(
      *   - 默认走 Discovery（同 artist + 当前 taste tags）
      *   - PipoNativeApp 在用户走 AI 选歌路径时可以替换为 pet-agent 的 source
      */
-    private val discovery = Discovery(repository)
-    /** 默认续杯源 —— Discovery 兜底（同 artist + 当前 taste tags） */
+    /** 默认续杯源 —— RecommendEngine 多路召回 + 多因子打分 + 多样性 rerank。
+     *  本地库 + 听歌行为 + 口味画像越丰富，结果越准；冷启动也能给"音色 + 标签"召回。
+     *  在 RecommendEngine 之上再加一层"排除当前队列已有 songKey"做最终安全网。 */
     private val defaultContinuousSource = ContinuousQueueSource { excludeIds ->
         val current = state.queue.getOrNull(state.currentIndex)
-        val profile = PipoGraph.tasteProfileStore.flow.value
-        val tags = if (profile != null) {
-            buildList {
-                profile.topArtists.take(3).forEach { add(it.name) }
-                profile.genres.take(3).forEach { add(it.tag) }
-            }
-        } else emptyList()
-        val raw = discovery.fetchMore(around = current, tags = tags, excludeIds = excludeIds, wantCount = 16)
-        // 跨版本去重 + 排除当前队列里已存在的"同一首歌"。
-        // 之前只按 neteaseId 去重，所以"浮夸 (Live)" / "浮夸 (Karaoke)" 都能进来。
-        // 现在用 TrackDedupe.songKey（normalize 标题 + 第 1 个 artist，去掉
-        // Live/Remix/伴奏/Cover 这些版本词），同一首只能留 1 个。
+        val raw = PipoGraph.recommendEngine.fetchMore(
+            anchor = current,
+            excludeIds = excludeIds,
+            wantCount = 8,
+        )
         val existingSongKeys = state.queue.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-        val seen = HashSet<String>()
-        raw.filter { t ->
-            val k = TrackDedupe.songKey(t)
-            if (k in existingSongKeys) return@filter false
-            seen.add(k)
-        }.take(8)
+        raw.filter { TrackDedupe.songKey(it) !in existingSongKeys }
     }
     private var continuousSource: ContinuousQueueSource? = defaultContinuousSource
     /** 续杯调用是否在飞行中 —— 防短时间内重复触发 */
@@ -336,12 +325,9 @@ class PlayerViewModel(
                 track.copy(streamUrl = url)
             }
             noLoop = false
-            // 歌单点歌 = 用户明确选了某张歌单，要的是"这张歌单"，不是"这首歌 + Discovery 续杯"。
-            // 之前默认挂 defaultContinuousSource，加上现在 phase-1 队列只有 1 首，
-            // maybeExtendQueue 立刻命中（remaining=0 ≤ 阈值 3），Discovery 用
-            // around=picked 去搜，常常拿回 "同一首的 Live/Karaoke/Acoustic 多版本"
-            // 灌进队尾 → 用户感觉"一直放这个歌的其他版本"。
-            // 改：歌单 tap 不挂 continuousSource，让 REPEAT_MODE_ALL 在歌单尾部循环。
+            // phase-1 期间显式 null —— 此时 queue 只有 1 首，开 continuous 会立刻触发
+            // maybeExtendQueue（remaining=0 ≤ 阈值 3），跟 phase-2 的 addMediaItems 抢插。
+            // phase-2 完成后再切回 RecommendEngine，让 "歌单播完接续相似歌" 这条 UX 也能用上。
             continuousSource = null
             app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
             // 状态先置 "1 首歌的队列" —— UI 立刻有正确状态可显示
@@ -377,6 +363,8 @@ class PlayerViewModel(
                 player.addMediaItems(tail.map(::toMediaItem))
             }
             state = state.copy(queue = listOf(pickedResolved) + tail, currentIndex = 0)
+            // continuousSource 保持 null —— 歌单 tap = 就播这张歌单，REPEAT_MODE_ALL
+            // 在尾部循环。不挂任何"相似续杯"，那是 explicit Discovery 入口的事
         }
     }
 
