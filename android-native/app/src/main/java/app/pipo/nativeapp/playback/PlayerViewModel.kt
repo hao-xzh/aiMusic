@@ -411,17 +411,26 @@ class PlayerViewModel(
     private fun syncFrom(player: Player) {
         val index = player.currentMediaItemIndex.coerceAtLeast(0)
         val queue = state.queue
+        // 关键：trackId 以 player.currentMediaItem.mediaId 为权威源，不再相信 state.queue[index]。
+        // 之前 phase-1/phase-2 期间（state.queue 还没追上 player 实际队列）会出现
+        // "用 queue 里的旧 track.id 拉歌词、配上 player 实际在播的另一首" → 歌词不对。
+        val playerMediaId = player.currentMediaItem?.mediaId
         val track = queue.getOrNull(index)
-        if (track != null && loadedLyricsFor != track.id) {
-            loadedLyricsFor = track.id
-            val targetTrackId = track.id
+        val authoritativeTrackId = playerMediaId ?: track?.id
+        if (authoritativeTrackId != null && loadedLyricsFor != authoritativeTrackId) {
+            loadedLyricsFor = authoritativeTrackId
+            // 立刻清空旧歌词 —— 拉新歌词有 100-500ms 网络延迟，期间宁可空白也不要
+            // 把 A 的歌词留在 B 上"对不上"
+            if (state.lyrics.isNotEmpty()) {
+                state = state.copy(lyrics = emptyList())
+            }
+            val targetTrackId = authoritativeTrackId
             viewModelScope.launch {
                 val lines = runCatching {
                     repository.lyricsForTrack(targetTrackId)
                 }.getOrDefault(emptyList())
-                // 切歌竞态保护：lyrics 拉取期间用户可能已经切到下一首，
-                // 这时 loadedLyricsFor 已经被新一轮覆盖，旧 lines 不能再写入 state，
-                // 否则会用 A 的歌词盖掉 B 的歌词
+                // 切歌竞态保护：拉取期间可能已切下一首 → loadedLyricsFor 被覆盖，
+                // 旧 lines 不能再写入 state，否则会用 A 的歌词盖掉 B 的歌词
                 if (loadedLyricsFor == targetTrackId) {
                     state = state.copy(lyrics = lines)
                 }
