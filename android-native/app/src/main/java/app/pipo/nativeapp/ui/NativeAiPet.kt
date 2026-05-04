@@ -493,10 +493,12 @@ fun NativeAiPet(
             )
         }
 
-        // ---- 助手回复浮气泡：贴在底部输入条正上方，6s 自动消散，新回复来覆盖旧的 ----
+        // ---- 助手回复浮气泡 ----
+        // pending=true → 渲染思考态三点动效（让用户知道 AI 在努力）
+        // 回复回来 → 切到正文，6s 自动消散
         // 不遮播放器，跟系统通知一样飘在角上
         AnimatedVisibility(
-            visible = open && latestReply != null,
+            visible = open && (pending || latestReply != null),
             enter = fadeIn(tween(220)) + slideInVertically(
                 animationSpec = tween(220, easing = PipoMotion.FlipEase),
                 initialOffsetY = { it / 3 },
@@ -513,7 +515,11 @@ fun NativeAiPet(
                 .imePadding()
                 .navigationBarsPadding(),
         ) {
-            ReplyBubble(text = latestReply.orEmpty(), tint = rgbToColor(useCoverEdgeColors(coverUrl).right, fallback = PipoColors.Mint))
+            // pending 时显式 null —— 哪怕上一条 latestReply 还在 6s 窗口里，也要先盖成思考态
+            ReplyBubble(
+                text = if (pending) null else latestReply,
+                tint = rgbToColor(useCoverEdgeColors(coverUrl).right, fallback = PipoColors.Mint),
+            )
         }
 
         // ---- 底部命令条：横贯屏宽 + 钉到底部，输入永远在拇指区 ----
@@ -656,17 +662,21 @@ private fun HintBubble(text: String) {
 /**
  * 助手回复浮气泡 —— 跟系统通知同语言：贴底部输入条上方，6s 自动消散，新回复覆盖旧的。
  * 玻璃 + 顶沿微亮 + 封面色边线（让"是谁说的"和音乐有关联，不像系统通知那么冷）。
+ *
+ * text == null → 思考态三点动效（pending）
+ * text != null → 正文
+ * text == "" → 不渲染
  */
 @Composable
-private fun ReplyBubble(text: String, tint: Color) {
-    if (text.isBlank()) return
+private fun ReplyBubble(text: String?, tint: Color) {
+    if (text != null && text.isBlank()) return
     Box(
         modifier = Modifier
             .widthIn(max = 320.dp)
             .clip(RoundedCornerShape(18.dp))
             .background(Color(0xE60A0D14))
             .drawBehind {
-                // 顶沿 + 左边沿一道封面色光，让气泡看起来"是从音乐里说出来的"
+                // 顶沿一道封面色光，让气泡看起来"是从音乐里说出来的"
                 drawRect(
                     brush = Brush.verticalGradient(
                         colors = listOf(tint.copy(alpha = 0.22f), Color.Transparent),
@@ -675,16 +685,71 @@ private fun ReplyBubble(text: String, tint: Color) {
                 )
             }
             .padding(horizontal = 14.dp, vertical = 11.dp),
+        contentAlignment = Alignment.CenterStart,
     ) {
-        Text(
-            text = text,
-            color = Color(0xF2F5F7FF),
-            style = TextStyle(
-                fontSize = 14.sp,
-                lineHeight = 20.sp,
-                letterSpacing = 0.15.sp,
+        if (text == null) {
+            ThinkingDots(tint = tint)
+        } else {
+            Text(
+                text = text,
+                color = Color(0xF2F5F7FF),
+                style = TextStyle(
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                    letterSpacing = 0.15.sp,
+                ),
+            )
+        }
+    }
+}
+
+/**
+ * 思考态三点动效 —— iMessage / WhatsApp 那种典型 typing indicator。
+ * 三个圆点错相 0/180/360ms 三档，alpha 0.3↔1.0 + 微 scale，让"它在动"清晰可感。
+ * 颜色用封面色，跟整个气泡的"是从音乐里说出来的"语义统一。
+ */
+@Composable
+private fun ThinkingDots(tint: Color) {
+    val transition = rememberInfiniteTransition(label = "thinkingDots")
+
+    @Composable
+    fun dotPhase(delayMs: Int): Float {
+        val v by transition.animateFloat(
+            initialValue = 0.3f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(540, delayMillis = delayMs, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
             ),
+            label = "dot$delayMs",
         )
+        return v
+    }
+
+    val a = dotPhase(0)
+    val b = dotPhase(180)
+    val c = dotPhase(360)
+
+    Row(
+        modifier = Modifier.padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        listOf(a, b, c).forEach { phase ->
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .graphicsLayer {
+                        alpha = phase
+                        // 同步微 scale —— 让节奏更"鼓"，不是单纯闪
+                        val s = 0.75f + phase * 0.25f
+                        scaleX = s
+                        scaleY = s
+                    }
+                    .clip(CircleShape)
+                    .background(tint.copy(alpha = 0.85f)),
+            )
+        }
     }
 }
 
