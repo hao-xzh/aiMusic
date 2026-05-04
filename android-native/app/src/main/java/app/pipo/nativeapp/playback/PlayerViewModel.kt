@@ -173,7 +173,15 @@ class PlayerViewModel(
 
     private fun logEventForPrev(type: BehaviorType, completionPctOverride: Float? = null) {
         val player = controller ?: return
-        val prev = state.queue.getOrNull(player.currentMediaItemIndex - 1) ?: return
+        val queue = state.queue
+        if (queue.isEmpty()) return
+        // REPEAT_MODE_ALL 自然 wraparound：last → first 时 currentMediaItemIndex=0，
+        // index-1=-1 → 之前直接 return，最后一首的"完成"事件丢失。
+        // wraparound 时取 queue.last() 作为 prev
+        val prevIdx = player.currentMediaItemIndex - 1
+        val prev = if (prevIdx >= 0) queue.getOrNull(prevIdx)
+        else queue.last()  // wraparound: 上一首是队列尾
+        if (prev == null) return
         viewModelScope.launch {
             behaviorLog.log(
                 BehaviorEvent(
@@ -267,6 +275,51 @@ class PlayerViewModel(
      *   - 整 batch 装为新队列，从第 0 首播
      *   - 把 AI 给的续杯 source 装上，队尾接近时自动从 reservoir / refill 取下一批
      */
+    /**
+     * 插一首到当前队列下一首位置 + 立刻跳过去播。
+     * 当前歌的进度被丢掉（用户的"插队"心智 = 立刻听 X，听完回到原本的下一首）。
+     * 不切歌单、不替换队列；REPEAT_MODE_ALL 保留。
+     */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    fun insertNext(track: NativeTrack) {
+        val player = controller ?: return
+        viewModelScope.launch {
+            val resolved = if (track.streamUrl.isNotBlank()) {
+                track
+            } else {
+                val id = track.neteaseId ?: return@launch
+                val url = runCatching { repository.songUrls(listOf(id)) }
+                    .getOrNull()?.firstOrNull { it.id == id }?.url
+                    ?.takeIf { it.isNotBlank() }
+                    ?: return@launch
+                track.copy(streamUrl = url)
+            }
+            val live = controller ?: return@launch
+            // 当前队列空（还没开始放过）→ 退化成"装队列 + 播"，避免插队进虚空
+            if (live.mediaItemCount == 0) {
+                state = state.copy(queue = listOf(resolved), currentIndex = 0)
+                live.setMediaItems(listOf(toMediaItem(resolved)), 0, 0L)
+                live.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+                live.volume = 1f
+                live.prepare()
+                live.play()
+                return@launch
+            }
+            val curIdx = live.currentMediaItemIndex.coerceAtLeast(0)
+            val insertIdx = (curIdx + 1).coerceAtMost(live.mediaItemCount)
+            live.addMediaItem(insertIdx, toMediaItem(resolved))
+            // state.queue 跟着 player 队列一起插
+            val newQueue = state.queue.toMutableList().apply {
+                add(insertIdx.coerceAtMost(size), resolved)
+            }
+            state = state.copy(queue = newQueue)
+            // 跳过去立刻播 —— "插队"语义是"我现在就要听 X"
+            live.seekTo(insertIdx, 0L)
+            ensurePlayerLive(live)
+            if (!live.playWhenReady) live.play()
+        }
+    }
+
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun playFromAgent(initialBatch: List<NativeTrack>, source: ContinuousQueueSource?) {
         if (initialBatch.isEmpty()) return

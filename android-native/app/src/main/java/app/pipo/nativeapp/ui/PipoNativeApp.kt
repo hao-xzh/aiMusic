@@ -157,6 +157,9 @@ fun PipoNativeApp() {
                         onPlayFromAgent = { batch, continuous ->
                             viewModel.playFromAgent(batch, continuous)
                         },
+                        onInsertFromAgent = { track ->
+                            viewModel.insertNext(track)
+                        },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }

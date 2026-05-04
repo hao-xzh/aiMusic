@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.data
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
@@ -39,7 +41,9 @@ class RecommendEngine(
         anchor: NativeTrack?,
         excludeIds: Set<Long>,
         wantCount: Int = 8,
-    ): List<NativeTrack> {
+    ): List<NativeTrack> = withContext(Dispatchers.Default) {
+        // 整段在 Default 上跑 —— 召回 + 排序 + 多样性都是 CPU 活，调用方多在 main，
+        // 不切走会偶发让主线程卡几十 ms（库一大就明显）
         val lib = runCatching { library.library() }.getOrDefault(emptyList())
         val taste = tasteProfileStore.flow.value
         val events = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
@@ -51,12 +55,14 @@ class RecommendEngine(
         val anchorKey = anchor?.let { TrackDedupe.songKey(it) }
         val anchorArtistKey = anchor?.firstArtistKey()
 
-        // 软排除：本地库里最近 24h 听过 / 推荐过的，先扣分但不禁
-        // 硬排除：anchor 自己 + excludeIds 里的 neteaseId
+        // 硬排除：anchor 自己 + excludeIds 里的 neteaseId + 24h 内推荐过的 neteaseId
+        // —— 之前 24h 推荐过的只走 -0.25 软扣分，多 channel 加起来仍能浮上来，导致
+        // "怎么又给我推这首"。改成硬排除，跨多次 fetchMore 调用都不会重复
         val hardExclude: (NativeTrack) -> Boolean = { t ->
             val ne = t.neteaseId
             val sk = TrackDedupe.songKey(t)
-            (ne != null && ne in excludeIds) || sk == anchorKey
+            (ne != null && ne in excludeIds) || sk == anchorKey ||
+                (ne != null && ne in recentRec.last24hTrackIds)
         }
 
         // ---- 召回 ----
@@ -68,7 +74,7 @@ class RecommendEngine(
 
         if (pool.isEmpty()) {
             // 本地空 → 直接走 AI / 在线兜底
-            return fetchFromOnline(anchor, taste, excludeIds, wantCount)
+            return@withContext fetchFromOnline(anchor, taste, excludeIds, wantCount)
         }
 
         // ---- 打分 ----
@@ -81,8 +87,8 @@ class RecommendEngine(
             val love = c.loveScore
             val ne = c.track.neteaseId
             val recencyPen = when {
+                // recentRec.last24h 已经在 hardExclude 里硬筛掉，这里不再列
                 ne != null && ne in recentPlay.last24hTrackIds -> -0.6
-                ne != null && ne in recentRec.last24hTrackIds -> -0.25
                 ne != null && ne in recentPlay.last7dTrackIds -> -0.10
                 else -> 0.0
             }
@@ -96,7 +102,7 @@ class RecommendEngine(
         val picks = pickDiverse(ranked, wantCount, anchorArtistKey)
         if (picks.size >= wantCount) {
             logRecommendations(picks)
-            return picks.map { it.track }
+            return@withContext picks.map { it.track }
         }
 
         // ---- 在线兜底 ----
@@ -105,7 +111,7 @@ class RecommendEngine(
             .filter { TrackDedupe.songKey(it) !in haveKeys && !hardExclude(it) }
         val final = picks.map { it.track } + online
         logRecommendations(picks)
-        return final.take(wantCount)
+        return@withContext final.take(wantCount)
     }
 
     // ============== 召回 ==============
@@ -187,7 +193,10 @@ class RecommendEngine(
         return out.take(20)
     }
 
-    /** ch3: 跟用户口味画像匹配（TasteProfile.topArtists / genres）*/
+    /** ch3: 跟用户口味画像匹配（仅 artist affinity 主信号）。
+     *  之前还做"标题包含 mood/genre 词" 的子串匹配 —— 任何标题里出现 "happy" / "love"
+     *  / "sad" 这种常见词的歌都会被误召为 taste 候选。命中率不准、噪声大，去掉。
+     *  真正的 mood/genre 召回 应该走 SemanticIndexer 的 vector 召回（见 PetAgent 路径）。 */
     private fun recallTaste(
         taste: TasteProfile?,
         lib: List<NativeTrack>,
@@ -197,11 +206,7 @@ class RecommendEngine(
         val artistAffinity = HashMap<String, Float>().apply {
             taste.topArtists.take(20).forEach { put(normalizeKey(it.name), it.affinity) }
         }
-        // 用 artist 命中作为主信号；标题里出现 mood/genre 词作为次信号（轻微）
-        val tagWords = (taste.moods + taste.genres.map { it.tag })
-            .map { normalizeKey(it) }
-            .filter { it.isNotBlank() }
-            .toSet()
+        if (artistAffinity.isEmpty()) return emptyList()
 
         val out = ArrayList<Candidate>()
         for (t in lib) {
@@ -210,10 +215,6 @@ class RecommendEngine(
             t.artist.split('/', '&', ',', '、').forEach { a ->
                 val key = normalizeKey(a)
                 artistAffinity[key]?.let { score += it.toDouble() * 0.7 }
-            }
-            if (score == 0.0 && tagWords.isNotEmpty()) {
-                val titleN = normalizeKey(t.title)
-                if (tagWords.any { it in titleN }) score += 0.15
             }
             if (score > 0.0) {
                 out.add(Candidate(track = t, tasteScore = score.coerceAtMost(1.0), source = SOURCE_TASTE))

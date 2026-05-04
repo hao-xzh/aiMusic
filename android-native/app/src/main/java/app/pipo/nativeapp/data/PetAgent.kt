@@ -29,7 +29,13 @@ class PetAgent(
     private val embeddingIndexer: EmbeddingIndexer = PipoGraph.embeddingIndexer,
 ) {
 
-    enum class Action { Chat, Play }
+    enum class Action {
+        Chat,
+        /** 替换整个队列（"听陈奕迅"、"放点振奋的"、"想听 X 从 Y 开始"） */
+        Play,
+        /** 插队到当前队列下一首（"放浮夸"、"来一首XX"——只想听这一首，别毁掉当前列表） */
+        Insert,
+    }
 
     data class AgentResponse(
         val reply: String,
@@ -81,6 +87,31 @@ class PetAgent(
         //     之前 hardTracks 字段在 recall 里完全没人用，textTracks 也只是 +0.6 分
         //     完全可能被 audio/semantic/behavior 几路压下去 —— 这是 bug 不是 feature。
         val pinnedNamed = resolvePinnedTracks(intent, localTracks)
+
+        // 1b) Insert 模式 —— 用户只想插一首（"放浮夸"、"来一首XX"），不毁掉当前队列。
+        //     不跑后续召回，只解析命名歌；命中就走 Insert action 让上层 insertNext。
+        //     如果命名歌完全找不到（本地没有 + 在线也搜不到），走 chat 礼貌拒绝。
+        if (parsed.queueAction == "insert") {
+            val pinnedOnlineOnly = resolvePinnedFromOnline(intent, pinnedNamed)
+            val toInsert = mergeUnique(pinnedNamed, pinnedOnlineOnly).take(1)
+            if (toInsert.isEmpty()) {
+                return AgentResponse(
+                    reply = "${parsed.reply}（这首我没找到，换个名字？）",
+                    action = Action.Chat,
+                    initialBatch = emptyList(),
+                    continuous = null,
+                )
+            }
+            runCatching {
+                recommendationLog.log(toInsert.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
+            }
+            return AgentResponse(
+                reply = parsed.reply,
+                action = Action.Insert,
+                initialBatch = toInsert,
+                continuous = null,
+            )
+        }
         val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
         val recentPlay = runCatching { behaviorLog.recentPlay() }.getOrDefault(BehaviorLog.RecentPlay(emptySet(), emptySet()))
         val recentRec = runCatching { recommendationLog.recentContext() }.getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
@@ -402,6 +433,8 @@ class PetAgent(
         val reply: String,
         val action: Action,
         val intent: PetIntent,
+        /** 来自 LLM queueIntent.action："insert" / "replace"，缺省 "replace" */
+        val queueAction: String,
     )
 
     private fun parseIntent(raw: String): Parsed? {
@@ -462,7 +495,9 @@ class PetAgent(
                 orderStyle = queue?.optString("orderStyle")?.takeIf { it.isNotBlank() } ?: "smooth",
                 desiredCount = obj.optInt("desiredCount", 30).coerceIn(1, 60),
             )
-            Parsed(reply, action, intent)
+            val queueAction = queue?.optString("action")?.lowercase()?.trim().orEmpty()
+                .let { if (it == "insert") "insert" else "replace" }
+            Parsed(reply, action, intent, queueAction)
         } catch (_: Exception) { null }
     }
 
@@ -500,6 +535,14 @@ class PetAgent(
 - chat：纯打招呼/问名字/感谢/闲聊
 - 模糊就偏 play —— 这是音乐宠物，沉默是失败。
 
+# queueIntent.action 怎么判（决定"插一首" 还是"换一整套"）
+- "insert"：用户**只指名一首**歌想听（"放浮夸"、"来一首七百年后"、"插一首 XX"）。
+  当前队列保留，新歌插到下一首立刻播；新歌结束后回到原本的下一首。
+- "replace"（默认）：用户在指定一个**音乐主题/情境/艺人探索**（"听陈奕迅"、"放点蓝调"、
+  "想听陈奕迅从浮夸开始"、"排几首慢的"、"陪我熬夜"）。把整个队列换成新的。
+- 判定要点：单歌名 → insert；指名艺人 / 指名艺人+起始歌 / 描述情绪场景 → replace。
+  不确定就 replace。
+
 # 字段约定（用得上才填，默认值都 OK）
 - queryText: 用户原句
 - textHints.{artists,tracks,albums}: 句子里直接点名的（不要瞎补）
@@ -533,11 +576,14 @@ USER 部分会带"时段"、可能含"明天就周末"/"再 3 天就国庆"/"今
 5) "你知道火星哥吗" →
 {"reply":"Bruno Mars。给你来一组。","action":"play","queryText":"你知道火星哥吗","textHints":{"artists":["Bruno Mars"]},"hardConstraints":{"artists":["Bruno Mars"]}}
 
-5b) "想听陈奕迅，从七百年后开始" →
-{"reply":"行。先开七百年后。","action":"play","queryText":"想听陈奕迅，从七百年后开始","textHints":{"artists":["陈奕迅"],"tracks":["七百年后"]},"hardConstraints":{"artists":["陈奕迅"],"tracks":["七百年后"]}}
+5b) "想听陈奕迅，从七百年后开始" → (replace 整列：探索一个艺人)
+{"reply":"行。先开七百年后。","action":"play","queryText":"想听陈奕迅，从七百年后开始","textHints":{"artists":["陈奕迅"],"tracks":["七百年后"]},"hardConstraints":{"artists":["陈奕迅"],"tracks":["七百年后"]},"queueIntent":{"action":"replace"}}
 
-5c) "放浮夸" →
-{"reply":"开浮夸。","action":"play","queryText":"放浮夸","textHints":{"tracks":["浮夸"]},"hardConstraints":{"tracks":["浮夸"]}}
+5c) "放浮夸" → (insert：只想听这一首，不毁掉当前队列)
+{"reply":"插一首。","action":"play","queryText":"放浮夸","textHints":{"tracks":["浮夸"]},"hardConstraints":{"tracks":["浮夸"]},"queueIntent":{"action":"insert"}}
+
+5d) "来一首七百年后" → (insert)
+{"reply":"来。","action":"play","queryText":"来一首七百年后","textHints":{"tracks":["七百年后"]},"hardConstraints":{"tracks":["七百年后"]},"queueIntent":{"action":"insert"}}
 
 6) "谢谢" →
 {"reply":"嗯。","action":"chat","queryText":"谢谢"}

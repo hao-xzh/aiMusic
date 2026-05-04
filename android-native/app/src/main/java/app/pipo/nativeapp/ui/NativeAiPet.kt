@@ -215,6 +215,7 @@ fun NativeAiPet(
     currentArtist: String,
     coverUrl: String?,
     onPlayFromAgent: (List<app.pipo.nativeapp.data.NativeTrack>, app.pipo.nativeapp.data.ContinuousQueueSource?) -> Unit,
+    onInsertFromAgent: (app.pipo.nativeapp.data.NativeTrack) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -559,9 +560,15 @@ fun NativeAiPet(
                         )
                         messages += PetMessage(fromUser = false, text = response.reply)
                         latestReply = response.reply
-                        if (response.action == app.pipo.nativeapp.data.PetAgent.Action.Play &&
-                            response.initialBatch.isNotEmpty()) {
-                            onPlayFromAgent(response.initialBatch, response.continuous)
+                        when {
+                            response.action == app.pipo.nativeapp.data.PetAgent.Action.Insert &&
+                                response.initialBatch.isNotEmpty() -> {
+                                onInsertFromAgent(response.initialBatch.first())
+                            }
+                            response.action == app.pipo.nativeapp.data.PetAgent.Action.Play &&
+                                response.initialBatch.isNotEmpty() -> {
+                                onPlayFromAgent(response.initialBatch, response.continuous)
+                            }
                         }
                         pending = false
                     }

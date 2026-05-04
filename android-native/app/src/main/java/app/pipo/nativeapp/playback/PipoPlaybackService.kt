@@ -169,16 +169,20 @@ class PipoPlaybackService : MediaSessionService() {
     /**
      * 用户从最近任务划掉 app 时调用。
      *
-     * 默认行为是：如果当前没在播 → stopSelf()。但 MediaSessionService 父类会在播放时
-     * **保留** service。我们显式实现这条逻辑：只有在确实空闲时才 stopSelf，正在播继续。
-     * —— 否则部分 ROM（小米/华为定制）会把整个服务连同前台通知一起干掉，"放着放着停了"。
+     * "空闲"判定：player == null / 队列空 / 处于 STATE_IDLE。
+     * **暂停状态（playWhenReady=false 但已加载且 STATE_READY）也保留 service** ——
+     * 之前用 playWhenReady 判，暂停一下再划掉就会被杀掉，用户从最近任务再点回来
+     * 发现通知没了、状态丢了。MediaSessionService 父类的语义就是"暂停的会话也要持续可见"。
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         val player = mediaSession?.player
-        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
+        if (player == null ||
+            player.mediaItemCount == 0 ||
+            player.playbackState == Player.STATE_IDLE
+        ) {
             stopSelf()
         }
-        // 在播 → 不调 stopSelf, 让前台 service 继续吃通知活
+        // 在播 / 暂停可恢复 → 不调 stopSelf, 让前台 service 继续吃通知活
     }
 
     override fun onDestroy() {
