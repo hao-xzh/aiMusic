@@ -62,6 +62,9 @@ class PlayerViewModel(
 
     private var controller: MediaController? = null
     private var loadedLyricsFor: String? = null
+    /** 每发一次 lyrics 拉取递增；fetch 完成时跟该值对比，过期 fetch 丢弃。
+     *  比对 trackId 的方案在 A→B→A 的快速切歌下会误把 B 的延迟响应判成 "目标还是 A" 写入。 */
+    private var lyricsRequestSeq: Long = 0L
 
     // 之前这里有副 ExoPlayer (OverlapPlayer) 做 crossfade 风格的两曲叠声接歌。
     // 用户反馈"听感混乱"——他们要的是 gapless（专辑模式无缝接，前一首尾巴拼下一首开头），
@@ -297,8 +300,15 @@ class PlayerViewModel(
             if (rest.isEmpty()) return@launch
             val resolvedRest = resolvePlayableQueue(rest).filter { it.streamUrl.isNotBlank() }
             if (resolvedRest.isEmpty()) return@launch
-            player.addMediaItems(resolvedRest.map(::toMediaItem))
-            state = state.copy(queue = listOf(firstResolved) + resolvedRest, currentIndex = 0)
+            // 重新拿一遍 controller —— phase-1 之后 service 可能已经 rebind/release
+            val livePlayer = controller ?: return@launch
+            livePlayer.addMediaItems(resolvedRest.map(::toMediaItem))
+            // 用 player 实际的 currentMediaItemIndex 写 state.currentIndex —— phase-1/2
+            // 之间用户可能已经按过 next（或自然播放结束），player 已经在 index 0 之外
+            state = state.copy(
+                queue = listOf(firstResolved) + resolvedRest,
+                currentIndex = livePlayer.currentMediaItemIndex.coerceAtLeast(0),
+            )
         }
     }
 
@@ -366,10 +376,16 @@ class PlayerViewModel(
             // startTrackId 放在 index 0，但保险起见按实际位置切
             val pickIdxInOrdered = ordered.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
             val tail = ordered.drop(pickIdxInOrdered + 1) + ordered.take(pickIdxInOrdered)
+            // 重新拿 controller —— suspend 期间 service 可能已经 rebind/release
+            val livePlayer = controller ?: return@launch
             if (tail.isNotEmpty()) {
-                player.addMediaItems(tail.map(::toMediaItem))
+                livePlayer.addMediaItems(tail.map(::toMediaItem))
             }
-            state = state.copy(queue = listOf(pickedResolved) + tail, currentIndex = 0)
+            // 用 player 实际 currentMediaItemIndex —— phase-1/2 之间用户可能按过 next
+            state = state.copy(
+                queue = listOf(pickedResolved) + tail,
+                currentIndex = livePlayer.currentMediaItemIndex.coerceAtLeast(0),
+            )
             // continuousSource 保持 null —— 歌单 tap = 就播这张歌单，REPEAT_MODE_ALL
             // 在尾部循环。不挂任何"相似续杯"，那是 explicit Discovery 入口的事
         }
@@ -464,13 +480,18 @@ class PlayerViewModel(
                 state = state.copy(lyrics = emptyList())
             }
             val targetTrackId = authoritativeTrackId
+            // 用单调递增 token 而不是 trackId 做竞态保护 ——
+            // A→B→A 切歌时 trackId 会回到 A，老的 A 拉取已经被新 B 覆盖（loadedLyricsFor=B），
+            // 然后又被新 A 覆盖（loadedLyricsFor=A），此时如果用 trackId 比对，老的 A
+            // 拉取（可能比新 A 拉取先到）会通过校验，把过期的（甚至来源不对的）lines 写入。
+            // counter 唯一递增，每次发起 +1，回来时只有"当前最新"的 token 能写
+            lyricsRequestSeq += 1
+            val mySeq = lyricsRequestSeq
             viewModelScope.launch {
                 val lines = runCatching {
                     repository.lyricsForTrack(targetTrackId)
                 }.getOrDefault(emptyList())
-                // 切歌竞态保护：拉取期间可能已切下一首 → loadedLyricsFor 被覆盖，
-                // 旧 lines 不能再写入 state，否则会用 A 的歌词盖掉 B 的歌词
-                if (loadedLyricsFor == targetTrackId) {
+                if (lyricsRequestSeq == mySeq) {
                     state = state.copy(lyrics = lines)
                 }
             }

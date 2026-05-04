@@ -72,8 +72,11 @@ class RecommendEngine(
         }
 
         // ---- 打分 ----
+        // 权重和约 = 1.0：rel 0.25 + co-listen 0.25 + taste 0.25 + love 0.15 + serendipity 0.10
+        // 之前少了 co-listen 那项 → 共听信号在 ranker 阶段不起作用，等于浪费了一路召回
         val ranked = pool.values.map { c ->
             val rel = c.audioSim
+            val co = c.coListenScore
             val taste0 = c.tasteScore
             val love = c.loveScore
             val ne = c.track.neteaseId
@@ -83,9 +86,9 @@ class RecommendEngine(
                 ne != null && ne in recentPlay.last7dTrackIds -> -0.10
                 else -> 0.0
             }
-            val score = 0.30 * rel + 0.25 * taste0 + 0.20 * love + recencyPen +
-                // 微噪声 ±0.03 给重排提供 serendipity，避免每次永远同一组
-                (kotlin.random.Random.nextDouble(-0.03, 0.03))
+            val score = 0.25 * rel + 0.25 * co + 0.25 * taste0 + 0.15 * love + recencyPen +
+                // 微噪声 ±0.05 给重排提供 serendipity，避免每次永远同一组
+                (kotlin.random.Random.nextDouble(-0.05, 0.05))
             c.copy(finalScore = score)
         }.sortedByDescending { it.finalScore }
 
@@ -343,6 +346,23 @@ class RecommendEngine(
         }
         for (e in eras) seeds.add(e)
         for (c in cultural) seeds.add(c)
+
+        // 冷启动兜底：taste 是空的（新用户没建画像 / 装库前）+ 没有 mood/genre/era/cultural →
+        // 上面所有循环都没 add。如果直接退化成"anchor.artist"，又回到"同 artist 热曲堆叠"
+        // 的老问题。给一组通用 mood/genre 种子保底，至少跨题材跨调子搜
+        if (seeds.isEmpty() && anchorArtist.isNotBlank()) {
+            seeds.add("$anchorArtist 同类")
+            seeds.add("华语流行 经典")
+            seeds.add("indie folk")
+            seeds.add("city pop")
+            seeds.add("ambient")
+        } else if (seeds.isEmpty()) {
+            // 连 anchor 也没有的极端 cold start —— 只能给最大公约数
+            seeds.add("华语流行 经典")
+            seeds.add("indie folk")
+            seeds.add("city pop")
+        }
+
         // 单独 anchor.artist 放最后兜底（且只放 1 个），不让它霸占 seeds
         if (anchorArtist.isNotBlank() && seeds.size < 3) seeds.add(anchorArtist)
         return seeds.toList().take(6)

@@ -92,12 +92,38 @@ class PipoPlaybackService : MediaSessionService() {
                 // 当前缓冲耗尽就停（"放着放着自动停止"的根因）
                 setWakeMode(C.WAKE_MODE_NETWORK)
 
+                // 同曲连续失败的 attempt 计数 —— 同一 mediaItemIndex 上连失 ≥3 次就放弃重试，
+                // 跳下一首或停下，避免坏 URL 触发 prepare → onPlayerError → prepare 死循环烧 CPU
+                var lastErrorIndex = -1
+                var consecutiveErrors = 0
+
                 addListener(object : Player.Listener {
+                    override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                        // 切歌成功 = 之前的 stuck 解开了 → 重置计数
+                        consecutiveErrors = 0
+                        lastErrorIndex = -1
+                    }
+
                     override fun onPlayerError(error: PlaybackException) {
-                        // 网络抖动 / 解码失败 → 自动 prepare 重试，比让用户手动恢复体验好。
-                        // 关键：所有分支都必须以 prepare() + play() 收尾，否则 player 会留在
-                        // STATE_IDLE → 用户后续按 next/play 都没反应（手机端被报过的 bug）
                         Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
+                        val curIdx = currentMediaItemIndex
+                        if (curIdx == lastErrorIndex) consecutiveErrors++ else {
+                            lastErrorIndex = curIdx
+                            consecutiveErrors = 1
+                        }
+                        // 同曲连续失败 ≥3 次 → 这首确实坏了，跳下一首；没下一首就停在 IDLE
+                        // 让用户手动决定（手动 next 会走 ensurePlayerLive 自愈路径）
+                        if (consecutiveErrors >= 3) {
+                            if (mediaItemCount > 1 && hasNextMediaItem()) {
+                                seekToNext()
+                                consecutiveErrors = 0
+                                lastErrorIndex = -1
+                                prepare()
+                                play()
+                            }
+                            return
+                        }
+
                         val recoverable = when (error.errorCode) {
                             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
                             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
@@ -107,13 +133,10 @@ class PipoPlaybackService : MediaSessionService() {
                             else -> false
                         }
                         if (recoverable) {
-                            // 同首歌 head 处重连
                             seekToDefaultPosition()
                         } else if (mediaItemCount > 1 && hasNextMediaItem()) {
-                            // 不可恢复（解码 / DRM）→ 跳下一首避免卡死
                             seekToNext()
                         } else {
-                            // 单歌失败：抹掉 position，让 prepare 后再次试同一项
                             seekToDefaultPosition()
                         }
                         prepare()

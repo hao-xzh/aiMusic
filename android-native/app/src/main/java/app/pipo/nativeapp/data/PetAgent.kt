@@ -163,13 +163,13 @@ class PetAgent(
             )
         }
 
-        // 3) 记 recommendation log（防 24h 内重复）
-        runCatching {
-            recommendationLog.log(final.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
-        }
-
         // 4) 拆 initialBatch + reservoir
         val initialBatch = final.take(12)
+        // 3) 记 recommendation log（防 24h 内重复）—— 只记 initialBatch；reservoir
+        //    在 makeContinuousSource 真被 drain 时才记，避免双重计数让 recencyPen 翻倍
+        runCatching {
+            recommendationLog.log(initialBatch.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
+        }
         val reservoir = final.drop(12)
 
         return AgentResponse(
@@ -209,22 +209,29 @@ class PetAgent(
             val titleKey = normalizeForMatch(rawTitle)
             if (titleKey.isEmpty()) continue
 
-            // 第 1 档：标题精确 + 艺人命中
-            val exactWithArtist = if (artistKeys.isEmpty()) null else library.firstOrNull { t ->
-                normalizeForMatch(t.title) == titleKey &&
-                    t.artist.split('/', '&', ',', '、').any { a ->
-                        normalizeForMatch(a) in artistKeys
+            val pick = if (artistKeys.isNotEmpty()) {
+                // 用户给了 artist 约束（"陈奕迅 浮夸"）→ 必须艺人命中。
+                // 三档都要艺人对得上，否则**宁可不 pin** 也不能挂错人的歌
+                //   1) 标题精确 + 艺人命中
+                //   2) 艺人命中 + 标题包含/被包含（"七百年后" ↔ "七百年后 (Live)"）
+                fun artistOk(t: NativeTrack) = t.artist.split('/', '&', ',', '、').any { a ->
+                    normalizeForMatch(a) in artistKeys
+                }
+                library.firstOrNull { t ->
+                    normalizeForMatch(t.title) == titleKey && artistOk(t)
+                } ?: library.firstOrNull { t ->
+                    val tk = normalizeForMatch(t.title)
+                    tk.isNotEmpty() && (titleKey in tk || tk in titleKey) && artistOk(t)
+                }
+            } else {
+                // 没艺人约束（"放浮夸"）→ 标题精确优先；包含次之；都不挑剔艺人
+                library.firstOrNull { normalizeForMatch(it.title) == titleKey }
+                    ?: library.firstOrNull {
+                        val tk = normalizeForMatch(it.title)
+                        tk.isNotEmpty() && (titleKey in tk || tk in titleKey)
                     }
-            }
-            // 第 2 档：标题精确（无艺人约束 / 艺人不命中也接受）
-            val exactOnly = library.firstOrNull { normalizeForMatch(it.title) == titleKey }
-            // 第 3 档：标题包含/被包含
-            val partial = library.firstOrNull {
-                val tk = normalizeForMatch(it.title)
-                tk.isNotEmpty() && (titleKey in tk || tk in titleKey)
-            }
+            } ?: continue
 
-            val pick = exactWithArtist ?: exactOnly ?: partial ?: continue
             val key = TrackDedupe.songKey(pick)
             if (key !in out) out[key] = pick
         }
@@ -246,17 +253,29 @@ class PetAgent(
         val missing = titles.filter { normalizeForMatch(it) !in pinnedTitleKeys }
         if (missing.isEmpty()) return emptyList()
 
-        val artistHint = (intent.hardArtists + intent.textArtists).firstOrNull()?.trim().orEmpty()
+        // 多 artist 时只用第一个不靠谱（"陈奕迅 浮夸 + 周杰伦 七里香" → "七里香 陈奕迅"）。
+        // 唯一 artist 时安全；多于 1 个时不带 artist hint，让搜索引擎自己定位
+        val artistHints = (intent.hardArtists + intent.textArtists)
+            .map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val singleArtistHint = if (artistHints.size == 1) artistHints[0] else ""
+
         return coroutineScope {
             val deferred = missing.map { title ->
                 async {
-                    val q = if (artistHint.isNotEmpty()) "$title $artistHint" else title
+                    val q = if (singleArtistHint.isNotEmpty()) "$title $singleArtistHint" else title
                     runCatching { repository.searchTracks(q, limit = 3) }.getOrDefault(emptyList())
                         .firstOrNull { hit ->
                             // 只接受标题 fuzzy 命中的，避免搜索引擎乱推不相干的
                             val tk = normalizeForMatch(hit.title)
                             val want = normalizeForMatch(title)
-                            tk.isNotEmpty() && (tk == want || want in tk || tk in want)
+                            if (tk.isEmpty() || (tk != want && want !in tk && tk !in want)) return@firstOrNull false
+                            // 单 artist hint 时也校验 artist 命中（防搜索引擎乱推同名）
+                            if (singleArtistHint.isNotEmpty()) {
+                                val artistKey = normalizeForMatch(singleArtistHint)
+                                hit.artist.split('/', '&', ',', '、').any {
+                                    normalizeForMatch(it) == artistKey
+                                }
+                            } else true
                         }
                 }
             }
