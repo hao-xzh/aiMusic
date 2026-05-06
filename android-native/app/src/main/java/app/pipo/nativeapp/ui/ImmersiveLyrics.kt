@@ -56,7 +56,6 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asComposeRenderEffect
@@ -887,11 +886,6 @@ private fun DrawScope.drawPerCharLiftedSweep(
     val minRampMs = 1000L
     // sweep 边缘的软过渡带宽：6dp 给"丝滑"，太大会糊成一团，太小又退化回硬切。
     val fadeWidthPx = 6.dp.toPx()
-    // Apple Music 风的"克制发光"参数：发光范围 sweep 两侧各 ~40dp 内（约 3-4 字），
-    // 越靠近 sweep 越亮，最大 alpha 0.35（克制 = 不到 0.5）。blurRadius 6f 给字母边缘
-    // 一圈微微的 halo —— 不是炫酷三开光，就是 outline 风的发光描边。
-    val glowRadiusPx = 40.dp.toPx()
-    val glowMaxAlpha = 0.35f
 
     // text 是 chars.joinToString("") { it.text } 拼出来的，
     // 这里反向给每个 text-index 标上它属于第几个 PipoLyricChar，方便 O(1) 查 timing。
@@ -959,41 +953,6 @@ private fun DrawScope.drawPerCharLiftedSweep(
             clipOp = ClipOp.Intersect,
         ) {
             drawText(layout, brush = brush, topLeft = Offset(0f, ty))
-        }
-
-        // ---- Apple Music 风发光：sweep 附近字符画一遍带 shadow 的覆盖，halo 显白边 ----
-        //   只对 sweep 当前视觉行的字、距 sweep ≤ 40dp 的字生效。
-        //   shadow 通过 drawText 的 shadow 参数动态注入，不需要额外 layout，零额外测量成本。
-        //   alpha 从 sweep 处的 0.35 平滑衰减到 40dp 处的 0；blurRadius 6f 给"克制"的发光感，
-        //   不是炫酷三色光，就是字母边缘那一圈微微发亮。
-        if (charLine == sweep.line && !sweep.notStarted && !sweep.allDone) {
-            val charCenter = (box.left + box.right) * 0.5f
-            val distFromSweep = kotlin.math.abs(charCenter - sweep.x)
-            if (distFromSweep < glowRadiusPx) {
-                val glowFade = 1f - (distFromSweep / glowRadiusPx)
-                val glowAlpha = glowFade * glowMaxAlpha * envelope
-                if (glowAlpha > 0.01f) {
-                    val pad = 5f
-                    clipRect(
-                        left = box.left - pad,
-                        top = layout.getLineTop(charLine) - pad,
-                        right = box.right + pad,
-                        bottom = layout.getLineBottom(charLine) + pad,
-                        clipOp = ClipOp.Intersect,
-                    ) {
-                        drawText(
-                            textLayoutResult = layout,
-                            color = fg.copy(alpha = glowAlpha * 0.4f),
-                            shadow = Shadow(
-                                color = fg.copy(alpha = glowAlpha),
-                                offset = Offset.Zero,
-                                blurRadius = 6f,
-                            ),
-                            topLeft = Offset(0f, ty),
-                        )
-                    }
-                }
-            }
         }
     }
 }
