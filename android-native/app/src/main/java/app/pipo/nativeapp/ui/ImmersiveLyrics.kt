@@ -622,10 +622,16 @@ private fun AppleMusicLyricRow(
     //     详见 drawPerCharLiftedSweep。
     //
     // 字符之间没有 fontWeight / scale / blur 差异，只有颜色和 translateY，避免单字跳跃感。
+    // 上层 overlay 只要还在画，底层 Text 就必须保持透明 —— 否则 overlay + 底层 Text
+    // 会**双重绘制**同样的字，透明度叠加 → 250ms 内字看着比平常亮一截，envelope 落到 0
+    // 后又恢复 → 用户看到的"滚到上面闪一下再恢复"就是这个。
+    // 所以 baseColor 的"透明开关"必须跟 overlay 的渲染条件 (liftEnvelope > 0.001f) 对齐，
+    // 而不是跟 isActive 对齐。
+    val overlayDrawing = isYrcLine && liftEnvelope > 0.001f
     val baseColor = when {
+        overlayDrawing -> Color.Transparent   // overlay 接管渲染，底层让位避免重叠
         isPast -> fg
         isActiveLrc -> fg
-        isActiveYrc -> Color.Transparent   // 上层 drawWithContent 重新逐字绘制
         else -> fgUnsung
     }
     var layout by remember(line.text) {
