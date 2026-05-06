@@ -7,7 +7,6 @@ import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -57,7 +56,6 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.lerp
@@ -524,9 +522,10 @@ private fun AppleMusicLyricRow(
     fgUnsung: Color,
 ) {
     // 行级焦点过渡：整行作为单一图层平滑进入焦点。
-    // 进入态 (isActive=true)：alpha 1, blur 0, scale 1.1（突出焦点）
-    // 离焦态：alpha 0.35（distance=1），blur 2dp，scale 1.0
-    // 远端只继续衰减 alpha，scale/blur 已无视觉差异，省 GPU。
+    // 进入态 (isActive=true)：alpha 1, blur 0
+    // 离焦态：alpha 0.35（distance=1），blur 2dp
+    // **不再放大** —— Apple Music 实际上根本不放大焦点行（之前 1.1 是误解）。
+    // 焦点感全靠 alpha + blur 的对比 + 字符级 ramp 上浮。
     val targetAlpha = when (distance) {
         0 -> 1.0f
         1 -> 0.35f
@@ -535,35 +534,25 @@ private fun AppleMusicLyricRow(
         4 -> 0.06f
         else -> 0.04f
     }
-    // ---- Apple Music 行级 spring（从 AMLL base.ts 的 scale / posY 参数翻译过来）----
-    //   scale spring  : mass=2, damping=25, stiffness=100  →  ζ≈0.88, k≈50（最慢最重）
-    //   posY/alpha    : mass=0.9, damping=15, stiffness=90 →  ζ≈0.83, k≈100（中速）
-    // 关键观察：scale 比 alpha/位移**慢一拍** → 放大有"重量、有落地感"，这是 Apple Music
-    // 切歌词时那种"行被推到前台"的舒服感的来源。我们这里把 scale 单独慢一拍。
-    // 比 amlv 直接用的 StiffnessLow=200 略快，给用户要求的"加速一倍"留余量。
-    val focusSpec: AnimationSpec<Float> = remember {
-        spring(dampingRatio = 0.83f, stiffness = 200f)   // 行 alpha / blur / lift / rowTy
+    // ---- Apple Music 行级过渡曲线（从 AMLL lyric-player.module.css 实测得出）----
+    // AMLL 真正的 CSS 是：
+    //     transition: opacity 0.25s, filter 0.2s
+    // 默认 CSS `ease` = cubic-bezier(0.25, 0.1, 0.25, 1)。**根本不是 spring**。
+    // spring 物理感只用在滚动 posY 上（行间相对位移），切句的 alpha/blur/lift 都是 tween。
+    // 之前误把 spring 全套给 alpha → 视觉上有 bouncy 感，不是 Apple Music。
+    val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
+    val alphaSpec: AnimationSpec<Float> = remember(cssEase) {
+        tween(durationMillis = 250, easing = cssEase)    // AMLL: opacity 0.25s
     }
-    val scaleSpec: AnimationSpec<Float> = remember {
-        spring(dampingRatio = 0.88f, stiffness = 100f)   // 行 scale 慢一拍，落地感
+    val blurSpec: AnimationSpec<Float> = remember(cssEase) {
+        tween(durationMillis = 200, easing = cssEase)    // AMLL: filter 0.2s
     }
     val rowAlpha by animateFloatAsState(
         targetValue = targetAlpha,
-        animationSpec = focusSpec,
+        animationSpec = alphaSpec,
         label = "lyricAlpha",
     )
-    // 关键：scale / blur / lift 这些"焦点动效"只给 YRC（字符级时间戳的数据）。
-    // LRC（整行时间戳）只走 alpha + 整句变色 —— 没有词级数据可以同步动画，整行抖动反而怪。
     val isYrcLineForFocus = line.chars.isNotEmpty()
-    val rowScale by animateFloatAsState(
-        // Apple Music 实测 ratio：active 1.1 / inactive 1.0（amlv 同款）。
-        // 之前 1.0 / 0.97 太轻微，焦点感没出来。
-        targetValue = if (isYrcLineForFocus) {
-            if (isActive) 1.1f else 1f
-        } else 1f,
-        animationSpec = scaleSpec,
-        label = "lyricScale",
-    )
     // 行级 translateY：归零，让 scale + alpha 承担"焦点层次"。
     // Apple Music / AMLL 的做法就是这样 —— 非活动行不靠位移区分，靠**比例缩小 + 透明度降低**，
     // 加上 scale 的弹簧落地感，整体"对齐感"比原来"future +2dp / past -1dp"那种位移要干净。
@@ -574,18 +563,16 @@ private fun AppleMusicLyricRow(
 
     // ---- Lift envelope ----
     // active YRC 时从 0 平滑上升到 1（per-char ramp 整体强度从无到全），离开 active 时再降回 0。
-    // 用与 alpha/blur 相同的 spring（ζ=0.83, k=200），切入切出有微弹的物理感。
-    // → future → active 切入时整段 ty "长出来"，active → past 切出时整段 ty "缩回去"，
-    //   配合 row scale 慢一拍的 spring，整体看起来焦点行被"推到前台"再"留在那"。
+    // 跟 alpha 同节奏（250ms CSS ease），不带物理弹跳 —— Apple Music 的切句没有 bounce 感。
     val liftEnvelope by animateFloatAsState(
         targetValue = if (isActiveYrc) 1f else 0f,
-        animationSpec = focusSpec,
+        animationSpec = alphaSpec,
         label = "liftEnvelope",
     )
     val rowBlurDp by animateFloatAsState(
         // blur 给所有行（LRC / YRC 都要）—— 模糊只是焦距感，不会引起位置错乱。
         targetValue = if (isActive) 0f else 2f,
-        animationSpec = focusSpec,
+        animationSpec = blurSpec,
         label = "lyricBlur",
     )
     // Apple Music 28sp Black 风格。
@@ -638,11 +625,7 @@ private fun AppleMusicLyricRow(
             .fillMaxWidth()
             .graphicsLayer {
                 alpha = rowAlpha
-                scaleX = rowScale
-                scaleY = rowScale
                 translationY = rowTranslateYDp.dp.toPx()
-                // 起点左、中线锚定 —— 左对齐文本在 scale 时左边不平移，避免横向抖动。
-                transformOrigin = TransformOrigin(0f, 0.5f)
             }
             // Modifier.blur 在 API 31+ 生效；旧版本静默忽略，不影响其他动效。
             .blur(rowBlurDp.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
