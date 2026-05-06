@@ -106,10 +106,10 @@ fun pickFgDim(tone: Tone): Color =
     if (tone == Tone.Dark) Color(0x8C000000) else Color(0x9EFFFFFF)
 
 /** 未唱字符色：active 行里要明显比已唱字段暗一档，但保留可读性。
- *  α 0.30/0.33 —— 比之前 0.35/0.40 再暗一档，已唱（fg α=1.0）跟未唱的亮度差从
- *  0.60-0.65 拉到 0.67-0.70，"提亮一度"的视觉感主要来自这个对比变大。 */
+ *  α 0.40/0.43 —— 之前 0.30/0.33 用户嫌太暗，提一档；已唱跟未唱的差仍有 ~0.60，
+ *  在保持对比的前提下让未唱字段整体更亮、更可读。 */
 fun pickFgUnsung(tone: Tone): Color =
-    if (tone == Tone.Dark) Color(0x4D000000) else Color(0x55FFFFFF)
+    if (tone == Tone.Dark) Color(0x66000000) else Color(0x6EFFFFFF)
 
 fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback

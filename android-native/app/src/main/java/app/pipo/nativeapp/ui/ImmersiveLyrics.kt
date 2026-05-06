@@ -528,15 +528,15 @@ private fun AppleMusicLyricRow(
     // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
     //
     // alpha 关键约束：**past line（distance=1）必须比 fgUnsung（active 行未唱字符）更暗**。
-    // pickFgUnsung 现在是 0.30（深底）/ 0.33（浅底），所以 distance=1 必须 < 0.30。
-    // 整体衰减比之前再低一档，给已唱-未唱的对比让出空间。
+    // pickFgUnsung 现在是 0.40（深底）/ 0.43（浅底），所以 distance=1 必须 < 0.40。
+    // 整体提一档，过去/未来行更亮更可读，仍守住"past 不亮于 active 未唱"红线。
     val targetAlpha = when (distance) {
         0 -> 1.0f
-        1 -> 0.26f
-        2 -> 0.20f
-        3 -> 0.15f
-        4 -> 0.12f
-        else -> 0.09f
+        1 -> 0.36f
+        2 -> 0.27f
+        3 -> 0.20f
+        4 -> 0.15f
+        else -> 0.11f
     }
     // 模糊：只给"列首尾"（distance ≥ 2 的远端行）。
     // 之前给所有非活动行加 blur 是错的 —— Apple Music 实际是焦点附近清晰、远端模糊（焦距感），
