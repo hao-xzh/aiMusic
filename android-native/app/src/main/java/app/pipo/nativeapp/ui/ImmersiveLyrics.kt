@@ -896,13 +896,15 @@ private fun DrawScope.drawPerCharLiftedSweep(
     }
 
     // 当前 sweep 落在的那条视觉行用 horizontal gradient brush；其它视觉行用纯色。
-    // Brush 的 startX/endX 是 DrawScope 的绝对坐标（与 layout.getBoundingBox 同坐标系），
-    // 默认 TileMode.Clamp：startX 之前都是 fg、endX 之后都是 fgUnsung，中间 6dp 线性过渡。
+    // 关键：fade band **整段在 sweep 之后**（startX = sweep.x），不再居中于 sweep。
+    // 这样 sweep 左侧（含正在唱的字本身）全是 fg 全亮色，gradient 只发生在前方
+    // 还没到的字上。之前居中时 sweep 那一点是 50/50 混色，正在变化的字看起来比
+    // 已唱完的字暗 → "已经放完的颜色比正在变化的亮" 的反直觉感就来自这里。
     val activeBrush: Brush = if (!sweep.notStarted && !sweep.allDone) {
         Brush.horizontalGradient(
             colors = listOf(fg, fgUnsung),
-            startX = sweep.x - fadeWidthPx / 2f,
-            endX = sweep.x + fadeWidthPx / 2f,
+            startX = sweep.x,
+            endX = sweep.x + fadeWidthPx,
         )
     } else {
         SolidColor(if (sweep.allDone) fg else fgUnsung)
