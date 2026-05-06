@@ -416,7 +416,9 @@ private fun AppleMusicLyricColumn(
         animate(
             initialValue = 0f,
             targetValue = delta,
-            animationSpec = tween(durationMillis = 720, easing = FastOutSlowInEasing),
+            // 切换歌词时滚动加速一倍（720 → 360ms），与焦点动画 300ms 同节奏，
+            // 整体"切歌词"的视觉节拍更紧，不再有"等滚动"的拖沓感。
+            animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
         ) { value, _ ->
             val step = value - prev
             prev = value
@@ -528,11 +530,11 @@ private fun AppleMusicLyricRow(
         4 -> 0.06f
         else -> 0.04f
     }
-    // cubic-bezier(0.22, 1, 0.36, 1) — easeOutQuint 风，前段快、后段缓收，
-    // 与 LazyColumn 的 720ms FastOutSlowIn 滚动节奏一致。
+    // cubic-bezier(0.22, 1, 0.36, 1) — easeOutQuint 风，前段快、后段缓收。
+    // 切换歌词加速一倍：600ms → 300ms，与 360ms 滚动同节拍，整段"切句"的动画更紧凑、灵动。
     val focusEasing = remember { CubicBezierEasing(0.22f, 1f, 0.36f, 1f) }
     val focusSpec = remember(focusEasing) {
-        tween<Float>(durationMillis = 600, easing = focusEasing)
+        tween<Float>(durationMillis = 300, easing = focusEasing)
     }
     val rowAlpha by animateFloatAsState(
         targetValue = targetAlpha,
@@ -549,22 +551,28 @@ private fun AppleMusicLyricRow(
         animationSpec = focusSpec,
         label = "lyricScale",
     )
-    // 行级 translateY：YRC 非活动行保持 ±dp 偏移，与 shader wave 的起点 / 终点对齐
-    // → future → active 切入、active → past 切出时无跳变；
-    // active YRC 自身 rowTy=0，shader 接管位移；LRC 始终 0（不参与 wave）。
+    // 行级 translateY：YRC 非活动行保持 ±dp 偏移，与 per-char wave 的 rest / settled 对齐
+    // → future（+1dp 微沉，对齐字符 rest）→ active（0，per-char 接管）→ past（-0.5dp 微抬，对齐字符 settled）
+    // 关键：用 animateFloatAsState 跑 focusSpec 让位移**平滑**变化（之前是直接赋值，
+    // 进 / 出 active 瞬间会跳 1-2dp，再被 lift envelope "拉回"，看起来就是"先抖一下再落位"）。
     val isYrcLine = line.chars.isNotEmpty()
     val isActiveYrc = isActive && isYrcLine
     val isActiveLrc = isActive && !isYrcLine
-    val rowTranslateYDp: Float = when {
+    val rowTranslateYTargetDp: Float = when {
         !isYrcLine -> 0f
         isActiveYrc -> 0f
-        isPast -> -1f
-        else -> 2f
+        isPast -> -0.5f
+        else -> 1f
     }
+    val rowTranslateYDp by animateFloatAsState(
+        targetValue = rowTranslateYTargetDp,
+        animationSpec = focusSpec,
+        label = "lyricRowTy",
+    )
 
     // ---- Lift envelope ----
-    // active YRC 时从 0 平滑上升到 1（shader 的 wave 强度从无到全），离开 active 时再降回 0。
-    // 用与 alpha/scale/blur 相同的 600ms cubic-bezier 曲线，节奏一致。
+    // active YRC 时从 0 平滑上升到 1（per-char wave 强度从无到全），离开 active 时再降回 0。
+    // 用与 alpha/scale/blur/rowTy 相同的 300ms cubic-bezier 曲线，节奏一致。
     // → future → active 切入时 wave 慢慢"长出来"，active → past 切出时 wave 慢慢"收回去"，
     //   不会有 ±dp 的跳变，整体看起来只有焦点行有动效。
     val liftEnvelope by animateFloatAsState(
@@ -602,10 +610,8 @@ private fun AppleMusicLyricRow(
     //     位移由 rowTy 决定，最朴素。
     //   - active YRC：底层 Text 透明（只用来跑 layout/measure），覆一层 drawWithContent，
     //     按字符索引逐个 clip 出该字符的横向条带，每条带内的整行文本被 translateY (per-char)
-    //     上移到对应位置。每个字符的 progress 用 sweep 的横坐标计算 ——
-    //     sweepX 已经过 charLeft：progress=1（已上浮 -6dp），
-    //     sweepX 还没碰到 charLeft：progress=0（停在 +8dp），
-    //     sweepX 落在 char 区间内：progress 在 (0,1) 平滑过渡 —— 这是"波浪"的本质。
+    //     上移到对应位置。每个字符的 raw 用 sweep 的横坐标计算 —— 见 drawPerCharLiftedSweep。
+    //     新版 3-phase wave：rest(+1dp) → peak(-1dp) → settled(-0.5dp)，每字符走完整波形再稳定。
     //
     // 字符之间没有 fontWeight / scale / blur 差异，只有颜色和 translateY，避免单字跳跃感。
     val baseColor = when {
@@ -618,14 +624,11 @@ private fun AppleMusicLyricRow(
         androidx.compose.runtime.mutableStateOf<TextLayoutResult?>(null)
     }
 
-    // ---- AGSL shader 路径暂时禁用 ----
-    // 之前在单行 YRC 上有 "整句直接全变色、没颜色过渡" 的 bug（多行 wrap 走 fallback 正常）。
-    // 现统一走 fallback 路径（drawPerCharLiftedSweep 在 DrawScope 里 per-char clipRect 渲染），
-    // 单行 / 多行行为一致，可控可验证。后续如果想恢复 shader 路径，需要在真机上验证 RuntimeShader
-    // uniform 是否每帧正确更新（怀疑是 graphicsLayer block 的重入时机或 RenderEffect 缓存问题）。
-    val canUseShader = false
+    // shader 路径已禁用 —— 多次尝试（state-tracked / Offscreen / 多行扩展 / 类型修复）后仍有
+    // 颜色异常或闪退问题，移动 GPU 驱动对 AGSL 的支持差异太大不可控。统一走 fallback per-char clipRect。
     @Suppress("UNUSED_VARIABLE")
     val cur = layout
+    val canUseShader = false
 
     Box(
         modifier = Modifier
@@ -680,29 +683,60 @@ private fun AppleMusicLyricRow(
 private const val LIFT_SHADER_SRC = """
 uniform shader content;
 uniform float sweepX;
+uniform float sweepLine;       // -1 = 还没开始；>= lineCount = 全部已唱；其他 = sweep 当前所在行
+uniform float lineCount;
+uniform half4 lineTops;        // 各行 top y（最多 4 行，未用填 1e9）
+uniform half4 lineBottoms;
 uniform float liftWindow;
 uniform float liftDownPx;
 uniform float liftDelta;
 uniform float colorWindow;
-uniform float envelope;       // 0=完全无 lift（chars at 0），1=完整波形
+uniform float envelope;
 uniform half4 fg;
 uniform half4 fgUnsung;
 
 half4 main(float2 c) {
-    // ---- Lift：sweep 已过的部分逐像素抬起，再乘以 envelope（进出 active 的柔性开关）----
-    float liftRaw = clamp((sweepX - c.x) / liftWindow, 0.0, 1.0);
+    // ---- 找当前像素所在行 + 该行 top/bottom（GLSL ES 不允许向量非常量索引，必须展开）----
+    float myLine = -1.0;
+    float lineTop = 0.0;
+    float lineBottom = 0.0;
+    if (c.y >= lineTops.x && c.y < lineBottoms.x) {
+        myLine = 0.0; lineTop = lineTops.x; lineBottom = lineBottoms.x;
+    } else if (c.y >= lineTops.y && c.y < lineBottoms.y) {
+        myLine = 1.0; lineTop = lineTops.y; lineBottom = lineBottoms.y;
+    } else if (c.y >= lineTops.z && c.y < lineBottoms.z) {
+        myLine = 2.0; lineTop = lineTops.z; lineBottom = lineBottoms.z;
+    } else if (c.y >= lineTops.w && c.y < lineBottoms.w) {
+        myLine = 3.0; lineTop = lineTops.w; lineBottom = lineBottoms.w;
+    }
+
+    // 不在任何行（行间空白或者超出范围）→ 透明
+    if (myLine < 0.0) return half4(0.0);
+
+    // ---- 根据行 vs sweepLine 决定 progress ----
+    float liftRaw;
+    float colorRaw;
+    if (myLine < sweepLine) {
+        liftRaw = 1.0; colorRaw = 1.0;
+    } else if (myLine > sweepLine) {
+        liftRaw = 0.0; colorRaw = 0.0;
+    } else {
+        liftRaw = clamp((sweepX - c.x) / liftWindow, 0.0, 1.0);
+        colorRaw = clamp((sweepX - c.x) / colorWindow, 0.0, 1.0);
+    }
+
+    // smootherstep
     float liftP = liftRaw * liftRaw * liftRaw * (liftRaw * (liftRaw * 6.0 - 15.0) + 10.0);
+    float colorP = colorRaw * colorRaw * colorRaw * (colorRaw * (colorRaw * 6.0 - 15.0) + 10.0);
+
     float ty = (liftDownPx + liftDelta * liftP) * envelope;
 
-    half4 src = content.eval(float2(c.x, c.y - ty));
+    // 把采样限制在本行 box 内 → 防止跨行 bleed
+    float sampleY = clamp(c.y - ty, lineTop, lineBottom - 0.001);
+    half4 src = content.eval(float2(c.x, sampleY));
     if (src.a < 0.001) return half4(0.0);
 
-    // ---- Color：同样"已过染色"，更短的过渡窗口 → 视感"per-char 切换"但是 sub-pixel 平滑 ----
-    // 颜色不受 envelope 影响 —— 颜色变化是音频同步的硬要求，不能渐入渐出。
-    float colorRaw = clamp((sweepX - c.x) / colorWindow, 0.0, 1.0);
-    float colorP = colorRaw * colorRaw * colorRaw * (colorRaw * (colorRaw * 6.0 - 15.0) + 10.0);
     half4 fill = mix(fgUnsung, fg, colorP);
-
     return half4(fill.rgb * src.a, src.a);
 }
 """
@@ -812,13 +846,22 @@ private fun DrawScope.drawPerCharColorOnly(
 }
 
 /**
- * 逐字符的"颜色 + lift"波浪：
+ * 逐字符的"颜色 + lift"波浪（Apple Music 风涟漪）：
+ *
  *   颜色 (colorProgress)：per-char 精确同步 sweep —— sweep 走过 charLeft → 染色，
  *                         保证"歌词颜色变化和音频同步"这条最硬的红线不破。
- *   上浮 (liftProgress)：用一个比单字宽得多的窗口（120dp）做平滑过渡，
- *                       并用 smootherstep 让起止更柔。这样"上浮波"会同时跨好几个字符，
- *                       邻字位移差很小，看起来是一道连续的丝滑涟漪而不是一格一格。
- *   字符之间没有 scale / blur / fontWeight 变化，只有颜色 + translateY。
+ *
+ *   上浮 (3-phase wave)：每个字符走一段完整波形 rest → peak → settled，不再"飙到顶冻住"。
+ *     · rest    = +1dp（未唱字微沉，与 row.future +1dp 对齐）
+ *     · peak    = -1dp（短暂上冲，对应"被扫到瞬间"）
+ *     · settled = -0.5dp（已唱字稳态，与 row.past -0.5dp 对齐）
+ *     总位移 2dp（之前 3dp，按用户要求降 1dp）；峰值后回落 0.5dp 给"柔和落位"的尾韵，
+ *     避免 smootherstep 末端导数为 0 + clamp 冻结造成的"跳到顶"观感。
+ *
+ *   窗口拉到 200dp（≈ 28sp 下 6-7 字宽，之前 60dp 只有 1-2 字）：同时有更多字符在过渡，
+ *   相邻 ty 差从 ~1.5px 降到 ~0.5px，"裂开"感大幅减弱，整道波看起来是连续涟漪而不是格子跳。
+ *
+ *   字符之间没有 scale / blur / fontWeight 差异，只有颜色 + translateY。
  */
 private fun DrawScope.drawPerCharLiftedSweep(
     layout: TextLayoutResult,
@@ -826,15 +869,20 @@ private fun DrawScope.drawPerCharLiftedSweep(
     positionMs: Long,
     fg: Color,
     fgUnsung: Color,
-    envelope: Float = 1f,                     // 0 = 完全无 lift；1 = 完整波形
+    envelope: Float = 1f,                       // 0 = 完全无 lift；1 = 完整波形
 ) {
     val sweep = computeSweepPos(layout, chars, positionMs)
     val text = layout.layoutInput.text.text
-    val liftDownPx = 2.dp.toPx() * envelope   // ty 按 envelope 缩放：进/出 active 平滑渐入渐出
-    val liftUpPx = (-1f).dp.toPx() * envelope
-    // 上浮过渡窗口拉到 ~120dp（≈ 28sp 字号下 5 个字宽），多字符同时在过渡 →
-    // 邻字 progress 差只有 ~0.2，对应 ty 差极小，看起来是一道连续的弧而非台阶。
-    val liftWindowPx = 120.dp.toPx()
+    // 三段式锚点：rest → peak → settled，envelope 按比例缩放整段位移
+    val liftRestPx = 1f.dp.toPx() * envelope
+    val liftPeakPx = (-1f).dp.toPx() * envelope
+    val liftSettledPx = (-0.5f).dp.toPx() * envelope
+    // 200dp 窗口 ≈ 6-7 个字符同步在过渡（之前 60dp 只有 1-2 字）
+    val liftWindowPx = 200.dp.toPx()
+    // 上升段占 50%、回落段占 50%（峰值居中），smootherstep 给两段各自柔和起止。
+    // 注意：piecewise smootherstep 在 raw=0.5（peak）处导数=0，会让字符"在峰值短暂悬停"，
+    // 这正是 Apple Music"涟漪到达再回落"的视觉特征，不是 bug。
+    val peakSplit = 0.5f
 
     for (i in text.indices) {
         val box = layout.getBoundingBox(i)
@@ -850,21 +898,26 @@ private fun DrawScope.drawPerCharLiftedSweep(
             else -> ((sweep.x - box.left) / (box.right - box.left)).coerceIn(0f, 1f)
         }
 
-        // 上浮：宽窗口 + smootherstep
+        // 上浮：与 color 同锚（box.left），sweep 之后才开始 → "即将亮起"的字母完全不动
         val liftRaw: Float = when {
             sweep.notStarted -> 0f
             sweep.allDone -> 1f
             charLine < sweep.line -> 1f
             charLine > sweep.line -> 0f
-            else -> {
-                val charCenter = (box.left + box.right) * 0.5f
-                ((sweep.x - charCenter + liftWindowPx * 0.5f) / liftWindowPx).coerceIn(0f, 1f)
-            }
+            else -> ((sweep.x - box.left) / liftWindowPx).coerceIn(0f, 1f)
         }
-        // smootherstep: 6t⁵ − 15t⁴ + 10t³
-        val liftProgress = liftRaw * liftRaw * liftRaw * (liftRaw * (liftRaw * 6f - 15f) + 10f)
 
-        val ty = liftDownPx + (liftUpPx - liftDownPx) * liftProgress
+        val ty = if (liftRaw < peakSplit) {
+            // 抬起段：rest → peak
+            val t = liftRaw / peakSplit
+            val s = t * t * t * (t * (t * 6f - 15f) + 10f)   // smootherstep
+            liftRestPx + (liftPeakPx - liftRestPx) * s
+        } else {
+            // 回落段：peak → settled
+            val t = (liftRaw - peakSplit) / (1f - peakSplit)
+            val s = t * t * t * (t * (t * 6f - 15f) + 10f)
+            liftPeakPx + (liftSettledPx - liftPeakPx) * s
+        }
         val color = lerp(fgUnsung, fg, colorProgress)
 
         // 多行文本严格按所在行 box clip，避免相邻行 ghost。
