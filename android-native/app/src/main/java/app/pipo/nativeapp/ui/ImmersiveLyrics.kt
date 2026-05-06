@@ -387,11 +387,13 @@ private fun AppleMusicLyricColumn(
 
     val listState = rememberLazyListState()
 
-    // ---- 关键升级：预滚动 ----
-    // 用 + lookaheadMs 计算"应当被滚到焦点的行"——比当前在唱的那行 / 待唱的那行
-    // 更早一拍切换，下一句**在唱响之前**已经平滑滚到焦点位置。
-    // 这接近 Apple Music："new line slides in 0.5–0.7s before its first word"。
-    val scrollLookaheadMs = 500L
+    // ---- 滚动 / 焦点切换的 lookahead ----
+    // 之前是 500ms：滚动比 alpha/blur 早 500ms 触发。Spring 滚动 ~360ms 内就稳了，
+    // 但 alpha/blur 要等到 sing boundary 才开始（再 250ms），中间有 ~140ms 的"空窗"——
+    // 用户看到的现象就是"滚上去 → 顿一下 → 突然加模糊"。
+    // 改成 100ms：滚动和 alpha/blur 几乎同时启动（差 100ms 内），两段动画并行进行，
+    // 滚动到位 ≈ alpha/blur 完成，整个过渡是一段连续的"渐入/渐出+滑动"，没有突变感。
+    val scrollLookaheadMs = 100L
     val scrollTargetIdx = remember(positionMs, lines) {
         if (lines.isEmpty()) 0
         else lines.indexOfLast { line -> positionMs + scrollLookaheadMs >= line.startMs }
@@ -474,10 +476,10 @@ private fun AppleMusicLyricColumn(
             // PlayerViewModel 算 activeLyricIndex 时用 coerceAtLeast(0)：歌还没开始就把
             // line 0 强制标成 active，导致 song start 时 line 0 立刻进入"焦点动效"，等到
             // 真正开唱时 sweep 又触发字符级 wave —— 看起来像同一句**播放了两遍**。
-            // 这里用与 scroll lookahead 一致的 500ms 提前量做 effective active：
-            //   smoothPos + 500ms 还没到 line[0].startMs → effectiveActiveIdx = -1（无 active）
+            // 这里复用 scroll lookahead（100ms）做 effective active 门：
+            //   smoothPos + 100ms 还没到 line[0].startMs → effectiveActiveIdx = -1（无 active）
             //   到了再切到真正的 activeLyricIndex
-            // 这样焦点动画**只在即将开唱前 500ms 触发一次**，紧接着 sweep wave 接力，视觉合一。
+            // 100ms 足够覆盖到歌真正开始时的进入态，不会过早触发焦点 / sweep 双动画。
             val effectiveActiveIdx = if (smoothedPositionMs + scrollLookaheadMs >= lines.first().startMs) {
                 activeLyricIndex
             } else {
