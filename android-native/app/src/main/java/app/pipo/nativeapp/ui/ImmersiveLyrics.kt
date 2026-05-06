@@ -56,6 +56,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.lerp
@@ -835,23 +836,18 @@ private fun DrawScope.drawPerCharColorOnly(
 private val EaseOutCss: Easing = CubicBezierEasing(0f, 0f, 0.58f, 1f)
 
 /**
- * 逐字符 "颜色 + 上浮"（直接复刻 AMLL/Apple Music 的 initFloatAnimation 思路）：
+ * 逐字符 "颜色 + 上浮"：
  *
- *   颜色 (colorProgress)：per-char 精确同步 sweep（音频时间），染色严格跟音频对齐。
+ *   颜色（per-pixel sweep，AMLL 风）：之前是"每字一个 colorProgress 然后整字 lerp 一个色"——
+ *     视觉上是"字一个一个跳变"，没有 sweep 流过的连续感。换成 **horizontal gradient brush**：
+ *     用 Brush.horizontalGradient 跨整行做 fg→fgUnsung 的渐变，过渡带宽 6dp，居中于 sweep.x。
+ *     这样**每个像素**的颜色都是连续插值，sweep 是一道丝滑的左→右扫过，跟 Apple Music 一致。
  *
- *   上浮 (per-char temporal ramp)：**关键概念**：不再是一道几何波扫过去，而是每个字符
- *     **自己有一个独立的时间轴**——
- *       · 字符 startMs 到了，开始自己的 ramp：translateY 从 0 → -1.4dp（= 0.05em @ 28sp）
- *       · ramp duration = max(1000ms, 字时长)。**短字也至少演 1 秒**，所以快歌字密的时候
- *         视觉上多个字"同时"还在缓缓上升；慢歌长尾音的时候字一个一个慢慢上升。
- *       · 这就是 Apple Music"歌词随音乐在动"的来源 —— 节奏直接锚到字的演唱时长，
- *         不是锚到 sweep 的几何位置。
- *       · 缓动用 CSS ease-out（cubic-bezier(0, 0, 0.58, 1)）—— AMLL 选的曲线，前段快后段缓收，
- *         字"被唱响"的瞬间动得最明显，缓缓贴近最高点。
- *       · 字 ramp 完后停在 -1.4dp（来自 AMLL `composite: "add"` + `fill: both` 的语义）。
- *         envelope 控制行级进出焦点时的 fade —— 离焦时整段 ty 按比例缩回 0。
+ *   上浮（per-char temporal ramp）：每个字符独立时间轴——开唱触发，duration=max(1000ms, 字时长)，
+ *     CSS ease-out → translateY 0 → -1.4dp。详见函数体注释。
+ *     这是 Apple Music"歌词随音乐在动"的真正来源 —— 节奏锚到字的演唱时长。
  *
- *   字符之间没有 scale / blur / fontWeight 差异，只有颜色 + translateY。
+ *   字符之间没有 scale / blur / fontWeight 差异，只有颜色 brush + translateY。
  */
 private fun DrawScope.drawPerCharLiftedSweep(
     layout: TextLayoutResult,
@@ -863,10 +859,12 @@ private fun DrawScope.drawPerCharLiftedSweep(
 ) {
     val sweep = computeSweepPos(layout, chars, positionMs)
     val text = layout.layoutInput.text.text
-    // AMLL: 0.05em，28sp 字号下 ≈ 1.4dp（之前 1dp，按 AMLL 实测值微调上来一点点）
+    // AMLL: 0.05em，28sp 字号下 ≈ 1.4dp
     val liftPeakPx = (-1.4f).dp.toPx() * envelope
     // AMLL `Math.max(1000, word.duration)` —— 短字至少演 1 秒
     val minRampMs = 1000L
+    // sweep 边缘的软过渡带宽：6dp 给"丝滑"，太大会糊成一团，太小又退化回硬切。
+    val fadeWidthPx = 6.dp.toPx()
 
     // text 是 chars.joinToString("") { it.text } 拼出来的，
     // 这里反向给每个 text-index 标上它属于第几个 PipoLyricChar，方便 O(1) 查 timing。
@@ -880,21 +878,25 @@ private fun DrawScope.drawPerCharLiftedSweep(
         }
     }
 
+    // 当前 sweep 落在的那条视觉行用 horizontal gradient brush；其它视觉行用纯色。
+    // Brush 的 startX/endX 是 DrawScope 的绝对坐标（与 layout.getBoundingBox 同坐标系），
+    // 默认 TileMode.Clamp：startX 之前都是 fg、endX 之后都是 fgUnsung，中间 6dp 线性过渡。
+    val activeBrush: Brush = if (!sweep.notStarted && !sweep.allDone) {
+        Brush.horizontalGradient(
+            colors = listOf(fg, fgUnsung),
+            startX = sweep.x - fadeWidthPx / 2f,
+            endX = sweep.x + fadeWidthPx / 2f,
+        )
+    } else {
+        SolidColor(if (sweep.allDone) fg else fgUnsung)
+    }
+
     for (i in text.indices) {
         val box = layout.getBoundingBox(i)
         if (box.right <= box.left) continue   // 行末空白等零宽字符，跳过
         val charLine = layout.getLineForOffset(i)
 
-        // 颜色：per-char 精确，与 sweep 严格同步（这条红线不动）
-        val colorProgress: Float = when {
-            sweep.notStarted -> 0f
-            sweep.allDone -> 1f
-            charLine < sweep.line -> 1f
-            charLine > sweep.line -> 0f
-            else -> ((sweep.x - box.left) / (box.right - box.left)).coerceIn(0f, 1f)
-        }
-
-        // 上浮：per-char 时间轴 ramp，不再是 sweep 几何驱动
+        // 上浮：per-char 时间轴 ramp，不是 sweep 几何驱动
         val charIdx = charIdxByTextIdx.getOrElse(i) { -1 }
         val ty = if (charIdx >= 0) {
             val pc = chars[charIdx]
@@ -905,7 +907,18 @@ private fun DrawScope.drawPerCharLiftedSweep(
         } else {
             0f
         }
-        val color = lerp(fgUnsung, fg, colorProgress)
+
+        // 选当前字符这帧应该用的 brush：
+        //   - sweep 之前的视觉行 → 已唱完，纯 fg
+        //   - sweep 当前行       → activeBrush（per-pixel 软过渡）
+        //   - sweep 之后的视觉行 → 还没唱到，纯 fgUnsung
+        val brush: Brush = when {
+            sweep.notStarted -> SolidColor(fgUnsung)
+            sweep.allDone -> SolidColor(fg)
+            charLine < sweep.line -> SolidColor(fg)
+            charLine > sweep.line -> SolidColor(fgUnsung)
+            else -> activeBrush
+        }
 
         // 多行文本严格按所在行 box clip，避免相邻行 ghost。
         // lineHeight 44sp > fontSize 28sp，行 box 内部上下各 ~8sp 空白能吸收 ±dp 位移。
@@ -916,7 +929,7 @@ private fun DrawScope.drawPerCharLiftedSweep(
             bottom = layout.getLineBottom(charLine),
             clipOp = ClipOp.Intersect,
         ) {
-            drawText(layout, color = color, topLeft = Offset(0f, ty))
+            drawText(layout, brush = brush, topLeft = Offset(0f, ty))
         }
     }
 }
