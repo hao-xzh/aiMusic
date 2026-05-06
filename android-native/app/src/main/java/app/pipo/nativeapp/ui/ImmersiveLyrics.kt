@@ -297,28 +297,50 @@ private fun ImmersiveIconButton(onClick: () -> Unit, content: @Composable () -> 
 // ---------- Apple Music 风格歌词列 ----------
 
 /**
- * 把 player tick 出来的离散 positionMs（约 30Hz / 33ms 一拍）外插成"按帧平滑"的位置流。
- *   - 上游来一个新 raw 时：作为 anchor，记下当时的 monotonic nanos
- *   - 后续每一帧：smooth = anchor + (frameNanos - anchorNanos) / 1_000_000
- *   - isPlaying=false 时停止外插（停止后 positionMs 不变，停在 anchor 即可）
- * 这样 120Hz 屏上每帧都能拿到新的位置，per-char 的 ty / 颜色都能丝滑过渡，不会出现
- * "每 4 帧才走一步"的颤动。
+ * 把 player 的 30Hz 离散 raw 位置流，转成按帧平滑且**始终跟踪音频**的连续位置 ——
+ * 字符级 sweep / lift wave 的时间源。
+ *
+ * 设计：软低通追踪 + 单调护栏
+ *   - 每帧算 `target = lastRaw + (now - lastRawNanos)`（预测此刻"真实"位置）
+ *   - `smoothed += (target - smoothed) * 0.4`（指数低通，τ ≈ 40ms）
+ *   - 但 **只允许前进**：如果 target 因为系统抖动暂时倒退（一拍 raw 来得慢，下一拍来得快这种情况），
+ *     smoothed 原地等，不跟着倒退。这是消除"sweep 在颤"的关键。
+ *   - 仅 seek（|diff| > 500ms）时硬锚定 —— 换歌、跳进度。
+ *
+ * 稳态滞后 ≈ 40ms（视觉上无感，远低于人眼 80ms 同步阈值）；不漂移、不抖动。
  */
 @Composable
-private fun rememberSmoothPositionMs(rawPositionMs: Long, isPlaying: Boolean): State<Long> =
-    produceState(initialValue = rawPositionMs, rawPositionMs, isPlaying) {
-        val anchorMs = rawPositionMs
-        val anchorNanos = System.nanoTime()
-        value = rawPositionMs
-        if (isPlaying) {
-            while (true) {
-                withFrameNanos { frameNanos ->
-                    val elapsed = ((frameNanos - anchorNanos) / 1_000_000L).coerceAtLeast(0L)
-                    value = anchorMs + elapsed
+private fun rememberSmoothPositionMs(rawPositionMs: Long, isPlaying: Boolean): State<Long> {
+    val output = remember { mutableStateOf(rawPositionMs) }
+    // raw 来一拍就更新 anchor（值 + 当时 monotonic nanos），coroutine 内按帧读最新。
+    val rawAnchor = remember { mutableStateOf(rawPositionMs to System.nanoTime()) }
+    LaunchedEffect(rawPositionMs) {
+        rawAnchor.value = rawPositionMs to System.nanoTime()
+    }
+
+    LaunchedEffect(isPlaying) {
+        if (!isPlaying) {
+            output.value = rawAnchor.value.first
+            return@LaunchedEffect
+        }
+        var smoothed = rawAnchor.value.first.toFloat()
+        while (true) {
+            withFrameNanos { frameNanos ->
+                val (lastRaw, lastRawNanos) = rawAnchor.value
+                val target = lastRaw.toFloat() +
+                    (frameNanos - lastRawNanos).toFloat() / 1_000_000f
+                val diff = target - smoothed
+                when {
+                    kotlin.math.abs(diff) > 500f -> smoothed = target           // seek
+                    diff > 0f -> smoothed += diff * 0.4f                        // 前进追赶
+                    // diff <= 0：target 比 smoothed 落后（线程抖动 / 短暂停拍），原地等。
                 }
+                output.value = smoothed.toLong()
             }
         }
     }
+    return output
+}
 
 @Composable
 private fun AppleMusicLyricColumn(
@@ -443,18 +465,34 @@ private fun AppleMusicLyricColumn(
             // 关掉 user 滚动，让歌词只跟着进度走（避免用户误触把活动行甩出 30% 位置）
             userScrollEnabled = false,
         ) {
+            // PlayerViewModel 算 activeLyricIndex 时用 coerceAtLeast(0)：歌还没开始就把
+            // line 0 强制标成 active，导致 song start 时 line 0 立刻进入"焦点动效"，等到
+            // 真正开唱时 sweep 又触发字符级 wave —— 看起来像同一句**播放了两遍**。
+            // 这里用与 scroll lookahead 一致的 500ms 提前量做 effective active：
+            //   smoothPos + 500ms 还没到 line[0].startMs → effectiveActiveIdx = -1（无 active）
+            //   到了再切到真正的 activeLyricIndex
+            // 这样焦点动画**只在即将开唱前 500ms 触发一次**，紧接着 sweep wave 接力，视觉合一。
+            val effectiveActiveIdx = if (smoothedPositionMs + scrollLookaheadMs >= lines.first().startMs) {
+                activeLyricIndex
+            } else {
+                -1
+            }
             itemsIndexed(
                 items = lines,
                 key = { _, line -> line.startMs },
             ) { idx, line ->
-                val distance = kotlin.math.abs(idx - activeLyricIndex)
+                val distance = if (effectiveActiveIdx < 0) {
+                    idx + 1   // 整列都按"未来"摊开，line 0 距离 1, line 1 距离 2, ...
+                } else {
+                    kotlin.math.abs(idx - effectiveActiveIdx)
+                }
                 // heightIn(min) 而不是 height(fixed) —— 长歌词自然换行成两行不被切。
                 // LazyColumn 内部支持变高 item，animateScrollToItem 仍能按 idx 定位。
                 Box(modifier = Modifier.heightIn(min = rowHeightDp)) {
                     AppleMusicLyricRow(
                         line = line,
-                        isActive = idx == activeLyricIndex,
-                        isPast = idx < activeLyricIndex,
+                        isActive = idx == effectiveActiveIdx,
+                        isPast = effectiveActiveIdx >= 0 && idx < effectiveActiveIdx,
                         distance = distance,
                         // 活动行的字符级 sweep / lift 用按帧外插的 smoothed 位置，颤动消失；
                         // 非活动行其实只用 isActive/isPast 派生状态，跟 positionMs 精度关系不大。
@@ -501,18 +539,19 @@ private fun AppleMusicLyricRow(
         animationSpec = focusSpec,
         label = "lyricAlpha",
     )
+    // 关键：scale / blur / lift 这些"焦点动效"只给 YRC（字符级时间戳的数据）。
+    // LRC（整行时间戳）只走 alpha + 整句变色 —— 没有词级数据可以同步动画，整行抖动反而怪。
+    val isYrcLineForFocus = line.chars.isNotEmpty()
     val rowScale by animateFloatAsState(
-        targetValue = if (isActive) 1f else 0.97f,
+        targetValue = if (isYrcLineForFocus) {
+            if (isActive) 1f else 0.97f
+        } else 1f,
         animationSpec = focusSpec,
         label = "lyricScale",
     )
-    // translateY 只给有字符级时间戳的行（YRC）用，LRC 行完全不做漂移：
-    //   YRC active: rowTy=0，每个字符**独立**用 sweep 的 x 坐标驱动 lerp(+2dp, -1dp, charProgress)，
-    //               从左到右连续上浮，跟颜色 sweep 同步。在下方 Text 的 drawWithContent 里画。
-    //   YRC future: 静止 +2dp（与 active YRC 起点对齐，切入无跳变）。
-    //   YRC past:   静止 -1dp（与 active YRC 终点对齐，切出无跳变）。
-    //   LRC 任何状态: 0dp，不漂移 —— 没有词级时间没法做"从左到右"的波，整句漂浮反而像
-    //                BUG（和颜色变化时机对不上），干脆只用 alpha/scale/blur 焦点过渡 + 整句变色。
+    // 行级 translateY：YRC 非活动行保持 ±dp 偏移，与 shader wave 的起点 / 终点对齐
+    // → future → active 切入、active → past 切出时无跳变；
+    // active YRC 自身 rowTy=0，shader 接管位移；LRC 始终 0（不参与 wave）。
     val isYrcLine = line.chars.isNotEmpty()
     val isActiveYrc = isActive && isYrcLine
     val isActiveLrc = isActive && !isYrcLine
@@ -522,9 +561,19 @@ private fun AppleMusicLyricRow(
         isPast -> -1f
         else -> 2f
     }
+
+    // ---- Lift envelope ----
+    // active YRC 时从 0 平滑上升到 1（shader 的 wave 强度从无到全），离开 active 时再降回 0。
+    // 用与 alpha/scale/blur 相同的 600ms cubic-bezier 曲线，节奏一致。
+    // → future → active 切入时 wave 慢慢"长出来"，active → past 切出时 wave 慢慢"收回去"，
+    //   不会有 ±dp 的跳变，整体看起来只有焦点行有动效。
+    val liftEnvelope by animateFloatAsState(
+        targetValue = if (isActiveYrc) 1f else 0f,
+        animationSpec = focusSpec,
+        label = "liftEnvelope",
+    )
     val rowBlurDp by animateFloatAsState(
-        // 全离焦 2dp、active 0dp。统一应用避免 distance 跨档时出现"blur 突然冒出来"
-        // 的视觉跳；远行 alpha 已极低，2dp 的 blur 在 GPU 上几乎免费。
+        // blur 给所有行（LRC / YRC 都要）—— 模糊只是焦距感，不会引起位置错乱。
         targetValue = if (isActive) 0f else 2f,
         animationSpec = focusSpec,
         label = "lyricBlur",
@@ -569,21 +618,14 @@ private fun AppleMusicLyricRow(
         androidx.compose.runtime.mutableStateOf<TextLayoutResult?>(null)
     }
 
-    // ---- AGSL shader 路径（API 33+，单行 active YRC）：lift + color 都交给 GPU 逐像素跑 ----
-    // 这条路径下 Text 用纯 fg 色实绘（shader 仅取 src.a 作为字形 mask，再用 sweep 算 fill 颜色）。
-    // 多行 wrap、API < 33 退回 per-char clip+ty 的 fallback。
-    val isApi33Plus = remember { Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU }
+    // ---- AGSL shader 路径暂时禁用 ----
+    // 之前在单行 YRC 上有 "整句直接全变色、没颜色过渡" 的 bug（多行 wrap 走 fallback 正常）。
+    // 现统一走 fallback 路径（drawPerCharLiftedSweep 在 DrawScope 里 per-char clipRect 渲染），
+    // 单行 / 多行行为一致，可控可验证。后续如果想恢复 shader 路径，需要在真机上验证 RuntimeShader
+    // uniform 是否每帧正确更新（怀疑是 graphicsLayer block 的重入时机或 RenderEffect 缓存问题）。
+    val canUseShader = false
+    @Suppress("UNUSED_VARIABLE")
     val cur = layout
-    val canUseShader = isApi33Plus && isActiveYrc && cur != null && cur.lineCount == 1
-    val sweep = if (canUseShader && cur != null) computeSweepPos(cur, line.chars, positionMs) else null
-    val density = LocalDensity.current
-    val liftDownPxShader = with(density) { 2.dp.toPx() }
-    val liftUpPxShader = with(density) { (-1f).dp.toPx() }
-    val liftWindowPxShader = with(density) { 120.dp.toPx() }      // 上浮过渡跨 5 字宽
-    val colorWindowPxShader = with(density) { 24.dp.toPx() }      // 颜色过渡 ≈ 1 字宽，紧贴 sweep
-    val shader = remember(isApi33Plus) {
-        if (isApi33Plus) RuntimeShader(LIFT_SHADER_SRC) else null
-    }
 
     Box(
         modifier = Modifier
@@ -600,53 +642,24 @@ private fun AppleMusicLyricRow(
             .blur(rowBlurDp.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
             .padding(vertical = 8.dp),
     ) {
-        // 内层 graphicsLayer 专门挂 shader（只在 active YRC 单行时启用），它先于外层
-        // alpha/scale/blur 作用于内容，所以 lift 在原始像素空间精确，scale 等不会扭曲它。
-        Box(
-            modifier = Modifier.graphicsLayer {
-                if (canUseShader && shader != null && sweep != null) {
-                    // sweepX：notStarted 拉到 -1e6（全部停在 liftDownPx），allDone 拉到 +1e6。
-                    val sx = when {
-                        sweep.notStarted -> -1_000_000f
-                        sweep.allDone -> 1_000_000f
-                        else -> sweep.x
+        Text(
+            text = line.text,
+            color = baseColor,
+            style = style,
+            onTextLayout = { layout = it },
+            modifier = if (isActiveYrc || liftEnvelope > 0.001f) {
+                Modifier.drawWithContent {
+                    drawContent()  // active YRC 时 baseColor=Transparent，drawContent 等同 no-op
+                    val cur2 = layout
+                    if (cur2 != null) {
+                        drawPerCharLiftedSweep(
+                            cur2, line.chars, positionMs, fg, fgUnsung,
+                            envelope = liftEnvelope,
+                        )
                     }
-                    shader.setFloatUniform("sweepX", sx)
-                    shader.setFloatUniform("liftWindow", liftWindowPxShader)
-                    shader.setFloatUniform("liftDownPx", liftDownPxShader)
-                    shader.setFloatUniform("liftDelta", liftUpPxShader - liftDownPxShader)
-                    shader.setFloatUniform("colorWindow", colorWindowPxShader)
-                    shader.setFloatUniform("fg", fg.red, fg.green, fg.blue, fg.alpha)
-                    shader.setFloatUniform(
-                        "fgUnsung", fgUnsung.red, fgUnsung.green, fgUnsung.blue, fgUnsung.alpha,
-                    )
-                    renderEffect = AndroidRenderEffect
-                        .createRuntimeShaderEffect(shader, "content")
-                        .asComposeRenderEffect()
-                } else {
-                    renderEffect = null
                 }
-            },
-        ) {
-            Text(
-                text = line.text,
-                // shader 路径：用 fg 实色描字形，shader 拿 src.a 当 mask 再涂自己算的颜色。
-                // 非 shader 路径 / fallback：用 baseColor（透明 then drawWithContent）。
-                color = if (canUseShader) fg else baseColor,
-                style = style,
-                onTextLayout = { layout = it },
-                modifier = if (isActiveYrc && !canUseShader) {
-                    Modifier.drawWithContent {
-                        drawContent()  // baseColor=Transparent
-                        val cur2 = layout
-                        if (cur2 != null) {
-                            // Fallback：API < 33 或多行 wrap，per-char ty + color 在 DrawScope 里做
-                            drawPerCharLiftedSweep(cur2, line.chars, positionMs, fg, fgUnsung)
-                        }
-                    }
-                } else Modifier,
-            )
-        }
+            } else Modifier,
+        )
     }
 }
 
@@ -671,19 +684,21 @@ uniform float liftWindow;
 uniform float liftDownPx;
 uniform float liftDelta;
 uniform float colorWindow;
+uniform float envelope;       // 0=完全无 lift（chars at 0），1=完整波形
 uniform half4 fg;
 uniform half4 fgUnsung;
 
 half4 main(float2 c) {
-    // ---- Lift：sweep 已过的部分逐像素抬起 ----
+    // ---- Lift：sweep 已过的部分逐像素抬起，再乘以 envelope（进出 active 的柔性开关）----
     float liftRaw = clamp((sweepX - c.x) / liftWindow, 0.0, 1.0);
     float liftP = liftRaw * liftRaw * liftRaw * (liftRaw * (liftRaw * 6.0 - 15.0) + 10.0);
-    float ty = liftDownPx + liftDelta * liftP;
+    float ty = (liftDownPx + liftDelta * liftP) * envelope;
 
     half4 src = content.eval(float2(c.x, c.y - ty));
     if (src.a < 0.001) return half4(0.0);
 
     // ---- Color：同样"已过染色"，更短的过渡窗口 → 视感"per-char 切换"但是 sub-pixel 平滑 ----
+    // 颜色不受 envelope 影响 —— 颜色变化是音频同步的硬要求，不能渐入渐出。
     float colorRaw = clamp((sweepX - c.x) / colorWindow, 0.0, 1.0);
     float colorP = colorRaw * colorRaw * colorRaw * (colorRaw * (colorRaw * 6.0 - 15.0) + 10.0);
     half4 fill = mix(fgUnsung, fg, colorP);
@@ -811,11 +826,12 @@ private fun DrawScope.drawPerCharLiftedSweep(
     positionMs: Long,
     fg: Color,
     fgUnsung: Color,
+    envelope: Float = 1f,                     // 0 = 完全无 lift；1 = 完整波形
 ) {
     val sweep = computeSweepPos(layout, chars, positionMs)
     val text = layout.layoutInput.text.text
-    val liftDownPx = 2.dp.toPx()              // 未上浮位（与 future 行对齐）
-    val liftUpPx = (-1f).dp.toPx()            // 已上浮位（与 past 行对齐）
+    val liftDownPx = 2.dp.toPx() * envelope   // ty 按 envelope 缩放：进/出 active 平滑渐入渐出
+    val liftUpPx = (-1f).dp.toPx() * envelope
     // 上浮过渡窗口拉到 ~120dp（≈ 28sp 字号下 5 个字宽），多字符同时在过渡 →
     // 邻字 progress 差只有 ~0.2，对应 ty 差极小，看起来是一道连续的弧而非台阶。
     val liftWindowPx = 120.dp.toPx()
