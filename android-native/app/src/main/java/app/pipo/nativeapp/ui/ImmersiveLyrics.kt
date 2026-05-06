@@ -525,17 +525,27 @@ private fun AppleMusicLyricRow(
     fgUnsung: Color,
 ) {
     // 行级焦点过渡：整行作为单一图层平滑进入焦点。
-    // 进入态 (isActive=true)：alpha 1, blur 0
-    // 离焦态：alpha 0.35（distance=1），blur 2dp
-    // **不再放大** —— Apple Music 实际上根本不放大焦点行（之前 1.1 是误解）。
-    // 焦点感全靠 alpha + blur 的对比 + 字符级 ramp 上浮。
+    // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
+    //
+    // alpha 衰减放缓 —— 之前下方歌词到 distance=3+ 已经几乎隐形，叠加列底部的
+    // 渐隐 mask 后下方一片黑。Apple Music 实际是 distance 1-2 还相当可读，
+    // 远端再慢慢淡出，**列尾的 fade mask 才是"消失"的主力**，per-line alpha 只是辅助层次。
     val targetAlpha = when (distance) {
         0 -> 1.0f
-        1 -> 0.35f
-        2 -> 0.18f
-        3 -> 0.10f
-        4 -> 0.06f
-        else -> 0.04f
+        1 -> 0.55f
+        2 -> 0.40f
+        3 -> 0.28f
+        4 -> 0.20f
+        else -> 0.14f
+    }
+    // 模糊：只给"列首尾"（distance ≥ 2 的远端行）。
+    // 之前给所有非活动行加 blur 是错的 —— Apple Music 实际是焦点附近清晰、远端模糊（焦距感），
+    // 不是"非焦点全模糊"。distance=1 的邻句（上 / 下一句）保持清晰，给读者扫读余光。
+    val targetBlur = when {
+        distance == 0 -> 0f
+        distance == 1 -> 0f          // 紧邻焦点：不模糊，只是 alpha 减弱
+        distance == 2 -> 1.2f        // 开始模糊
+        else -> 2f                    // 远端：完整 2dp 模糊
     }
     // ---- Apple Music 行级过渡曲线（从 AMLL lyric-player.module.css 实测得出）----
     // AMLL 真正的 CSS 是：
@@ -573,8 +583,7 @@ private fun AppleMusicLyricRow(
         label = "liftEnvelope",
     )
     val rowBlurDp by animateFloatAsState(
-        // blur 给所有行（LRC / YRC 都要）—— 模糊只是焦距感，不会引起位置错乱。
-        targetValue = if (isActive) 0f else 2f,
+        targetValue = targetBlur,
         animationSpec = blurSpec,
         label = "lyricBlur",
     )
@@ -586,7 +595,8 @@ private fun AppleMusicLyricRow(
     //   → 整行变宽几像素，看起来"右边抖一下"。letterSpacing = 0 让两态宽度一致。
     val style = TextStyle(
         fontSize = 28.sp,
-        fontWeight = FontWeight.Black,
+        // ExtraBold (800) 比 Black (900) 细一度，视觉上不那么"压迫"，更接近 Apple Music
+        fontWeight = FontWeight.ExtraBold,
         lineHeight = 44.sp,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
