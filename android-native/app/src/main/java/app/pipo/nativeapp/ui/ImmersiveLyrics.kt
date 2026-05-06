@@ -56,6 +56,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asComposeRenderEffect
@@ -528,20 +529,15 @@ private fun AppleMusicLyricRow(
     // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
     //
     // alpha 关键约束：**past line（distance=1）必须比 fgUnsung（active 行未唱字符）更暗**。
-    //
-    // pickFgUnsung 给的 alpha 是 0.35（深底）/ 0.40（浅底）；如果 past line 行级 alpha
-    // 高于 0.40，past line 整行的实际亮度（× 全亮 fg 颜色）就会比 active 行还没刷到的
-    // 那一段（× 0.40 fgUnsung 颜色）更亮 —— 用户会感到"上一句比正在唱的更亮"，反直觉。
-    //
-    // distance=1 压到 0.38（< fgUnsung 0.40）确保 past 永远暗于 active 任何部分。
-    // 远端继续衰减，但保持比之前 0.10/0.06 那一档明显高，配合列尾 fade mask 仍可读。
+    // pickFgUnsung 现在是 0.30（深底）/ 0.33（浅底），所以 distance=1 必须 < 0.30。
+    // 整体衰减比之前再低一档，给已唱-未唱的对比让出空间。
     val targetAlpha = when (distance) {
         0 -> 1.0f
-        1 -> 0.38f
-        2 -> 0.28f
-        3 -> 0.20f
-        4 -> 0.14f
-        else -> 0.10f
+        1 -> 0.26f
+        2 -> 0.20f
+        3 -> 0.15f
+        4 -> 0.12f
+        else -> 0.09f
     }
     // 模糊：只给"列首尾"（distance ≥ 2 的远端行）。
     // 之前给所有非活动行加 blur 是错的 —— Apple Music 实际是焦点附近清晰、远端模糊（焦距感），
@@ -622,16 +618,17 @@ private fun AppleMusicLyricRow(
     //     详见 drawPerCharLiftedSweep。
     //
     // 字符之间没有 fontWeight / scale / blur 差异，只有颜色和 translateY，避免单字跳跃感。
-    // 上层 overlay 只要还在画，底层 Text 就必须保持透明 —— 否则 overlay + 底层 Text
-    // 会**双重绘制**同样的字，透明度叠加 → 250ms 内字看着比平常亮一截，envelope 落到 0
-    // 后又恢复 → 用户看到的"滚到上面闪一下再恢复"就是这个。
-    // 所以 baseColor 的"透明开关"必须跟 overlay 的渲染条件 (liftEnvelope > 0.001f) 对齐，
-    // 而不是跟 isActive 对齐。
+    // baseColor —— **永远给一个真实颜色**，不再用 Color.Transparent。
+    // 之前 active YRC 用 Color.Transparent，Compose 检测到完全透明会**跳过 Text 测量**
+    // → onTextLayout 不触发 → layout 永远是 null → 上层 overlay 因为 cur2 == null 不绘制
+    // → 整行空白，直到行变 past、baseColor 切回 fg 才触发测量。
+    // 现在永远用 fgUnsung 作为 active YRC 的底层颜色（非 0 alpha 强制 Compose 真正测量布局），
+    // 隐藏由 drawWithContent 里**跳过 drawContent()** 完成 —— 这样 overlay 也不会双重绘制。
     val overlayDrawing = isYrcLine && liftEnvelope > 0.001f
     val baseColor = when {
-        overlayDrawing -> Color.Transparent   // overlay 接管渲染，底层让位避免重叠
         isPast -> fg
         isActiveLrc -> fg
+        isActiveYrc -> fgUnsung   // 仅作为 layout 测量用的"占位色"，drawWithContent 里被跳过
         else -> fgUnsung
     }
     var layout by remember(line.text) {
@@ -662,7 +659,9 @@ private fun AppleMusicLyricRow(
             onTextLayout = { layout = it },
             modifier = if (isActiveYrc || liftEnvelope > 0.001f) {
                 Modifier.drawWithContent {
-                    drawContent()  // active YRC 时 baseColor=Transparent，drawContent 等同 no-op
+                    // overlayDrawing 时跳过 drawContent —— 不画底层 Text，避免双重绘制 +
+                    // 同时保证 Text 已被测量（用 fgUnsung 占位色）以拿到 layout。
+                    if (!overlayDrawing) drawContent()
                     val cur2 = layout
                     if (cur2 != null) {
                         drawPerCharLiftedSweep(
@@ -888,6 +887,11 @@ private fun DrawScope.drawPerCharLiftedSweep(
     val minRampMs = 1000L
     // sweep 边缘的软过渡带宽：6dp 给"丝滑"，太大会糊成一团，太小又退化回硬切。
     val fadeWidthPx = 6.dp.toPx()
+    // Apple Music 风的"克制发光"参数：发光范围 sweep 两侧各 ~40dp 内（约 3-4 字），
+    // 越靠近 sweep 越亮，最大 alpha 0.35（克制 = 不到 0.5）。blurRadius 6f 给字母边缘
+    // 一圈微微的 halo —— 不是炫酷三开光，就是 outline 风的发光描边。
+    val glowRadiusPx = 40.dp.toPx()
+    val glowMaxAlpha = 0.35f
 
     // text 是 chars.joinToString("") { it.text } 拼出来的，
     // 这里反向给每个 text-index 标上它属于第几个 PipoLyricChar，方便 O(1) 查 timing。
@@ -955,6 +959,41 @@ private fun DrawScope.drawPerCharLiftedSweep(
             clipOp = ClipOp.Intersect,
         ) {
             drawText(layout, brush = brush, topLeft = Offset(0f, ty))
+        }
+
+        // ---- Apple Music 风发光：sweep 附近字符画一遍带 shadow 的覆盖，halo 显白边 ----
+        //   只对 sweep 当前视觉行的字、距 sweep ≤ 40dp 的字生效。
+        //   shadow 通过 drawText 的 shadow 参数动态注入，不需要额外 layout，零额外测量成本。
+        //   alpha 从 sweep 处的 0.35 平滑衰减到 40dp 处的 0；blurRadius 6f 给"克制"的发光感，
+        //   不是炫酷三色光，就是字母边缘那一圈微微发亮。
+        if (charLine == sweep.line && !sweep.notStarted && !sweep.allDone) {
+            val charCenter = (box.left + box.right) * 0.5f
+            val distFromSweep = kotlin.math.abs(charCenter - sweep.x)
+            if (distFromSweep < glowRadiusPx) {
+                val glowFade = 1f - (distFromSweep / glowRadiusPx)
+                val glowAlpha = glowFade * glowMaxAlpha * envelope
+                if (glowAlpha > 0.01f) {
+                    val pad = 5f
+                    clipRect(
+                        left = box.left - pad,
+                        top = layout.getLineTop(charLine) - pad,
+                        right = box.right + pad,
+                        bottom = layout.getLineBottom(charLine) + pad,
+                        clipOp = ClipOp.Intersect,
+                    ) {
+                        drawText(
+                            textLayoutResult = layout,
+                            color = fg.copy(alpha = glowAlpha * 0.4f),
+                            shadow = Shadow(
+                                color = fg.copy(alpha = glowAlpha),
+                                offset = Offset.Zero,
+                                blurRadius = 6f,
+                            ),
+                            topLeft = Offset(0f, ty),
+                        )
+                    }
+                }
+            }
         }
     }
 }
