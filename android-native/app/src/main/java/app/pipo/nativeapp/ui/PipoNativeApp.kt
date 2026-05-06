@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.ui
 
+import android.app.Activity
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
@@ -14,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -22,6 +25,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.pipo.nativeapp.playback.PlayerViewModel
 
@@ -67,6 +71,21 @@ fun PipoNativeApp() {
 
         LaunchedEffect(immersive, route) {
             if (immersive || route != Route.Player) coverAnchor.releaseCoverRect()
+        }
+
+        // 进入沉浸式歌词页时给 window 加 FLAG_KEEP_SCREEN_ON，退出时立刻清掉。
+        // DisposableEffect 的 onDispose 在整个 composable 被销毁时也会清理，防止 leak。
+        val view = LocalView.current
+        DisposableEffect(immersive) {
+            val window = (view.context as? Activity)?.window
+            if (immersive) {
+                window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            onDispose {
+                window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
         }
 
         CompositionLocalProvider(LocalCoverAnchor provides coverAnchor) {
