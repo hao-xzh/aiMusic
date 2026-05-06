@@ -9,8 +9,10 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -125,6 +127,11 @@ class PlayerViewModel(
     )
         private set
 
+    /** 已经在本曲尝试过 URL 重签的 trackId —— 重签后再失败就别回头了，跳下一首 */
+    private val urlRefreshTried = HashSet<String>()
+    /** 当前正在刷新 URL 的 trackId —— 错误风暴里只让一个刷新协程在飞 */
+    private var refreshingUrlForTrack: String? = null
+
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             syncFrom(player)
@@ -134,6 +141,14 @@ class PlayerViewModel(
             mediaItem: androidx.media3.common.MediaItem?,
             reason: Int,
         ) {
+            // 切到新一首 = 之前那首已经播过去了（自然结束 / 用户切 / 重签后跳过来），
+            // 把当前这首从"已尝试重签"集合里清出来，等若干小时后这首 URL 又过期时还能重签一次。
+            // PLAYLIST_CHANGED（playFromAgent/playTrack/setMediaItems）→ 整张表清空。
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
+                urlRefreshTried.clear()
+            } else {
+                mediaItem?.mediaId?.let { urlRefreshTried.remove(it) }
+            }
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 logEventForPrev(BehaviorType.Completed, completionPctOverride = 1f)
                 logEventForCurrent(BehaviorType.PlayStarted)
@@ -142,6 +157,89 @@ class PlayerViewModel(
                 logEventForCurrent(BehaviorType.PlayStarted)
             }
         }
+
+        override fun onPlayerError(error: PlaybackException) {
+            // 网易直链是签名 URL，几小时就过期。播着播着 URL 死掉 → ExoPlayer 拿 4xx → IDLE，
+            // 之前 toggle()/next() 里 prepare() 还是同一个死链 → "按播放没反应、自动切又一直切"。
+            // 这里用 neteaseId 重新签 URL + replaceMediaItem 让用户感受不到 URL 已过期。
+            handleLikelyUrlExpiry(error)
+        }
+    }
+
+    private fun isLikelyUrlExpiry(error: PlaybackException): Boolean = when (error.errorCode) {
+        PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+        PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+        PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+        PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
+        else -> false
+    }
+
+    private fun handleLikelyUrlExpiry(error: PlaybackException) {
+        if (!isLikelyUrlExpiry(error)) {
+            Log.w("PlayerVM", "non-recoverable playback error code=${error.errorCodeName}")
+            return
+        }
+        val player = controller ?: return
+        val curIdx = player.currentMediaItemIndex.coerceAtLeast(0)
+        val track = state.queue.getOrNull(curIdx) ?: return
+        if (refreshingUrlForTrack == track.id) return
+
+        // 已经在这首上重签过一次还失败 —— 这首确实坏了（区域受限 / 真下架 / 重签 URL 也是死的）。
+        // 死链一次就能确认，不需要"先重试 N 次再放弃"。
+        if (track.id in urlRefreshTried) {
+            Log.w("PlayerVM", "${track.title} died after refresh, skipping")
+            skipToNextOrStop(player)
+            return
+        }
+        val ne = track.neteaseId ?: run {
+            // 没有 neteaseId 没法重签 —— 直接跳
+            skipToNextOrStop(player)
+            return
+        }
+
+        urlRefreshTried.add(track.id)
+        refreshingUrlForTrack = track.id
+        // 错误时 player 在 IDLE，currentPosition 可能已重置。state.positionMs 由 syncFrom
+        // 持续更新，是更可靠的"上一刻播到哪儿"。
+        val resumePosMs = state.positionMs.coerceAtLeast(0L)
+        viewModelScope.launch {
+            try {
+                val fresh = runCatching { repository.songUrls(listOf(ne)) }
+                    .getOrNull()?.firstOrNull { it.id == ne }?.url
+                    ?.takeIf { it.isNotBlank() }
+                if (fresh == null) {
+                    // 重签拿不到 URL —— 可能是网络真挂了（不是单首问题）。
+                    // 这时候不能自动跳，跳了就一路自动切；停在 IDLE，等用户回过神再点播放。
+                    Log.w("PlayerVM", "songUrls returned no url for ${track.title}, staying paused")
+                    return@launch
+                }
+                val livePlayer = controller ?: return@launch
+                // 期间用户可能已切歌 —— 只在还停在同一首时替换
+                if (livePlayer.currentMediaItemIndex != curIdx) return@launch
+                val updated = track.copy(streamUrl = fresh)
+                val newQueue = state.queue.toMutableList().apply {
+                    if (curIdx in indices) set(curIdx, updated)
+                }
+                state = state.copy(queue = newQueue)
+                livePlayer.replaceMediaItem(curIdx, toMediaItem(updated))
+                livePlayer.prepare()
+                if (resumePosMs > 1000L) {
+                    livePlayer.seekTo(curIdx, resumePosMs)
+                }
+                livePlayer.play()
+            } finally {
+                refreshingUrlForTrack = null
+            }
+        }
+    }
+
+    private fun skipToNextOrStop(p: Player) {
+        if (p.mediaItemCount > 1 && p.hasNextMediaItem()) {
+            p.seekToNextMediaItem()
+            p.prepare()
+            p.play()
+        }
+        // 队列只剩这一首 / 在末尾且没循环 → 停在 IDLE，让用户决定
     }
 
     private val behaviorLog by lazy { PipoGraph.behaviorLog }

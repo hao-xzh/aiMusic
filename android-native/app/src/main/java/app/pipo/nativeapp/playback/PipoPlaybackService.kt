@@ -111,8 +111,8 @@ class PipoPlaybackService : MediaSessionService() {
                             lastErrorIndex = curIdx
                             consecutiveErrors = 1
                         }
-                        // 同曲连续失败 ≥3 次 → 这首确实坏了，跳下一首；没下一首就停在 IDLE
-                        // 让用户手动决定（手动 next 会走 ensurePlayerLive 自愈路径）
+                        // 同曲连续失败 ≥3 次 → 这首确实坏了（或 ViewModel 重签也没救），
+                        // 跳下一首；没下一首就停在 IDLE 让用户手动决定
                         if (consecutiveErrors >= 3) {
                             if (mediaItemCount > 1 && hasNextMediaItem()) {
                                 seekToNext()
@@ -124,23 +124,35 @@ class PipoPlaybackService : MediaSessionService() {
                             return
                         }
 
+                        // HTTP 类错误大概率是网易直链过期 —— 不要在服务层 prepare/play
+                        // 同一个死 URL（之前会触发"快速 retry → 3 次后跳下一首（也死）→ 一路自动切"
+                        // 的雪崩）。停在 IDLE，让 PlayerViewModel.onPlayerError 走 songUrls 重签
+                        // + replaceMediaItem 路径，再 prepare+play。
+                        val isUrlExpiryLike = when (error.errorCode) {
+                            PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+                            PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+                            PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+                            PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
+                            else -> false
+                        }
+                        if (isUrlExpiryLike) return
+
+                        // 网络抖动等一过性错误 —— 当前 URL 还没过期，原地 prepare 重试就行
                         val recoverable = when (error.errorCode) {
                             PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
-                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
-                            PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
-                            PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
-                            PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
+                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> true
                             else -> false
                         }
                         if (recoverable) {
                             seekToDefaultPosition()
+                            prepare()
+                            play()
                         } else if (mediaItemCount > 1 && hasNextMediaItem()) {
                             seekToNext()
-                        } else {
-                            seekToDefaultPosition()
+                            prepare()
+                            play()
                         }
-                        prepare()
-                        play()
+                        // 其他不可恢复错误：停在 IDLE
                     }
                 })
             }
