@@ -880,12 +880,10 @@ private fun DrawScope.drawPerCharLiftedSweep(
 ) {
     val sweep = computeSweepPos(layout, chars, positionMs)
     val text = layout.layoutInput.text.text
-    // AMLL: 0.05em，28sp 字号下 ≈ 1.4dp
-    val liftPeakPx = (-1.4f).dp.toPx() * envelope
+    // 1.6dp 上浮峰值（AMLL 是 0.05em ≈ 1.4dp，这里上调到 ~0.057em，幅度稍微更明显一点）
+    val liftPeakPx = (-1.6f).dp.toPx() * envelope
     // AMLL `Math.max(1000, word.duration)` —— 短字至少演 1 秒
     val minRampMs = 1000L
-    // sweep 边缘的软过渡带宽：6dp 给"丝滑"，太大会糊成一团，太小又退化回硬切。
-    val fadeWidthPx = 6.dp.toPx()
 
     // text 是 chars.joinToString("") { it.text } 拼出来的，
     // 这里反向给每个 text-index 标上它属于第几个 PipoLyricChar，方便 O(1) 查 timing。
@@ -899,20 +897,13 @@ private fun DrawScope.drawPerCharLiftedSweep(
         }
     }
 
-    // 当前 sweep 落在的那条视觉行用 horizontal gradient brush；其它视觉行用纯色。
-    // 关键：fade band **整段在 sweep 之后**（startX = sweep.x），不再居中于 sweep。
-    // 这样 sweep 左侧（含正在唱的字本身）全是 fg 全亮色，gradient 只发生在前方
-    // 还没到的字上。之前居中时 sweep 那一点是 50/50 混色，正在变化的字看起来比
-    // 已唱完的字暗 → "已经放完的颜色比正在变化的亮" 的反直觉感就来自这里。
-    val activeBrush: Brush = if (!sweep.notStarted && !sweep.allDone) {
-        Brush.horizontalGradient(
-            colors = listOf(fg, fgUnsung),
-            startX = sweep.x,
-            endX = sweep.x + fadeWidthPx,
-        )
-    } else {
-        SolidColor(if (sweep.allDone) fg else fgUnsung)
-    }
+    // 颜色对齐 LRC：active 行**整行 fg**（跟 LRC active 行同色），不再 per-char 渐变到 fgUnsung。
+    // sung 与 unsung 的视觉区分完全交给两套机制：
+    //   1. 行级 alpha（active=1.0，past=0.36，future 也是 0.36 但 baseColor 取 fgUnsung）
+    //   2. per-char 上浮动画（已唱字升到峰值，未唱字停在基线）
+    // 唯一例外：sweep.notStarted（行刚激活但 sweep 还没踏进第一个字）用 fgUnsung，
+    //          跟"刚被推上来还没真开始唱"这一瞬态对齐，避免活动行从 future 直接跳成全 fg 的硬切。
+    val activeBrush: Brush = if (sweep.notStarted) SolidColor(fgUnsung) else SolidColor(fg)
 
     for (i in text.indices) {
         val box = layout.getBoundingBox(i)
@@ -931,17 +922,9 @@ private fun DrawScope.drawPerCharLiftedSweep(
             0f
         }
 
-        // 选当前字符这帧应该用的 brush：
-        //   - sweep 之前的视觉行 → 已唱完，纯 fg
-        //   - sweep 当前行       → activeBrush（per-pixel 软过渡）
-        //   - sweep 之后的视觉行 → 还没唱到，纯 fgUnsung
-        val brush: Brush = when {
-            sweep.notStarted -> SolidColor(fgUnsung)
-            sweep.allDone -> SolidColor(fg)
-            charLine < sweep.line -> SolidColor(fg)
-            charLine > sweep.line -> SolidColor(fgUnsung)
-            else -> activeBrush
-        }
+        // 跟 LRC 对齐：active 行整行 fg，sweep 还没踏进第一个字时用 fgUnsung（瞬态过渡）。
+        // 不再 per-char 区分（charLine < / > / == sweep.line），整行同色。
+        val brush: Brush = activeBrush
 
         // 多行文本严格按所在行 box clip，避免相邻行 ghost。
         // lineHeight 44sp > fontSize 28sp，行 box 内部上下各 ~8sp 空白能吸收 ±dp 位移。
