@@ -527,16 +527,21 @@ private fun AppleMusicLyricRow(
     // 行级焦点过渡：整行作为单一图层平滑进入焦点。
     // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
     //
-    // alpha 衰减放缓 —— 之前下方歌词到 distance=3+ 已经几乎隐形，叠加列底部的
-    // 渐隐 mask 后下方一片黑。Apple Music 实际是 distance 1-2 还相当可读，
-    // 远端再慢慢淡出，**列尾的 fade mask 才是"消失"的主力**，per-line alpha 只是辅助层次。
+    // alpha 关键约束：**past line（distance=1）必须比 fgUnsung（active 行未唱字符）更暗**。
+    //
+    // pickFgUnsung 给的 alpha 是 0.35（深底）/ 0.40（浅底）；如果 past line 行级 alpha
+    // 高于 0.40，past line 整行的实际亮度（× 全亮 fg 颜色）就会比 active 行还没刷到的
+    // 那一段（× 0.40 fgUnsung 颜色）更亮 —— 用户会感到"上一句比正在唱的更亮"，反直觉。
+    //
+    // distance=1 压到 0.38（< fgUnsung 0.40）确保 past 永远暗于 active 任何部分。
+    // 远端继续衰减，但保持比之前 0.10/0.06 那一档明显高，配合列尾 fade mask 仍可读。
     val targetAlpha = when (distance) {
         0 -> 1.0f
-        1 -> 0.55f
-        2 -> 0.40f
-        3 -> 0.28f
-        4 -> 0.20f
-        else -> 0.14f
+        1 -> 0.38f
+        2 -> 0.28f
+        3 -> 0.20f
+        4 -> 0.14f
+        else -> 0.10f
     }
     // 模糊：只给"列首尾"（distance ≥ 2 的远端行）。
     // 之前给所有非活动行加 blur 是错的 —— Apple Music 实际是焦点附近清晰、远端模糊（焦距感），
