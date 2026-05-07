@@ -105,11 +105,11 @@ fun pickFg(tone: Tone): Color =
 fun pickFgDim(tone: Tone): Color =
     if (tone == Tone.Dark) Color(0x8C000000) else Color(0x9EFFFFFF)
 
-/** 未唱字符色：active 行里要明显比已唱字段暗一档，但保留可读性。
- *  α 0.40/0.43 —— 之前 0.30/0.33 用户嫌太暗，提一档；已唱跟未唱的差仍有 ~0.60，
- *  在保持对比的前提下让未唱字段整体更亮、更可读。 */
+/** 未唱字符色：active 行里要比已唱字暗一档，但保留可读性。
+ *  α 0.55/0.58 —— YRC active 行右半（未唱部分）也亮起来，整行平均亮度跟 LRC active
+ *  整行 fg 那种"通体明亮"的视觉接近。已唱跟未唱仍有 0.45 的差，sweep 颜色变化看得出来。 */
 fun pickFgUnsung(tone: Tone): Color =
-    if (tone == Tone.Dark) Color(0x66000000) else Color(0x6EFFFFFF)
+    if (tone == Tone.Dark) Color(0x8C000000) else Color(0x94FFFFFF)
 
 fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback
