@@ -13,6 +13,7 @@ import {
 } from "@/lib/tauri";
 import { useAppSettings } from "@/lib/app-settings";
 import { BackButton } from "@/components/BackButton";
+import { DotText } from "@/components/DotText";
 import {
   useAnalysisProgress,
   startBackgroundAnalysis,
@@ -21,7 +22,7 @@ import {
 import { loadLibrary } from "@/lib/library";
 import { getUserFacts, setUserFacts } from "@/lib/pet-memory";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { Children, useEffect, useState, type ReactNode } from "react";
 
 export default function SettingsPage() {
   const [me, setMe] = useState<UserProfile | null | "loading">("loading");
@@ -57,41 +58,38 @@ export default function SettingsPage() {
         width: "100%",
       }}
     >
-      {/* 三列 grid：BackButton（左 36px）/ 标题（中间 1fr，textAlign center 自然
-          落在屏幕几何中心）/ 36px 镜像占位（右）。flex + flex:1 那种写法标题中心
-          只在"BackButton 右边到屏幕右边沿"这段空间里居中，整体偏右；右边补一个
-          同宽空 div 才能让中点真正落在屏幕中线。 */}
+      {/* BackButton 单独一行，hero 居中 —— 跟 /login 同款"DotText 大标题 + 副标题"
+          的版式。原来那个小 SETTINGS 在三列 grid 里看起来是注释，不是页眉。 */}
+      <div className="safe-top" style={{ display: "flex", paddingTop: 4 }}>
+        <BackButton href="/" />
+      </div>
       <div
-        className="safe-top"
         style={{
-          display: "grid",
-          gridTemplateColumns: "36px 1fr 36px",
-          alignItems: "center",
-          gap: 12,
-          paddingBottom: 8,
+          display: "flex",
+          justifyContent: "center",
+          marginTop: "clamp(12px, 3vh, 24px)",
+          marginBottom: 6,
         }}
       >
-        <BackButton href="/" />
-        <div style={{ ...brand, marginTop: 0, marginBottom: 0 }}>SETTINGS</div>
-        <div aria-hidden />
+        <DotText text="设置" fontSize={48} grid={4} dotRadius={1.6} />
       </div>
       <div style={subtitle}>
-        Pipo 把你的账号状态、播放规则、AI 口吻都攒在本地。
+        Pipo 把你的账号、播放规则、AI 口吻都攒在本地。
       </div>
 
-      <Section title="音乐来源">
+      <Section title="音乐来源" label="SOURCE">
         <NeteaseRow me={me} err={err} />
       </Section>
 
-      <Section title="音频分析（接歌丝滑度）">
+      <Section title="整库声学分析" subtitle="接歌丝滑度" label="ANALYSIS">
         <AnalysisRow />
       </Section>
 
-      <Section title="音频缓存">
+      <Section title="音频缓存" subtitle="原始字节" label="CACHE">
         <AudioCacheRow />
       </Section>
 
-      <Section title="外观">
+      <Section title="外观" label="LOOK">
         <Toggle
           label="隐藏点阵纹理"
           desc="去掉播放页全屏的点阵叠加，只保留封面模糊背景"
@@ -100,27 +98,27 @@ export default function SettingsPage() {
         />
       </Section>
 
-      <Section title="播放规则">
+      <Section title="播放规则" label="RULES">
         <Toggle label="工作时段自动播放" desc="09:00 – 18:30（可自定义）" initial={true} />
         <Toggle label="开会时自动暂停" desc="读取系统日历判断" initial={true} />
         <Toggle label="午休换放松歌单" desc="12:00 – 13:30" initial={false} />
         <Toggle label="深夜降低推荐节奏" desc="22:30 之后" initial={true} />
       </Section>
 
-      <Section title="关于你">
+      <Section title="关于你" subtitle="自述事实" label="ABOUT YOU">
         <UserFactsRow />
       </Section>
 
-      <Section title="AI 接入">
+      <Section title="AI 接入" label="AI">
         <AiProvidersRow />
       </Section>
 
-      <Section title="AI 解说">
+      <Section title="AI 解说" label="NARRATION">
         <Toggle label="每首歌给一段解说" desc="类似 Pipo 的那种 DJ 口吻" initial={true} />
         <Toggle label="中文解说" desc="关闭则使用英文" initial={true} />
       </Section>
 
-      <div style={{ marginTop: 24, color: "#8a93a8", fontSize: 12, textAlign: "center" }}>
+      <div style={footerNote}>
         登录 cookie & API key 仅保存在本机 · 不上传
       </div>
     </div>
@@ -273,7 +271,7 @@ function AiProvidersRow() {
   const editing = editingDraft != null;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14, padding: "2px 2px" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       {/* Provider 切换 —— pill tab 形式 */}
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         {cfg.providers.map((p) => {
@@ -575,25 +573,56 @@ const dangerBtn: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+// Section —— 每一组设置都是一张「软玻璃卡」：
+//   header 行：中文标题 +（可选）描述 +（可选）右侧 mono 大写 brand label
+//   body：卡片内 padding，flex column。
+//
+// 多子节点时（譬如「播放规则」里的 4 个 Toggle）自动给相邻子节点之间加一道
+// 1px hairline 分隔；只有一个子节点（譬如某个 Row 组件自己内部已 flex 排版）
+// 则不加，避免 row 内部被切成奇怪几段。
+function Section({
+  title,
+  subtitle,
+  label,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  label?: string;
+  children: ReactNode;
+}) {
+  const items = Children.toArray(children);
+  const multi = items.length > 1;
   return (
-    <div style={sectionBlock}>
-      <div style={sectionTitle}>{title}</div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>{children}</div>
-    </div>
+    <section style={sectionBlock}>
+      <div style={sectionHeader}>
+        <div style={sectionTitle}>{title}</div>
+        {subtitle && <div style={sectionSubtitleInline}>{subtitle}</div>}
+        {label && <div style={sectionLabel}>{label}</div>}
+      </div>
+      <div style={sectionCard}>
+        {multi
+          ? items.map((c, i) => (
+              <div
+                key={i}
+                style={
+                  i === 0
+                    ? undefined
+                    : {
+                        borderTop: "1px solid rgba(233,239,255,0.06)",
+                        paddingTop: 6,
+                        marginTop: 6,
+                      }
+                }
+              >
+                {c}
+              </div>
+            ))
+          : children}
+      </div>
+    </section>
   );
 }
-
-const brand: React.CSSProperties = {
-  textAlign: "center",
-  fontSize: 11,
-  letterSpacing: 4,
-  color: "rgba(233,239,255,0.42)",
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-  marginTop: "clamp(12px, 3vh, 24px)",
-  marginBottom: 14,
-  textTransform: "uppercase",
-};
 
 const subtitle: React.CSSProperties = {
   textAlign: "center",
@@ -604,24 +633,64 @@ const subtitle: React.CSSProperties = {
 };
 
 const sectionBlock: React.CSSProperties = {
-  marginBottom: 28,
+  marginBottom: 22,
+};
+
+const sectionHeader: React.CSSProperties = {
+  display: "flex",
+  alignItems: "baseline",
+  gap: 10,
+  marginBottom: 10,
+  paddingLeft: 4,
+  paddingRight: 4,
 };
 
 const sectionTitle: React.CSSProperties = {
-  color: "rgba(233,239,255,0.42)",
-  fontSize: 11,
-  letterSpacing: 2.2,
+  color: "#f5f7ff",
+  fontSize: 16,
+  fontWeight: 600,
+  letterSpacing: -0.1,
+};
+
+const sectionSubtitleInline: React.CSSProperties = {
+  color: "#6c7489",
+  fontSize: 12,
+  fontWeight: 400,
+};
+
+const sectionLabel: React.CSSProperties = {
+  marginLeft: "auto",
+  color: "rgba(155,227,198,0.55)",
+  fontSize: 10,
+  letterSpacing: 2.4,
   textTransform: "uppercase",
-  marginBottom: 14,
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const sectionCard: React.CSSProperties = {
+  background: "rgba(255,255,255,0.025)",
+  border: "1px solid rgba(233,239,255,0.06)",
+  borderRadius: 16,
+  padding: "16px 18px",
+  display: "flex",
+  flexDirection: "column",
+  gap: 14,
+};
+
+const footerNote: React.CSSProperties = {
+  marginTop: 28,
+  color: "#6c7489",
+  fontSize: 11,
+  textAlign: "center",
+  letterSpacing: 0.3,
 };
 
 function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: string | null }) {
   const loading = me === "loading";
   const connected = !!me && me !== "loading";
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14, padding: "4px 4px" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div>
           <div style={{ fontWeight: 600 }}>网易云音乐</div>
           <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2 }}>
@@ -754,7 +823,7 @@ function AnalysisRow() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "2px 2px" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <div>
         <div style={{ fontWeight: 600 }}>整库 BPM / 能量 / 声学特征分析</div>
         <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2, lineHeight: 1.55 }}>
@@ -919,7 +988,7 @@ function AudioCacheRow() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: "2px 2px" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <div>
         <div style={{ fontWeight: 600 }}>歌曲原始字节缓存</div>
         <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2, lineHeight: 1.55 }}>
@@ -1100,11 +1169,12 @@ function Toggle({
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        padding: "10px 4px",
+        gap: 16,
+        padding: "6px 0",
         cursor: "pointer",
       }}
     >
-      <div>
+      <div style={{ minWidth: 0 }}>
         <div style={{ fontWeight: 600 }}>{label}</div>
         <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2 }}>{desc}</div>
       </div>
@@ -1112,6 +1182,7 @@ function Toggle({
         style={{
           width: 42,
           height: 24,
+          flexShrink: 0,
           borderRadius: 999,
           background: on ? "#9be3c6" : "rgba(233,239,255,0.15)",
           position: "relative",
@@ -1186,7 +1257,7 @@ function UserFactsRow() {
     "通勤 30 分钟。最近常熬夜。喜欢 city pop 和后摇。";
 
   return (
-    <div style={{ padding: "8px 4px 4px" }}>
+    <div>
       <div style={{ color: "#8a93a8", fontSize: 12, marginBottom: 8, lineHeight: 1.6 }}>
         TA 自己写的事实比 AI 从行为里推断的更准。任何工作时间 / 作息 / 习惯 / 喜好都可以塞进来,Pipo 会顺着这些回应你。
       </div>
