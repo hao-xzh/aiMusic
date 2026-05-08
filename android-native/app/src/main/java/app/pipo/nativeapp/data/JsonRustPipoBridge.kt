@@ -1,7 +1,9 @@
 package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -266,17 +268,42 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     }
 
     private suspend fun callRaw(command: String, args: JSONObject = JSONObject()): String {
-        return withContext(Dispatchers.IO) {
-            invokeNative(command, args.toString()).also { raw ->
-                val trimmed = raw.trimStart()
-                if (trimmed.startsWith("{")) {
-                    val obj = runCatching { JSONObject(raw) }.getOrNull()
-                    val message = obj?.optStringOrNull("error")
-                    if (!message.isNullOrBlank()) {
-                        throw RustBridgeException(command, message)
+        // 给 JNI 调用一个硬上限。invokeNative 是同步 native 调用,withTimeout cancel
+        // 只能解锁 Kotlin 这边的 suspend —— 底层 native 线程不响应 Java thread interrupt,
+        // 会继续跑到 Rust 端自己的 timeout / 完成。我们容忍这种"僵尸 IO 线程",
+        // 关键是上层 viewModelScope 不会永久 pending(协程堆积、歌词不显示、续杯不来
+        // 都会消解)。
+        //
+        // 30s 是经验值:DeepSeek/网易 API 正常 RTT < 2s,留 15× 余量给慢网三次重试。
+        // AI chat / embed 类大 payload 偶尔慢,所以不能太短。
+        return try {
+            withTimeout(30_000L) {
+                withContext(Dispatchers.IO) {
+                    invokeNative(command, args.toString()).also { raw ->
+                        val trimmed = raw.trimStart()
+                        if (trimmed.startsWith("{")) {
+                            val obj = runCatching { JSONObject(raw) }.getOrNull()
+                            // 显式 error 字段 → bridge 层传上来的错误(不是网易业务码)
+                            val message = obj?.optStringOrNull("error")
+                            if (!message.isNullOrBlank()) {
+                                throw RustBridgeException(command, message)
+                            }
+                            // 注意:**不在这里检测网易业务级 code**。
+                            // 网易各接口的 code 语义不一致,且很多 code 是合法状态:
+                            //   - qrCheck: 800/801/802/803 都是 QR 各种状态
+                            //   - captchaSent: 503 = 频繁请求(用户体验信息,不是错)
+                            //   - phoneLogin: 502 = 验证码错(要给用户看 message)
+                            // 之前在这里 throw 把扫码登录的 801/802 也当成异常,
+                            // 导致永远拿不到 803 成功 → 扫码登录全失败。
+                            // 业务码由各 caller 自己处理(QrLoginStatus.code / PhoneLoginStatus.code 等)。
+                        }
                     }
                 }
             }
+        } catch (e: TimeoutCancellationException) {
+            // 转成 RustBridgeException,跟其它 bridge 错误统一被上层 runCatching 捕获,
+            // 不会冒泡成未捕获异常崩 app
+            throw RustBridgeException(command, "timeout after 30s")
         }
     }
 

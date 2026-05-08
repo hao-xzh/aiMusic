@@ -49,6 +49,14 @@ class PlaylistCacheStore(context: Context) {
             if (obj.optInt("v") != VERSION) return null
             val userId = obj.optLong("userId", 0L).takeIf { it != 0L } ?: return null
             val savedAtMs = obj.optLong("savedAtMs", 0L)
+            // 主动废弃 7 天以上的 cache —— 这种"用户长期不开 app"的场景,旧快照里
+            // 大概率有歌单已经被改/删了,先显示 7+ 天前的旧列表然后被网络覆盖会 flash
+            // 一下,体验比直接显示空 EmptyState 还差。直接当作无 cache 让用户看到
+            // "正在加载"几百 ms 更干净。
+            if (savedAtMs > 0 && System.currentTimeMillis() - savedAtMs > MAX_AGE_MS) {
+                runCatching { file.delete() }
+                return null
+            }
             val plArr = obj.optJSONArray("playlists") ?: return null
             val playlists = ArrayList<PipoPlaylist>(plArr.length())
             for (i in 0 until plArr.length()) {
@@ -167,6 +175,7 @@ class PlaylistCacheStore(context: Context) {
     companion object {
         private const val FILE_NAME = "playlist_cache_v1.json"
         private const val VERSION = 1
-        private const val STALE_AFTER_MS = 24L * 3600 * 1000  // 24h
+        private const val STALE_AFTER_MS = 24L * 3600 * 1000  // 24h:isStale 阈值
+        private const val MAX_AGE_MS = 7L * 24 * 3600 * 1000  // 7d:超过这个直接废弃 cache
     }
 }

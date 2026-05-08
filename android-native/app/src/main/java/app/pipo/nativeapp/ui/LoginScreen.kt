@@ -2,6 +2,7 @@ package app.pipo.nativeapp.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,10 +12,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -27,6 +26,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -36,11 +36,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * 登录页 —— 镜像 src/app/login/page.tsx 的 Android 默认（手机号 + 验证码）路径。
+ * 登录页 —— 网易云 App 扫码登录。
  *
- *   - 手机号 + 验证码（默认）
- *   - 60s 重发倒计时
- *   - 已登录后切回上一页
+ * 走原生 weapi qr_start + qr_check 轮询。code 含义:
+ *   800 = 二维码过期
+ *   801 = 等待扫码
+ *   802 = 等待手机端确认
+ *   803 = 授权成功 → cookie 已存,refreshAccount 拿到账号 → onBack 回上一页
+ *
+ * 之前这页是手机号 + 验证码方式,网易经常风控被拒,体验差且跟设置页扫码方式割裂。
+ * 统一只保留扫码。
  */
 @Composable
 fun LoginScreen(onBack: () -> Unit) {
@@ -48,22 +53,17 @@ fun LoginScreen(onBack: () -> Unit) {
     val account by repository.account.collectAsState(initial = null)
     val scope = rememberCoroutineScope()
 
-    var phone by remember { mutableStateOf("") }
-    var captcha by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf<String?>(null) }
-    var sending by remember { mutableStateOf(false) }
-    var verifying by remember { mutableStateOf(false) }
-    var cooldown by remember { mutableStateOf(0) }
+    var qrContent by remember { mutableStateOf<String?>(null) }
+    var status by remember { mutableStateOf("点下面用网易云 App 扫码") }
 
+    // 已登录后切回上一页
     LaunchedEffect(account) {
         if (account != null) onBack()
     }
 
-    LaunchedEffect(cooldown) {
-        if (cooldown > 0) {
-            delay(1000)
-            cooldown -= 1
-        }
+    // 进入页面立刻拉一张二维码,不让用户多按一次按钮
+    LaunchedEffect(Unit) {
+        runQrFlow(repository, onContent = { qrContent = it }, onStatus = { status = it })
     }
 
     Column(
@@ -71,7 +71,6 @@ fun LoginScreen(onBack: () -> Unit) {
             .fillMaxSize()
             .background(PipoColors.Bg0)
             .statusBarsPadding()
-            .verticalScroll(rememberScrollState())
             .padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
         TextButton(onClick = onBack) {
@@ -86,76 +85,117 @@ fun LoginScreen(onBack: () -> Unit) {
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            "登录网易云，把 14 年的歌单接进来。",
+            "登录网易云,把 14 年的歌单接进来。",
             color = PipoColors.TextDim,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(horizontal = 6.dp),
         )
 
-        Spacer(modifier = Modifier.height(28.dp))
-        OutlinedTextField(
-            value = phone,
-            onValueChange = { phone = it.filter(Char::isDigit).take(11) },
-            label = { Text("手机号") },
-            singleLine = true,
+        Spacer(modifier = Modifier.height(36.dp))
+
+        Box(
             modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            qrContent?.let { content ->
+                QrCode(
+                    content = content,
+                    modifier = Modifier
+                        .size(240.dp)
+                        .clip(RoundedCornerShape(12.dp)),
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+        Text(
+            status,
+            color = PipoColors.TextDim,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 6.dp),
         )
-        Spacer(modifier = Modifier.height(12.dp))
+
+        Spacer(modifier = Modifier.height(16.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            OutlinedTextField(
-                value = captcha,
-                onValueChange = { captcha = it.filter(Char::isDigit).take(6) },
-                label = { Text("验证码") },
-                singleLine = true,
-                modifier = Modifier.weight(1f),
-            )
-            Spacer(modifier = Modifier.size(10.dp))
             TextButton(
-                enabled = !sending && cooldown == 0 && phone.length == 11,
                 onClick = {
-                    sending = true
                     scope.launch {
-                        val sent = repository.sendPhoneCaptcha(phone = phone)
-                        status = sent.message ?: "验证码已发"
-                        if (sent.code == 200) cooldown = 60
-                        sending = false
+                        runQrFlow(repository, onContent = { qrContent = it }, onStatus = { status = it })
                     }
                 },
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
-                    if (cooldown > 0) "${cooldown}s" else "发送验证码",
+                    if (qrContent == null) "生成二维码" else "刷新二维码",
                     color = PipoColors.Mint,
                 )
             }
         }
-        Spacer(modifier = Modifier.height(20.dp))
-        TextButton(
-            enabled = !verifying && phone.length == 11 && captcha.isNotBlank(),
-            onClick = {
-                verifying = true
-                scope.launch {
-                    val s = repository.loginWithPhone(phone = phone, captcha = captcha)
-                    status = s.nickname?.let { "已登录 · $it" } ?: s.message ?: "登录失败"
-                    repository.refreshAccount()
-                    verifying = false
-                }
-            },
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(if (verifying) "登录中…" else "登录", color = PipoColors.Gold)
-        }
+    }
+}
 
-        status?.let {
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                it,
-                color = PipoColors.TextDim,
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(horizontal = 6.dp),
-            )
+/**
+ * 跑一轮扫码:start → 60s 内每 2s poll 一次 → 803 成功 / 800 过期 / 超时 都退出。
+ * 抽出来共用,也好让"刷新二维码"按钮重复触发。
+ */
+private suspend fun runQrFlow(
+    repository: app.pipo.nativeapp.data.PipoRepository,
+    onContent: (String?) -> Unit,
+    onStatus: (String) -> Unit,
+) {
+    onStatus("正在请求二维码…")
+    val startResult = runCatching { repository.startQrLogin() }
+    val start = startResult.getOrNull()
+    if (start == null) {
+        onContent(null)
+        // 把真异常的类型 + message 露出来,光说"网络问题"找不到根因
+        val err = startResult.exceptionOrNull()
+        onStatus("拉取二维码失败:${err?.javaClass?.simpleName}: ${err?.message ?: "未知"}")
+        return
+    }
+    if (start.qrContent.isBlank()) {
+        onContent(null)
+        onStatus("拉取二维码失败 —— bridge 返回空内容(可能 native lib 没加载)")
+        return
+    }
+    onContent(start.qrContent)
+    onStatus("用网易云 App 扫上面这个码")
+    repeat(30) {
+        delay(2_000)
+        val s = runCatching { repository.checkQrLogin(start.key) }.getOrNull()
+        if (s == null) {
+            onStatus("网络异常 —— 稍等再刷新")
+            return
+        }
+        when (s.code) {
+            801 -> onStatus("等待扫码…")
+            802 -> onStatus("已扫码,在手机上确认登录")
+            803 -> {
+                onStatus(s.nickname?.let { "已登录 · $it" } ?: "登录成功")
+                onContent(null)
+                runCatching { repository.refreshAccount() }
+                return
+            }
+            800 -> {
+                onStatus("二维码已过期 —— 点刷新重新生成")
+                onContent(null)
+                return
+            }
+            else -> {
+                onStatus(s.message ?: "状态码 ${s.code}")
+                if (s.code < 0) {
+                    onContent(null)
+                    return
+                }
+            }
         }
     }
+    // 60s 还没扫完
+    onStatus("二维码超时 —— 点刷新重新生成")
+    onContent(null)
 }

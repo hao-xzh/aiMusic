@@ -214,6 +214,14 @@ private fun DistillLibrary(
         initialPage = 0,
         pageCount = { playlists.size },
     )
+    // 列表长度变化(歌单删除 / 网易云端少了一张)时,如果 currentPage 已经越界,
+    // pagerState.currentPage 会停留在旧 index → focused 永远 null →
+    // 曲目列表静默不更新。强制 scroll 回 0 让 focused 恢复有效。
+    LaunchedEffect(playlists.size) {
+        if (playlists.isNotEmpty() && pagerState.currentPage >= playlists.size) {
+            pagerState.scrollToPage(0)
+        }
+    }
     val focused = playlists.getOrNull(pagerState.currentPage)
     var tracks by remember { mutableStateOf<List<app.pipo.nativeapp.data.NativeTrack>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
@@ -635,8 +643,6 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
     val scope = rememberCoroutineScope()
     var loginStatus by remember { mutableStateOf<String?>(null) }
     var qrContent by remember { mutableStateOf<String?>(null) }
-    var phone by remember { mutableStateOf("") }
-    var captcha by remember { mutableStateOf("") }
     var apiKeyDraft by remember { mutableStateOf("") }
     var aiReply by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) {
@@ -652,56 +658,76 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
             modifier = Modifier.padding(bottom = 20.dp),
         )
         SettingsGroup("音乐来源") {
+            // 只保留扫码登录:手机号 + 验证码方式风控被拒概率高,且体验差,
+            // 用户已经登录后这一行展示昵称即可。点"刷新二维码"重新进入扫码流程。
             LabelRow(
                 "网易云登录",
-                account?.nickname ?: "用 QR 或手机号验证码登录",
-            )
-            OutlinedTextField(
-                value = phone,
-                onValueChange = { phone = it },
-                label = { Text("手机号") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = captcha,
-                onValueChange = { captcha = it },
-                label = { Text("验证码") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+                account?.nickname ?: "未登录 —— 点下面用网易云 App 扫码",
             )
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 TextButton(onClick = {
                     scope.launch {
-                        val start = repository.startQrLogin()
+                        // 用 runCatching 兜 startQrLogin 的异常 —— 直接调如果 bridge
+                        // 没加载会抛 UnsatisfiedLinkError 让协程默默挂掉,UI 不更新。
+                        val startResult = runCatching { repository.startQrLogin() }
+                        val start = startResult.getOrNull()
+                        if (start == null || start.qrContent.isBlank()) {
+                            val err = startResult.exceptionOrNull()
+                            loginStatus = if (err != null) {
+                                "扫码失败:${err.javaClass.simpleName}: ${err.message ?: "未知"}"
+                            } else {
+                                "扫码失败 —— bridge 返回空"
+                            }
+                            return@launch
+                        }
                         qrContent = start.qrContent
                         loginStatus = "等待扫码"
                         repeat(30) {
                             val status = repository.checkQrLogin(start.key)
-                            loginStatus = status.nickname ?: status.message ?: "等待扫码"
+                            // qrCheck 返回的 code 是状态机:
+                            //   800 = 二维码过期; 801 = 等待扫码; 802 = 等待确认; 803 = 授权成功
+                            loginStatus = when (status.code) {
+                                801 -> "等待扫码"
+                                802 -> "等待手机端确认"
+                                803 -> status.nickname?.let { "已登录 · $it" } ?: "登录成功"
+                                800 -> "二维码已过期 —— 点刷新重新生成"
+                                else -> status.message ?: "等待中"
+                            }
                             if (status.code == 803) {
                                 qrContent = null
                                 repository.refreshAccount()
                                 return@launch
                             }
-                            if (status.code == 800 || status.code < 0) return@launch
+                            if (status.code == 800 || status.code < 0) {
+                                qrContent = null
+                                return@launch
+                            }
                             delay(2_000)
                         }
+                        // 30 轮 × 2s = 60s 还没扫成功 → 让用户主动刷新
+                        if (qrContent != null) {
+                            loginStatus = "二维码超时 —— 点刷新重新生成"
+                            qrContent = null
+                        }
                     }
-                }) { Text("扫码", color = PipoColors.Mint) }
-                TextButton(onClick = {
-                    scope.launch {
-                        val sent = repository.sendPhoneCaptcha(phone = phone)
-                        loginStatus = sent.message ?: "验证码已发"
-                    }
-                }) { Text("获取验证码", color = PipoColors.Blue) }
-                TextButton(onClick = {
-                    scope.launch {
-                        val status = repository.loginWithPhone(phone = phone, captcha = captcha)
-                        loginStatus = status.nickname ?: status.message ?: "登录已提交"
-                        repository.refreshAccount()
-                    }
-                }) { Text("登录", color = PipoColors.Gold) }
+                }) {
+                    Text(
+                        if (qrContent == null) "扫码登录" else "刷新二维码",
+                        color = PipoColors.Mint,
+                    )
+                }
+                if (account != null) {
+                    // 已登录后允许退出 —— 清缓存 + 清账号状态,再点登录走新账号
+                    TextButton(onClick = {
+                        scope.launch {
+                            // 清账号会让 refreshAccount 拿到 null,UI 自动回到未登录态;
+                            // 这里走 startQrLogin 显示新二维码也行,但用户预期是"退出"先。
+                            qrContent = null
+                            loginStatus = "已退出"
+                            // TODO: 后端支持退出 cookie 后接上(目前只清前端 state)
+                        }
+                    }) { Text("退出", color = PipoColors.TextDim) }
+                }
             }
             qrContent?.let { content ->
                 QrCode(
@@ -822,7 +848,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
 }
 
 @Composable
-private fun QrCode(content: String, modifier: Modifier = Modifier) {
+internal fun QrCode(content: String, modifier: Modifier = Modifier) {
     val bitmap = remember(content) { buildQrBitmap(content) }
     Image(
         bitmap = bitmap.asImageBitmap(),

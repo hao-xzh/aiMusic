@@ -84,11 +84,30 @@ class RustBridgeRepository(
     }
 
     override suspend fun startQrLogin(): QrLoginStart {
-        return safe({ bridge.neteaseQrStart() }, { fallback.startQrLogin() })
+        // 不走 safe() —— 之前 safe 吞掉异常返回空 fallback,UI 拿到空二维码 + 泛文案
+        // "Login bridge unavailable",根因(网络 / JNI / cookie / 风控)完全看不到。
+        // 这里直接抛,让 LoginScreen.runQrFlow 用 runCatching 拿到异常信息显示。
+        try {
+            return bridge.neteaseQrStart()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            android.util.Log.w("PipoLogin", "startQrLogin failed", e)
+            throw e
+        }
     }
 
     override suspend fun checkQrLogin(key: String): QrLoginStatus {
-        return safe({ bridge.neteaseQrCheck(key) }, { QrLoginStatus(code = -1, message = "Login bridge unavailable") })
+        try {
+            return bridge.neteaseQrCheck(key)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            android.util.Log.w("PipoLogin", "checkQrLogin failed", e)
+            // checkQrLogin 在轮询里被频繁调,这里返回带异常文案的 status,而不是 throw,
+            // 让轮询循环能优雅退出 + 显示信息
+            return QrLoginStatus(code = -1, message = "${e.javaClass.simpleName}: ${e.message ?: "bridge error"}")
+        }
     }
 
     override suspend fun sendPhoneCaptcha(phone: String, countryCode: Int): CaptchaSentStatus {
@@ -110,13 +129,12 @@ class RustBridgeRepository(
     }
 
     override suspend fun refreshPlaylists() {
-        // stale-while-revalidate：
-        //   - 已有非空缓存 + 不过期 → 跳过网络
-        //   - 已有非空缓存 + 过期 → 立刻显示旧的，同时后台拉新覆盖
-        //   - 无缓存 → 阻塞拉网
-        val haveMemory = playlistState.value.isNotEmpty()
-        if (haveMemory && !cacheStale) return
-
+        // stale-while-revalidate 的**正确**做法:UI 已经从 init 时的 cache 看到内容了,
+        // 这里**总是后台拉网**覆盖。
+        //
+        // 之前的 `if (haveMemory && !cacheStale) return` 是错的 —— 只要冷启动时缓存
+        // 不到 24h,refreshPlaylists 永远短路,网易云那边新建/改名/换封面的歌单
+        // app 重启都看不到。用户感受是"歌单始终不更新"。
         val fresh = safe(
             {
                 val account = accountState.value ?: bridge.neteaseAccount().also { accountState.value = it }
@@ -125,6 +143,20 @@ class RustBridgeRepository(
             { emptyList() },
         )
         if (fresh.isNotEmpty()) {
+            // 用 updateTime 对比精准 invalidate:网易云对每张歌单维护 updateTime,
+            // 同一 id 的歌单 updateTime 变了 = tracks 也可能变了,旧 cache 不可信。
+            // 不变的 → cache 仍可复用,省一次 tracksForPlaylist 网络往返。
+            val oldByIdTime = playlistState.value.associate { it.id to it.updateTime }
+            for (p in fresh) {
+                val oldTime = oldByIdTime[p.id]
+                if (oldTime != null && p.updateTime != null && oldTime != p.updateTime) {
+                    tracksMemoryCache.remove(p.id)
+                }
+            }
+            // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)
+            val freshIds = fresh.mapTo(HashSet()) { it.id }
+            tracksMemoryCache.keys.retainAll(freshIds)
+
             playlistState.value = fresh
             cacheStale = false
             val uid = accountState.value?.userId
