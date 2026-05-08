@@ -62,7 +62,12 @@ class EmbeddingStore(context: Context) {
 
     @Synchronized
     private fun persist() {
-        val raf = RandomAccessFile(file, "rw")
+        // 之前的版本直接 setLength(0) + 边写到原文件 —— 进程被 OOM kill 或异常退出时
+        // 文件留半截,下次 loadAll readFully() 抛异常 → catch 把 30MB embeddings 全
+        // 删掉。蒸馏出来的语义索引一夜归零的根因。
+        // 改成 write-tmp + fsync + atomic rename:即使写到一半被 kill,原文件仍完整。
+        val tmp = File(file.parentFile, "$FILE_NAME.tmp")
+        val raf = RandomAccessFile(tmp, "rw")
         try {
             raf.setLength(0)
             // header
@@ -86,8 +91,18 @@ class EmbeddingStore(context: Context) {
                 for (f in vec) buf.putFloat(f)
                 raf.write(buf.array())
             }
+            // 强制刷到磁盘 —— 不调 fd.sync() 只到 page cache,设备掉电仍丢
+            raf.fd.sync()
         } finally {
             raf.close()
+        }
+        // POSIX rename 在同一文件系统下原子。Android filesDir 都在内部存储,同 fs。
+        // Android 的 File.renameTo 在目标已存在时部分版本行为不一致,显式 delete 兜底。
+        if (!tmp.renameTo(file)) {
+            file.delete()
+            if (!tmp.renameTo(file)) {
+                tmp.delete()
+            }
         }
     }
 

@@ -46,7 +46,11 @@ class RecommendationLog(context: Context) {
         return out
     }
 
+    @Synchronized
     fun log(trackIds: List<Long>, source: Source = Source.Pet) {
+        // @Synchronized:之前 ensureBuffer/flush 都加了锁,但 log 自己没加。多个线程
+        // 同时 log 时拿到同一个 MutableList,并发 add 会 ConcurrentModificationException
+        // 或丢条目。PetAgent / Discovery / RecommendEngine 真有几条线并行写日志。
         if (trackIds.isEmpty()) return
         val buf = ensureBuffer()
         val now = System.currentTimeMillis() / 1000

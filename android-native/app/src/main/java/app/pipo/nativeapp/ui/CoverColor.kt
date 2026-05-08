@@ -10,7 +10,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.graphics.scale
-import coil.ImageLoader
+import coil.Coil
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import kotlinx.coroutines.Dispatchers
@@ -40,7 +40,11 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
         }
         val bitmap = withContext(Dispatchers.IO) {
             runCatching {
-                val loader = ImageLoader.Builder(context).build()
+                // 之前每次切歌都 ImageLoader.Builder(context).build() 新建一个 loader,
+                // Coil ImageLoader 内部带线程池 + 内存/磁盘缓存,是重对象。频繁切歌时
+                // 旧 loader 持有 native bitmap 不释放 → 长时间听歌内存稳定上涨。
+                // 用 Coil 的全局单例 —— ImageLoader 全 app 共享一份,缓存命中率也更高。
+                val loader = Coil.imageLoader(context)
                 val request = ImageRequest.Builder(context)
                     .data(url)
                     .allowHardware(false)

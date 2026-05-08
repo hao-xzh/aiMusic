@@ -31,13 +31,15 @@ class AudioFeaturesStore(context: Context) {
     /** 批量查 —— 缺的返回 null（DistillEngine 会过滤掉） */
     fun getMany(trackIds: List<String>): List<AudioFeatures?> = trackIds.map { memory[it] }
 
+    @Synchronized
     fun put(trackId: String, features: AudioFeatures) {
+        // @Synchronized:read-modify-write 整段必须串行,否则两个线程同时 put 不同 trackId
+        // 时,后写的会用早读到的 JSON 覆盖,丢掉对方的写入。
+        // (PlayerViewModel.startFeaturePrefetch 跟 LibraryAnalysis.refresh 真有可能并发)
         memory[trackId] = features
-        // 写盘：合并到 JSON map
         val current = prefs.getString(KEY, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
             ?: JSONObject()
         current.put(trackId, encode(features))
-        // cap 1000 条
         if (current.length() > MAX_ENTRIES) {
             val keys = current.keys().asSequence().toList().take(current.length() - MAX_ENTRIES)
             keys.forEach { current.remove(it) }

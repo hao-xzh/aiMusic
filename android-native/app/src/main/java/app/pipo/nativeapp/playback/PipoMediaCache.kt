@@ -26,7 +26,12 @@ object PipoMediaCache {
         }
     }
 
+    @Synchronized
     fun stats(context: Context): MediaCacheStats {
+        // synchronized 跟 clear() 互斥:之前 stats 与 clear 并发时,countFiles 走 dir
+        // 树枚举,期间 clear 把 SimpleCache 内部文件正在删 → 读到不一致计数。
+        // SimpleCache 内部本身线程安全,但跨"cacheSpace + 文件 walk"两个独立调用
+        // 不是原子,这里加锁是把"快照取一份"语义统一。
         val active = cache
         if (active != null) {
             return MediaCacheStats(

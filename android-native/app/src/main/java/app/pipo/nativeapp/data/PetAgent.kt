@@ -222,6 +222,28 @@ class PetAgent(
         s.lowercase().replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？()（）\\[\\]【】《》<>&/]+"), "")
 
     /**
+     * 同名多版本曲目的"挑选偏好":值越小越优先。
+     * 用户说"放浮夸"默认想要的是录音棚版,不是 Live / Remix / 伴奏 / 翻唱。
+     * 之前 firstOrNull 选库里第一个,完全看入库顺序常常选错版本。
+     *
+     * 计权策略:
+     *   - 基础:标题长度(短的通常没附加标注 = studio 主版本)
+     *   - 加权:括号附加里包含"Live/Remix/Acoustic/Demo/Cover/伴奏/Remaster"等关键字时往后排
+     */
+    private fun trackVariantWeight(title: String): Int {
+        val lower = title.lowercase()
+        var w = title.length
+        if ("live" in lower || "现场" in lower || "演唱会" in lower) w += 1000
+        if ("伴奏" in lower || "instrumental" in lower || "karaoke" in lower) w += 1000
+        if ("cover" in lower || "翻唱" in lower) w += 800
+        if ("remix" in lower || "混音" in lower) w += 700
+        if ("acoustic" in lower || "unplugged" in lower) w += 600
+        if ("demo" in lower) w += 500
+        if ("remaster" in lower || "重制" in lower) w += 300
+        return w
+    }
+
+    /**
      * 在本地库里找用户点名的歌。匹配优先级：
      *   1) 标题归一化完全相等 + 任一艺人也命中（陈奕迅 + 七百年后 → 钉那一首）
      *   2) 标题归一化完全相等（同名翻唱也认）
@@ -242,25 +264,32 @@ class PetAgent(
 
             val pick = if (artistKeys.isNotEmpty()) {
                 // 用户给了 artist 约束（"陈奕迅 浮夸"）→ 必须艺人命中。
-                // 三档都要艺人对得上，否则**宁可不 pin** 也不能挂错人的歌
+                // 两档都要艺人对得上，否则**宁可不 pin** 也不能挂错人的歌
                 //   1) 标题精确 + 艺人命中
                 //   2) 艺人命中 + 标题包含/被包含（"七百年后" ↔ "七百年后 (Live)"）
+                // 同档内多版本时按 trackVariantWeight 排,优先 studio 版,避免选 Live/Remix。
                 fun artistOk(t: NativeTrack) = t.artist.split('/', '&', ',', '、').any { a ->
                     normalizeForMatch(a) in artistKeys
                 }
-                library.firstOrNull { t ->
+                val exactWithArtist = library.filter { t ->
                     normalizeForMatch(t.title) == titleKey && artistOk(t)
-                } ?: library.firstOrNull { t ->
-                    val tk = normalizeForMatch(t.title)
-                    tk.isNotEmpty() && (titleKey in tk || tk in titleKey) && artistOk(t)
                 }
+                val partialWithArtist = library.filter { t ->
+                    val tk = normalizeForMatch(t.title)
+                    tk.isNotEmpty() && tk != titleKey && (titleKey in tk || tk in titleKey) && artistOk(t)
+                }
+                (exactWithArtist + partialWithArtist).minByOrNull { trackVariantWeight(it.title) }
             } else {
-                // 没艺人约束（"放浮夸"）→ 标题精确优先；包含次之；都不挑剔艺人
-                library.firstOrNull { normalizeForMatch(it.title) == titleKey }
-                    ?: library.firstOrNull {
-                        val tk = normalizeForMatch(it.title)
-                        tk.isNotEmpty() && (titleKey in tk || tk in titleKey)
-                    }
+                // 没艺人约束（"放浮夸"）→ 标题精确优先；包含次之；都不挑剔艺人。
+                // 同档内多版本(浮夸 / 浮夸 (Live Ver.) / 浮夸 (伴奏)) 按 trackVariantWeight
+                // 排:无括号附加的 studio 版本最优,Live/Remix/伴奏 等都往后排。
+                // 之前直接 firstOrNull 选库里第一个匹配,完全看入库顺序,常常选到 Live 版。
+                val exact = library.filter { normalizeForMatch(it.title) == titleKey }
+                val partial = library.filter {
+                    val tk = normalizeForMatch(it.title)
+                    tk.isNotEmpty() && tk != titleKey && (titleKey in tk || tk in titleKey)
+                }
+                (exact + partial).minByOrNull { trackVariantWeight(it.title) }
             } ?: continue
 
             val key = TrackDedupe.songKey(pick)

@@ -73,8 +73,31 @@ class RecommendEngine(
         recallLove(events, lib, recentPlay, hardExclude).forEach { pool.merge(it) }
 
         if (pool.isEmpty()) {
-            // 本地空 → 直接走 AI / 在线兜底
-            return@withContext fetchFromOnline(anchor, taste, excludeIds, wantCount)
+            // 本地空 → 走 AI / 在线兜底,但**也要过多样性筛选**。之前直接 return online,
+            // 冷启动用户(无听历)拿到的可能全是同一艺人的 hot songs("怎么推都是周杰伦")。
+            // 多取一倍 wantCount,然后按"每艺人 ≤ 2 首"去重。
+            val online = fetchFromOnline(anchor, taste, excludeIds, wantCount * 2)
+            val seenArtist = HashMap<String, Int>()
+            val diverse = ArrayList<NativeTrack>(wantCount)
+            for (t in online) {
+                val ak = t.firstArtistKey()
+                val cnt = seenArtist[ak] ?: 0
+                if (cnt >= 2) continue
+                seenArtist[ak] = cnt + 1
+                diverse.add(t)
+                if (diverse.size >= wantCount) break
+            }
+            // 如果艺人去重后还不够 wantCount,把剩下的(可能同艺人)按原顺序补上,
+            // 不让"多样性"完全 starve 掉数量
+            if (diverse.size < wantCount) {
+                val have = diverse.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+                for (t in online) {
+                    if (TrackDedupe.songKey(t) in have) continue
+                    diverse.add(t)
+                    if (diverse.size >= wantCount) break
+                }
+            }
+            return@withContext diverse
         }
 
         // ---- 打分 ----

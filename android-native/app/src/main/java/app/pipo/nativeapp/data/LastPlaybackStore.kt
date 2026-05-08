@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -22,7 +23,10 @@ class LastPlaybackStore(context: Context) {
     /** 200 首 queue 的 JSON 序列化能到 ~10ms，不能跑在主线程 */
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private var lastSavedAtMs = 0L
+    /** AtomicLong + CAS:saveThrottled 在 player tick 上跑,主线程 + IO 完成回调可能并发。
+     *  之前裸 `var` 会让两个线程同时通过 `now - lastSavedAtMs < THROTTLE` 判断,都赋值同一个 now,
+     *  都 launch 写盘 → 浪费一次 IO。CAS 保证只有"第一个抢到节流窗口的"会写。 */
+    private val lastSavedAtMs = AtomicLong(0L)
 
     data class Snapshot(
         val queue: List<NativeTrack>,
@@ -55,8 +59,10 @@ class LastPlaybackStore(context: Context) {
      */
     fun saveThrottled(queue: List<NativeTrack>, currentIndex: Int, positionMs: Long) {
         val now = System.currentTimeMillis()
-        if (now - lastSavedAtMs < THROTTLE_MS) return
-        lastSavedAtMs = now
+        val prev = lastSavedAtMs.get()
+        if (now - prev < THROTTLE_MS) return
+        // CAS:只有第一个跨越节流窗口的调用会通过;其它在窗口期内的并发调用全 skip
+        if (!lastSavedAtMs.compareAndSet(prev, now)) return
         // 主线程只做一次 list 浅拷贝（List 不可变，元素是 data class，安全）
         val snap = queue.take(MAX_QUEUE)
         ioScope.launch { writeSnapshot(snap, currentIndex, positionMs) }

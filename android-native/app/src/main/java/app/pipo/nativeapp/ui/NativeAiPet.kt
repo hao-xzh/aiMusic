@@ -122,19 +122,24 @@ private data class PetMessage(val fromUser: Boolean, val text: String)
  * 重启 app 时整个对象 reset，相当于新 session 重新开始计数 —— 这是想要的语义。
  */
 private object PetBubbleState {
+    // @Volatile:这些字段绝大多数从 Compose LaunchedEffect 读写(主线程),
+    // 但 PlayerViewModel.playFromAgent / playTrack 调 resetForNewQueue 也是主线程。
+    // 理论上无 race,但加 @Volatile 保证万一未来从其它 dispatcher 写入,可见性无副作用。
     /** 已经评过的 trackId（playerKey）。同一首歌不会再发 AI 请求 */
-    var lastCommentedKey: String? = null
+    @Volatile var lastCommentedKey: String? = null
     /** 上一首什么 —— 给 commentOnTrack USER prompt 当 "刚刚那首" 锚点 */
-    var previousTrack: Pair<String, String>? = null
+    @Volatile var previousTrack: Pair<String, String>? = null
     /** 队列里这是第几首（1 起算） */
-    var positionInQueue: Int = 0
+    @Volatile var positionInQueue: Int = 0
     /** TA 最近一句话 —— 给 commentOnTrack 当 "TA 之前说" 锚点 */
-    var lastUserContext: String? = null
-    /** 30s 滚动窗口里切歌的时间戳 */
+    @Volatile var lastUserContext: String? = null
+    /** 30s 滚动窗口里切歌的时间戳。MutableList 不是线程安全;这个字段全部访问都
+     *  在 LaunchedEffect (Main) 里串行,目前不需要 thread-safe collection。 */
     val recentChanges: MutableList<Long> = mutableListOf()
     /** 切歌过快进入冷却到这个时间戳为止 */
-    var cooldownUntil: Long = 0L
+    @Volatile var cooldownUntil: Long = 0L
 
+    @Synchronized
     fun resetForNewQueue() {
         lastCommentedKey = null
         previousTrack = null

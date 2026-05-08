@@ -32,11 +32,13 @@ class TrackSemanticStore(context: Context) {
 
     fun has(trackId: String): Boolean = memory.containsKey(trackId)
 
+    @Synchronized
     fun put(profile: TrackSemanticProfile) {
         memory[profile.trackId] = profile
         persistMerge(profile)
     }
 
+    @Synchronized
     fun putAll(profiles: Collection<TrackSemanticProfile>) {
         if (profiles.isEmpty()) return
         profiles.forEach { memory[it.trackId] = it }
@@ -48,6 +50,9 @@ class TrackSemanticStore(context: Context) {
 
     fun count(): Int = memory.size
 
+    // @Synchronized:read-modify-write 必须串行;put 已经持锁,这里嵌套 sync 是 reentrant
+    // OK。如果未来从其他入口直接调 persistMerge 也安全。
+    @Synchronized
     private fun persistMerge(profile: TrackSemanticProfile) {
         val current = readJsonMap()
         current.put(profile.trackId, encode(profile))

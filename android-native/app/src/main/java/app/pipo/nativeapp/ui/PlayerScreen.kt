@@ -71,12 +71,19 @@ fun PlayerScreen(
         .collectAsState(initial = app.pipo.nativeapp.data.NativeSettings())
 
     LaunchedEffect(state.isPlaying) {
+        // 不在播 → 单次 reset Amp,然后退出。之前 while(true) 在暂停态也每 420ms tick
+        // 一次 refreshPosition,viewmodel 走 syncFrom + 歌词比对 + 续杯检查,待机也耗电。
+        // isPlaying 变 true 时 LaunchedEffect 自动 relaunch,重新进入 30Hz tick 循环。
+        if (!state.isPlaying) {
+            Amp.set(0f)
+            viewModel.refreshPosition()
+            return@LaunchedEffect
+        }
         while (true) {
             viewModel.refreshPosition()
-            if (!state.isPlaying) Amp.set(0f)
             // 33ms ≈ 30Hz —— 之前 80ms 让歌词的 per-letter 颜色 sweep 显得分级不连续
             // （短词 200ms 内只有 2~3 帧）。30Hz 让 sweep 视觉连贯。
-            delay(if (state.isPlaying) 33L else 420L)
+            delay(33L)
         }
     }
 
