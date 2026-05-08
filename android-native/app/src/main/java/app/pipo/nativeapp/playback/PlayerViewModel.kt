@@ -25,8 +25,10 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.TrackDedupe
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.min
 
 /**
@@ -67,6 +69,14 @@ class PlayerViewModel(
     /** 每发一次 lyrics 拉取递增；fetch 完成时跟该值对比，过期 fetch 丢弃。
      *  比对 trackId 的方案在 A→B→A 的快速切歌下会误把 B 的延迟响应判成 "目标还是 A" 写入。 */
     private var lyricsRequestSeq: Long = 0L
+    /** 上一次歌词拉取协程 —— 启新的之前 cancel,避免快速切歌时一堆协程攒着等
+     *  callRaw 的 30s timeout 槽位。lyricsRequestSeq 已经保证写不进 stale 数据,
+     *  这里 cancel 是早释放资源 + 避免 IO 线程堆积。 */
+    private var lyricsJob: Job? = null
+    /** playFromAgent / playTrack 的 phase generation —— phase-2 完成时跟当前值
+     *  对比,不一致说明用户已经启了新的播放,phase-2 的 addMediaItems 不能往
+     *  新队列尾部追(否则会污染新歌单)。 */
+    private var playGen: Int = 0
 
     // 之前这里有副 ExoPlayer (OverlapPlayer) 做 crossfade 风格的两曲叠声接歌。
     // 用户反馈"听感混乱"——他们要的是 gapless（专辑模式无缝接，前一首尾巴拼下一首开头），
@@ -202,31 +212,60 @@ class PlayerViewModel(
         // 错误时 player 在 IDLE，currentPosition 可能已重置。state.positionMs 由 syncFrom
         // 持续更新，是更可靠的"上一刻播到哪儿"。
         val resumePosMs = state.positionMs.coerceAtLeast(0L)
+        val targetTrackId = track.id
         viewModelScope.launch {
             try {
-                val fresh = runCatching { repository.songUrls(listOf(ne)) }
-                    .getOrNull()?.firstOrNull { it.id == ne }?.url
-                    ?.takeIf { it.isNotBlank() }
+                // 给整个重签流程一个硬上限 —— 之前没 timeout，弱网时 songUrls 可以
+                // pending 几十秒，期间任何后续错误都被 refreshingUrlForTrack 检查挡住，
+                // player 永远卡死在"听着听着停了"的状态。10s 是经验值:正常 RTT < 1s,
+                // 给慢网三次内部重试的余量。
+                val fresh = withTimeoutOrNull(10_000L) {
+                    runCatching { repository.songUrls(listOf(ne)) }
+                        .getOrNull()?.firstOrNull { it.id == ne }?.url
+                        ?.takeIf { it.isNotBlank() }
+                }
                 if (fresh == null) {
-                    // 重签拿不到 URL —— 可能是网络真挂了（不是单首问题）。
-                    // 这时候不能自动跳，跳了就一路自动切；停在 IDLE，等用户回过神再点播放。
+                    // 拿不到 URL: 网络真挂了 / 网易返回空 / 超时。
+                    // 不能自动跳(跳了就一路自动切)，停在 IDLE 等用户回来。
+                    // 把 urlRefreshTried 回滚 —— 否则一次临时性故障会永久毒化这首歌:
+                    // 下次再点直接 skipToNextOrStop，相当于"这首再也播不了"。
                     Log.w("PlayerVM", "songUrls returned no url for ${track.title}, staying paused")
+                    urlRefreshTried.remove(targetTrackId)
                     return@launch
                 }
-                val livePlayer = controller ?: return@launch
-                // 期间用户可能已切歌 —— 只在还停在同一首时替换
-                if (livePlayer.currentMediaItemIndex != curIdx) return@launch
+                val livePlayer = controller ?: run {
+                    urlRefreshTried.remove(targetTrackId)
+                    return@launch
+                }
+                // 重签期间 player 自身可能已经把 current 自动切到下一首(service 端 onPlayerError
+                // 兜底里的 seekToNext，或者 ExoPlayer 自己 transition)。**用 mediaId 找位置**
+                // 而不是比较 index —— 这首歌在队列里就该被替换，管它现在 player 在播哪首。
+                // 之前用 `currentMediaItemIndex != curIdx` 判,自动 transition 后会被
+                // 误当成"用户切歌冲突"直接放弃,player 留在 IDLE。
+                val updatedIdx = (0 until livePlayer.mediaItemCount).firstOrNull { i ->
+                    livePlayer.getMediaItemAt(i).mediaId == targetTrackId
+                }
+                if (updatedIdx == null) {
+                    // 队列里已经没这首了(用户清队 / 切歌单)—— 放弃，无需回滚 tried
+                    return@launch
+                }
                 val updated = track.copy(streamUrl = fresh)
                 val newQueue = state.queue.toMutableList().apply {
-                    if (curIdx in indices) set(curIdx, updated)
+                    val stateIdx = indexOfFirst { it.id == targetTrackId }
+                    if (stateIdx >= 0) set(stateIdx, updated)
                 }
                 state = state.copy(queue = newQueue)
-                livePlayer.replaceMediaItem(curIdx, toMediaItem(updated))
-                livePlayer.prepare()
-                if (resumePosMs > 1000L) {
-                    livePlayer.seekTo(curIdx, resumePosMs)
+                livePlayer.replaceMediaItem(updatedIdx, toMediaItem(updated))
+                // 只有 player 还停在被重签的这首上(没自动跳走)才接续播放;
+                // 已经在播下一首时不去打断 —— replaceMediaItem 已把 URL 更新,
+                // 下次 wraparound / 用户手动回来时直接是新 URL。
+                if (livePlayer.currentMediaItemIndex == updatedIdx) {
+                    livePlayer.prepare()
+                    if (resumePosMs > 1000L) {
+                        livePlayer.seekTo(updatedIdx, resumePosMs)
+                    }
+                    livePlayer.play()
                 }
-                livePlayer.play()
             } finally {
                 refreshingUrlForTrack = null
             }
@@ -422,6 +461,11 @@ class PlayerViewModel(
     fun playFromAgent(initialBatch: List<NativeTrack>, source: ContinuousQueueSource?) {
         if (initialBatch.isEmpty()) return
         val player = controller ?: return
+        // phase-1 开始前 ++ —— phase-2 在 await resolvePlayableQueue 期间用户可能再次
+        // 启播(playFromAgent / playTrack / insertNext),那时 playGen 已被新一次 ++,
+        // 我们这次的 phase-2 拿到 gen != playGen 就放弃 addMediaItems,避免把
+        // "上一次歌单的剩余歌" 追到 "这一次新歌单" 的尾部 → 队列脏掉。
+        val gen = ++playGen
         viewModelScope.launch {
             // -------- 阶段 1：解析第 1 首立刻播 --------
             val first = initialBatch.first()
@@ -435,6 +479,7 @@ class PlayerViewModel(
                     ?: return@launch
                 first.copy(streamUrl = url)
             }
+            if (gen != playGen) return@launch
             noLoop = false
             continuousSource = source
             app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
@@ -451,6 +496,9 @@ class PlayerViewModel(
             if (rest.isEmpty()) return@launch
             val resolvedRest = resolvePlayableQueue(rest).filter { it.streamUrl.isNotBlank() }
             if (resolvedRest.isEmpty()) return@launch
+            // generation 检查:resolvePlayableQueue 期间用户可能已切到别的歌单,
+            // 此时 playGen 已被 bump,我们这次 phase-2 是过期的,放弃追加。
+            if (gen != playGen) return@launch
             // 重新拿一遍 controller —— phase-1 之后 service 可能已经 rebind/release
             val livePlayer = controller ?: return@launch
             livePlayer.addMediaItems(resolvedRest.map(::toMediaItem))
@@ -479,6 +527,8 @@ class PlayerViewModel(
         val player = controller ?: return
         val playable = contextQueue.filter { it.streamUrl.isNotBlank() || it.neteaseId != null }
         if (playable.isEmpty()) return
+        // 同 playFromAgent 注释:phase-2 过程中用户可能再启播,gen 不一致就放弃。
+        val gen = ++playGen
         viewModelScope.launch {
             // -------- 阶段 1：立刻开播"那一首" --------
             // 优先用已有 streamUrl；没有就只为这 1 个 id 发 1 次 songUrls 请求
@@ -492,6 +542,7 @@ class PlayerViewModel(
                     ?: return@launch
                 track.copy(streamUrl = url)
             }
+            if (gen != playGen) return@launch
             noLoop = false
             // phase-1 期间显式 null —— 此时 queue 只有 1 首，开 continuous 会立刻触发
             // maybeExtendQueue（remaining=0 ≤ 阈值 3），跟 phase-2 的 addMediaItems 抢插。
@@ -514,6 +565,8 @@ class PlayerViewModel(
             if (rest.isEmpty()) return@launch
             val resolvedRest = resolvePlayableQueue(rest).filter { it.streamUrl.isNotBlank() }
             if (resolvedRest.isEmpty()) return@launch
+            // 同 playFromAgent:resolvePlayableQueue 期间用户可能切到别的歌单
+            if (gen != playGen) return@launch
             val full = listOf(pickedResolved) + resolvedRest
             val ordered = if (smooth) {
                 app.pipo.nativeapp.data.SmoothQueue.smooth(
@@ -638,7 +691,8 @@ class PlayerViewModel(
             // counter 唯一递增，每次发起 +1，回来时只有"当前最新"的 token 能写
             lyricsRequestSeq += 1
             val mySeq = lyricsRequestSeq
-            viewModelScope.launch {
+            lyricsJob?.cancel()
+            lyricsJob = viewModelScope.launch {
                 val lines = runCatching {
                     repository.lyricsForTrack(targetTrackId)
                 }.getOrDefault(emptyList())

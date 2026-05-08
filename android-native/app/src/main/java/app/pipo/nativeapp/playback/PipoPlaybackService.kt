@@ -37,7 +37,19 @@ class PipoPlaybackService : MediaSessionService() {
             .setUpstreamDataSourceFactory(
                 DefaultHttpDataSource.Factory()
                     .setUserAgent("PipoNative/0.1")
-                    .setAllowCrossProtocolRedirects(true),
+                    .setAllowCrossProtocolRedirects(true)
+                    // 网易 CDN 有反盗链:无 Referer 的 Range 请求会偶发返回 4xx/302,
+                    // 表现为切歌时 ExoPlayer 报 ERROR_CODE_IO_BAD_HTTP_STATUS,然后
+                    // PlayerViewModel 走重签 URL 路径 —— 但每次切歌都被打断不可接受。
+                    // 桌面端 (Tauri/Rust) 的 cdn_client 自动注入这条,这里给安卓端补上。
+                    .setDefaultRequestProperties(
+                        mapOf("Referer" to "https://music.163.com/")
+                    )
+                    // 默认 connect/read timeout 都是 8s, 移动网弱信号下首字节就可能 > 8s。
+                    // 给一个更宽容的窗口,让 ExoPlayer 自己的"重试 + recoverable 路径"
+                    // 来兜底,而不是动不动就抛网络错误打断播放。
+                    .setConnectTimeoutMs(15_000)
+                    .setReadTimeoutMs(15_000),
             )
             // 缓存写失败时仍能继续播 —— 网络抖动不掉歌
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
@@ -47,14 +59,17 @@ class PipoPlaybackService : MediaSessionService() {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
-        // gapless 接歌的 buffer 调小一些（默认 50s 太大，next track 切到时机会拖）
-        // 同时保证最低 ~5s 防 mobile 网络抖动
+        // gapless 接歌的 buffer 调小一些（默认 50s 太大，next track 切到时机会拖）。
+        // 给 min/max 留更多余量是为了网络抖动时不至于秒空 —— 之前 minBufferMs=15s 在
+        // 4G 弱信号下,刚补满就被消耗,反复 rebuffer 触发 ERROR_CODE_IO_NETWORK_*。
+        // bufferForPlaybackMs 拉回 ExoPlayer 默认 2500ms:首字节就开播太激进,
+        // 切歌瞬间下一首还没攒够 1.5s 就报错,新连接还来不及补就被 onPlayerError 打断。
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 15_000,
-                /* maxBufferMs = */ 30_000,
-                /* bufferForPlaybackMs = */ 1_500,
-                /* bufferForPlaybackAfterRebufferMs = */ 4_000,
+                /* minBufferMs = */ 25_000,
+                /* maxBufferMs = */ 40_000,
+                /* bufferForPlaybackMs = */ 2_500,
+                /* bufferForPlaybackAfterRebufferMs = */ 5_000,
             )
             // 对接歌过渡至关重要：当前曲不再向前缓冲、空间留给下一首
             .setPrioritizeTimeOverSizeThresholds(true)
