@@ -20,9 +20,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,7 +33,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoGraph
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 /**
  * 登录页 —— 网易云 App 扫码登录。
@@ -51,10 +50,10 @@ import kotlinx.coroutines.launch
 fun LoginScreen(onBack: () -> Unit) {
     val repository = PipoGraph.repository
     val account by repository.account.collectAsState(initial = null)
-    val scope = rememberCoroutineScope()
 
     var qrContent by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("点下面用网易云 App 扫码") }
+    var qrRefreshNonce by remember { mutableIntStateOf(0) }
 
     // 已登录后切回上一页
     LaunchedEffect(account) {
@@ -62,7 +61,8 @@ fun LoginScreen(onBack: () -> Unit) {
     }
 
     // 进入页面立刻拉一张二维码,不让用户多按一次按钮
-    LaunchedEffect(Unit) {
+    // nonce 变化时 LaunchedEffect 会自动 cancel 上一次轮询，避免旧二维码覆盖新二维码状态。
+    LaunchedEffect(qrRefreshNonce) {
         runQrFlow(repository, onContent = { qrContent = it }, onStatus = { status = it })
     }
 
@@ -123,11 +123,7 @@ fun LoginScreen(onBack: () -> Unit) {
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             TextButton(
-                onClick = {
-                    scope.launch {
-                        runQrFlow(repository, onContent = { qrContent = it }, onStatus = { status = it })
-                    }
-                },
+                onClick = { qrRefreshNonce += 1 },
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(

@@ -1,8 +1,5 @@
 package app.pipo.nativeapp.ui
 
-import android.graphics.Bitmap
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.width
@@ -24,12 +21,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -45,32 +36,21 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.CompositingStrategy
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.playback.PlayerViewModel
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.EncodeHintType
-import com.google.zxing.MultiFormatWriter
-import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 /** 子页面用的返回回调 —— PipoNativeApp 在 push 进入前提供，返回到 Player root。 */
 val LocalOnBack = staticCompositionLocalOf<(() -> Unit)?> { null }
@@ -82,98 +62,6 @@ data class PipoNav(
     val openDistill: () -> Unit,
 )
 val LocalNav = staticCompositionLocalOf<PipoNav?> { null }
-
-@Composable
-fun TasteScreen() {
-    val profile by app.pipo.nativeapp.data.PipoGraph.tasteProfileStore.flow.collectAsState()
-    val nav = LocalNav.current
-    ScreenScaffold(title = "TASTE") {
-        val p = profile
-        if (p == null) {
-            EmptyState(
-                title = "还没蒸馏",
-                subtitle = "去歌单页点右上 \"蒸馏\" 按钮，挑几张歌单蒸馏一份你的口味画像。",
-            )
-            Spacer(modifier = Modifier.height(20.dp))
-            Box(
-                modifier = Modifier
-                    .padding(horizontal = 24.dp)
-                    .clip(CircleShape)
-                    .background(PipoColors.Mint.copy(alpha = 0.18f))
-                    .clickable { nav?.openDistill?.invoke() }
-                    .padding(horizontal = 18.dp, vertical = 10.dp),
-            ) {
-                Text("去歌单页", color = PipoColors.Mint, style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold))
-            }
-            return@ScreenScaffold
-        }
-
-        // ---- Hero：summary + taglines ----
-        Text(
-            text = p.summary,
-            color = PipoColors.Ink,
-            style = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.Bold, lineHeight = 30.sp, letterSpacing = (-0.3).sp),
-            modifier = Modifier.padding(bottom = 8.dp),
-        )
-        p.taglines.forEach { line ->
-            Text(
-                text = line,
-                color = PipoColors.TextMuted,
-                style = TextStyle(fontSize = 14.sp, lineHeight = 22.sp, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic),
-                modifier = Modifier.padding(bottom = 4.dp),
-            )
-        }
-        Spacer(modifier = Modifier.height(20.dp))
-
-        // ---- 统计三连 ----
-        StatGrid(
-            items = listOf(
-                "歌单" to p.sourcePlaylistCount.toString(),
-                "总曲目" to p.totalTrackCount.toString(),
-                "AI 蒸馏" to "${p.sampledTrackCount} 首",
-                "更新于" to dateOnly(p.derivedAt),
-            ),
-        )
-        Spacer(modifier = Modifier.height(28.dp))
-
-        // ---- 主流派（带权重条） ----
-        SectionTitle("主流派")
-        p.genres.forEach { g ->
-            GenreRow(g)
-        }
-        Spacer(modifier = Modifier.height(20.dp))
-
-        // ---- 年代倾向（横向 segmented） ----
-        if (p.eras.isNotEmpty()) {
-            SectionTitle("年代倾向")
-            EraBars(p.eras)
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-
-        // ---- 情绪关键词（chips） ----
-        if (p.moods.isNotEmpty()) {
-            SectionTitle("情绪关键词")
-            ChipFlow(p.moods, accent = PipoColors.Mint)
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-
-        // ---- Top 艺人（带 affinity 条） ----
-        if (p.topArtists.isNotEmpty()) {
-            SectionTitle("Top 艺人")
-            p.topArtists.forEach { a ->
-                ArtistRow(a)
-            }
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-
-        // ---- 文化坐标 ----
-        if (p.culturalContext.isNotEmpty()) {
-            SectionTitle("文化坐标")
-            ChipFlow(p.culturalContext, accent = PipoColors.Blue)
-            Spacer(modifier = Modifier.height(28.dp))
-        }
-    }
-}
 
 @Composable
 fun DistillScreen(repository: PipoRepository = PipoGraph.repository) {
@@ -630,252 +518,6 @@ private fun IconChip(
     }
 }
 
-@Composable
-fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
-    val account by repository.account.collectAsState(initial = null)
-    val cacheStats by repository.audioCacheStats.collectAsState(
-        initial = app.pipo.nativeapp.data.AudioCacheStats(0, 0, 0),
-    )
-    val aiConfig by repository.aiConfig.collectAsState(
-        initial = app.pipo.nativeapp.data.AiConfigView(activeProvider = "", providers = emptyList()),
-    )
-    val settings by repository.settings.collectAsState(initial = NativeSettings())
-    val scope = rememberCoroutineScope()
-    var loginStatus by remember { mutableStateOf<String?>(null) }
-    var qrContent by remember { mutableStateOf<String?>(null) }
-    var apiKeyDraft by remember { mutableStateOf("") }
-    var aiReply by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) {
-        repository.refreshAccount()
-        repository.refreshAudioCacheStats()
-        repository.refreshAiConfig()
-    }
-    ScreenScaffold(title = "SETTINGS") {
-        Text(
-            "Pipo 把你的账号状态、播放规则、AI 口吻都攒在本地。",
-            color = PipoColors.TextDim,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(bottom = 20.dp),
-        )
-        SettingsGroup("音乐来源") {
-            // 只保留扫码登录:手机号 + 验证码方式风控被拒概率高,且体验差,
-            // 用户已经登录后这一行展示昵称即可。点"刷新二维码"重新进入扫码流程。
-            LabelRow(
-                "网易云登录",
-                account?.nickname ?: "未登录 —— 点下面用网易云 App 扫码",
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = {
-                    scope.launch {
-                        // 用 runCatching 兜 startQrLogin 的异常 —— 直接调如果 bridge
-                        // 没加载会抛 UnsatisfiedLinkError 让协程默默挂掉,UI 不更新。
-                        val startResult = runCatching { repository.startQrLogin() }
-                        val start = startResult.getOrNull()
-                        if (start == null || start.qrContent.isBlank()) {
-                            val err = startResult.exceptionOrNull()
-                            loginStatus = if (err != null) {
-                                "扫码失败:${err.javaClass.simpleName}: ${err.message ?: "未知"}"
-                            } else {
-                                "扫码失败 —— bridge 返回空"
-                            }
-                            return@launch
-                        }
-                        qrContent = start.qrContent
-                        loginStatus = "等待扫码"
-                        repeat(30) {
-                            val status = repository.checkQrLogin(start.key)
-                            // qrCheck 返回的 code 是状态机:
-                            //   800 = 二维码过期; 801 = 等待扫码; 802 = 等待确认; 803 = 授权成功
-                            loginStatus = when (status.code) {
-                                801 -> "等待扫码"
-                                802 -> "等待手机端确认"
-                                803 -> status.nickname?.let { "已登录 · $it" } ?: "登录成功"
-                                800 -> "二维码已过期 —— 点刷新重新生成"
-                                else -> status.message ?: "等待中"
-                            }
-                            if (status.code == 803) {
-                                qrContent = null
-                                repository.refreshAccount()
-                                return@launch
-                            }
-                            if (status.code == 800 || status.code < 0) {
-                                qrContent = null
-                                return@launch
-                            }
-                            delay(2_000)
-                        }
-                        // 30 轮 × 2s = 60s 还没扫成功 → 让用户主动刷新
-                        if (qrContent != null) {
-                            loginStatus = "二维码超时 —— 点刷新重新生成"
-                            qrContent = null
-                        }
-                    }
-                }) {
-                    Text(
-                        if (qrContent == null) "扫码登录" else "刷新二维码",
-                        color = PipoColors.Mint,
-                    )
-                }
-                if (account != null) {
-                    // 已登录后允许退出 —— 清缓存 + 清账号状态,再点登录走新账号
-                    TextButton(onClick = {
-                        scope.launch {
-                            // 清账号会让 refreshAccount 拿到 null,UI 自动回到未登录态;
-                            // 这里走 startQrLogin 显示新二维码也行,但用户预期是"退出"先。
-                            qrContent = null
-                            loginStatus = "已退出"
-                            // TODO: 后端支持退出 cookie 后接上(目前只清前端 state)
-                        }
-                    }) { Text("退出", color = PipoColors.TextDim) }
-                }
-            }
-            qrContent?.let { content ->
-                QrCode(
-                    content = content,
-                    modifier = Modifier
-                        .padding(top = 6.dp)
-                        .size(180.dp)
-                        .clip(RoundedCornerShape(8.dp)),
-                )
-            }
-            loginStatus?.let { LabelRow("登录状态", it) }
-        }
-
-        SettingsGroup("音频缓存") {
-            LabelRow(
-                "歌曲原始字节缓存",
-                "${cacheStats.totalMb} MB / ${cacheStats.maxMb} MB · ${cacheStats.count} 首",
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = { scope.launch { repository.clearAudioCache() } }) {
-                    Text("清空缓存", color = PipoColors.Blue)
-                }
-                TextButton(onClick = { scope.launch { repository.setCacheMaxMb(4096) } }) {
-                    Text("上限 4 GB", color = PipoColors.Gold)
-                }
-            }
-        }
-
-        SettingsGroup("AI key") {
-            val activeProvider = aiConfig.providers.firstOrNull { it.id == aiConfig.activeProvider }
-            val anyHasKey = aiConfig.providers.any { it.hasKey }
-            LabelRow(
-                "服务商",
-                activeProvider?.let { "${it.label} · ${it.model}" } ?: "DeepSeek / OpenAI / MiMo",
-            )
-            if (!anyHasKey) {
-                LabelRow(
-                    "未配置",
-                    "填入任一 provider 的 API key 才会有 AI 招呼 / 单曲点评 / Discovery",
-                )
-            }
-            ToggleRow("DJ 旁白", settings.aiNarration) {
-                scope.launch { repository.updateSettings(settings.copy(aiNarration = it)) }
-            }
-            aiConfig.providers.forEach { provider ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        LabelRow(
-                            provider.label,
-                            if (provider.hasKey) "key ${provider.keyPreview ?: "已存"}" else "未填 key",
-                        )
-                    }
-                    TextButton(onClick = { scope.launch { repository.setAiProvider(provider.id) } }) {
-                        Text(
-                            if (provider.id == aiConfig.activeProvider) "当前" else "切换",
-                            color = PipoColors.Mint,
-                        )
-                    }
-                }
-            }
-            OutlinedTextField(
-                value = apiKeyDraft,
-                onValueChange = { apiKeyDraft = it },
-                label = { Text("API key") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = {
-                    scope.launch { repository.aiSetApiKey(aiConfig.activeProvider, apiKeyDraft) }
-                }) { Text("保存 key", color = PipoColors.Blue) }
-                TextButton(onClick = {
-                    scope.launch { aiReply = repository.aiPing() }
-                }) { Text("Ping", color = PipoColors.Gold) }
-            }
-            aiReply?.let { LabelRow("AI 回复", it) }
-        }
-
-        SettingsGroup("播放规则") {
-            ToggleRow("工作时段自动播放", settings.workdayAutoplay) {
-                scope.launch { repository.updateSettings(settings.copy(workdayAutoplay = it)) }
-            }
-            ToggleRow("会议时暂停", settings.pauseDuringMeetings) {
-                scope.launch { repository.updateSettings(settings.copy(pauseDuringMeetings = it)) }
-            }
-            ToggleRow("午休换放松歌单", settings.lunchRelaxMode) {
-                scope.launch { repository.updateSettings(settings.copy(lunchRelaxMode = it)) }
-            }
-        }
-
-        SettingsGroup("外观") {
-            ToggleRow("隐藏点阵叠加", settings.hideDotPattern) {
-                scope.launch { repository.updateSettings(settings.copy(hideDotPattern = it)) }
-            }
-        }
-
-        SettingsGroup("关于你") {
-            OutlinedTextField(
-                value = settings.userFacts,
-                onValueChange = { value ->
-                    val facts = value.take(400)
-                    scope.launch { repository.updateSettings(settings.copy(userFacts = facts)) }
-                    // 同步到 PetMemory —— 让 AI digest 能拿到，跟 React 端的字段同源
-                    runCatching { app.pipo.nativeapp.data.PipoGraph.petMemory.setUserFacts(facts) }
-                },
-                label = { Text("工作时间 / 作息 / 习惯 / 喜好") },
-                minLines = 4,
-                maxLines = 6,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            LabelRow("已写", "${settings.userFacts.length} / 400")
-        }
-    }
-}
-
-@Composable
-internal fun QrCode(content: String, modifier: Modifier = Modifier) {
-    val bitmap = remember(content) { buildQrBitmap(content) }
-    Image(
-        bitmap = bitmap.asImageBitmap(),
-        contentDescription = "QR login",
-        modifier = modifier.background(Color.White),
-        contentScale = ContentScale.FillBounds,
-    )
-}
-
-private fun buildQrBitmap(content: String, size: Int = 512): Bitmap {
-    val hints = mapOf(
-        EncodeHintType.MARGIN to 1,
-        EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
-        EncodeHintType.CHARACTER_SET to "UTF-8",
-    )
-    val matrix = MultiFormatWriter().encode(content, BarcodeFormat.QR_CODE, size, size, hints)
-    val pixels = IntArray(size * size)
-    for (y in 0 until size) {
-        for (x in 0 until size) {
-            pixels[y * size + x] = if (matrix[x, y]) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
-        }
-    }
-    return Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).apply {
-        setPixels(pixels, 0, size, 0, 0, size, size)
-    }
-}
-
 /**
  * 子页面通用 scaffold —— 镜像 src/app/settings/page.tsx 的 36px 1fr 36px header 结构。
  *   - 左 36dp BackButton（由 LocalOnBack 提供）
@@ -883,7 +525,7 @@ private fun buildQrBitmap(content: String, size: Int = 512): Bitmap {
  *   - 右 36dp 占位（让标题中点真正落在屏幕中线）
  */
 @Composable
-private fun ScreenScaffold(
+internal fun ScreenScaffold(
     title: String,
     content: @Composable ColumnScope.() -> Unit,
 ) {
@@ -942,7 +584,7 @@ private fun ScreenScaffold(
 }
 
 @Composable
-private fun EmptyState(title: String, subtitle: String) {
+internal fun EmptyState(title: String, subtitle: String) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -959,228 +601,6 @@ private fun EmptyState(title: String, subtitle: String) {
             text = subtitle,
             color = PipoColors.TextDim,
             style = TextStyle(fontSize = 13.sp),
-        )
-    }
-}
-
-@Composable
-private fun SectionTitle(text: String) {
-    Text(
-        text = text,
-        color = PipoColors.TextDim,
-        style = TextStyle(fontSize = 11.sp, letterSpacing = 3.sp, fontWeight = FontWeight.SemiBold),
-        modifier = Modifier.padding(bottom = 12.dp),
-    )
-}
-
-@Composable
-private fun GenreRow(g: app.pipo.nativeapp.data.GenreTag) {
-    Column(modifier = Modifier.padding(vertical = 8.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text(g.tag, color = PipoColors.Ink, style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold))
-            Text("${(g.weight * 100).toInt()}%", color = PipoColors.TextDim, style = TextStyle(fontSize = 11.sp))
-        }
-        LinearProgressIndicator(
-            progress = { g.weight.coerceIn(0f, 1f) },
-            color = PipoColors.Mint,
-            trackColor = Color(0x18FFFFFF),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 6.dp)
-                .height(4.dp)
-                .clip(CircleShape),
-        )
-        if (g.examples.isNotEmpty()) {
-            Text(
-                g.examples.joinToString(" · "),
-                color = PipoColors.TextDim,
-                style = TextStyle(fontSize = 11.sp, lineHeight = 16.sp),
-                modifier = Modifier.padding(top = 6.dp),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-@Composable
-private fun EraBars(eras: List<app.pipo.nativeapp.data.EraSlice>) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.Bottom,
-    ) {
-        eras.forEach { e ->
-            Column(
-                modifier = Modifier.weight(1f),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height((40 * e.weight.coerceIn(0f, 1f) + 4).dp)
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(PipoColors.Mint.copy(alpha = 0.30f + 0.6f * e.weight)),
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    e.label,
-                    color = PipoColors.TextDim,
-                    style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Medium),
-                )
-            }
-        }
-    }
-}
-
-@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
-@Composable
-private fun ChipFlow(items: List<String>, accent: Color) {
-    androidx.compose.foundation.layout.FlowRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        items.forEach { s ->
-            Text(
-                text = s,
-                color = accent,
-                style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium),
-                modifier = Modifier
-                    .clip(CircleShape)
-                    .background(accent.copy(alpha = 0.12f))
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun ArtistRow(a: app.pipo.nativeapp.data.ArtistAffinity) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = a.name,
-            color = PipoColors.Ink,
-            style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
-            modifier = Modifier.weight(1f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Box(
-            modifier = Modifier
-                .width(72.dp)
-                .height(3.dp)
-                .clip(CircleShape)
-                .background(Color(0x18FFFFFF)),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth(a.affinity.coerceIn(0f, 1f))
-                    .height(3.dp)
-                    .clip(CircleShape)
-                    .background(PipoColors.Mint),
-            )
-        }
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = "${(a.affinity * 100).toInt()}",
-            color = PipoColors.TextDim,
-            style = TextStyle(fontSize = 11.sp),
-        )
-    }
-}
-
-private fun dateOnly(epochSec: Long): String {
-    if (epochSec <= 0) return "—"
-    val date = java.time.Instant.ofEpochSecond(epochSec)
-        .atZone(java.time.ZoneId.systemDefault())
-        .toLocalDate()
-    return "${date.monthValue}/${date.dayOfMonth}"
-}
-
-@Composable
-private fun StatGrid(items: List<Pair<String, String>>) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        items.chunked(2).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-                row.forEach { item ->
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color(0x12FFFFFF))
-                            .padding(16.dp),
-                    ) {
-                        Text(item.second, color = PipoColors.Ink, style = MaterialTheme.typography.headlineSmall)
-                        Text(item.first, color = PipoColors.TextDim, style = MaterialTheme.typography.labelMedium)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsGroup(label: String, content: @Composable ColumnScope.() -> Unit) {
-    Text(
-        text = label,
-        color = PipoColors.Ink,
-        style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold),
-        modifier = Modifier.padding(top = 24.dp, bottom = 12.dp),
-    )
-    Column(content = content)
-}
-
-@Composable
-private fun LabelRow(label: String, detail: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column {
-            Text(label, color = PipoColors.Ink, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-            Text(
-                detail,
-                color = PipoColors.TextDim,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-@Composable
-private fun ToggleRow(label: String, value: Boolean, onChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Text(label, color = PipoColors.Ink, style = MaterialTheme.typography.titleSmall)
-        Switch(
-            checked = value,
-            onCheckedChange = onChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = PipoColors.Bg0,
-                checkedTrackColor = PipoColors.Mint,
-                uncheckedThumbColor = PipoColors.TextDim,
-                uncheckedTrackColor = Color(0x22FFFFFF),
-            ),
         )
     }
 }

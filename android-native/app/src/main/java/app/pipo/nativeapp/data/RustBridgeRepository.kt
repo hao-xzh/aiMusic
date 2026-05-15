@@ -22,7 +22,7 @@ import kotlin.math.max
  * - audio_cache_* / audio_get_features
  * - ai_get_config / ai_set_provider / ai_set_api_key / ai_set_model
  */
-@OptIn(UnstableApi::class)
+@androidx.annotation.OptIn(UnstableApi::class)
 class RustBridgeRepository(
     private val bridge: RustPipoBridge,
     private val appContext: Context? = null,
@@ -44,6 +44,7 @@ class RustBridgeRepository(
     private var cachedUserId: Long? = null
 
     /** 曲目内存缓存：playlistId → tracks。冷启动 init 时灌入上次的快照，运行时累加 */
+    private val tracksCacheLock = Any()
     private val tracksMemoryCache = mutableMapOf<Long, List<NativeTrack>>()
 
     init {
@@ -55,7 +56,9 @@ class RustBridgeRepository(
             // 不在这里反推 accountState —— 实际 accountState 仍要靠 refreshAccount 走网拿 cookie
             // 验证；只是把上一次的 playlists 显示出来当作 stale-while-revalidate
             playlistState.value = snap.playlists
-            tracksMemoryCache.putAll(snap.tracks)
+            synchronized(tracksCacheLock) {
+                tracksMemoryCache.putAll(snap.tracks)
+            }
             cacheStale = snap.isStale
             cachedUserId = snap.userId
         }
@@ -76,7 +79,9 @@ class RustBridgeRepository(
         val oldUserId = cachedUserId
         if (newUserId != null && oldUserId != null && newUserId != oldUserId) {
             playlistState.value = emptyList()
-            tracksMemoryCache.clear()
+            synchronized(tracksCacheLock) {
+                tracksMemoryCache.clear()
+            }
             playlistCache?.clear()
             cachedUserId = null
             cacheStale = false
@@ -147,40 +152,48 @@ class RustBridgeRepository(
             // 同一 id 的歌单 updateTime 变了 = tracks 也可能变了,旧 cache 不可信。
             // 不变的 → cache 仍可复用,省一次 tracksForPlaylist 网络往返。
             val oldByIdTime = playlistState.value.associate { it.id to it.updateTime }
-            for (p in fresh) {
-                val oldTime = oldByIdTime[p.id]
-                if (oldTime != null && p.updateTime != null && oldTime != p.updateTime) {
-                    tracksMemoryCache.remove(p.id)
+            val tracksSnapshot = synchronized(tracksCacheLock) {
+                for (p in fresh) {
+                    val oldTime = oldByIdTime[p.id]
+                    if (oldTime != null && p.updateTime != null && oldTime != p.updateTime) {
+                        tracksMemoryCache.remove(p.id)
+                    }
                 }
+                // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)
+                val freshIds = fresh.mapTo(HashSet()) { it.id }
+                tracksMemoryCache.keys.retainAll(freshIds)
+                HashMap(tracksMemoryCache)
             }
-            // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)
-            val freshIds = fresh.mapTo(HashSet()) { it.id }
-            tracksMemoryCache.keys.retainAll(freshIds)
 
             playlistState.value = fresh
             cacheStale = false
             val uid = accountState.value?.userId
             if (uid != null) {
                 cachedUserId = uid
-                playlistCache?.save(uid, fresh, tracksMemoryCache)
+                playlistCache?.save(uid, fresh, tracksSnapshot)
             }
         }
     }
 
     override suspend fun tracksForPlaylist(playlistId: Long): List<NativeTrack> {
-        tracksMemoryCache[playlistId]?.let { return it }
+        synchronized(tracksCacheLock) {
+            tracksMemoryCache[playlistId]
+        }?.let { return it }
         val fresh = safe(
             { bridge.neteasePlaylistTracks(playlistId) },
             { fallback.tracksForPlaylist(playlistId) },
         )
         if (fresh.isNotEmpty()) {
-            tracksMemoryCache[playlistId] = fresh
+            val tracksSnapshot = synchronized(tracksCacheLock) {
+                tracksMemoryCache[playlistId] = fresh
+                HashMap(tracksMemoryCache)
+            }
             // 拉到新一张歌单 tracks 后，把整个 in-memory cache 重新落盘
             // （save 内部异步 IO，不阻塞调用方）
             val uid = accountState.value?.userId ?: cachedUserId
             val playlists = playlistState.value
             if (uid != null && playlists.isNotEmpty()) {
-                playlistCache?.save(uid, playlists, tracksMemoryCache)
+                playlistCache?.save(uid, playlists, tracksSnapshot)
             }
         }
         return fresh

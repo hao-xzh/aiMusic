@@ -19,10 +19,14 @@ class LibraryLoader(private val repository: PipoRepository) {
 
     suspend fun library(forceRefresh: Boolean = false): List<NativeTrack> {
         if (!forceRefresh) cached?.let { return it }
-        val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        var playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
         if (playlists.isEmpty()) {
-            cached = emptyList()
-            return emptyList()
+            runCatching {
+                repository.refreshAccount()
+                repository.refreshPlaylists()
+            }
+            playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+            if (playlists.isEmpty()) return emptyList()
         }
         val tracks = coroutineScope {
             val deferred = playlists.map { p ->
@@ -39,7 +43,9 @@ class LibraryLoader(private val repository: PipoRepository) {
             }
             out
         }
-        cached = tracks
+        if (tracks.isNotEmpty()) {
+            cached = tracks
+        }
         return tracks
     }
 

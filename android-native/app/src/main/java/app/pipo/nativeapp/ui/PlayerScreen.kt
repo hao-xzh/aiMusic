@@ -326,7 +326,7 @@ private fun PipoProgressBar(progress: Float, onSeek: (Float) -> Unit) {
         animationSpec = tween(durationMillis = 120),
         label = "progress",
     )
-    BoxWithConstraints(
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(4.dp)

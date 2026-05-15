@@ -8,6 +8,7 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.CacheWriter
 import app.pipo.nativeapp.data.NativeTrack
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 
@@ -34,6 +35,9 @@ class NextTrackPrewarmer(
             writer.cache()
             Log.d("PipoPrewarm", "prewarmed ${track.title}")
             true
+        } catch (e: CancellationException) {
+            writer.cancel()
+            throw e
         } catch (e: Exception) {
             Log.w("PipoPrewarm", "prewarm failed for ${track.title}", e)
             false
