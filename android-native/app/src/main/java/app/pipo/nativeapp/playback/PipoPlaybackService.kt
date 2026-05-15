@@ -9,8 +9,6 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -32,27 +30,7 @@ class PipoPlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
-        val cacheDataSourceFactory = CacheDataSource.Factory()
-            .setCache(PipoMediaCache.get(this))
-            .setUpstreamDataSourceFactory(
-                DefaultHttpDataSource.Factory()
-                    .setUserAgent("PipoNative/0.1")
-                    .setAllowCrossProtocolRedirects(true)
-                    // 网易 CDN 有反盗链:无 Referer 的 Range 请求会偶发返回 4xx/302,
-                    // 表现为切歌时 ExoPlayer 报 ERROR_CODE_IO_BAD_HTTP_STATUS,然后
-                    // PlayerViewModel 走重签 URL 路径 —— 但每次切歌都被打断不可接受。
-                    // 桌面端 (Tauri/Rust) 的 cdn_client 自动注入这条,这里给安卓端补上。
-                    .setDefaultRequestProperties(
-                        mapOf("Referer" to "https://music.163.com/")
-                    )
-                    // 默认 connect/read timeout 都是 8s, 移动网弱信号下首字节就可能 > 8s。
-                    // 给一个更宽容的窗口,让 ExoPlayer 自己的"重试 + recoverable 路径"
-                    // 来兜底,而不是动不动就抛网络错误打断播放。
-                    .setConnectTimeoutMs(15_000)
-                    .setReadTimeoutMs(15_000),
-            )
-            // 缓存写失败时仍能继续播 —— 网络抖动不掉歌
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        val cacheDataSourceFactory = PipoMediaDataSources.cacheFactory(this)
 
         val musicAttrs = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
@@ -107,67 +85,11 @@ class PipoPlaybackService : MediaSessionService() {
                 // 当前缓冲耗尽就停（"放着放着自动停止"的根因）
                 setWakeMode(C.WAKE_MODE_NETWORK)
 
-                // 同曲连续失败的 attempt 计数 —— 同一 mediaItemIndex 上连失 ≥3 次就放弃重试，
-                // 跳下一首或停下，避免坏 URL 触发 prepare → onPlayerError → prepare 死循环烧 CPU
-                var lastErrorIndex = -1
-                var consecutiveErrors = 0
-
                 addListener(object : Player.Listener {
-                    override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
-                        // 切歌成功 = 之前的 stuck 解开了 → 重置计数
-                        consecutiveErrors = 0
-                        lastErrorIndex = -1
-                    }
-
                     override fun onPlayerError(error: PlaybackException) {
+                        // 恢复策略统一放在 PlayerViewModel。Service 层只记录底层错误，
+                        // 避免这里 seek/prepare/play 和 ViewModel 的 URL 重签互相抢状态。
                         Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
-                        val curIdx = currentMediaItemIndex
-                        if (curIdx == lastErrorIndex) consecutiveErrors++ else {
-                            lastErrorIndex = curIdx
-                            consecutiveErrors = 1
-                        }
-                        // 同曲连续失败 ≥3 次 → 这首确实坏了（或 ViewModel 重签也没救），
-                        // 跳下一首；没下一首就停在 IDLE 让用户手动决定
-                        if (consecutiveErrors >= 3) {
-                            if (mediaItemCount > 1 && hasNextMediaItem()) {
-                                seekToNext()
-                                consecutiveErrors = 0
-                                lastErrorIndex = -1
-                                prepare()
-                                play()
-                            }
-                            return
-                        }
-
-                        // HTTP 类错误大概率是网易直链过期 —— 不要在服务层 prepare/play
-                        // 同一个死 URL（之前会触发"快速 retry → 3 次后跳下一首（也死）→ 一路自动切"
-                        // 的雪崩）。停在 IDLE，让 PlayerViewModel.onPlayerError 走 songUrls 重签
-                        // + replaceMediaItem 路径，再 prepare+play。
-                        val isUrlExpiryLike = when (error.errorCode) {
-                            PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
-                            PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
-                            PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
-                            PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
-                            else -> false
-                        }
-                        if (isUrlExpiryLike) return
-
-                        // 网络抖动等一过性错误 —— 当前 URL 还没过期，原地 prepare 重试就行
-                        val recoverable = when (error.errorCode) {
-                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
-                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> true
-                            else -> false
-                        }
-                        if (recoverable) {
-                            seekToDefaultPosition()
-                            prepare()
-                            play()
-                        } else if (mediaItemCount > 1 && hasNextMediaItem()) {
-                            seekToNext()
-                            prepare()
-                            play()
-                        }
-                        // 其他不可恢复错误：停在 IDLE
                     }
                 })
             }

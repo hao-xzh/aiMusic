@@ -26,6 +26,7 @@ import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.TrackDedupe
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -105,10 +106,10 @@ class PlayerViewModel(
     private var continuousSource: ContinuousQueueSource? = defaultContinuousSource
     /** 续杯调用是否在飞行中 —— 防短时间内重复触发 */
     private var fetchingMore = false
-    /** 续杯耗尽后置 true → 队尾不再 wraparound，让播放自然结束 */
-    private var noLoop = false
     /** current 后剩 < N 首时触发续杯。3 = 至少留 2 首缓冲 */
     private val extendThreshold = 3
+    /** URL 获取优先保留无损；无损不可用时自动降级，保证长时间播放不断。 */
+    private val streamLevelFallbacks = listOf("lossless", "exhigh", "higher", "standard")
 
     // gapless 模式不需要 currentPlan / overlapStartedFor / fadeOutScheduledFor / fadeJob
     // 所有跨曲过渡交给 ExoPlayer 自己处理（ConcatenatingMediaSource 内部已经做缓冲预拉）
@@ -141,6 +142,17 @@ class PlayerViewModel(
     private val urlRefreshTried = HashSet<String>()
     /** 当前正在刷新 URL 的 trackId —— 错误风暴里只让一个刷新协程在飞 */
     private var refreshingUrlForTrack: String? = null
+    /** 弱网类错误的原地恢复计数；超过上限再重签 URL。 */
+    private var transientRetryForTrack: String? = null
+    private var transientRetryCount = 0
+    private var transientRetryJob: Job? = null
+    /** 防止一串坏 URL 把整张歌单瞬间跳空。真正出声后清零。 */
+    private var recoverySkipCount = 0
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private val nextTrackPrewarmer by lazy { NextTrackPrewarmer(appContext) }
+    private var nextPrewarmJob: Job? = null
+    private var prewarmingNextKey: String? = null
+    private var prewarmedNextKey: String? = null
 
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
@@ -159,6 +171,9 @@ class PlayerViewModel(
             } else {
                 mediaItem?.mediaId?.let { urlRefreshTried.remove(it) }
             }
+            transientRetryForTrack = null
+            transientRetryCount = 0
+            transientRetryJob?.cancel()
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 logEventForPrev(BehaviorType.Completed, completionPctOverride = 1f)
                 logEventForCurrent(BehaviorType.PlayStarted)
@@ -169,10 +184,19 @@ class PlayerViewModel(
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            // 网易直链是签名 URL，几小时就过期。播着播着 URL 死掉 → ExoPlayer 拿 4xx → IDLE，
-            // 之前 toggle()/next() 里 prepare() 还是同一个死链 → "按播放没反应、自动切又一直切"。
-            // 这里用 neteaseId 重新签 URL + replaceMediaItem 让用户感受不到 URL 已过期。
-            handleLikelyUrlExpiry(error)
+            handlePlaybackError(error)
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_ENDED) {
+                recoverUnexpectedEndedState()
+            }
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (isPlaying) {
+                recoverySkipCount = 0
+            }
         }
     }
 
@@ -184,14 +208,62 @@ class PlayerViewModel(
         else -> false
     }
 
-    private fun handleLikelyUrlExpiry(error: PlaybackException) {
-        if (!isLikelyUrlExpiry(error)) {
-            Log.w("PlayerVM", "non-recoverable playback error code=${error.errorCodeName}")
+    private fun isTransientNetworkError(error: PlaybackException): Boolean = when (error.errorCode) {
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> true
+        else -> false
+    }
+
+    private fun handlePlaybackError(error: PlaybackException) {
+        Log.w("PlayerVM", "playback error code=${error.errorCodeName}")
+        when {
+            isLikelyUrlExpiry(error) -> refreshCurrentTrackUrl("url-expiry")
+            isTransientNetworkError(error) -> retryTransientNetworkError(error)
+            else -> controller?.let(::skipToNextOrStop)
+        }
+    }
+
+    private fun retryTransientNetworkError(error: PlaybackException) {
+        val player = controller ?: return
+        val track = currentTrackFor(player) ?: return
+        if (transientRetryForTrack == track.id) {
+            transientRetryCount += 1
+        } else {
+            transientRetryForTrack = track.id
+            transientRetryCount = 1
+        }
+        if (transientRetryCount > MAX_TRANSIENT_RETRIES) {
+            Log.w("PlayerVM", "network retry exhausted for ${track.title}, refreshing url")
+            transientRetryForTrack = null
+            transientRetryCount = 0
+            refreshCurrentTrackUrl("network-retry-exhausted")
             return
         }
+        val attempt = transientRetryCount
+        val resumePosMs = maxOf(player.currentPosition, state.positionMs).coerceAtLeast(0L)
+        val targetTrackId = track.id
+        transientRetryJob?.cancel()
+        transientRetryJob = viewModelScope.launch {
+            delay((attempt * 1200L).coerceAtMost(3500L))
+            val livePlayer = controller ?: return@launch
+            val targetIdx = livePlayer.indexOfMediaId(targetTrackId) ?: return@launch
+            if (currentTrackFor(livePlayer)?.id != targetTrackId) return@launch
+            livePlayer.repeatMode = Player.REPEAT_MODE_ALL
+            livePlayer.seekTo(targetIdx, resumePosMs)
+            livePlayer.prepare()
+            livePlayer.play()
+            Log.w("PlayerVM", "network retry #$attempt for ${track.title}: ${error.errorCodeName}")
+        }
+    }
+
+    private fun refreshCurrentTrackUrl(reason: String) {
         val player = controller ?: return
-        val curIdx = player.currentMediaItemIndex.coerceAtLeast(0)
-        val track = state.queue.getOrNull(curIdx) ?: return
+        val track = currentTrackFor(player) ?: return
+        refreshTrackUrlAndResume(player, track, reason)
+    }
+
+    private fun refreshTrackUrlAndResume(initialPlayer: Player, track: NativeTrack, reason: String) {
+        val player = controller ?: initialPlayer
         if (refreshingUrlForTrack == track.id) return
 
         // 已经在这首上重签过一次还失败 —— 这首确实坏了（区域受限 / 真下架 / 重签 URL 也是死的）。
@@ -211,40 +283,22 @@ class PlayerViewModel(
         refreshingUrlForTrack = track.id
         // 错误时 player 在 IDLE，currentPosition 可能已重置。state.positionMs 由 syncFrom
         // 持续更新，是更可靠的"上一刻播到哪儿"。
-        val resumePosMs = state.positionMs.coerceAtLeast(0L)
+        val resumePosMs = maxOf(player.currentPosition, state.positionMs).coerceAtLeast(0L)
         val targetTrackId = track.id
         viewModelScope.launch {
             try {
-                // 给整个重签流程一个硬上限 —— 之前没 timeout，弱网时 songUrls 可以
-                // pending 几十秒，期间任何后续错误都被 refreshingUrlForTrack 检查挡住，
-                // player 永远卡死在"听着听着停了"的状态。10s 是经验值:正常 RTT < 1s,
-                // 给慢网三次内部重试的余量。
-                val fresh = withTimeoutOrNull(10_000L) {
-                    runCatching { repository.songUrls(listOf(ne)) }
-                        .getOrNull()?.firstOrNull { it.id == ne }?.url
-                        ?.takeIf { it.isNotBlank() }
-                }
+                val fresh = fetchPlayableUrl(ne)
                 if (fresh == null) {
-                    // 拿不到 URL: 网络真挂了 / 网易返回空 / 超时。
-                    // 不能自动跳(跳了就一路自动切)，停在 IDLE 等用户回来。
-                    // 把 urlRefreshTried 回滚 —— 否则一次临时性故障会永久毒化这首歌:
-                    // 下次再点直接 skipToNextOrStop，相当于"这首再也播不了"。
-                    Log.w("PlayerVM", "songUrls returned no url for ${track.title}, staying paused")
-                    urlRefreshTried.remove(targetTrackId)
+                    Log.w("PlayerVM", "songUrls returned no url for ${track.title}, skipping ($reason)")
+                    controller?.let(::skipToNextOrStop)
                     return@launch
                 }
                 val livePlayer = controller ?: run {
                     urlRefreshTried.remove(targetTrackId)
                     return@launch
                 }
-                // 重签期间 player 自身可能已经把 current 自动切到下一首(service 端 onPlayerError
-                // 兜底里的 seekToNext，或者 ExoPlayer 自己 transition)。**用 mediaId 找位置**
-                // 而不是比较 index —— 这首歌在队列里就该被替换，管它现在 player 在播哪首。
-                // 之前用 `currentMediaItemIndex != curIdx` 判,自动 transition 后会被
-                // 误当成"用户切歌冲突"直接放弃,player 留在 IDLE。
-                val updatedIdx = (0 until livePlayer.mediaItemCount).firstOrNull { i ->
-                    livePlayer.getMediaItemAt(i).mediaId == targetTrackId
-                }
+                // 重签期间用户可能切歌或换歌单。用 mediaId 找位置，而不是相信旧 index。
+                val updatedIdx = livePlayer.indexOfMediaId(targetTrackId)
                 if (updatedIdx == null) {
                     // 队列里已经没这首了(用户清队 / 切歌单)—— 放弃，无需回滚 tried
                     return@launch
@@ -260,10 +314,10 @@ class PlayerViewModel(
                 // 已经在播下一首时不去打断 —— replaceMediaItem 已把 URL 更新,
                 // 下次 wraparound / 用户手动回来时直接是新 URL。
                 if (livePlayer.currentMediaItemIndex == updatedIdx) {
-                    livePlayer.prepare()
                     if (resumePosMs > 1000L) {
                         livePlayer.seekTo(updatedIdx, resumePosMs)
                     }
+                    livePlayer.prepare()
                     livePlayer.play()
                 }
             } finally {
@@ -272,9 +326,39 @@ class PlayerViewModel(
         }
     }
 
+    private fun recoverUnexpectedEndedState() {
+        val player = controller ?: return
+        if (!player.playWhenReady || player.mediaItemCount == 0 || state.queue.isEmpty()) return
+        Log.w("PlayerVM", "player reached STATE_ENDED while playWhenReady=true, restarting queue")
+        player.repeatMode = Player.REPEAT_MODE_ALL
+        val targetIdx = player.currentMediaItemIndex.coerceIn(0, player.mediaItemCount - 1)
+        player.seekToDefaultPosition(targetIdx)
+        player.prepare()
+        player.play()
+    }
+
+    private fun currentTrackFor(player: Player): NativeTrack? {
+        val mediaId = player.currentMediaItem?.mediaId
+        return mediaId?.let { id -> state.queue.firstOrNull { it.id == id } }
+            ?: state.queue.getOrNull(player.currentMediaItemIndex.coerceAtLeast(0))
+    }
+
+    private fun Player.indexOfMediaId(mediaId: String): Int? {
+        return (0 until mediaItemCount).firstOrNull { i -> getMediaItemAt(i).mediaId == mediaId }
+    }
+
     private fun skipToNextOrStop(p: Player) {
-        if (p.mediaItemCount > 1 && p.hasNextMediaItem()) {
-            p.seekToNextMediaItem()
+        if (recoverySkipCount >= MAX_RECOVERY_SKIPS) {
+            Log.w("PlayerVM", "too many recovery skips in a row, staying paused")
+            p.pause()
+            return
+        }
+        if (p.mediaItemCount > 1) {
+            recoverySkipCount += 1
+            p.repeatMode = Player.REPEAT_MODE_ALL
+            val currentIdx = p.currentMediaItemIndex.coerceIn(0, p.mediaItemCount - 1)
+            val nextIdx = if (currentIdx + 1 < p.mediaItemCount) currentIdx + 1 else 0
+            p.seekTo(nextIdx, 0L)
             p.prepare()
             p.play()
         }
@@ -349,8 +433,7 @@ class PlayerViewModel(
                                         .filter { it.streamUrl.isNotBlank() }
                                     if (resolved.isEmpty()) return@runCatching
                                     val targetIdx = snap.currentIndex.coerceIn(0, resolved.size - 1)
-                                    // 冷启动：复位上次 session 留下的"队列跑空"标记 + 默认循环
-                                    noLoop = false
+                                    // 冷启动：恢复后仍保持队列循环，避免播完一次就停。
                                     state = state.copy(queue = resolved, currentIndex = targetIdx)
                                     player.setMediaItems(
                                         resolved.map(::toMediaItem),
@@ -361,7 +444,6 @@ class PlayerViewModel(
                                     player.prepare()
                                     // 不要 play()——等用户点
                                     syncFrom(player)
-                                    startFeaturePrefetch()
                                 }
                             }
                         } else {
@@ -374,13 +456,11 @@ class PlayerViewModel(
                                     val tracks = resolvePlayableQueue(repository.tracksForPlaylist(playlistId))
                                         .filter { it.streamUrl.isNotBlank() }
                                     if (tracks.isEmpty()) return@runCatching
-                                    noLoop = false
                                     state = state.copy(queue = tracks)
                                     player.setMediaItems(tracks.map(::toMediaItem))
                                     player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
                                     player.prepare()
                                     syncFrom(player)
-                                    startFeaturePrefetch()
                                 }
                             }
                         }
@@ -425,10 +505,7 @@ class PlayerViewModel(
                 track
             } else {
                 val id = track.neteaseId ?: return@launch
-                val url = runCatching { repository.songUrls(listOf(id)) }
-                    .getOrNull()?.firstOrNull { it.id == id }?.url
-                    ?.takeIf { it.isNotBlank() }
-                    ?: return@launch
+                val url = fetchPlayableUrl(id) ?: return@launch
                 track.copy(streamUrl = url)
             }
             val live = controller ?: return@launch
@@ -473,14 +550,10 @@ class PlayerViewModel(
                 first
             } else {
                 val id = first.neteaseId ?: return@launch
-                val url = runCatching { repository.songUrls(listOf(id)) }
-                    .getOrNull()?.firstOrNull { it.id == id }?.url
-                    ?.takeIf { it.isNotBlank() }
-                    ?: return@launch
+                val url = fetchPlayableUrl(id) ?: return@launch
                 first.copy(streamUrl = url)
             }
             if (gen != playGen) return@launch
-            noLoop = false
             continuousSource = source
             app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
             state = state.copy(queue = listOf(firstResolved), currentIndex = 0)
@@ -489,7 +562,6 @@ class PlayerViewModel(
             player.volume = 1f
             player.prepare()
             player.play()
-            startFeaturePrefetch()
 
             // -------- 阶段 2：后台补 batch 剩下歌 --------
             val rest = initialBatch.drop(1)
@@ -536,14 +608,10 @@ class PlayerViewModel(
                 track
             } else {
                 val id = track.neteaseId ?: return@launch
-                val url = runCatching { repository.songUrls(listOf(id)) }
-                    .getOrNull()?.firstOrNull { it.id == id }?.url
-                    ?.takeIf { it.isNotBlank() }
-                    ?: return@launch
+                val url = fetchPlayableUrl(id) ?: return@launch
                 track.copy(streamUrl = url)
             }
             if (gen != playGen) return@launch
-            noLoop = false
             // phase-1 期间显式 null —— 此时 queue 只有 1 首，开 continuous 会立刻触发
             // maybeExtendQueue（remaining=0 ≤ 阈值 3），跟 phase-2 的 addMediaItems 抢插。
             // phase-2 完成后再切回 RecommendEngine，让 "歌单播完接续相似歌" 这条 UX 也能用上。
@@ -556,7 +624,6 @@ class PlayerViewModel(
             player.volume = 1f
             player.prepare()
             player.play()
-            startFeaturePrefetch()
 
             // -------- 阶段 2：后台补完整队列 --------
             // 解析剩下歌的 URL（分批 ≤ 50 个），smooth 排序，append 到播放器
@@ -662,6 +729,8 @@ class PlayerViewModel(
             }
         }
         controller?.removeListener(listener)
+        nextPrewarmJob?.cancel()
+        nextTrackPrewarmer.cancel()
         MediaController.releaseFuture(controllerFuture)
         controller = null
         super.onCleared()
@@ -716,11 +785,79 @@ class PlayerViewModel(
         )
         // 续杯：current 后剩 < 阈值时调一次 fetchMore
         maybeExtendQueue(player)
+        maybePrewarmNextTrack(player)
         // 节流持久化：杀掉冷启动黑屏 + 跳到 playlist[0] 的尴尬
         if (queue.isNotEmpty()) {
             lastPlaybackStore.saveThrottled(queue, index, state.positionMs)
         }
     }
+
+    private fun maybePrewarmNextTrack(player: Player) {
+        if (!player.isPlaying) return
+        val durationMs = player.duration.takeIf { it > 0 } ?: state.durationMs
+        if (durationMs <= 0L) return
+        val positionMs = player.currentPosition.coerceAtLeast(state.positionMs)
+        val remainingMs = (durationMs - positionMs).coerceAtLeast(0L)
+        val shouldPrewarm = positionMs >= (durationMs * PREWARM_AFTER_PROGRESS).toLong() ||
+            remainingMs <= PREWARM_WHEN_REMAINING_MS
+        if (!shouldPrewarm) return
+        val nextTrack = nextTrackFor(player) ?: return
+        val nextKey = prewarmKey(nextTrack)
+        if (nextKey == prewarmedNextKey || nextKey == prewarmingNextKey) return
+
+        nextPrewarmJob?.cancel()
+        nextTrackPrewarmer.cancel()
+        prewarmingNextKey = nextKey
+        nextPrewarmJob = viewModelScope.launch {
+            val playable = refreshTrackForPrewarm(nextTrack) ?: run {
+                if (prewarmingNextKey == nextKey) prewarmingNextKey = null
+                return@launch
+            }
+            val playableKey = prewarmKey(playable)
+            val warmed = withTimeoutOrNull(NEXT_PREWARM_TIMEOUT_MS) {
+                nextTrackPrewarmer.prewarm(playable)
+            } ?: false
+            if (warmed) {
+                prewarmedNextKey = playableKey
+            }
+            if (prewarmingNextKey == nextKey || prewarmingNextKey == playableKey) {
+                prewarmingNextKey = null
+            }
+        }
+    }
+
+    private suspend fun refreshTrackForPrewarm(track: NativeTrack): NativeTrack? {
+        val refreshed = track.neteaseId
+            ?.let { id -> fetchPlayableUrl(id)?.let { url -> track.copy(streamUrl = url) } }
+            ?: track.takeIf { it.streamUrl.isNotBlank() }
+            ?: return null
+        val player = controller ?: return refreshed
+        val itemIndex = player.indexOfMediaId(refreshed.id) ?: return refreshed
+        val queueIndex = state.queue.indexOfFirst { it.id == refreshed.id }
+        if (queueIndex >= 0 && state.queue[queueIndex].streamUrl != refreshed.streamUrl) {
+            val nextQueue = state.queue.toMutableList().apply { set(queueIndex, refreshed) }
+            state = state.copy(queue = nextQueue)
+        }
+        if (itemIndex != player.currentMediaItemIndex) {
+            runCatching { player.replaceMediaItem(itemIndex, toMediaItem(refreshed)) }
+        }
+        return refreshed
+    }
+
+    private fun nextTrackFor(player: Player): NativeTrack? {
+        val queue = state.queue
+        if (queue.size < 2) return null
+        val currentId = player.currentMediaItem?.mediaId
+        val currentIndex = currentId
+            ?.let { id -> queue.indexOfFirst { it.id == id } }
+            ?.takeIf { it >= 0 }
+            ?: state.currentIndex.coerceIn(0, queue.lastIndex)
+        val nextIndex = if (currentIndex + 1 < queue.size) currentIndex + 1 else 0
+        if (nextIndex == currentIndex) return null
+        return queue.getOrNull(nextIndex)
+    }
+
+    private fun prewarmKey(track: NativeTrack): String = "${track.id}:${track.streamUrl}"
 
     private fun maybeExtendQueue(player: Player) {
         if (fetchingMore) return
@@ -735,7 +872,7 @@ class PlayerViewModel(
                 val more = source.fetchMore(excludeIds)
                 if (more.isEmpty()) {
                     // source 跑空了 —— 不关闭循环。
-                    // 之前这里 setRepeatMode(OFF) + noLoop=true，导致：当前队列播完
+                    // 之前这里关闭循环，导致：当前队列播完
                     // → STATE_ENDED → seekToNextMediaItem 是 no-op → 用户感觉
                     // "播完就停，next 也按不动，要重启 app"。
                     // 现在改成：拆掉 source（不再尝试续杯）但保留 REPEAT_MODE_ALL，
@@ -747,7 +884,6 @@ class PlayerViewModel(
                 if (resolved.isEmpty()) return@launch
                 state = state.copy(queue = queue + resolved)
                 player.addMediaItems(resolved.map(::toMediaItem))
-                startFeaturePrefetch()
             } finally {
                 fetchingMore = false
             }
@@ -813,39 +949,38 @@ class PlayerViewModel(
         // 故意空：单曲索引集中到 Distill batch，每首歌减少 2 次 AI 调用
     }
 
-    /**
-     * 后台逐曲拉取 Symphonia features —— 拿到 head/tail 静音后写入 AudioFeaturesStore，
-     * 同时用 ExoPlayer `replaceMediaItem` 替换原 MediaItem 为带 clipping 的版本。
-     */
-    private fun startFeaturePrefetch() {
-        val player = controller ?: return
-        viewModelScope.launch {
-            state.queue.forEachIndexed { idx, track ->
-                val ne = track.neteaseId ?: return@forEachIndexed
-                if (featuresStore.get(track.id) != null) return@forEachIndexed
-                if (track.streamUrl.isBlank()) return@forEachIndexed
-                val features = runCatching { repository.audioFeatures(ne, track.streamUrl) }.getOrNull()
-                    ?: return@forEachIndexed
-                featuresStore.put(track.id, features)
-                if (idx == player.currentMediaItemIndex) return@forEachIndexed
-                if (idx >= player.mediaItemCount) return@forEachIndexed
-                runCatching { player.replaceMediaItem(idx, toMediaItem(track)) }
+    private suspend fun fetchPlayableUrl(id: Long): String? {
+        for (level in streamLevelFallbacks) {
+            val url = withTimeoutOrNull(STREAM_URL_TIMEOUT_MS) {
+                runCatching { repository.songUrls(listOf(id), level) }
+                    .getOrNull()
+                    ?.firstOrNull { it.id == id }
+                    ?.url
+                    ?.takeIf { it.isNotBlank() }
             }
+            if (!url.isNullOrBlank()) return url
         }
+        return null
     }
 
     private suspend fun resolvePlayableQueue(queue: List<NativeTrack>): List<NativeTrack> {
         val missingIds = queue.mapNotNull { track ->
             if (track.streamUrl.isBlank()) track.neteaseId else null
-        }
+        }.distinct()
         if (missingIds.isEmpty()) return queue
-        // 分批 ≤ 50 个 id —— netease 单次大批 (200+) 偶尔会丢一半响应，
-        // 表现为"队列后半段没 url，播完第一首就停"。50 是经验稳定值。
+        // 分批 ≤ 50 个 id；无损不可用时自动降级到较低码率，避免队列里混入空 URL。
         val urls = HashMap<Long, String>()
-        for (chunk in missingIds.chunked(50)) {
-            runCatching { repository.songUrls(chunk) }.getOrNull()?.forEach { u ->
-                u.url?.takeIf { it.isNotBlank() }?.let { urls[u.id] = it }
+        var unresolved = missingIds
+        for (level in streamLevelFallbacks) {
+            for (chunk in unresolved.chunked(50)) {
+                withTimeoutOrNull(STREAM_URL_TIMEOUT_MS) {
+                    runCatching { repository.songUrls(chunk, level) }.getOrNull()
+                }?.forEach { u ->
+                    u.url?.takeIf { it.isNotBlank() }?.let { urls[u.id] = it }
+                }
             }
+            unresolved = unresolved.filter { it !in urls }
+            if (unresolved.isEmpty()) break
         }
         return queue.map { track ->
             val id = track.neteaseId
@@ -856,5 +991,14 @@ class PlayerViewModel(
                 track
             }
         }
+    }
+
+    companion object {
+        private const val STREAM_URL_TIMEOUT_MS = 15_000L
+        private const val MAX_TRANSIENT_RETRIES = 2
+        private const val MAX_RECOVERY_SKIPS = 2
+        private const val PREWARM_AFTER_PROGRESS = 0.55f
+        private const val PREWARM_WHEN_REMAINING_MS = 90_000L
+        private const val NEXT_PREWARM_TIMEOUT_MS = 20_000L
     }
 }
