@@ -157,6 +157,12 @@ impl CacheDb {
     /// 用最新的 netease user/playlist 响应同步 playlists 表。
     /// - upsert 所有传入的 playlists
     /// - 删除本地有但远端没有的（即"用户删了这个歌单"）
+    ///
+    /// 注意：UPDATE 分支故意 **不** 写 `update_time`。这一列的语义是
+    /// “我们当前缓存的 `playlist_tracks` 快照对应的 update_time”——
+    /// 只有 `save_playlist_detail` 真正落了一遍 tracks 之后才有资格更新它。
+    /// 否则前端 SWR 拿 `cached.update_time` 和 `fresh.update_time` 比，
+    /// 两边都是新值，永远等于，更新过的歌单 tracks 不会重拉。
     pub fn save_playlists(&self, uid: i64, items: &[PlaylistInfo]) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -174,7 +180,6 @@ impl CacheDb {
                    name=excluded.name,
                    cover_url=excluded.cover_url,
                    track_count=excluded.track_count,
-                   update_time=excluded.update_time,
                    synced_at=excluded.synced_at",
             )?;
             for p in items {
