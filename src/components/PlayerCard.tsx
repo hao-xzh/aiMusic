@@ -294,6 +294,7 @@ function ImmersiveLyrics({
   );
   const containerRef = useRef<HTMLDivElement>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
+  const coverHaloRef = useRef<HTMLDivElement>(null);
   const coverRef = useRef<HTMLDivElement>(null);
   const lyricRef = useRef<HTMLDivElement>(null);
   const titleBarRef = useRef<HTMLDivElement>(null);
@@ -363,7 +364,7 @@ function ImmersiveLyrics({
     if (phase !== "opening") return;
     const ctx = getRefs();
     if (!ctx) return;
-    const { backdrop, cover, lyric, titleBar } = ctx;
+    const { backdrop, coverHalo, cover, lyric, titleBar } = ctx;
 
     const srcCover = sourceCoverRect();
     const srcLyric = sourceLyricRect();
@@ -375,6 +376,7 @@ function ImmersiveLyrics({
     // 没源 rect 就退化成纯淡入；移动端走 FLIP（120Hz 设备 hold 得住）
     if (!srcCover) {
       applyTargetImmediate(cover, target.cover);
+      if (coverHalo) applyTargetImmediate(coverHalo, target.cover);
       applyTargetImmediate(lyric, target.lyric);
       backdrop.style.transition = "none";
       backdrop.style.opacity = "0";
@@ -393,6 +395,7 @@ function ImmersiveLyrics({
 
     // 起始：封面 / 歌词都瞬移到 compact rect，背景透明，标题条隐藏
     applyRectImmediate(cover, srcCover);
+    if (coverHalo) applyRectImmediate(coverHalo, srcCover);
     cover.style.borderRadius = "12px";
     if (srcLyric) {
       applyRectImmediate(lyric, srcLyric);
@@ -407,7 +410,7 @@ function ImmersiveLyrics({
     }
     lyric.style.opacity = "0.0";
     backdrop.style.transition = "none";
-    backdrop.style.opacity = "0";
+    backdrop.style.opacity = "1";
     if (titleBar) {
       titleBar.style.transition = "none";
       titleBar.style.opacity = "0";
@@ -418,6 +421,10 @@ function ImmersiveLyrics({
     // 下一帧动到自然 immersive 目标
     requestAnimationFrame(() => {
       const t = transitionFor(["top", "left", "width", "height", "border-radius", "opacity"]);
+      if (coverHalo) {
+        coverHalo.style.transition = transitionFor(["top", "left", "width", "height", "opacity"]);
+        applyTargetCss(coverHalo, target.cover);
+      }
       cover.style.transition = t;
       applyTargetCss(cover, target.cover);
       cover.style.borderRadius = "0px";
@@ -426,7 +433,7 @@ function ImmersiveLyrics({
       applyTargetCss(lyric, target.lyric);
       lyric.style.opacity = "1";
 
-      backdrop.style.transition = `opacity ${FLIP_DURATION_MS}ms ${FLIP_EASE}`;
+      backdrop.style.transition = "none";
       backdrop.style.opacity = "1";
 
       if (titleBar) {
@@ -454,10 +461,11 @@ function ImmersiveLyrics({
     // 写入闭包用到的 helpers
     function getRefs() {
       const backdrop = backdropRef.current;
+      const coverHalo = coverHaloRef.current;
       const cover = coverRef.current;
       const lyric = lyricRef.current;
       if (!backdrop || !cover || !lyric) return null;
-      return { backdrop, cover, lyric, titleBar: titleBarRef.current };
+      return { backdrop, coverHalo, cover, lyric, titleBar: titleBarRef.current };
     }
   }, [phase, sourceCoverRect, sourceLyricRect, layout]);
 
@@ -465,6 +473,7 @@ function ImmersiveLyrics({
   useLayoutEffect(() => {
     if (phase !== "closing") return;
     const backdrop = backdropRef.current;
+    const coverHalo = coverHaloRef.current;
     const cover = coverRef.current;
     const lyric = lyricRef.current;
     const titleBar = titleBarRef.current;
@@ -480,6 +489,10 @@ function ImmersiveLyrics({
     if (!srcCover) {
       backdrop.style.transition = `opacity 280ms ${CLOSE_EASE}`;
       backdrop.style.opacity = "0";
+      if (coverHalo) {
+        coverHalo.style.transition = `opacity 280ms ${CLOSE_EASE}`;
+        coverHalo.style.opacity = "0";
+      }
       cover.style.transition = `opacity 280ms ${CLOSE_EASE}`;
       cover.style.opacity = "0";
       lyric.style.transition = `opacity 280ms ${CLOSE_EASE}`;
@@ -497,6 +510,15 @@ function ImmersiveLyrics({
     );
 
     cover.style.transition = t;
+    if (coverHalo) {
+      coverHalo.style.transition = transitionFor(
+        ["top", "left", "width", "height", "opacity"],
+        CLOSE_DURATION_MS,
+        CLOSE_EASE,
+      );
+      applyRectCss(coverHalo, srcCover);
+      coverHalo.style.opacity = "0";
+    }
     applyRectCss(cover, srcCover);
     cover.style.borderRadius = "12px";
 
@@ -597,6 +619,33 @@ function ImmersiveLyrics({
           }}
         />
       </div>
+
+      {/* 封面边缘融合层：跟清晰封面同尺寸、同轨迹，但在封面下方多扩散一圈。
+          它只负责把封面外沿的真实色彩带到采样色云里，不参与主体视觉，也不改变
+          歌词 / 标题布局。这样比单纯加重背景 blur 更稳：中心仍然干净，接缝更少。 */}
+      {coverUrl && (
+        <div
+          ref={coverHaloRef}
+          aria-hidden
+          style={{
+            position: "absolute",
+            ...layout.cover,
+            zIndex: 1,
+            pointerEvents: "none",
+            opacity: layout.isDesktop ? 0.44 : 0.36,
+            backgroundImage: `url(${coverUrl})`,
+            backgroundSize: "cover",
+            backgroundPosition: "center",
+            filter: layout.isDesktop
+              ? "blur(42px) saturate(1.22) brightness(1.02)"
+              : "blur(34px) saturate(1.16) brightness(1.02)",
+            transform: layout.isDesktop ? "scale(1.1)" : "scale(1.08)",
+            transformOrigin: "center",
+            WebkitMaskImage: layout.coverHaloMask,
+            maskImage: layout.coverHaloMask,
+          }}
+        />
+      )}
 
       {/* 封面：尺寸 / 位置 / mask 全部由 layout 决定。
           - 手机端单向 mask（底部渐隐进歌词区）
@@ -769,6 +818,7 @@ type ImmersiveLayout = {
   lyric: Pos;
   // 封面 mask（可能是单条或多条 linear-gradient 组合）
   coverMask: string;
+  coverHaloMask: string;
   // 多 mask 时用 "intersect" 求交；单 mask 默认 "add"
   coverMaskComposite: "intersect" | "add";
   // 背景 gradient（采样色驱动，作为模糊封面 backdrop 拉不到时的兜底底色）
@@ -823,6 +873,12 @@ function computeLayout(
         "rgba(0,0,0,0.15) 82%, " +
         "rgba(0,0,0,0.02) 95%, " +
         "transparent 100%)",
+      coverHaloMask:
+        "linear-gradient(to bottom, " +
+        "transparent 0%, " +
+        "rgba(0,0,0,0.12) 34%, " +
+        "rgba(0,0,0,0.72) 66%, " +
+        "#000 100%)",
       coverMaskComposite: "add",
       bgGradient:
         `linear-gradient(180deg, ` +
@@ -875,6 +931,10 @@ function computeLayout(
     coverMask:
       "linear-gradient(to right, transparent 0%, #000 4%, #000 65%, transparent 100%), " +
       "linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%)",
+    coverHaloMask:
+      "radial-gradient(closest-side at 50% 50%, " +
+      "transparent 0%, transparent 48%, " +
+      "rgba(0,0,0,0.58) 72%, #000 100%)",
     coverMaskComposite: "intersect",
     // 桌面 bg：模糊封面拉不到时的兜底纯色 gradient（采样色驱动）
     bgGradient:

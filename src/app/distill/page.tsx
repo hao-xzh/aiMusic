@@ -1001,6 +1001,7 @@ function TrackRow({
 }) {
   const active = player.current?.neteaseId === track.id;
   const isPlayingThis = active && player.isPlaying;
+  const rowBaseBg = active ? rowActiveBg(fg) : "rgba(255,255,255,0)";
 
   const onRowClick = () => {
     // 单击播放：active 行就 toggle，非 active 直接切歌
@@ -1033,17 +1034,24 @@ function TrackRow({
         padding: "7px 6px",
         boxSizing: "border-box",
         cursor: "pointer",
-        background: "transparent",
-        transition: "opacity 160ms ease",
+        borderRadius: 8,
+        background: rowBaseBg,
+        transition: "opacity 160ms ease, background 160ms ease",
         opacity: active ? 1 : 0.78,
         WebkitTapHighlightColor: "transparent",
         outline: "none",
       }}
       onMouseEnter={(e) => {
-        if (!active) e.currentTarget.style.opacity = "0.94";
+        if (!active) {
+          e.currentTarget.style.opacity = "0.94";
+          e.currentTarget.style.background = rowHoverBg(fg);
+        }
       }}
       onMouseLeave={(e) => {
-        if (!active) e.currentTarget.style.opacity = "0.78";
+        if (!active) {
+          e.currentTarget.style.opacity = "0.78";
+          e.currentTarget.style.background = "rgba(255,255,255,0)";
+        }
       }}
     >
       {/* 不再显示序号；左侧固定 12px 指示槽，active/inactive 不挤动文字。 */}
@@ -1175,6 +1183,18 @@ const playBtn = (fg: string): React.CSSProperties => ({
   transition: "transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
 });
 
+function rowActiveBg(fg: string): string {
+  return isDarkTextColor(fg) ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.08)";
+}
+
+function rowHoverBg(fg: string): string {
+  return isDarkTextColor(fg) ? "rgba(0,0,0,0.05)" : "rgba(255,255,255,0.055)";
+}
+
+function isDarkTextColor(fg: string): boolean {
+  return fg.startsWith("rgba(0,") || fg.startsWith("rgb(0,");
+}
+
 // ---------- 顶部按钮图标 ----------
 //
 // 视觉统一三件事：
@@ -1231,7 +1251,7 @@ function SparkIcon() {
 /** 顶部 floating 图标 —— 36x36 chip + 20x20 SVG（手指点更舒服，
  *  视觉也比 Mac 三键稍大一档），无 chip 背景，drop-shadow 兜底可读性。 */
 function chipStyle(fg: string): React.CSSProperties {
-  const isDarkText = fg.startsWith("rgba(0,") || fg.startsWith("rgb(0,");
+  const isDarkText = isDarkTextColor(fg);
   const shadow = isDarkText
     ? "drop-shadow(0 1px 4px rgba(255,255,255,0.6))"
     : "drop-shadow(0 1px 6px rgba(0,0,0,0.55))";
