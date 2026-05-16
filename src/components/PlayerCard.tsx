@@ -1347,8 +1347,7 @@ function MeasuredLyricColumn({
   const outerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const [translateY, setTranslateY] = useState(0);
-
-  useLayoutEffect(() => {
+  const measureAndPlace = useCallback(() => {
     const outer = outerRef.current;
     const inner = innerRef.current;
     if (!outer || !inner) return;
@@ -1361,7 +1360,29 @@ function MeasuredLyricColumn({
     const top = target.offsetTop;
     const h = target.offsetHeight;
     setTranslateY(containerH * focusFraction - top - h / 2);
-  }, [activeIdx, scrollIdx, children, focusFraction]);
+  }, [focusFraction]);
+
+  useLayoutEffect(() => {
+    measureAndPlace();
+  }, [activeIdx, scrollIdx, measureAndPlace]);
+
+  useLayoutEffect(() => {
+    const outer = outerRef.current;
+    if (!outer) return;
+    let timer: number | null = null;
+    const ro = new ResizeObserver(() => {
+      if (timer != null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        measureAndPlace();
+      }, 90);
+    });
+    ro.observe(outer);
+    return () => {
+      if (timer != null) window.clearTimeout(timer);
+      ro.disconnect();
+    };
+  }, [measureAndPlace]);
 
   return (
     <div ref={outerRef} style={outerStyle}>

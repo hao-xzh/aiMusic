@@ -11,9 +11,9 @@
  *
  * 实现要点：
  *   - 永远只渲染 prev / focused / next 三张 slot
- *   - prev 在轴上 translate(-size)，next 在 translate(+size) —— 切换时直接
- *     改 focusIdx，slots 走 380ms transition 平滑滑入
- *   - 拖动期间 transition 关掉、所有 slot 加上实时 drag delta；松手判定阈值
+ *   - vertical（desktop）走 Android cover-flow 的竖向版：上下邻张露出一截，
+ *     焦点封面 1.0 scale，邻张 0.86 scale + 轻微 rotateX。
+ *   - 拖动 / 滚轮期间 transition 关掉、所有 slot 加上实时 delta；松手判定阈值
  *   - 内置 ResizeObserver 拿到容器尺寸算 cover 边长，调用方不用传 size
  */
 import { cdn } from "@/lib/cdn";
@@ -39,6 +39,7 @@ const SWITCH_EASE = "cubic-bezier(0.22, 0.61, 0.36, 1)";
 const SWITCH_MS = 380;
 const DRAG_THRESHOLD_PX = 60;
 const FLICK_SPEED = 0.5; // px / ms
+const WHEEL_THRESHOLD_PX = 72;
 
 export function PlaylistPager({
   playlists,
@@ -58,8 +59,11 @@ export function PlaylistPager({
     delta: 0,
   });
   const startRef = useRef<{ p: number; t: number }>({ p: 0, t: 0 });
-  // 鼠标滚轮防抖
+  const pointerIdRef = useRef<number | null>(null);
+  // 鼠标滚轮累积 + 防抖
+  const wheelAccumRef = useRef(0);
   const wheelLockRef = useRef<number | null>(null);
+  const wheelResetRef = useRef<number | null>(null);
 
   // 自测自身尺寸：焦点封面边长 = 横向 → 容器宽；竖向 → 容器高 - 2*peek
   useEffect(() => {
@@ -81,31 +85,48 @@ export function PlaylistPager({
   const focused = playlists[focusIdx] ?? null;
   const prev = focusIdx > 0 ? playlists[focusIdx - 1] : null;
   const next = focusIdx < playlists.length - 1 ? playlists[focusIdx + 1] : null;
+  const axisStep = horizontal ? size : size * 0.76;
+  const threshold = Math.max(DRAG_THRESHOLD_PX, Math.min(120, axisStep * 0.22));
 
-  // ---- 触摸 ----
-  const onTouchStart = (e: React.TouchEvent) => {
-    const t = e.touches[0]!;
+  const finishDrag = (delta: number, dt: number) => {
+    const speed = Math.abs(delta) / Math.max(1, dt);
+    const triggered = Math.abs(delta) > threshold || speed > FLICK_SPEED;
+    if (triggered) {
+      if (delta < 0 && next) onChange(focusIdx + 1);
+      else if (delta > 0 && prev) onChange(focusIdx - 1);
+    }
+    setDrag({ active: false, delta: 0 });
+  };
+
+  // ---- 鼠标 / 触摸拖动 ----
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    pointerIdRef.current = e.pointerId;
+    e.currentTarget.setPointerCapture(e.pointerId);
     startRef.current = {
-      p: horizontal ? t.clientX : t.clientY,
+      p: horizontal ? e.clientX : e.clientY,
       t: Date.now(),
     };
     setDrag({ active: true, delta: 0 });
   };
-  const onTouchMove = (e: React.TouchEvent) => {
-    if (!drag.active) return;
-    const t = e.touches[0]!;
-    const cur = horizontal ? t.clientX : t.clientY;
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!drag.active || pointerIdRef.current !== e.pointerId) return;
+    const cur = horizontal ? e.clientX : e.clientY;
     setDrag({ active: true, delta: cur - startRef.current.p });
   };
-  const onTouchEnd = () => {
-    if (!drag.active) return;
-    const dt = Math.max(1, Date.now() - startRef.current.t);
-    const speed = Math.abs(drag.delta) / dt;
-    const triggered = Math.abs(drag.delta) > DRAG_THRESHOLD_PX || speed > FLICK_SPEED;
-    if (triggered) {
-      if (drag.delta < 0 && next) onChange(focusIdx + 1);
-      else if (drag.delta > 0 && prev) onChange(focusIdx - 1);
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!drag.active || pointerIdRef.current !== e.pointerId) return;
+    const dt = Date.now() - startRef.current.t;
+    pointerIdRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // 已被系统释放时忽略。
     }
+    finishDrag(drag.delta, dt);
+  };
+  const onPointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (pointerIdRef.current === e.pointerId) pointerIdRef.current = null;
     setDrag({ active: false, delta: 0 });
   };
 
@@ -113,13 +134,39 @@ export function PlaylistPager({
   const onWheel = (e: React.WheelEvent) => {
     if (horizontal) return;
     if (wheelLockRef.current !== null) return;
-    if (Math.abs(e.deltaY) < 20) return;
+    if (Math.abs(e.deltaY) < 2) return;
     e.preventDefault();
-    if (e.deltaY > 0 && next) onChange(focusIdx + 1);
-    else if (e.deltaY < 0 && prev) onChange(focusIdx - 1);
-    wheelLockRef.current = window.setTimeout(() => {
-      wheelLockRef.current = null;
-    }, SWITCH_MS + 30);
+    wheelAccumRef.current += e.deltaY;
+    const capped = Math.max(-threshold, Math.min(threshold, -wheelAccumRef.current));
+    setDrag({ active: true, delta: capped });
+
+    if (wheelResetRef.current !== null) clearTimeout(wheelResetRef.current);
+    const reached = Math.abs(wheelAccumRef.current) >= WHEEL_THRESHOLD_PX;
+    if (reached) {
+      const direction = wheelAccumRef.current > 0 ? 1 : -1;
+      const canMove = direction > 0 ? !!next : !!prev;
+      if (canMove) {
+        wheelLockRef.current = window.setTimeout(() => {
+          wheelLockRef.current = null;
+        }, SWITCH_MS + 80);
+        window.setTimeout(() => {
+          onChange(focusIdx + direction);
+          setDrag({ active: false, delta: 0 });
+          wheelAccumRef.current = 0;
+        }, 70);
+      } else {
+        wheelResetRef.current = window.setTimeout(() => {
+          wheelAccumRef.current = 0;
+          setDrag({ active: false, delta: 0 });
+        }, 130);
+      }
+      return;
+    }
+
+    wheelResetRef.current = window.setTimeout(() => {
+      wheelAccumRef.current = 0;
+      setDrag({ active: false, delta: 0 });
+    }, 140);
   };
 
   useEffect(() => {
@@ -127,35 +174,24 @@ export function PlaylistPager({
       if (wheelLockRef.current !== null) {
         clearTimeout(wheelLockRef.current);
       }
+      if (wheelResetRef.current !== null) {
+        clearTimeout(wheelResetRef.current);
+      }
     };
   }, []);
 
-  // 每个 slot 的 translate（轴向上的位置）
-  const trans = (offset: -1 | 0 | 1): string => {
-    const base = offset * size;
-    const dragDelta = drag.active ? drag.delta : 0;
-    const total = base + dragDelta;
-    return horizontal ? `translateX(${total}px)` : `translateY(${total}px)`;
-  };
-
-  // 透明度：拖动时按位移给"邻张渐显"反馈
-  const opa = (offset: -1 | 0 | 1): number => {
-    if (!drag.active) return offset === 0 ? 1 : peek > 0 ? 0.34 : 0;
-    const t = Math.max(-1, Math.min(1, drag.delta / size));
-    if (offset === 0) return Math.max(0.5, 1 - Math.abs(t) * 0.4);
-    if ((offset === -1 && t > 0) || (offset === 1 && t < 0)) {
-      // 朝邻张拖时它渐显
-      return 0.32 + Math.abs(t) * 0.6;
-    }
-    return Math.max(0.05, 0.32 - Math.abs(t) * 0.27);
+  const visualOffset = (offset: -1 | 0 | 1): number => {
+    const dragUnit = drag.active ? drag.delta / axisStep : 0;
+    return offset + dragUnit;
   };
 
   return (
     <div
       ref={containerRef}
-      onTouchStart={onTouchStart}
-      onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
       onWheel={onWheel}
       style={{
         position: "relative",
@@ -166,15 +202,18 @@ export function PlaylistPager({
         touchAction: horizontal ? "pan-y" : "none",
         overflow: "hidden",
         userSelect: "none",
+        cursor: drag.active ? "grabbing" : "grab",
+        perspective: horizontal ? "1200px" : "900px",
       }}
     >
       {prev && (
         <Slot
           playlist={prev}
-          translate={trans(-1)}
-          opacity={opa(-1)}
+          visualOffset={visualOffset(-1)}
+          axisStep={axisStep}
           size={size}
           isFocused={false}
+          horizontal={horizontal}
           dragging={drag.active}
           mask={mask}
           maskComposite={maskComposite}
@@ -184,10 +223,11 @@ export function PlaylistPager({
       {focused && (
         <Slot
           playlist={focused}
-          translate={trans(0)}
-          opacity={opa(0)}
+          visualOffset={visualOffset(0)}
+          axisStep={axisStep}
           size={size}
           isFocused
+          horizontal={horizontal}
           dragging={drag.active}
           mask={mask}
           maskComposite={maskComposite}
@@ -196,10 +236,11 @@ export function PlaylistPager({
       {next && (
         <Slot
           playlist={next}
-          translate={trans(1)}
-          opacity={opa(1)}
+          visualOffset={visualOffset(1)}
+          axisStep={axisStep}
           size={size}
           isFocused={false}
+          horizontal={horizontal}
           dragging={drag.active}
           mask={mask}
           maskComposite={maskComposite}
@@ -212,26 +253,38 @@ export function PlaylistPager({
 
 function Slot({
   playlist,
-  translate,
-  opacity,
+  visualOffset,
+  axisStep,
   size,
   isFocused,
+  horizontal,
   dragging,
   mask,
   maskComposite,
   onClick,
 }: {
   playlist: PlaylistInfo;
-  translate: string;
-  opacity: number;
+  visualOffset: number;
+  axisStep: number;
   size: number;
   isFocused: boolean;
+  horizontal: boolean;
   dragging: boolean;
   mask?: string;
   maskComposite?: "intersect" | "add";
   onClick?: () => void;
 }) {
   const cover = playlist.coverImgUrl;
+  const absOffset = Math.min(1, Math.abs(visualOffset));
+  const translatePx = visualOffset * axisStep;
+  const translate = horizontal
+    ? `translate3d(${translatePx}px, 0, 0)`
+    : `translate3d(0, ${translatePx}px, 0)`;
+  const scale = 1 - absOffset * 0.14;
+  const opacity = 1 - absOffset * 0.4;
+  const rotate = horizontal
+    ? `rotateY(${visualOffset * 24}deg)`
+    : `rotateX(${-visualOffset * 18}deg)`;
   // 焦点封面用调用方给的 mask（跟歌词页一样的 4 向 / 底部渐隐）。
   // 邻张 / 拖动中的非焦点 slot 不上 mask —— 它需要边界清楚才像"另一张唱片"
   const slotMask = isFocused ? mask : undefined;
@@ -248,14 +301,14 @@ function Slot({
         height: size,
         marginTop: -size / 2,
         marginLeft: -size / 2,
-        transform: `${translate} ${isFocused ? "" : "scale(0.92)"}`,
+        transform: `${translate} ${rotate} scale(${scale})`,
         opacity,
         transition: dragging
           ? "none"
           : `transform ${SWITCH_MS}ms ${SWITCH_EASE}, opacity 320ms ease`,
         cursor: isFocused ? "default" : "pointer",
         willChange: "transform, opacity",
-        zIndex: isFocused ? 2 : 1,
+        zIndex: Math.round(10 - absOffset * 4),
         // mask 挂在外层 div，而不是 img 上 —— 这样 borderRadius 跟 mask 共存不会冲突
         ...(slotMask
           ? {
@@ -285,8 +338,8 @@ function Slot({
             userSelect: "none",
             borderRadius: isFocused ? 0 : 12,
             boxShadow: isFocused
-              ? "none"
-              : "0 12px 30px rgba(0,0,0,0.5), 0 4px 10px rgba(0,0,0,0.32)",
+              ? "0 24px 80px rgba(0,0,0,0.34), 0 0 0 1px rgba(255,255,255,0.08)"
+              : "0 16px 44px rgba(0,0,0,0.46), 0 4px 12px rgba(0,0,0,0.28)",
           }}
         />
       ) : (

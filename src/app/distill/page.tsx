@@ -628,9 +628,6 @@ function ImmersiveLayout({
             focusIdx={focusIdx}
             onChange={onFocusChange}
             orientation="vertical"
-            peek={0}
-            mask={COVER_MASK_DESKTOP}
-            maskComposite="intersect"
           />
         </div>
         {focused && (
