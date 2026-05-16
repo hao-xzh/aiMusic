@@ -8,7 +8,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -40,8 +39,6 @@ fun DotField(
     count: Int = 300,
     modifier: Modifier = Modifier,
 ) {
-    val amp by Amp.flow.collectAsState()
-
     // 当前 canvas 尺寸（px）
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
 
@@ -58,7 +55,7 @@ fun DotField(
         particles.ensure(canvasSize.width.toFloat(), canvasSize.height.toFloat())
 
         var lastNs = 0L
-        while (true) {
+        while (playing || visAlpha >= 0.005f || smoothAmp >= 0.005f) {
             withFrameNanos { ns ->
                 val dt = if (lastNs == 0L) 0.016f else min(0.05f, (ns - lastNs) / 1_000_000_000f)
                 lastNs = ns
@@ -67,7 +64,7 @@ fun DotField(
                 val target = if (playing) 1f else 0f
                 visAlpha += (target - visAlpha) * min(1f, dt * 4f)
 
-                val rawAmp = amp
+                val rawAmp = Amp.flow.value
                 smoothAmp += (rawAmp - smoothAmp) * min(1f, dt * 7f)
 
                 if (visAlpha >= 0.005f && canvasSize.width > 0 && canvasSize.height > 0) {

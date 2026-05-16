@@ -79,12 +79,13 @@ fun PipoNativeApp() {
             if ((immersive && !isLandscape) || route != Route.Player) coverAnchor.releaseCoverRect()
         }
 
-        // 进入沉浸式歌词页时给 window 加 FLAG_KEEP_SCREEN_ON，退出时立刻清掉。
+        // 播放页 / 歌词页保持屏幕常亮；用户手动电源键锁屏仍由系统处理。
         // DisposableEffect 的 onDispose 在整个 composable 被销毁时也会清理，防止 leak。
         val view = LocalView.current
-        DisposableEffect(immersive) {
+        val keepScreenOn = route == Route.Player
+        DisposableEffect(keepScreenOn) {
             val window = (view.context as? Activity)?.window
-            if (immersive) {
+            if (keepScreenOn) {
                 window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             } else {
                 window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -176,8 +177,8 @@ fun PipoNativeApp() {
                 // 后台蒸馏的浮条 —— 跨所有 route 都可见，不阻碍交互
                 DistillStatusChip()
 
-                // 全局 AiPet（仅在 Player root + 非沉浸式时显示）
-                if (route == Route.Player && !immersive) {
+                // 全局 AiPet（仅在 Player root + 非沉浸式 + 竖屏时显示）
+                if (route == Route.Player && !immersive && !isLandscape) {
                     val state = viewModel.state
                     val currentTrack = state.queue.getOrNull(state.currentIndex)
                     NativeAiPet(

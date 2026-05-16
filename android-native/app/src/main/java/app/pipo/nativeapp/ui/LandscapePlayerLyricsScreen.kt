@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,7 +18,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
@@ -34,6 +35,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -72,6 +74,7 @@ internal fun LandscapePlayerLyricsScreen(
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
     val seamColor = rgbToColor(edges.right, fallback = PipoColors.Bg1)
+    val density = LocalDensity.current
 
     Box(modifier = Modifier.fillMaxSize()) {
         ImmersiveBackdrop(progress = 1f, coverUrl = coverUrl)
@@ -80,6 +83,8 @@ internal fun LandscapePlayerLyricsScreen(
             modifier = Modifier.fillMaxSize(),
         ) {
             val coverSide = maxHeight
+            val statusTopPadding = with(density) { WindowInsets.statusBars.getTop(this).toDp() }
+            val compactStatusTopPadding = maxOf(0.dp, statusTopPadding - 6.dp)
             Row(modifier = Modifier.fillMaxSize()) {
                 LandscapeCoverPane(
                     coverUrl = coverUrl,
@@ -93,9 +98,8 @@ internal fun LandscapePlayerLyricsScreen(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .statusBarsPadding()
                         .navigationBarsPadding()
-                        .padding(start = 10.dp, end = 26.dp, top = 4.dp, bottom = 2.dp),
+                        .padding(start = 10.dp, end = 26.dp, top = compactStatusTopPadding, bottom = 0.dp),
                 ) {
                     LandscapeTrackHeader(
                         title = title,
@@ -117,6 +121,13 @@ internal fun LandscapePlayerLyricsScreen(
                         fgUnsung = fgUnsung,
                         onSeekToMs = onSeekToMs,
                         horizontalPadding = 0.dp,
+                        rowMinHeight = 52.dp,
+                        rowVerticalPadding = 6.dp,
+                        lyricFontSize = 25.sp,
+                        lyricLineHeight = 39.sp,
+                        lyricFontWeight = FontWeight.ExtraBold,
+                        bottomFadeStart = 0.90f,
+                        bottomFadeSoftEnd = 0.98f,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth(),
@@ -217,10 +228,9 @@ private fun LandscapeTrackHeader(
             text = title.ifBlank { "—" },
             color = fg,
             style = TextStyle(
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 0.sp,
-                lineHeight = 23.sp,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = (-0.2).sp,
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -232,7 +242,7 @@ private fun LandscapeTrackHeader(
                 if (album.isNotBlank()) append(" · $album")
             }.ifBlank { " " },
             color = fgDim,
-            style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium, lineHeight = 15.sp),
+            style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -256,8 +266,8 @@ private fun LandscapeBottomControls(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 62.dp)
-            .padding(top = 16.dp),
+            .heightIn(min = 54.dp)
+            .padding(top = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -265,6 +275,8 @@ private fun LandscapeBottomControls(
         PipoProgressBar(
             progress = progress,
             onSeek = onSeek,
+            trackColor = fg.copy(alpha = 0.18f),
+            fillColor = fg,
             modifier = Modifier.weight(1f),
         )
         LandscapeTimeText((durationMs - positionMs).coerceAtLeast(0L), fgDim, prefix = "-")

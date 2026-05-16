@@ -442,6 +442,8 @@ internal fun PipoProgressBar(
     progress: Float,
     onSeek: (Float) -> Unit,
     modifier: Modifier = Modifier,
+    trackColor: Color = Color(0x1FE9EFFF),
+    fillColor: Color = Color(0xEBF5F7FF),
 ) {
     var draggingProgress by remember { mutableStateOf<Float?>(null) }
     val displayProgress = (draggingProgress ?: progress).coerceIn(0f, 1f)
@@ -484,14 +486,14 @@ internal fun PipoProgressBar(
                 .fillMaxWidth()
                 .height(4.dp)
                 .clip(RoundedCornerShape(50))
-                .background(Color(0x1FE9EFFF)),
+                .background(trackColor),
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth(fraction = animated)
                     .height(4.dp)
                     .clip(RoundedCornerShape(50))
-                    .background(Color(0xEBF5F7FF)),
+                    .background(fillColor),
             )
         }
     }

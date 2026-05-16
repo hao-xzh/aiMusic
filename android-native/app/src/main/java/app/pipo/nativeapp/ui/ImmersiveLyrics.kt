@@ -73,6 +73,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricChar
@@ -377,6 +378,13 @@ internal fun AppleMusicLyricColumn(
     onSeekToMs: (Long) -> Unit,
     modifier: Modifier = Modifier,
     horizontalPadding: Dp = 24.dp,
+    rowMinHeight: Dp = 60.dp,
+    rowVerticalPadding: Dp = 8.dp,
+    lyricFontSize: TextUnit = 28.sp,
+    lyricLineHeight: TextUnit = 44.sp,
+    lyricFontWeight: FontWeight = FontWeight.ExtraBold,
+    bottomFadeStart: Float = 0.80f,
+    bottomFadeSoftEnd: Float = 0.94f,
 ) {
     // 把 player 的 30Hz tick 平滑成按帧位置（120Hz 屏丝滑度提升关键）
     val smoothedPositionMs by rememberSmoothPositionMs(positionMs, isPlaying)
@@ -405,7 +413,6 @@ internal fun AppleMusicLyricColumn(
     // contentPadding.top = 容器高度 18%：活动行落在偏上一点的位置（更接近 Apple Music
     // 那种"焦点行靠上 1/4"的视觉重心），上方 fade 区给得更狠。
     val density = LocalDensity.current
-    val rowHeightDp = 60.dp
     var containerHeightPx by remember { mutableStateOf(0) }
 
     val listState = rememberLazyListState()
@@ -492,6 +499,8 @@ internal fun AppleMusicLyricColumn(
     // 上方留 11%（约 1 行 + 少量呼吸空间），让活动行上方只露出 1 句历史歌词
     val topPadDp = with(density) { (containerHeightPx * 0.11f).toDp() }
     val bottomPadDp = with(density) { (containerHeightPx * 0.89f).toDp() }
+    val bottomSolidStop = bottomFadeStart.coerceIn(0.60f, 0.96f)
+    val bottomSoftStop = bottomFadeSoftEnd.coerceIn(bottomSolidStop, 0.99f)
 
     Box(
         modifier = modifier
@@ -508,8 +517,8 @@ internal fun AppleMusicLyricColumn(
                             0.05f to Color.Black.copy(alpha = 0.10f),
                             0.10f to Color.Black.copy(alpha = 0.50f),
                             0.14f to Color.Black,
-                            0.80f to Color.Black,
-                            0.94f to Color.Black.copy(alpha = 0.4f),
+                            bottomSolidStop to Color.Black,
+                            bottomSoftStop to Color.Black.copy(alpha = 0.4f),
                             1f to Color.Transparent,
                         ),
                     ),
@@ -586,7 +595,7 @@ internal fun AppleMusicLyricColumn(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = rowHeightDp)
+                        .heightIn(min = rowMinHeight)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
@@ -607,6 +616,10 @@ internal fun AppleMusicLyricColumn(
                         positionMs = if (isManualFocusLine) completedLinePositionMs(line) else smoothedPositionMs,
                         fg = fg,
                         fgUnsung = fgUnsung,
+                        fontSize = lyricFontSize,
+                        lineHeight = lyricLineHeight,
+                        fontWeight = lyricFontWeight,
+                        verticalPadding = rowVerticalPadding,
                     )
                 }
             }
@@ -629,6 +642,10 @@ private fun AppleMusicLyricRow(
     positionMs: Long,
     fg: Color,
     fgUnsung: Color,
+    fontSize: TextUnit,
+    lineHeight: TextUnit,
+    fontWeight: FontWeight,
+    verticalPadding: Dp,
 ) {
     var wasActive by remember(line.startMs) { mutableStateOf(isActive) }
     var becamePastAtRealtime by remember(line.startMs) { mutableStateOf<Long?>(null) }
@@ -732,10 +749,10 @@ private fun AppleMusicLyricRow(
     //   都生效（紧凑）。Active 第一个字符颜色一变 → run 数增多 → run 间不应用 letter-spacing
     //   → 整行变宽几像素，看起来"右边抖一下"。letterSpacing = 0 让两态宽度一致。
     val style = TextStyle(
-        fontSize = 28.sp,
+        fontSize = fontSize,
         // ExtraBold (800) 比 Black (900) 细一度，视觉上不那么"压迫"，更接近 Apple Music
-        fontWeight = FontWeight.ExtraBold,
-        lineHeight = 44.sp,
+        fontWeight = fontWeight,
+        lineHeight = lineHeight,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
             trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
@@ -787,7 +804,7 @@ private fun AppleMusicLyricRow(
             }
             // Modifier.blur 在 API 31+ 生效；旧版本静默忽略，不影响其他动效。
             .blur(rowBlurDp.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
-            .padding(vertical = 8.dp),
+            .padding(vertical = verticalPadding),
     ) {
         Text(
             text = line.text,
@@ -999,6 +1016,8 @@ private data class LyricDrawUnit(
     val line: Int,
     val left: Float,
     val right: Float,
+    val inkLeft: Float,
+    val inkRight: Float,
     val segmentStartProgress: Float,
     val segmentEndProgress: Float,
 )
@@ -1045,13 +1064,24 @@ private fun addLyricDrawUnit(
 ) {
     var left = Float.POSITIVE_INFINITY
     var right = Float.NEGATIVE_INFINITY
+    var inkLeft = Float.POSITIVE_INFINITY
+    var inkRight = Float.NEGATIVE_INFINITY
+    val text = layout.layoutInput.text.text
     for (i in start until end) {
         val box = layout.getBoundingBox(i)
         if (box.right <= box.left) continue
         left = minOf(left, box.left)
         right = maxOf(right, box.right)
+        if (!text[i].isWhitespace()) {
+            inkLeft = minOf(inkLeft, box.left)
+            inkRight = maxOf(inkRight, box.right)
+        }
     }
     if (left.isFinite() && right.isFinite() && right > left) {
+        if (!inkLeft.isFinite() || !inkRight.isFinite() || inkRight <= inkLeft) {
+            inkLeft = left
+            inkRight = right
+        }
         val tokenLength = (tokenEnd - tokenStart).coerceAtLeast(1)
         val startProgress = ((start - tokenStart).toFloat() / tokenLength.toFloat()).coerceIn(0f, 1f)
         val endProgress = ((end - tokenStart).toFloat() / tokenLength.toFloat()).coerceIn(startProgress, 1f)
@@ -1061,6 +1091,8 @@ private fun addLyricDrawUnit(
                 line = line,
                 left = left,
                 right = right,
+                inkLeft = inkLeft,
+                inkRight = inkRight,
                 segmentStartProgress = startProgress,
                 segmentEndProgress = endProgress,
             ),
@@ -1101,6 +1133,7 @@ private fun DrawScope.drawPerCharLiftedSweep(
     val liftPeakPx = (-0.95f).dp.toPx() * envelope
 
     val fadeWidthPx = 6.dp.toPx()
+    val glyphEdgeOverdrawPx = 5.dp.toPx()
 
     for (idx in units.indices) {
         val unit = units[idx]
@@ -1112,20 +1145,20 @@ private fun DrawScope.drawPerCharLiftedSweep(
 
         // 按视觉单元 clip，而不是按单个字母 clip：
         // 英文单词会作为一个整体上浮和重绘，避免字母之间因 clip 边缘抗锯齿出现裂缝。
-        // 左右边界使用相邻视觉单元之间的空白中线，避免上一版 padding 造成首尾双层叠色。
+        // 字形真实 ink 会略微超出 advance box，j/y/w 这类首尾字母尤其明显；这里只向
+        // 单词外侧的空白/行外借一点绘制安全区。英文空格会附在前一个 token 末尾，
+        // 所以当前词向左借位时只允许借到 previous.inkRight 之后，不侵入前一个真实字形。
         // lineHeight 44sp > fontSize 28sp，行 box 内部上下各 ~8sp 空白能吸收 ±dp 位移。
         val previous = units.getOrNull(idx - 1)?.takeIf { it.line == unit.line }
         val next = units.getOrNull(idx + 1)?.takeIf { it.line == unit.line }
-        val gapToPrevious = if (previous != null) unit.left - previous.right else 0f
-        val gapToNext = if (next != null) next.left - unit.right else 0f
         val clipLeft = when {
-            previous == null -> layout.getLineLeft(unit.line)
-            gapToPrevious >= 0f -> previous.right + gapToPrevious / 2f
+            previous == null -> layout.getLineLeft(unit.line) - glyphEdgeOverdrawPx
+            unit.left > previous.inkRight -> maxOf(previous.inkRight, unit.left - glyphEdgeOverdrawPx)
             else -> unit.left
         }
         val clipRight = when {
-            next == null -> layout.getLineRight(unit.line)
-            gapToNext >= 0f -> unit.right + gapToNext / 2f
+            next == null -> layout.getLineRight(unit.line) + glyphEdgeOverdrawPx
+            next.inkLeft > unit.right -> minOf(next.inkLeft, unit.right + glyphEdgeOverdrawPx)
             else -> unit.right
         }
         clipRect(
@@ -1139,7 +1172,11 @@ private fun DrawScope.drawPerCharLiftedSweep(
         }
         if (segmentProgress > 0f) {
             val sweepX = unit.left + (unit.right - unit.left) * segmentProgress
-            val sungRight = sweepX.coerceIn(clipLeft, clipRight)
+            val sungRight = if (segmentProgress >= 1f) {
+                clipRight
+            } else {
+                sweepX.coerceIn(clipLeft, clipRight)
+            }
             if (sungRight > clipLeft) {
                 clipRect(
                     left = clipLeft,
