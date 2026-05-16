@@ -579,9 +579,9 @@ function FloatingTopBar({
   const isWin = platform === "windows";
   const isAndroid = platform === "android";
   const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
-  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "52px";
-  const contentTop = isAndroid ? safeTop : "0px";
-  const leftInset = isMac ? 124 : 18;
+  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "40px";
+  const contentTop = isAndroid ? safeTop : "4px";
+  const leftInset = isMac ? 112 : 18;
   const rightInset = isWin ? 158 : 24;
   return (
     <div
@@ -609,8 +609,8 @@ function FloatingTopBar({
           minWidth: 0,
           display: "flex",
           alignItems: "center",
-          gap: 10,
-          height: 38,
+          gap: 9,
+          height: 30,
         }}
       >
         <button
@@ -625,7 +625,7 @@ function FloatingTopBar({
           style={{
             minWidth: 0,
             color: fg,
-            fontSize: 14,
+            fontSize: 13,
             fontWeight: 650,
             letterSpacing: 0.2,
             whiteSpace: "nowrap",
@@ -1443,7 +1443,7 @@ function isDarkTextColor(fg: string): boolean {
 //      - Profile：心形+点已经填得够，保持
 //      - Gear：齿轮太密，缩小到 ~17x17 + 居中，跟其它三个齐平
 const TOP_ICON_SW = 1.85;
-const TOP_ICON_SIZE = 20;
+const TOP_ICON_SIZE = 18;
 
 function BackIcon() {
   return (
@@ -1490,9 +1490,9 @@ function chipStyle(fg: string): React.CSSProperties {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: 34,
-    height: 34,
-    borderRadius: 9,
+    width: 30,
+    height: 30,
+    borderRadius: 8,
     border: "none",
     background: "transparent",
     color: fg,

@@ -634,14 +634,14 @@ function ImmersiveLyrics({
             ...layout.cover,
             zIndex: 1,
             pointerEvents: "none",
-            opacity: layout.isDesktop ? 0.56 : 0.36,
+            opacity: layout.isDesktop ? 0 : 0.36,
             backgroundImage: `url(${coverUrl})`,
             backgroundSize: "cover",
             backgroundPosition: "center",
             filter: layout.isDesktop
-              ? "blur(56px) saturate(1.24) brightness(1.02)"
+              ? "blur(64px) saturate(1.2) brightness(1.02)"
               : "blur(34px) saturate(1.16) brightness(1.02)",
-            transform: layout.isDesktop ? "scale(1.16)" : "scale(1.08)",
+            transform: layout.isDesktop ? "scale(1.22)" : "scale(1.08)",
             transformOrigin: "center",
             WebkitMaskImage: layout.coverHaloMask,
             maskImage: layout.coverHaloMask,
@@ -693,6 +693,12 @@ function ImmersiveLyrics({
               height: "100%",
               objectFit: "cover",
               display: "block",
+              ...(layout.coverImageMask
+                ? {
+                    WebkitMaskImage: layout.coverImageMask,
+                    maskImage: layout.coverImageMask,
+                  }
+                : {}),
               transform: isPlaying ? "scale(1.012)" : "scale(1)",
               transition: "transform 4000ms ease-in-out",
               willChange: "transform",
@@ -820,6 +826,7 @@ type ImmersiveLayout = {
   lyric: Pos;
   // 封面 mask（可能是单条或多条 linear-gradient 组合）
   coverMask: string;
+  coverImageMask?: string;
   coverHaloMask: string;
   // 多 mask 时用 "intersect" 求交；单 mask 默认 "add"
   coverMaskComposite: "intersect" | "add";
@@ -927,30 +934,45 @@ function computeLayout(
       width: `calc(100vw - ${lyricLeft} - ${lyricRight})`,
       height: "84vh",
     },
-    // 桌面四向 mask：左右上下边界都归零到 transparent，中间保留主体。
-    // 左 / 下 fade 更长：截图里这两侧最容易出现色带，必须更早退场。
-    // 右侧靠近歌词区也保留长 fade，避免封面矩形边缘压到歌词背景上。
+    // 桌面封面：保持主体清晰，只拉长上 / 左 / 右边缘退场。
+    // 底部沿用较长退场，避免重新引入底部硬边。
     coverMask:
-      "linear-gradient(to right, " +
-      "transparent 0%, rgba(0,0,0,0.06) 4%, rgba(0,0,0,0.28) 10%, rgba(0,0,0,0.68) 18%, #000 28%, " +
-      "#000 50%, rgba(0,0,0,0.72) 63%, rgba(0,0,0,0.22) 76%, transparent 90%, transparent 100%), " +
-      "linear-gradient(to bottom, " +
-      "transparent 0%, rgba(0,0,0,0.5) 6%, #000 12%, #000 70%, rgba(0,0,0,0.82) 78%, rgba(0,0,0,0.55) 86%, rgba(0,0,0,0.24) 94%, transparent 100%)",
-    coverHaloMask:
-      "radial-gradient(ellipse 118% 108% at 40% 60%, " +
-      "transparent 0%, transparent 30%, " +
-      "rgba(0,0,0,0.42) 54%, " +
-      "rgba(0,0,0,0.30) 82%, " +
+      "linear-gradient(180deg, " +
+      "transparent 0%, " +
+      "rgba(0,0,0,0.18) 7%, " +
+      "rgba(0,0,0,0.42) 14%, " +
+      "rgba(0,0,0,0.74) 21%, " +
+      "#000 25%, " +
+      "#000 70%, " +
+      "rgba(0,0,0,0.78) 78%, " +
+      "rgba(0,0,0,0.38) 88%, " +
+      "rgba(0,0,0,0.10) 95%, " +
       "transparent 100%)",
-    coverMaskComposite: "intersect",
-    // 桌面 bg：模糊封面拉不到时的兜底纯色 gradient（采样色驱动）
+    coverImageMask:
+      "linear-gradient(90deg, " +
+      "transparent 0%, " +
+      "rgba(0,0,0,0.16) 7%, " +
+      "rgba(0,0,0,0.42) 14%, " +
+      "rgba(0,0,0,0.74) 21%, " +
+      "#000 25%, " +
+      "#000 75%, " +
+      "rgba(0,0,0,0.86) 81%, " +
+      "rgba(0,0,0,0.58) 89%, " +
+      "rgba(0,0,0,0.22) 96%, " +
+      "transparent 100%)",
+    coverHaloMask:
+      "radial-gradient(ellipse 74% 78% at 48% 48%, " +
+      "transparent 0%, transparent 36%, " +
+      "rgba(0,0,0,0.24) 54%, " +
+      "rgba(0,0,0,0.16) 70%, " +
+      "transparent 82%, " +
+      "transparent 100%)",
+    coverMaskComposite: "add",
+    // 桌面 bg：只用 soft radial，不在封面 left/right/top/bottom 位置设置线性 stop。
     bgGradient:
-      `linear-gradient(90deg, ` +
-      `rgb(${leftRgb}) 0px, ` +
-      `rgb(${leftRgb}) ${left}, ` +
-      `rgb(${seamRgb}) calc(${left} + ${W} * 0.28), ` +
-      `rgb(${rightRgb}) calc(${left} + ${W}), ` +
-      `rgb(${rightRgb}) 100%)`,
+      `radial-gradient(95% 120% at 18% 52%, rgba(${leftRgb},0.38), rgba(${leftRgb},0) 72%), ` +
+      `radial-gradient(110% 95% at 42% 86%, rgba(${seamRgb},0.34), rgba(${seamRgb},0) 76%), ` +
+      `radial-gradient(105% 110% at 74% 34%, rgba(${rightRgb},0.30), rgba(${rightRgb},0) 74%)`,
     fgColor,
     fgDimColor,
     isDesktop: true,
