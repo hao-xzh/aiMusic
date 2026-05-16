@@ -21,10 +21,15 @@ import kotlinx.coroutines.withContext
 /**
  * 封面边缘色采样 + 明暗判断 —— 镜像 src/lib/cover-color.ts。
  *
- *   - 顶 / 底 / 右三边各采样 5px，平均 RGB
+ *   - 顶 / 底 / 左 / 右边各采样 5px，平均 RGB
  *   - luma 145 阈值 → "dark"（用深色文字）/ "light"（用浅色文字）
  */
-data class EdgeColors(val top: IntArray?, val bottom: IntArray?, val right: IntArray?) {
+data class EdgeColors(
+    val top: IntArray?,
+    val bottom: IntArray?,
+    val right: IntArray?,
+    val left: IntArray? = null,
+) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
 }
@@ -97,8 +102,9 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
     val top = avg(0, 5)
     val bottom = avg(h - 5, h)
     val right = avg(0, h, w - 5, w)
+    val left = avg(0, h, 0, 5)
     if (small !== bitmap) small.recycle()
-    return EdgeColors(top, bottom, right)
+    return EdgeColors(top, bottom, right, left)
 }
 
 fun computeTone(rgb: IntArray?): Tone {

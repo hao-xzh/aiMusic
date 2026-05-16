@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
@@ -73,11 +74,15 @@ internal fun LandscapePlayerLyricsScreen(
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
-    val seamColor = rgbToColor(edges.right, fallback = PipoColors.Bg1)
+    val landscapeAccent = rgbToColor(edges.right ?: edges.top ?: edges.left ?: edges.bottom, fallback = PipoColors.Bg1)
+    val seamColor = landscapeAccent
     val density = LocalDensity.current
 
     Box(modifier = Modifier.fillMaxSize()) {
-        ImmersiveBackdrop(progress = 1f, coverUrl = coverUrl)
+        LandscapeBackdrop(
+            accentColor = landscapeAccent,
+            edgeColor = landscapeAccent,
+        )
 
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize(),
@@ -150,6 +155,60 @@ internal fun LandscapePlayerLyricsScreen(
             }
         }
     }
+}
+
+@Composable
+private fun LandscapeBackdrop(
+    accentColor: Color,
+    edgeColor: Color,
+) {
+    val seamAccent = lerp(accentColor, Color.Black, 0.10f)
+    val panelAccent = lerp(accentColor, Color.Black, 0.22f)
+    val farAccent = lerp(accentColor, Color(0xFF10131B), 0.32f)
+    val quietEdge = lerp(edgeColor, panelAccent, 0.34f)
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.horizontalGradient(
+                    colorStops = arrayOf(
+                        0.0f to seamAccent,
+                        0.42f to seamAccent,
+                        0.76f to panelAccent,
+                        1.0f to farAccent,
+                    ),
+                ),
+            )
+            .drawWithContent {
+                drawContent()
+                val w = size.width
+                val h = size.height
+                val maxDim = kotlin.math.max(w, h)
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(accentColor.copy(alpha = 0.26f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(w * 0.22f, h * 0.22f),
+                        radius = maxDim * 0.90f,
+                    ),
+                    radius = maxDim,
+                    center = androidx.compose.ui.geometry.Offset(w * 0.22f, h * 0.22f),
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(quietEdge.copy(alpha = 0.14f), Color.Transparent),
+                        center = androidx.compose.ui.geometry.Offset(w * 0.88f, h * 0.26f),
+                        radius = maxDim * 0.78f,
+                    ),
+                    radius = maxDim,
+                    center = androidx.compose.ui.geometry.Offset(w * 0.88f, h * 0.26f),
+                )
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.08f)),
+                    ),
+                )
+            },
+    )
 }
 
 @Composable
