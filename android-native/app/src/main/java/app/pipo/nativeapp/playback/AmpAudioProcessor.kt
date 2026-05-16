@@ -24,12 +24,13 @@ class AmpAudioProcessor : BaseAudioProcessor() {
     private var inputChannelCount: Int = 0
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        // 非 PCM 不接管 —— 抛 UnhandledAudioFormatException 让 sink 跳过这层处理器
+        // 非常规 PCM 不接管。这里是视觉用的旁路 RMS，不应该因为某首歌的输出格式
+        // 不在白名单里把播放链路带崩；返回 NOT_SET 让 Media3 跳过这层处理器。
         when (inputAudioFormat.encoding) {
             androidx.media3.common.C.ENCODING_PCM_16BIT,
             androidx.media3.common.C.ENCODING_PCM_24BIT,
             androidx.media3.common.C.ENCODING_PCM_FLOAT -> Unit
-            else -> throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
+            else -> return AudioProcessor.AudioFormat.NOT_SET
         }
         inputEncoding = inputAudioFormat.encoding
         inputChannelCount = inputAudioFormat.channelCount.coerceAtLeast(1)
@@ -41,7 +42,7 @@ class AmpAudioProcessor : BaseAudioProcessor() {
         val pos = inputBuffer.position()
         val limit = inputBuffer.limit()
 
-        val rms = computeRms(inputBuffer, pos, limit)
+        val rms = runCatching { computeRms(inputBuffer, pos, limit) }.getOrDefault(0f)
         // React 端 baseAlpha 0.42 + amp 0.3 系数，amp 大致在 0..1
         // 这里直接把 RMS 归一化到 0..1 写进去，AiPet / DotField 自己再二阶平滑
         Amp.set(rms.coerceIn(0f, 1f))

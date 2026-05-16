@@ -2,6 +2,9 @@ package app.pipo.nativeapp.playback
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -27,6 +30,9 @@ import androidx.media3.session.MediaSessionService
 @UnstableApi
 class PipoPlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+    private var notificationPlayer: RecoveringNotificationPlayer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var lastKeepAlivePrepareAtMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -90,6 +96,32 @@ class PipoPlaybackService : MediaSessionService() {
                         // 恢复策略统一放在 PlayerViewModel。Service 层只记录底层错误，
                         // 避免这里 seek/prepare/play 和 ViewModel 的 URL 重签互相抢状态。
                         Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
+                        notificationPlayer?.armRecoveryWindow()
+                        keepMediaNotificationAlive(this@apply, "error")
+                    }
+
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        when (playbackState) {
+                            Player.STATE_IDLE -> keepMediaNotificationAlive(this@apply, "idle")
+                            Player.STATE_BUFFERING,
+                            Player.STATE_READY -> {
+                                if (playWhenReady && mediaItemCount > 0) {
+                                    notificationPlayer?.armRecoveryWindow()
+                                    mediaSession?.let { session ->
+                                        onUpdateNotification(session, true)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        if (isPlaying) {
+                            notificationPlayer?.clearRecoveryWindow()
+                            mediaSession?.let { session ->
+                                onUpdateNotification(session, true)
+                            }
+                        }
                     }
                 })
             }
@@ -106,13 +138,45 @@ class PipoPlaybackService : MediaSessionService() {
             PendingIntent.FLAG_IMMUTABLE,
         )
 
-        mediaSession = MediaSession.Builder(this, player)
+        val sessionPlayer = RecoveringNotificationPlayer(player).also {
+            notificationPlayer = it
+        }
+        mediaSession = MediaSession.Builder(this, sessionPlayer)
             .setSessionActivity(sessionActivity)
             .build()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
         return mediaSession
+    }
+
+    private fun keepMediaNotificationAlive(player: Player, reason: String) {
+        if (!player.playWhenReady || player.mediaItemCount == 0) return
+        val now = SystemClock.elapsedRealtime()
+        val sessionPlayer = notificationPlayer ?: return
+        if (!sessionPlayer.isRecovering()) return
+        if (now - lastKeepAlivePrepareAtMs < KEEP_ALIVE_PREPARE_COOLDOWN_MS) return
+        lastKeepAlivePrepareAtMs = now
+
+        mainHandler.post {
+            val session = mediaSession ?: return@post
+            if (!player.playWhenReady || player.mediaItemCount == 0) return@post
+            if (player.playbackState == Player.STATE_IDLE) {
+                // Media3 默认通知在 IDLE 时会被 cancel。恢复期先 prepare 到 BUFFERING,
+                // 保住前台媒体会话；真正换 URL / 跳坏歌仍由 PlayerViewModel 决定。
+                runCatching { player.prepare() }
+                    .onFailure { Log.w("PipoPlayer", "notification keep-alive prepare failed ($reason)", it) }
+            }
+            mainHandler.postDelayed({
+                val liveSession = mediaSession ?: return@postDelayed
+                if (player.playWhenReady &&
+                    player.mediaItemCount > 0 &&
+                    sessionPlayer.playbackState != Player.STATE_IDLE
+                ) {
+                    onUpdateNotification(liveSession, true)
+                }
+            }, KEEP_ALIVE_NOTIFICATION_DELAY_MS)
+        }
     }
 
     /**
@@ -140,6 +204,12 @@ class PipoPlaybackService : MediaSessionService() {
             session.release()
         }
         mediaSession = null
+        notificationPlayer = null
         super.onDestroy()
+    }
+
+    private companion object {
+        private const val KEEP_ALIVE_PREPARE_COOLDOWN_MS = 1_500L
+        private const val KEEP_ALIVE_NOTIFICATION_DELAY_MS = 80L
     }
 }

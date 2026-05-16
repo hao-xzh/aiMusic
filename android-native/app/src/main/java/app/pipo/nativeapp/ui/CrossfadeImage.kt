@@ -15,7 +15,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 
 /**
  * 双层 cross-fade 封面 —— 镜像 src/components/PlayerCard.tsx CoverImageLayer。
@@ -36,6 +38,7 @@ fun CrossfadeCoverImage(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     durationMs: Int = 720,
+    maxDecodeSizePx: Int? = null,
 ) {
     var currentUrl by remember { mutableStateOf<String?>(null) }
     var previousUrl by remember { mutableStateOf<String?>(null) }
@@ -57,6 +60,10 @@ fun CrossfadeCoverImage(
                     targetAlpha = 0f,
                     initialScale = 1f,
                     targetScale = 1f,
+                    maxDecodeSizePx = maxDecodeSizePx,
+                    onFinished = {
+                        if (previousUrl == prev) previousUrl = null
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -72,6 +79,7 @@ fun CrossfadeCoverImage(
                     targetAlpha = 1f,
                     initialScale = 1.018f,
                     targetScale = 1f,
+                    maxDecodeSizePx = maxDecodeSizePx,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -88,18 +96,34 @@ private fun FadingImage(
     targetAlpha: Float,
     initialScale: Float,
     targetScale: Float,
+    maxDecodeSizePx: Int?,
+    onFinished: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     val alpha = remember { Animatable(initialAlpha) }
     val scale = remember { Animatable(initialScale) }
+    val model = remember(context, url, maxDecodeSizePx) {
+        if (maxDecodeSizePx == null) {
+            url
+        } else {
+            ImageRequest.Builder(context)
+                .data(url)
+                .size(maxDecodeSizePx, maxDecodeSizePx)
+                .memoryCacheKey("cover:$maxDecodeSizePx:$url")
+                .diskCacheKey(url)
+                .build()
+        }
+    }
     LaunchedEffect(Unit) {
         alpha.animateTo(targetAlpha, animationSpec = tween(durationMs, easing = SoftEase))
+        onFinished?.invoke()
     }
     LaunchedEffect(Unit) {
         scale.animateTo(targetScale, animationSpec = tween(durationMs, easing = SoftEase))
     }
     AsyncImage(
-        model = url,
+        model = model,
         contentDescription = null,
         contentScale = contentScale,
         modifier = modifier.graphicsLayer {

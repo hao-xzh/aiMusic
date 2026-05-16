@@ -42,4 +42,4 @@
 -keep class app.pipo.nativeapp.runtime.** { *; }
 
 # 保留泛型 / 注解 / 内部类签名
--keepattributes Signature, *Annotation*, InnerClasses, EnclosingMethod
+-keepattributes Signature, *Annotation*, InnerClasses, EnclosingMethod, SourceFile, LineNumberTable

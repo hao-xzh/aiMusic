@@ -1,6 +1,8 @@
 package app.pipo.nativeapp
 
 import android.app.Application
+import android.content.ComponentCallbacks2
+import coil.Coil
 import app.pipo.nativeapp.data.JsonRustPipoBridge
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.RustBridgeRepository
@@ -8,8 +10,21 @@ import app.pipo.nativeapp.data.RustBridgeRepository
 class PipoApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        CrashLogStore.install(this)
         PipoGraph.installContext(this)
         installRustBridgeWhenPackaged()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            Coil.imageLoader(this).memoryCache?.clear()
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        Coil.imageLoader(this).memoryCache?.clear()
     }
 
     private fun installRustBridgeWhenPackaged() {

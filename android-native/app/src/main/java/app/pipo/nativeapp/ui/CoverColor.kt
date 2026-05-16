@@ -91,6 +91,7 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
     val top = avg(0, 5)
     val bottom = avg(h - 5, h)
     val right = avg(0, h, w - 5, w)
+    if (small !== bitmap) small.recycle()
     return EdgeColors(top, bottom, right)
 }
 
@@ -119,4 +120,3 @@ fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback
     return Color(red = rgb[0] / 255f, green = rgb[1] / 255f, blue = rgb[2] / 255f)
 }
-
