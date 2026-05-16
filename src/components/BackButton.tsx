@@ -3,7 +3,7 @@
 /**
  * 通用返回按钮 —— 给去 nav 化后的子页面（settings / taste / login）顶部用。
  *
- * 视觉一致：圆 chip + backdrop blur，跟 distill 的 floating top bar 保持同一语言。
+ * 视觉一致：透明 icon button，跟 distill 的 floating top bar 保持同一语言。
  * 行为：传 href 走 Link（用于回首页/上一层固定路由），不传 href 调 router.back()。
  */
 import Link from "next/link";
@@ -39,20 +39,20 @@ export function BackButton({ href, label = "返回" }: Props) {
   );
 }
 
-// 36x36 chip + 20x20 SVG，跟 distill 顶部 chipStyle 同款
+// 34x34 透明 icon button，跟 distill 顶部 chipStyle 同款
 const chip: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
-  width: 36,
-  height: 36,
-  borderRadius: 999,
+  width: 34,
+  height: 34,
+  borderRadius: 9,
   border: "none",
   background: "transparent",
   color: "rgba(245,247,255,0.86)",
   cursor: "pointer",
   textDecoration: "none",
-  filter: "drop-shadow(0 1px 6px rgba(0,0,0,0.55))",
   WebkitTapHighlightColor: "transparent",
-  transition: "transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
+  opacity: 0.92,
+  transition: "background 140ms ease, opacity 140ms ease",
 };

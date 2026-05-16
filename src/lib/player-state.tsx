@@ -187,6 +187,26 @@ const MANUAL_CROSSFADE_S = 0.4;
 const CONTINUOUS_EXTEND_THRESHOLD = 3;
 const PLAYBACK_LEVELS = ["lossless", "exhigh", "higher", "standard"] as const;
 type PlaybackLevel = (typeof PLAYBACK_LEVELS)[number];
+const SONG_URL_TIMEOUT_MS = 15_000;
+const SONG_URL_CACHE_TTL_MS = 20 * 60_000;
+
+type SongUrlCacheEntry = {
+  url: string;
+  level: PlaybackLevel;
+  expiresAt: number;
+};
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId != null) clearTimeout(timeoutId);
+  }
+}
 
 export type Track = {
   id: string;
@@ -252,6 +272,7 @@ export type PlayerAPI = PlayerState & {
     contextQueue?: TrackInfo[],
     opts?: PlayNeteaseOptions,
   ) => Promise<void>;
+  warmTrackUrls: (tracks: TrackInfo[], limit?: number) => void;
   insertNext: (t: TrackInfo) => Promise<void>;
   pause: () => void;
   resume: () => void;
@@ -355,6 +376,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const pendingPlaybackGenRef = useRef<number | null>(null);
   /** 已经触发过 prefetch 的 trackId 集 —— 避免同一首反复发请求 */
   const prefetchedSetRef = useRef<Set<number>>(new Set());
+  /** songUrls 的 session 级短缓存；歌单 hover/可视区预热命中后，点击不再等 URL 往返。 */
+  const urlCacheRef = useRef<Map<number, SongUrlCacheEntry>>(new Map());
+  const warmingUrlSetRef = useRef<Set<number>>(new Set());
   /** 当前正在播放的 audio-cache URL；给提前排下一首时补算当前歌分析用。 */
   const currentAudioUrlRef = useRef<string | null>(null);
   /**
@@ -566,9 +590,17 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     neteaseId: number,
     preferredLevels: readonly PlaybackLevel[] = PLAYBACK_LEVELS,
   ): Promise<{ url: string; level: PlaybackLevel } | null> => {
+    const cached = urlCacheRef.current.get(neteaseId);
+    if (cached && cached.expiresAt > Date.now() && preferredLevels.includes(cached.level)) {
+      return { url: cached.url, level: cached.level };
+    }
     for (const level of preferredLevels) {
       try {
-        const urls = await netease.songUrls([neteaseId], level);
+        const urls = await withTimeout(
+          netease.songUrls([neteaseId], level),
+          SONG_URL_TIMEOUT_MS,
+          `songUrls:${level}:${neteaseId}`,
+        );
         const u = urls[0];
         if (u?.url) {
           console.debug("[claudio quality]", {
@@ -578,7 +610,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             sizeMB: (u.size / 1024 / 1024).toFixed(2),
           });
           // 走 audio cache scheme：命中本地直接读，miss 才拉网络 + 落盘 LRU
-          return { url: wrapAudioUrl(neteaseId, u.url), level };
+          const wrapped = wrapAudioUrl(neteaseId, u.url);
+          urlCacheRef.current.set(neteaseId, {
+            url: wrapped,
+            level,
+            expiresAt: Date.now() + SONG_URL_CACHE_TTL_MS,
+          });
+          return { url: wrapped, level };
         }
       } catch (e) {
         console.debug(`[claudio] ${level} 失败`, e);
@@ -768,6 +806,32 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         }
       })();
     }
+  }, [fetchUrl]);
+
+  const warmTrackUrls = useCallback((tracks: TrackInfo[], limit = 12) => {
+    if (tracks.length === 0) return;
+    const now = Date.now();
+    const candidates = tracks
+      .filter((track) => {
+        const cached = urlCacheRef.current.get(track.id);
+        if (cached && cached.expiresAt > now) return false;
+        return !warmingUrlSetRef.current.has(track.id);
+      })
+      .slice(0, limit);
+    if (candidates.length === 0) return;
+
+    for (const track of candidates) warmingUrlSetRef.current.add(track.id);
+    void (async () => {
+      for (const track of candidates) {
+        try {
+          await fetchUrl(track.id);
+        } catch (e) {
+          console.debug("[claudio] warmTrackUrls failed", track.id, e);
+        } finally {
+          warmingUrlSetRef.current.delete(track.id);
+        }
+      }
+    })();
   }, [fetchUrl]);
 
   // ============================================================
@@ -1668,6 +1732,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     () => ({
       ...state,
       playNetease,
+      warmTrackUrls,
       insertNext,
       pause,
       resume,
@@ -1680,7 +1745,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       like,
       dislike,
     }),
-    [state, playNetease, insertNext, pause, resume, toggle, next, prev, seek, setAiStatus, setMood, like, dislike],
+    [state, playNetease, warmTrackUrls, insertNext, pause, resume, toggle, next, prev, seek, setAiStatus, setMood, like, dislike],
   );
 
   return <PlayerCtx.Provider value={api}>{children}</PlayerCtx.Provider>;

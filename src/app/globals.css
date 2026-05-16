@@ -83,6 +83,11 @@ button, a, [role="button"], [tabindex] {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes coverSwap {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
 /* 正在播放指示器（三条 bar 跳动）—— alternate + ease-in-out 让弹性更"音乐"，
    不是机械的方波。每根 bar 加 stagger 延迟，错峰跳动而非整体上下。 */
 @keyframes playingBar {
@@ -131,7 +136,7 @@ html[data-platform="windows"] body {
  * .safe-top 给页面顶部 floating 按钮用，自动避开各平台的"系统占位"：
  *
  *   Android：状态栏 inset（fallback 28px）
- *   Mac：左上 ~78x28 的红黄绿三键（titleBarStyle: "Overlay"）
+ *   Mac：左上红黄绿三键（titleBarStyle: "Overlay"），内容从系统按钮组右侧同一行开始
  *   Windows：右上 ~138x32 的 decorum min/max/close 三键
  *
  * 桌面 (≥720px) 上 env(safe-area-inset-*) 为 0，所以单纯的 .safe-top 不会引入
@@ -147,7 +152,7 @@ html[data-platform="android"] .safe-top {
    distill 封面 + play page floating bar 自己 inline 设置 paddingLeft/Right，
    会覆盖下面这两条规则（inline 优先级高）。 */
 html[data-platform="mac"] .safe-top {
-  padding-left: 86px;
+  padding-left: 112px;
 }
 html[data-platform="windows"] .safe-top {
   padding-right: 152px;

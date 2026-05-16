@@ -310,6 +310,7 @@ function ImmersiveLyrics({
   // 接缝 / 顶部 / 右侧采样色 fallback
   const seamRgb = edgeColors.bottom ?? "8, 10, 18";
   const topRgb = edgeColors.top ?? "8, 10, 18";
+  const leftRgb = edgeColors.left ?? topRgb;
   const rightRgb = edgeColors.right ?? seamRgb;
 
   // 文字颜色根据 bg 亮度自适应（取 cover 底部 / 右侧色算 luma）
@@ -326,8 +327,8 @@ function ImmersiveLyrics({
 
   // 一次性算出整套布局：cover/title/lyric 位置、mask 方向、bg gradient
   const layout = useMemo(
-    () => computeLayout(isDesktop, topRgb, seamRgb, rightRgb, fgColor, fgDimColor),
-    [isDesktop, topRgb, seamRgb, rightRgb, fgColor, fgDimColor],
+    () => computeLayout(isDesktop, topRgb, seamRgb, leftRgb, rightRgb, fgColor, fgDimColor),
+    [isDesktop, topRgb, seamRgb, leftRgb, rightRgb, fgColor, fgDimColor],
   );
 
   useEffect(() => {
@@ -600,6 +601,8 @@ function ImmersiveLyrics({
           // 三个 radial 叠加：top-left 主色 + top-right 主色 + bottom-center 接缝色。
           // CSS 多层 background 从上往下渲染，最后一项是底层。无 blur，无 pattern。
           background: [
+            `radial-gradient(115% 95% at 22% 100%, rgba(${seamRgb},0.98), rgba(${seamRgb},0) 72%)`,
+            `radial-gradient(105% 120% at 4% 48%, rgba(${leftRgb},0.86), rgba(${leftRgb},0) 64%)`,
             `radial-gradient(120% 110% at 20% 18%, rgba(${topRgb},0.95), rgba(${topRgb},0) 65%)`,
             `radial-gradient(110% 100% at 85% 30%, rgba(${rightRgb},0.85), rgba(${rightRgb},0) 60%)`,
             `radial-gradient(140% 130% at 50% 95%, rgba(${seamRgb},0.95), rgba(${seamRgb},0) 70%)`,
@@ -631,14 +634,14 @@ function ImmersiveLyrics({
             ...layout.cover,
             zIndex: 1,
             pointerEvents: "none",
-            opacity: layout.isDesktop ? 0.44 : 0.36,
+            opacity: layout.isDesktop ? 0.56 : 0.36,
             backgroundImage: `url(${coverUrl})`,
             backgroundSize: "cover",
             backgroundPosition: "center",
             filter: layout.isDesktop
-              ? "blur(42px) saturate(1.22) brightness(1.02)"
+              ? "blur(56px) saturate(1.24) brightness(1.02)"
               : "blur(34px) saturate(1.16) brightness(1.02)",
-            transform: layout.isDesktop ? "scale(1.1)" : "scale(1.08)",
+            transform: layout.isDesktop ? "scale(1.16)" : "scale(1.08)",
             transformOrigin: "center",
             WebkitMaskImage: layout.coverHaloMask,
             maskImage: layout.coverHaloMask,
@@ -833,6 +836,7 @@ function computeLayout(
   isDesktop: boolean,
   topRgb: string,
   seamRgb: string,
+  leftRgb: string,
   rightRgb: string,
   fgColor: string,
   fgDimColor: string,
@@ -924,25 +928,27 @@ function computeLayout(
       height: "84vh",
     },
     // 桌面四向 mask：左右上下边界都归零到 transparent，中间保留主体。
-    // 右侧靠近歌词区的 fade 更长，避免封面矩形边缘压到歌词背景上。
+    // 左 / 下 fade 更长：截图里这两侧最容易出现色带，必须更早退场。
+    // 右侧靠近歌词区也保留长 fade，避免封面矩形边缘压到歌词背景上。
     coverMask:
       "linear-gradient(to right, " +
-      "transparent 0%, rgba(0,0,0,0.12) 5%, rgba(0,0,0,0.72) 12%, #000 18%, " +
+      "transparent 0%, rgba(0,0,0,0.06) 4%, rgba(0,0,0,0.28) 10%, rgba(0,0,0,0.68) 18%, #000 28%, " +
       "#000 50%, rgba(0,0,0,0.72) 63%, rgba(0,0,0,0.22) 76%, transparent 90%, transparent 100%), " +
       "linear-gradient(to bottom, " +
-      "transparent 0%, rgba(0,0,0,0.5) 6%, #000 12%, #000 86%, rgba(0,0,0,0.32) 94%, transparent 100%)",
+      "transparent 0%, rgba(0,0,0,0.5) 6%, #000 12%, #000 70%, rgba(0,0,0,0.82) 78%, rgba(0,0,0,0.55) 86%, rgba(0,0,0,0.24) 94%, transparent 100%)",
     coverHaloMask:
-      "radial-gradient(closest-side at 50% 50%, " +
-      "transparent 0%, transparent 42%, " +
-      "rgba(0,0,0,0.34) 60%, " +
-      "rgba(0,0,0,0.24) 78%, " +
+      "radial-gradient(ellipse 118% 108% at 40% 60%, " +
+      "transparent 0%, transparent 30%, " +
+      "rgba(0,0,0,0.42) 54%, " +
+      "rgba(0,0,0,0.30) 82%, " +
       "transparent 100%)",
     coverMaskComposite: "intersect",
     // 桌面 bg：模糊封面拉不到时的兜底纯色 gradient（采样色驱动）
     bgGradient:
       `linear-gradient(90deg, ` +
-      `rgb(${topRgb}) 0px, ` +
-      `rgb(${seamRgb}) ${left}, ` +
+      `rgb(${leftRgb}) 0px, ` +
+      `rgb(${leftRgb}) ${left}, ` +
+      `rgb(${seamRgb}) calc(${left} + ${W} * 0.28), ` +
       `rgb(${rightRgb}) calc(${left} + ${W}), ` +
       `rgb(${rightRgb}) 100%)`,
     fgColor,

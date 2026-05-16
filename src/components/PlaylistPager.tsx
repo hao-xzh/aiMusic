@@ -349,9 +349,7 @@ function Slot({
             display: "block",
             userSelect: "none",
             borderRadius: 14,
-            boxShadow: isFocused
-              ? "0 18px 56px rgba(0,0,0,0.30), 0 0 0 1px rgba(255,255,255,0.10)"
-              : "0 12px 34px rgba(0,0,0,0.36), 0 0 0 1px rgba(255,255,255,0.08)",
+            boxShadow: "none",
           }}
         />
       ) : (

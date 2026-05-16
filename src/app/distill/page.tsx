@@ -579,10 +579,10 @@ function FloatingTopBar({
   const isWin = platform === "windows";
   const isAndroid = platform === "android";
   const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
-  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "58px";
+  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "52px";
   const contentTop = isAndroid ? safeTop : "0px";
-  const leftInset = isMac ? 112 : 16;
-  const rightInset = isWin ? 158 : 18;
+  const leftInset = isMac ? 124 : 18;
+  const rightInset = isWin ? 158 : 24;
   return (
     <div
       data-tauri-drag-region
@@ -600,11 +600,7 @@ function FloatingTopBar({
         paddingRight: rightInset,
         gap: 12,
         boxSizing: "border-box",
-        background:
-          "linear-gradient(180deg, rgba(8,9,12,0.52) 0%, rgba(8,9,12,0.38) 100%)",
-        borderBottom: "1px solid rgba(255,255,255,0.075)",
-        backdropFilter: "blur(18px) saturate(1.18)",
-        WebkitBackdropFilter: "blur(18px) saturate(1.18)",
+        background: "transparent",
         zIndex: 20,
       }}
     >
@@ -635,9 +631,6 @@ function FloatingTopBar({
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
-            textShadow: isDarkTextColor(fg)
-              ? "0 1px 2px rgba(255,255,255,0.28)"
-              : "0 1px 3px rgba(0,0,0,0.38)",
           }}
         >
           {title}
@@ -650,19 +643,6 @@ function FloatingTopBar({
   );
 }
 
-// === 完全照抄 PlayerCard ImmersiveLyrics 的布局：
-//     - 手机 stacked：cover 顶（80% 区域不 mask，下 20% 渐隐进背景），
-//       title 块压在封面下边缘的 mask 区，列表在更下方
-//     - 桌面 side-by-side：cover 居左，4 向 mask 把封面边缘溶进背景，
-//       title 块在封面正下方，列表占满右侧 + 上下 18% mask 渐隐
-//     - 列表上下也走 mask，跟歌词列同款上下淡入
-const COVER_MASK_MOBILE =
-  "linear-gradient(to bottom, #000 55%, transparent 100%)";
-const COVER_MASK_DESKTOP =
-  "linear-gradient(to right, transparent 0%, #000 4%, #000 65%, transparent 100%), " +
-  "linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%)";
-const LIST_MASK =
-  "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)";
 const TRACK_ROW_HEIGHT = 58;
 const TRACK_ROW_OVERSCAN = 8;
 const PIPO_MINT = "#9BE3C6";
@@ -695,47 +675,38 @@ function ImmersiveLayout({
   onPlayAll: () => void;
 }) {
   if (isDesktop) {
-    const coverSize = "clamp(280px, 29vw, 380px)";
+    const coverSize = "clamp(320px, min(46vw, 66vh), 760px)";
     return (
       <div
         style={{
           position: "absolute",
-          top: 58,
+          top: 52,
           left: 0,
           right: 0,
           bottom: 0,
           display: "grid",
           gridTemplateColumns:
-            "minmax(300px, clamp(340px, 34vw, 450px)) minmax(420px, 640px)",
+            "minmax(320px, min(46vw, 760px)) minmax(360px, 620px)",
           justifyContent: "center",
-          alignItems: "start",
-          gap: "clamp(44px, 7vw, 110px)",
-          padding: "clamp(28px, 4vh, 54px) clamp(32px, 6vw, 96px) clamp(28px, 4vh, 48px)",
+          alignItems: "center",
+          gap: "clamp(54px, 7vw, 118px)",
+          padding: "clamp(34px, 6vh, 76px) clamp(36px, 6vw, 104px) clamp(36px, 6vh, 76px)",
           boxSizing: "border-box",
         }}
       >
         <div
-          data-tauri-drag-region
           style={{
             width: coverSize,
             maxWidth: "100%",
             justifySelf: "end",
           }}
         >
-          <div
-            style={{
-              width: "100%",
-              height: `calc(${coverSize} + 112px)`,
-            }}
-          >
-            <PlaylistPager
-              playlists={playlists}
-              focusIdx={focusIdx}
-              onChange={onFocusChange}
-              orientation="vertical"
-              peek={56}
-            />
-          </div>
+          <FlatPlaylistCover
+            playlists={playlists}
+            focusIdx={focusIdx}
+            onChange={onFocusChange}
+            focused={focused}
+          />
           {focused && (
             <div
               key={focused.id}
@@ -762,12 +733,10 @@ function ImmersiveLayout({
         <div
           style={{
             position: "relative",
-            height: "calc(100vh - 58px - clamp(56px, 8vh, 96px))",
+            height: "calc(100vh - 52px - clamp(72px, 12vh, 132px))",
             minHeight: 420,
-            maxHeight: 760,
             alignSelf: "stretch",
             overflow: "hidden",
-            borderLeft: "1px solid rgba(255,255,255,0.06)",
           }}
         >
           <TrackListImmersive
@@ -862,6 +831,129 @@ function ImmersiveLayout({
   );
 }
 
+function FlatPlaylistCover({
+  playlists,
+  focusIdx,
+  onChange,
+  focused,
+}: {
+  playlists: PlaylistInfo[];
+  focusIdx: number;
+  onChange: (i: number) => void;
+  focused: PlaylistInfo | null;
+}) {
+  const pointerRef = useRef<{ id: number; x: number; y: number; t: number } | null>(null);
+  const wheelAccumRef = useRef(0);
+  const wheelLockRef = useRef<number | null>(null);
+  const wheelResetRef = useRef<number | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const moveFocus = useCallback(
+    (step: number) => {
+      const nextIdx = Math.max(0, Math.min(playlists.length - 1, focusIdx + step));
+      if (nextIdx !== focusIdx) onChange(nextIdx);
+    },
+    [focusIdx, onChange, playlists.length],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (wheelLockRef.current !== null) clearTimeout(wheelLockRef.current);
+      if (wheelResetRef.current !== null) clearTimeout(wheelResetRef.current);
+    };
+  }, []);
+
+  const cover = focused?.coverImgUrl;
+
+  return (
+    <div
+      onWheel={(e) => {
+        if (wheelLockRef.current !== null || playlists.length <= 1) return;
+        if (Math.abs(e.deltaY) < 2) return;
+        e.preventDefault();
+        wheelAccumRef.current += e.deltaY;
+        if (Math.abs(wheelAccumRef.current) < 66) {
+          if (wheelResetRef.current !== null) clearTimeout(wheelResetRef.current);
+          wheelResetRef.current = window.setTimeout(() => {
+            wheelAccumRef.current = 0;
+          }, 140);
+          return;
+        }
+        const step = wheelAccumRef.current > 0 ? 1 : -1;
+        wheelAccumRef.current = 0;
+        moveFocus(step);
+        wheelLockRef.current = window.setTimeout(() => {
+          wheelLockRef.current = null;
+        }, 280);
+      }}
+      onPointerDown={(e) => {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        pointerRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, t: Date.now() };
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setIsDragging(true);
+      }}
+      onPointerUp={(e) => {
+        const start = pointerRef.current;
+        if (!start || start.id !== e.pointerId) return;
+        pointerRef.current = null;
+        setIsDragging(false);
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {}
+        const dx = e.clientX - start.x;
+        const dy = e.clientY - start.y;
+        const primary = Math.abs(dy) >= Math.abs(dx) ? dy : dx;
+        const speed = Math.abs(primary) / Math.max(1, Date.now() - start.t);
+        if (Math.abs(primary) > 58 || speed > 0.48) {
+          moveFocus(primary < 0 ? 1 : -1);
+        }
+      }}
+      onPointerCancel={(e) => {
+        if (pointerRef.current?.id === e.pointerId) pointerRef.current = null;
+        setIsDragging(false);
+      }}
+      style={{
+        width: "100%",
+        aspectRatio: "1 / 1",
+        borderRadius: 14,
+        overflow: "hidden",
+        background: "rgba(255,255,255,0.045)",
+        cursor: playlists.length > 1 ? (isDragging ? "grabbing" : "grab") : "default",
+        userSelect: "none",
+        touchAction: "none",
+      }}
+      aria-label={focused?.name ?? "歌单封面"}
+      title={focused?.name ?? "歌单封面"}
+    >
+      {cover ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          key={focused?.id ?? cover}
+          src={cdn(cover)}
+          alt={focused?.name ?? "歌单封面"}
+          draggable={false}
+          style={{
+            width: "100%",
+            height: "100%",
+            display: "block",
+            objectFit: "cover",
+            animation: "coverSwap 220ms ease both",
+          }}
+        />
+      ) : (
+        <div
+          style={{
+            width: "100%",
+            height: "100%",
+            background:
+              "linear-gradient(135deg, rgba(255,255,255,0.07), rgba(255,255,255,0.025))",
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 function PlayAllBtn({
   fg,
   canPlay,
@@ -890,7 +982,6 @@ function PlayAllBtn({
         cursor: canPlay ? "pointer" : "not-allowed",
         opacity: canPlay ? 1 : 0.4,
         flexShrink: 0,
-        filter: "drop-shadow(0 2px 6px rgba(0,0,0,0.45))",
         transition: "transform 160ms ease",
       }}
       aria-label="播放全部"
@@ -993,6 +1084,11 @@ function TrackListImmersive({
             {error}
           </div>
         )}
+        {!loading && !error && tracks.length === 0 && (
+          <div style={{ color: fgDim, fontSize: 13, padding: "0 24px" }}>
+            这张歌单是空的
+          </div>
+        )}
         {tracks.length > 0 && (
           <FusionTrackList
             tracks={tracks}
@@ -1089,6 +1185,15 @@ function FusionTrackList({
     TRACK_ROW_OVERSCAN * 2;
   const endIndex = Math.min(tracks.length, startIndex + visibleCount);
   const visibleTracks = tracks.slice(startIndex, endIndex);
+  const warmTrackUrls = player.warmTrackUrls;
+  const warmCandidates = visibleTracks.slice(0, 12);
+  const warmKey = warmCandidates.map((track) => track.id).join(",");
+
+  useEffect(() => {
+    if (warmCandidates.length === 0) return;
+    warmTrackUrls(warmCandidates, warmCandidates.length);
+  }, [warmTrackUrls, warmKey]);
+
   return (
     <div style={{ position: "relative", height: totalHeight, padding: androidDensity ? 0 : "0 4px" }}>
       <div
@@ -1203,7 +1308,7 @@ function TrackRow({
           style={{
             color: visuallyActive && androidDensity ? PIPO_MINT : fg,
             fontSize: 14,
-            fontWeight: 600,
+            fontWeight: 500,
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -1306,7 +1411,6 @@ const playBtn = (fg: string): React.CSSProperties => ({
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
-  filter: "drop-shadow(0 1px 4px rgba(0,0,0,0.4))",
   WebkitTapHighlightColor: "transparent",
   transition: "transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
 });
@@ -1380,24 +1484,8 @@ function SparkIcon() {
   );
 }
 
-const toolbarCluster: React.CSSProperties = {
-  height: 32,
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 6,
-  borderRadius: 9,
-  padding: 2,
-  background: "rgba(255,255,255,0.055)",
-  border: "1px solid rgba(255,255,255,0.075)",
-  boxShadow: "0 8px 24px rgba(0,0,0,0.16)",
-};
-
 /** 顶部 titlebar 按钮：参考 Codex 桌面栏的轻量 icon button。 */
 function chipStyle(fg: string): React.CSSProperties {
-  const isDarkText = isDarkTextColor(fg);
-  const shadow = isDarkText
-    ? "drop-shadow(0 1px 2px rgba(255,255,255,0.36))"
-    : "drop-shadow(0 1px 3px rgba(0,0,0,0.34))";
   return {
     display: "inline-flex",
     alignItems: "center",
@@ -1410,7 +1498,6 @@ function chipStyle(fg: string): React.CSSProperties {
     color: fg,
     cursor: "pointer",
     textDecoration: "none",
-    filter: shadow,
     WebkitTapHighlightColor: "transparent",
     opacity: 0.92,
     transition: "background 140ms ease, opacity 140ms ease",

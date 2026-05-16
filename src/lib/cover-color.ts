@@ -4,7 +4,7 @@
  * 封面边缘色采样 + 明暗判断 —— 让歌词页 / 歌单页 / 任何"以封面为氛围"的页面
  * 共用同一套配色逻辑：
  *
- *   useCoverEdgeColors(url)  ：拿到顶 / 底 / 右三边的平均 RGB，前端按布局取需要的边
+ *   useCoverEdgeColors(url)  ：拿到顶 / 底 / 左 / 右边的平均 RGB，前端按布局取需要的边
  *   computeTone(rgb)         ：粗暴算亮度 → "dark" 或 "light"，决定文字色
  *   pickFg / pickFgDim       ：根据 tone 直接给一对前景色
  *
@@ -14,14 +14,24 @@
 
 import { useEffect, useState } from "react";
 
-export type EdgeColors = { top: string | null; bottom: string | null; right: string | null };
+export type EdgeColors = {
+  top: string | null;
+  bottom: string | null;
+  left: string | null;
+  right: string | null;
+};
 
 export function useCoverEdgeColors(url: string | null): EdgeColors {
-  const [colors, setColors] = useState<EdgeColors>({ top: null, bottom: null, right: null });
+  const [colors, setColors] = useState<EdgeColors>({
+    top: null,
+    bottom: null,
+    left: null,
+    right: null,
+  });
 
   useEffect(() => {
     if (!url) {
-      setColors({ top: null, bottom: null, right: null });
+      setColors({ top: null, bottom: null, left: null, right: null });
       return;
     }
     let cancelled = false;
@@ -55,12 +65,12 @@ export function useCoverEdgeColors(url: string | null): EdgeColors {
         };
         const top = sample(0, 5);
         const bottom = sample(H - 5, H);
-        const sampleRight = () => {
+        const sampleColumn = (xStart: number, xEnd: number) => {
           let r = 0,
             g = 0,
             b = 0,
             n = 0;
-          const data = ctx.getImageData(W - 5, 0, 5, H).data;
+          const data = ctx.getImageData(xStart, 0, xEnd - xStart, H).data;
           for (let i = 0; i < data.length; i += 4) {
             r += data[i]!;
             g += data[i + 1]!;
@@ -70,9 +80,10 @@ export function useCoverEdgeColors(url: string | null): EdgeColors {
           if (n === 0) return null;
           return `${Math.round(r / n)}, ${Math.round(g / n)}, ${Math.round(b / n)}`;
         };
-        const right = sampleRight();
+        const left = sampleColumn(0, 5);
+        const right = sampleColumn(W - 5, W);
         if (cancelled) return;
-        setColors({ top, bottom, right });
+        setColors({ top, bottom, left, right });
       } catch (e) {
         console.debug("[claudio] cover edge color sample failed", e);
       }
