@@ -513,52 +513,46 @@ function FloatingTopBar({
   const isMac = platform === "mac";
   const isWin = platform === "windows";
   const isAndroid = platform === "android";
-  // paddingTop 要把状态栏 / 红黄绿 / decorum 三键的占位都算进去。
-  //   Mac: 0 + 4 = 4（红黄绿中心 ~y=18，icon 36 居中后 ~y=18）
-  //   Win: 0 + 1 = 1（decorum 中心 ~y=16）
-  //   Android: env(safe-area-inset-top) + 6（状态栏后留 6px 透气，icon 不再压顶）
-  //   default: 12
-  // 之前用 .safe-top 类 + 内联 paddingTop 数字，inline 会覆盖类的 env padding
-  // 导致 Android 下 icon 顶到状态栏。这里直接用 calc 把 env 包进 inline。
-  const padTop: string =
-    isMac
-      ? "4px"
-      : isWin
-      ? "1px"
-      : isAndroid
-      ? "calc(max(env(safe-area-inset-top), 28px) + 6px)"
-      : "12px";
+  const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
+  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "48px";
+  const contentTop = isAndroid ? safeTop : "0px";
+  const leftInset = isMac ? 88 : 14;
+  const rightInset = isWin ? 154 : 14;
   return (
     <div
-      // data-tauri-drag-region：让顶部"空白"区域作为窗口拖动区
-      // —— 没有这条 Mac/Win 桌面用户没法用鼠标拖动 app
       data-tauri-drag-region
       style={{
         position: "absolute",
         top: 0,
         left: 0,
         right: 0,
+        height: barHeight,
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        paddingTop: padTop,
-        paddingBottom: 8,
-        // Mac 红黄绿宽 ~78 + 透气；Win decorum ~138 + 透气
-        paddingLeft: isMac ? 86 : 14,
-        paddingRight: isWin ? 152 : 14,
+        paddingTop: contentTop,
+        paddingLeft: leftInset,
+        paddingRight: rightInset,
         gap: 12,
+        boxSizing: "border-box",
+        background:
+          "linear-gradient(180deg, rgba(6,8,14,0.30) 0%, rgba(6,8,14,0.14) 58%, rgba(6,8,14,0) 100%)",
+        backdropFilter: "blur(12px)",
+        WebkitBackdropFilter: "blur(12px)",
         zIndex: 10,
       }}
     >
-      <button
-        onClick={onBack}
-        style={chipStyle(fg)}
-        aria-label={backLabel}
-        title={backLabel}
-      >
-        <BackIcon />
-      </button>
-      <div style={{ display: "flex", gap: 8 }}>{right}</div>
+      <div style={toolbarCluster}>
+        <button
+          onClick={onBack}
+          style={chipStyle(fg)}
+          aria-label={backLabel}
+          title={backLabel}
+        >
+          <BackIcon />
+        </button>
+      </div>
+      <div style={toolbarCluster}>{right}</div>
     </div>
   );
 }
@@ -1203,8 +1197,8 @@ function isDarkTextColor(fg: string): boolean {
 //      - Spark：原 4 角星中心偏上（y=10）+ 路径 14x14 → 居中 y=12 + 20x20
 //      - Profile：心形+点已经填得够，保持
 //      - Gear：齿轮太密，缩小到 ~17x17 + 居中，跟其它三个齐平
-const TOP_ICON_SW = 1.9;
-const TOP_ICON_SIZE = 22;
+const TOP_ICON_SW = 1.85;
+const TOP_ICON_SIZE = 20;
 
 function BackIcon() {
   return (
@@ -1245,20 +1239,31 @@ function SparkIcon() {
   );
 }
 
-/** 顶部 floating 图标 —— 36x36 chip + 20x20 SVG（手指点更舒服，
- *  视觉也比 Mac 三键稍大一档），无 chip 背景，drop-shadow 兜底可读性。 */
+const toolbarCluster: React.CSSProperties = {
+  height: 32,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  borderRadius: 9,
+  padding: 2,
+  background: "rgba(255,255,255,0.055)",
+  border: "1px solid rgba(255,255,255,0.075)",
+  boxShadow: "0 8px 24px rgba(0,0,0,0.16)",
+};
+
+/** 顶部 titlebar 按钮：32x32，和 macOS 交通灯 / Windows caption row 同一高度节奏。 */
 function chipStyle(fg: string): React.CSSProperties {
   const isDarkText = isDarkTextColor(fg);
   const shadow = isDarkText
-    ? "drop-shadow(0 1px 4px rgba(255,255,255,0.6))"
-    : "drop-shadow(0 1px 6px rgba(0,0,0,0.55))";
+    ? "drop-shadow(0 1px 3px rgba(255,255,255,0.45))"
+    : "drop-shadow(0 1px 4px rgba(0,0,0,0.45))";
   return {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: 36,
-    height: 36,
-    borderRadius: 999,
+    width: 32,
+    height: 28,
+    borderRadius: 7,
     border: "none",
     background: "transparent",
     color: fg,
@@ -1266,7 +1271,8 @@ function chipStyle(fg: string): React.CSSProperties {
     textDecoration: "none",
     filter: shadow,
     WebkitTapHighlightColor: "transparent",
-    transition: "transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
+    transition:
+      "background 160ms ease, transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
   };
 }
 
