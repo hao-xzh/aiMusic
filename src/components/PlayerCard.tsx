@@ -315,7 +315,7 @@ function ImmersiveLyrics({
   // 文字颜色根据 bg 亮度自适应（取 cover 底部 / 右侧色算 luma）
   const luminanceProbe = isDesktop ? rightRgb : seamRgb;
   const tone = computeTone(luminanceProbe);
-  const fgColor = tone === "dark" ? "rgba(0, 0, 0, 0.92)" : "rgba(255, 255, 255, 0.96)";
+  const fgColor = tone === "dark" ? "rgb(0, 0, 0)" : "rgb(255, 255, 255)";
   const fgDimColor = tone === "dark" ? "rgba(0, 0, 0, 0.32)" : "rgba(255, 255, 255, 0.32)";
   // active 行里"未唱"字符的颜色：跟主色同源，仅压低 alpha 到中等亮度。
   // 不能直接用 fgDimColor —— 那个是给非 active 行用的过暗值，
@@ -1296,8 +1296,8 @@ function LyricColumn({
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
       scrollIdx={view.scrollIdx}
-      // 焦点行落在容器顶 22%（Apple Music 风的"焦点偏上"），不再 50% 居中
-      focusFraction={0.22}
+      // PC/桌面歌词模式：当前行焦点落在容器顶 40%，按实际听感再往下压。
+      focusFraction={0.4}
       outerStyle={{
         ...immersiveLyricFrame,
         // 顶部 fade 加狠：0..26% 渐进透明 → 全亮，老句子退场时几乎看不见。
@@ -1411,60 +1411,51 @@ function useLyricView(p: LyricViewParams): {
   rows: React.ReactNode;
   translateExpr: string;
   activeIdx: number;
-  /** 应当被滚到焦点位置的行 —— 比 activeIdx 早 ~600ms 切换，
-   *  让下一句在唱响**之前**已经平滑滚到焦点（Apple Music 风的"预滚动"） */
+  /** 应当被滚到焦点位置的行 —— 只保留 100ms 轻预滚动，避免视觉先切句。 */
   scrollIdx: number;
 } {
-  const useYrc = p.yrcLines.length > 0;
-  const lrcTimes = useMemo(
-    () => (useYrc ? p.yrcLines.map((y) => y.time) : p.lines.map((l) => l.time)),
+  const useYrc = p.yrcLines.some((line) => line.chars.length > 0);
+  const lyricLines = useMemo(
+    () => (useYrc ? p.yrcLines : p.lines),
     [useYrc, p.lines, p.yrcLines],
+  );
+  const audioStarts = useMemo(
+    () =>
+      lyricLines.map((line) =>
+        useYrc ? yrcAudioStart(line as YrcLine) : (line as LrcLine).time,
+      ),
+    [lyricLines, useYrc],
+  );
+  const audioEnds = useMemo(
+    () =>
+      lyricLines.map((line, i) =>
+        useYrc
+          ? yrcAudioEnd(line as YrcLine)
+          : i + 1 < lyricLines.length
+            ? (lyricLines[i + 1] as LrcLine).time
+            : (line as LrcLine).time + 5,
+      ),
+    [lyricLines, useYrc],
   );
 
   // 二分定位当前行（actually active = 已经在唱的那行）
   const idx = useMemo(() => {
-    if (lrcTimes.length === 0) return -1;
-    let lo = 0,
-      hi = lrcTimes.length - 1,
-      ans = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (lrcTimes[mid] <= p.positionSec) {
-        ans = mid;
-        lo = mid + 1;
-      } else {
-        hi = mid - 1;
-      }
-    }
-    return ans;
-  }, [lrcTimes, p.positionSec]);
+    return activeLineIndexAt(p.positionSec, audioStarts, audioEnds);
+  }, [audioStarts, audioEnds, p.positionSec]);
 
-  // 预滚动：用 positionSec + 0.6s 二分，得到"600ms 后会激活的那行"
-  // 这一行不会因此被 wipe，但会被滚到焦点位置 → 下一句"在唱响前"已经到位
-  const scrollLookaheadSec = 0.6;
+  // 预滚动只提前 100ms：跟 Android 端一致，滚动和 active alpha 几乎同时发生。
+  // 之前 600ms 太早，会出现"下一句已经上来，但上一句颜色还没扫完"的割裂。
+  const scrollLookaheadSec = 0.1;
   const scrollIdx = useMemo(() => {
-    if (lrcTimes.length === 0) return -1;
-    const probe = p.positionSec + scrollLookaheadSec;
-    let lo = 0,
-      hi = lrcTimes.length - 1,
-      ans = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (lrcTimes[mid] <= probe) {
-        ans = mid;
-        lo = mid + 1;
-      } else {
-        hi = mid - 1;
-      }
-    }
-    return ans;
-  }, [lrcTimes, p.positionSec]);
+    return activeLineIndexAt(p.positionSec + scrollLookaheadSec, audioStarts, audioEnds);
+  }, [audioStarts, audioEnds, p.positionSec]);
 
-  if (lrcTimes.length === 0) {
+  if (audioStarts.length === 0) {
     return { empty: true, rows: null, translateExpr: "0px", activeIdx: -1, scrollIdx: -1 };
   }
 
-  const safeIdx = Math.max(idx, 0);
+  const hasActiveLine = idx >= 0;
+  const safeIdx = hasActiveLine ? idx : 0;
   const safeScrollIdx = Math.max(scrollIdx, safeIdx);
   const total = useYrc ? p.yrcLines.length : p.lines.length;
 
@@ -1485,9 +1476,9 @@ function useLyricView(p: LyricViewParams): {
   const fgUnsung = p.fgUnsungColor ?? fgDim;
   const rowEls: React.ReactNode[] = [];
   for (let i = 0; i < total; i++) {
-    const isActive = i === safeIdx;
+    const isActive = hasActiveLine && i === safeIdx;
     const isScrollTarget = i === safeScrollIdx;
-    const distance = Math.abs(i - safeIdx);
+    const distance = hasActiveLine ? Math.abs(i - safeIdx) : i + 1;
     if (useYrc) {
       const line = p.yrcLines[i]!;
       rowEls.push(
@@ -1539,7 +1530,7 @@ function useLyricView(p: LyricViewParams): {
   }
 
   // column 偏移：让 safeScrollIdx 行落在 centerRow 槽位（注意：用 scroll target，不是 active）。
-  // 这样下一句在唱响前的 600ms 已经平滑滚到焦点位置，唱响时直接开始 wipe。
+  // 只保留 100ms 轻预滚动，避免视觉早于声音明显切到下一句。
   const centerRow = Math.floor(p.visibleRows / 2);
   const offset = centerRow - safeScrollIdx;
   const translateExpr = `calc(${offset} * ${p.rowH})`;
@@ -1548,9 +1539,45 @@ function useLyricView(p: LyricViewParams): {
     empty: false,
     rows: rowEls,
     translateExpr,
-    activeIdx: safeIdx,
+    activeIdx: hasActiveLine ? safeIdx : -1,
     scrollIdx: safeScrollIdx,
   };
+}
+
+function activeLineIndexAt(
+  positionSec: number,
+  audioStarts: readonly number[],
+  audioEnds: readonly number[],
+): number {
+  if (audioStarts.length === 0) return -1;
+  let lo = 0;
+  let hi = audioStarts.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (audioStarts[mid]! <= positionSec) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (ans > 0 && positionSec < audioEnds[ans - 1]! - 0.02) {
+    return ans - 1;
+  }
+  return ans;
+}
+
+function yrcAudioStart(line: YrcLine): number {
+  return line.chars[0]?.startSec ?? line.time;
+}
+
+function yrcAudioEnd(line: YrcLine): number {
+  if (line.chars.length === 0) return line.time + Math.max(0.4, line.durSec);
+  return Math.max(
+    line.time + Math.max(0, line.durSec),
+    ...line.chars.map((char) => char.startSec + Math.max(0.001, char.durSec)),
+  );
 }
 
 // ============== 行组件（React.memo 包，非当前行不每帧重渲） ==============
