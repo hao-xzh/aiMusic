@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.ui
 
 import android.graphics.Bitmap
+import android.graphics.Bitmap.Config
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -9,6 +10,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.graphics.drawable.toBitmap
 import androidx.core.graphics.scale
 import coil.Coil
 import coil.request.ImageRequest
@@ -51,8 +53,12 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
                     .build()
                 val res = loader.execute(request)
                 (res as? SuccessResult)?.drawable?.let { drawable ->
-                    val src = drawable as? android.graphics.drawable.BitmapDrawable
-                    src?.bitmap
+                    (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                        ?: drawable.toBitmap(
+                            width = drawable.intrinsicWidth.coerceAtLeast(64),
+                            height = drawable.intrinsicHeight.coerceAtLeast(64),
+                            config = Config.ARGB_8888,
+                        )
                 }
             }.getOrNull()
         } ?: return@LaunchedEffect

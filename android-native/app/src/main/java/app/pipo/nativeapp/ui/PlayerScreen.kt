@@ -1,7 +1,15 @@
 package app.pipo.nativeapp.ui
 
+import android.content.res.Configuration
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -45,6 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -54,6 +63,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.playback.PlayerViewModel
 import app.pipo.nativeapp.runtime.Amp
 import kotlinx.coroutines.delay
@@ -94,6 +104,9 @@ fun PlayerScreen(
     val progress = if (state.durationMs > 0) {
         (state.positionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
     } else 0f
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+        configuration.screenWidthDp > configuration.screenHeightDp
 
     val hideAlpha by animateFloatAsState(
         targetValue = if (immersiveActive) 0f else 1f,
@@ -101,12 +114,107 @@ fun PlayerScreen(
         label = "hideAlpha",
     )
 
+    AnimatedContent(
+        targetState = isLandscape,
+        modifier = Modifier.fillMaxSize(),
+        transitionSpec = {
+            val enter = fadeIn(
+                animationSpec = tween(260, delayMillis = 70, easing = PipoMotion.FlipEase),
+            ) + scaleIn(
+                initialScale = 0.982f,
+                animationSpec = tween(300, easing = PipoMotion.FlipEase),
+            )
+            val exit = fadeOut(
+                animationSpec = tween(170, easing = PipoMotion.CloseEase),
+            ) + scaleOut(
+                targetScale = 1.018f,
+                animationSpec = tween(220, easing = PipoMotion.CloseEase),
+            )
+            enter togetherWith exit using SizeTransform(clip = false)
+        },
+        label = "playerOrientation",
+    ) { landscape ->
+        if (landscape) {
+            val lyricClock = LyricTiming.resolve(
+                positionMs = state.positionMs,
+                lines = state.lyrics,
+            )
+            LandscapePlayerLyricsScreen(
+                coverUrl = state.artworkUrl,
+                title = state.title,
+                artist = state.artist,
+                album = state.album,
+                lyrics = state.lyrics,
+                activeLyricIndex = lyricClock.activeIndex,
+                positionMs = lyricClock.positionMs,
+                durationMs = state.durationMs,
+                progress = progress,
+                isPlaying = state.isPlaying,
+                isLoading = state.isLoading,
+                controlsEnabled = state.queue.isNotEmpty(),
+                onToggle = viewModel::toggle,
+                onNext = viewModel::next,
+                onSeek = viewModel::seekTo,
+                onSeekToMs = viewModel::seekToMs,
+            )
+        } else {
+            PortraitPlayerContent(
+                artworkUrl = state.artworkUrl,
+                isPlaying = state.isPlaying,
+                title = state.title,
+                artist = state.artist,
+                album = state.album,
+                lyricsReady = state.lyrics.isNotEmpty(),
+                queueReady = state.queue.isNotEmpty(),
+                isLoading = state.isLoading,
+                positionMs = state.positionMs,
+                durationMs = state.durationMs,
+                progress = progress,
+                hideAlpha = hideAlpha,
+                hideCover = immersiveActive,
+                hideDotPattern = settings.hideDotPattern,
+                onOpenLyrics = onOpenLyrics,
+                onOpenDistill = onOpenDistill,
+                onOpenSettings = onOpenSettings,
+                onPrevious = viewModel::previous,
+                onToggle = viewModel::toggle,
+                onNext = viewModel::next,
+                onSeek = viewModel::seekTo,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PortraitPlayerContent(
+    artworkUrl: String?,
+    isPlaying: Boolean,
+    title: String,
+    artist: String,
+    album: String,
+    lyricsReady: Boolean,
+    queueReady: Boolean,
+    isLoading: Boolean,
+    positionMs: Long,
+    durationMs: Long,
+    progress: Float,
+    hideAlpha: Float,
+    hideCover: Boolean,
+    hideDotPattern: Boolean,
+    onOpenLyrics: () -> Unit,
+    onOpenDistill: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onPrevious: () -> Unit,
+    onToggle: () -> Unit,
+    onNext: () -> Unit,
+    onSeek: (Float) -> Unit,
+) {
     Box(modifier = Modifier.fillMaxSize()) {
         // 全局背景（封面驱动 blur + DotField + 切歌 cross-fade）
         AdaptiveDotField(
-            coverUrl = state.artworkUrl,
-            isPlaying = state.isPlaying,
-            showDots = !settings.hideDotPattern,
+            coverUrl = artworkUrl,
+            isPlaying = isPlaying,
+            showDots = !hideDotPattern,
         )
 
         BoxWithConstraints(
@@ -143,20 +251,20 @@ fun PlayerScreen(
                         .align(Alignment.CenterHorizontally),
                 ) {
                     CompactCover(
-                        coverUrl = state.artworkUrl,
-                        isPlaying = state.isPlaying,
-                        hidden = immersiveActive,
+                        coverUrl = artworkUrl,
+                        isPlaying = isPlaying,
+                        hidden = hideCover,
                     )
 
                     Spacer(modifier = Modifier.height(titleGap))
-                    if (state.title.isNotBlank()) {
+                    if (title.isNotBlank()) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .alpha(hideAlpha),
                         ) {
                             Text(
-                                text = state.title,
+                                text = title,
                                 color = Color(0xFFF5F7FF),
                                 style = TextStyle(
                                     fontSize = titleFs,
@@ -170,8 +278,8 @@ fun PlayerScreen(
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = buildString {
-                                    append(state.artist)
-                                    if (state.album.isNotBlank()) append(" · ${state.album}")
+                                    append(artist)
+                                    if (album.isNotBlank()) append(" · $album")
                                 },
                                 color = Color(0x8CE9EFFF),
                                 style = TextStyle(
@@ -189,16 +297,16 @@ fun PlayerScreen(
                     Spacer(modifier = Modifier.height(titleGap))
                     PipoProgressBar(
                         progress = progress,
-                        onSeek = viewModel::seekTo,
+                        onSeek = onSeek,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        MonoTime(state.positionMs, color = Color(0xB8E9EFFF))
+                        MonoTime(positionMs, color = Color(0xB8E9EFFF))
                         MonoTime(
-                            (state.durationMs - state.positionMs).coerceAtLeast(0L),
+                            (durationMs - positionMs).coerceAtLeast(0L),
                             color = Color(0x6BE9EFFF),
                             prefix = "-",
                         )
@@ -208,8 +316,8 @@ fun PlayerScreen(
                     TriCol(
                         a = {
                             FlatBtn(
-                                onClick = viewModel::previous,
-                                enabled = state.queue.isNotEmpty(),
+                                onClick = onPrevious,
+                                enabled = queueReady,
                                 size = clampDp(50.dp, viewportW * 0.115f, 64.dp),
                             ) {
                                 SkipBackGlyph(modifier = Modifier.size(clampDp(32.dp, viewportW * 0.085f, 44.dp)))
@@ -217,14 +325,14 @@ fun PlayerScreen(
                         },
                         b = {
                             FlatBtn(
-                                onClick = viewModel::toggle,
-                                enabled = state.queue.isNotEmpty(),
+                                onClick = onToggle,
+                                enabled = queueReady,
                                 size = clampDp(64.dp, viewportW * 0.155f, 80.dp),
                             ) {
                                 val centerGlyphSize = clampDp(44.dp, viewportW * 0.12f, 60.dp)
-                                if (state.isLoading) {
+                                if (isLoading) {
                                     LoadingRing(modifier = Modifier.size(centerGlyphSize * 0.68f))
-                                } else if (state.isPlaying) {
+                                } else if (isPlaying) {
                                     PauseGlyph(modifier = Modifier.size(centerGlyphSize))
                                 } else {
                                     PlayGlyph(modifier = Modifier.size(centerGlyphSize))
@@ -233,8 +341,8 @@ fun PlayerScreen(
                         },
                         c = {
                             FlatBtn(
-                                onClick = viewModel::next,
-                                enabled = state.queue.isNotEmpty(),
+                                onClick = onNext,
+                                enabled = queueReady,
                                 size = clampDp(50.dp, viewportW * 0.115f, 64.dp),
                             ) {
                                 SkipForwardGlyph(modifier = Modifier.size(clampDp(32.dp, viewportW * 0.085f, 44.dp)))
@@ -246,7 +354,7 @@ fun PlayerScreen(
                     TriCol(
                         modifier = Modifier.alpha(hideAlpha),
                         a = {
-                            NavIconBtn(onClick = onOpenLyrics, enabled = state.lyrics.isNotEmpty()) {
+                            NavIconBtn(onClick = onOpenLyrics, enabled = lyricsReady) {
                                 LyricsIcon(modifier = Modifier.size(24.dp))
                             }
                         },
@@ -330,7 +438,11 @@ private fun CompactCover(coverUrl: String?, isPlaying: Boolean, hidden: Boolean)
  *   - 跟 React `progressFill { transition: width 120ms linear }` 同款
  */
 @Composable
-private fun PipoProgressBar(progress: Float, onSeek: (Float) -> Unit) {
+internal fun PipoProgressBar(
+    progress: Float,
+    onSeek: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     var draggingProgress by remember { mutableStateOf<Float?>(null) }
     val displayProgress = (draggingProgress ?: progress).coerceIn(0f, 1f)
     val animated by animateFloatAsState(
@@ -339,7 +451,7 @@ private fun PipoProgressBar(progress: Float, onSeek: (Float) -> Unit) {
         label = "progress",
     )
     Box(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .height(24.dp)
             .pointerInput(onSeek) {
@@ -391,7 +503,7 @@ private fun progressFromOffset(x: Float, width: Int): Float {
 }
 
 @Composable
-private fun LoadingRing(modifier: Modifier = Modifier) {
+internal fun LoadingRing(modifier: Modifier = Modifier) {
     CircularProgressIndicator(
         modifier = modifier,
         color = Color(0xFFF5F7FF),

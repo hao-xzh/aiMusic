@@ -21,6 +21,7 @@ import app.pipo.nativeapp.data.LastPlaybackStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoLyricLine
+import app.pipo.nativeapp.data.SmoothQueue
 import app.pipo.nativeapp.data.TrackDedupe
 import app.pipo.nativeapp.data.TransitionScore
 import kotlinx.coroutines.Job
@@ -86,11 +87,8 @@ class PlayerViewModel(
      *  新队列尾部追(否则会污染新歌单)。 */
     private var playGen: Int = 0
 
-    // 之前这里有副 ExoPlayer (OverlapPlayer) 做 crossfade 风格的两曲叠声接歌。
-    // 用户反馈"听感混乱"——他们要的是 gapless（连续边界无缝接，前一首尾巴拼下一首开头），
-    // 不是 DJ 风格 crossfade。所以删掉副 player + 所有重叠淡入淡出逻辑，
-    // 改用 ExoPlayer 自带 gapless transition + ClippingConfiguration 裁头尾静音
-    // （toMediaItem 里已经做了）。这才是 iTunes / 网易 那种"接得像同一首"的体验。
+    // 真正的播放权威仍是 MediaSessionService 里的主 ExoPlayer。Service 侧的 SmartAutoMixer
+    // 只在 TransitionScore 高置信度时短暂接入副 deck；这里负责把队列排到更容易混。
 
     /**
      * 续杯式队列扩展。镜像 src/lib/player-state.tsx 的 `continuousSourceRef`：
@@ -108,7 +106,17 @@ class PlayerViewModel(
             wantCount = 8,
         )
         val existingSongKeys = state.queue.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-        raw.filter { TrackDedupe.songKey(it) !in existingSongKeys }
+        val unique = raw.filter { TrackDedupe.songKey(it) !in existingSongKeys }
+        if (current != null && unique.size > 1) {
+            SmoothQueue.smooth(
+                tracks = listOf(current) + unique,
+                featuresStore = featuresStore,
+                startTrackId = current.id,
+                mode = SmoothQueue.Mode.Discovery,
+            ).filter { it.id != current.id }
+        } else {
+            unique
+        }
     }
     private var continuousSource: ContinuousQueueSource? = defaultContinuousSource
     /** 续杯调用是否在飞行中 —— 防短时间内重复触发 */

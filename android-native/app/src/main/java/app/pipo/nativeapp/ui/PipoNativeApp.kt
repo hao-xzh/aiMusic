@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.ui
 
 import android.app.Activity
+import android.content.res.Configuration
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -25,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.pipo.nativeapp.data.LyricTiming
@@ -55,6 +57,9 @@ fun PipoNativeApp() {
         var immersive by remember { mutableStateOf(false) }
         val viewModel: PlayerViewModel = viewModel()
         val coverAnchor = rememberCoverAnchorState()
+        val configuration = LocalConfiguration.current
+        val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+            configuration.screenWidthDp > configuration.screenHeightDp
 
         // 600ms FlipEase 入 / 540ms CloseEase 出，驱动整个沉浸式过渡
         val coverProgress by animateFloatAsState(
@@ -70,8 +75,8 @@ fun PipoNativeApp() {
             derivedStateOf { coverProgress > 0.02f }
         }
 
-        LaunchedEffect(immersive, route) {
-            if (immersive || route != Route.Player) coverAnchor.releaseCoverRect()
+        LaunchedEffect(immersive, route, isLandscape) {
+            if ((immersive && !isLandscape) || route != Route.Player) coverAnchor.releaseCoverRect()
         }
 
         // 进入沉浸式歌词页时给 window 加 FLAG_KEEP_SCREEN_ON，退出时立刻清掉。
@@ -100,41 +105,49 @@ fun PipoNativeApp() {
                     viewModel = viewModel,
                 )
 
-                // 沉浸式 backdrop（仅黑兜底 + 模糊封面 + 顶/底渐变压底，不含标题歌词）
-                ImmersiveBackdrop(
-                    progress = coverProgress,
-                    coverUrl = viewModel.state.artworkUrl,
-                )
+                AnimatedVisibility(
+                    visible = !isLandscape,
+                    enter = fadeIn(tween(240, easing = PipoMotion.FlipEase)),
+                    exit = fadeOut(tween(180, easing = PipoMotion.CloseEase)),
+                ) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                    // 沉浸式 backdrop（仅黑兜底 + 模糊封面 + 顶/底渐变压底，不含标题歌词）
+                    ImmersiveBackdrop(
+                        progress = coverProgress,
+                        coverUrl = viewModel.state.artworkUrl,
+                    )
 
-                // 真 FLIP 封面 —— 在 backdrop 之上、标题歌词之下
-                TransitioningCover(
-                    compactRect = coverAnchor.state.value.rect,
-                    coverUrl = viewModel.state.artworkUrl,
-                    progress = coverProgress,
-                )
+                    // 真 FLIP 封面 —— 在 backdrop 之上、标题歌词之下
+                    TransitioningCover(
+                        compactRect = coverAnchor.state.value.rect,
+                        coverUrl = viewModel.state.artworkUrl,
+                        progress = coverProgress,
+                    )
 
-                // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
-                // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
-                val lyricClock = LyricTiming.resolve(
-                    positionMs = viewModel.state.positionMs,
-                    lines = viewModel.state.lyrics,
-                )
-                ImmersiveLyricsOverlay(
-                    progress = coverProgress,
-                    coverUrl = viewModel.state.artworkUrl,
-                    title = viewModel.state.title,
-                    artist = viewModel.state.artist,
-                    lyrics = viewModel.state.lyrics,
-                    activeLyricIndex = lyricClock.activeIndex,
-                    positionMs = lyricClock.positionMs,
-                    isPlaying = viewModel.state.isPlaying,
-                    onClose = { immersive = false },
-                    onToggle = viewModel::toggle,
-                    onNext = viewModel::next,
-                    onSeekToMs = { targetMs ->
-                        viewModel.seekToMs(targetMs)
-                    },
-                )
+                    // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
+                    // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
+                    val lyricClock = LyricTiming.resolve(
+                        positionMs = viewModel.state.positionMs,
+                        lines = viewModel.state.lyrics,
+                    )
+                    ImmersiveLyricsOverlay(
+                        progress = coverProgress,
+                        coverUrl = viewModel.state.artworkUrl,
+                        title = viewModel.state.title,
+                        artist = viewModel.state.artist,
+                        lyrics = viewModel.state.lyrics,
+                        activeLyricIndex = lyricClock.activeIndex,
+                        positionMs = lyricClock.positionMs,
+                        isPlaying = viewModel.state.isPlaying,
+                        onClose = { immersive = false },
+                        onToggle = viewModel::toggle,
+                        onNext = viewModel::next,
+                        onSeekToMs = { targetMs ->
+                            viewModel.seekToMs(targetMs)
+                        },
+                    )
+                    }
+                }
 
                 // 子页面 push 动画（distill / settings / taste / login）
                 AnimatedVisibility(

@@ -31,7 +31,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
@@ -83,8 +82,8 @@ fun NativeAiPet(
     // 锚点：cover rect 在 → attached 模式（贴封面右下内侧）；不在 → free（屏幕右下）
     val anchor = LocalCoverAnchor.current
     val coverRect = anchor.state.value.rect
-    // 跟随封面采样色染主球（React 端 sampleVividColor 的对位）
-    // 笑脸主体用固定米色奶白（跟原 logo 一致），不再从封面采样染色
+    // 封面采样色统一驱动宠物、输入条和回复气泡，避免常驻球体在播放页里突兀。
+    val petPalette = rememberPetPalette(useCoverEdgeColors(coverUrl))
 
     // 风场弹簧物理 + 节拍包络 —— 镜像 src/components/AiPet.tsx 159-289 行
     //   - 三层不同频率正弦叠加形成"自然风"
@@ -373,7 +372,7 @@ fun NativeAiPet(
             // pending 时显式 null —— 哪怕上一条 latestReply 还在 6s 窗口里，也要先盖成思考态
             ReplyBubble(
                 text = if (pending) null else latestReply,
-                tint = rgbToColor(useCoverEdgeColors(coverUrl).right, fallback = PipoColors.Mint),
+                palette = petPalette,
             )
         }
 
@@ -397,7 +396,7 @@ fun NativeAiPet(
                 .navigationBarsPadding(),
         ) {
             PetCommandBar(
-                coverUrl = coverUrl,
+                palette = petPalette,
                 input = input,
                 pending = pending,
                 hintText = if (messages.isEmpty()) emptyHint else "说点什么…",
@@ -463,7 +462,7 @@ fun NativeAiPet(
                 }
             },
         ) {
-            HintBubble(hint.orEmpty())
+            HintBubble(hint.orEmpty(), palette = petPalette)
         }
 
         // ---- Orb：常驻挂在封面右下，是命令条的开关 ----
@@ -488,6 +487,7 @@ fun NativeAiPet(
                 sway = swayDeg,
                 pulseScale = orbScale,
                 attached = (coverRect != null),
+                palette = petPalette,
                 onClick = { open = !open; if (open) hint = null },
             )
         }

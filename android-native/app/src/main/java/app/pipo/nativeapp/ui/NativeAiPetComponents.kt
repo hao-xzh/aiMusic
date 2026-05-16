@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.ui
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -57,19 +58,144 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+internal data class PetPalette(
+    val accent: Color,
+    val accentTop: Color,
+    val face: Color,
+    val faceInk: Color,
+    val halo: Color,
+    val rope: Color,
+    val panel: Color,
+    val panelText: Color,
+    val panelTextDim: Color,
+    val actionText: Color,
+)
+
 @Composable
-internal fun HintBubble(text: String) {
+internal fun rememberPetPalette(edges: EdgeColors): PetPalette {
+    val raw = remember(edges) { buildPetPalette(edges) }
+    val accent by animateColorAsState(raw.accent, tween(520), label = "petAccent")
+    val accentTop by animateColorAsState(raw.accentTop, tween(520), label = "petAccentTop")
+    val face by animateColorAsState(raw.face, tween(520), label = "petFace")
+    val halo by animateColorAsState(raw.halo, tween(520), label = "petHalo")
+    val rope by animateColorAsState(raw.rope, tween(520), label = "petRope")
+    val panel by animateColorAsState(raw.panel, tween(520), label = "petPanel")
+    val panelText = if (relativeLuma(panel) > 0.58f) Color(0xF20A0D14) else Color(0xF2F5F7FF)
+    val panelTextDim = panelText.copy(alpha = 0.62f)
+    val actionText = if (relativeLuma(accent) > 0.58f) Color(0xFF0A0D14) else Color(0xFFF5F7FF)
+    return PetPalette(
+        accent = accent,
+        accentTop = accentTop,
+        face = face,
+        faceInk = if (relativeLuma(face) > 0.52f) Color(0xFF1B1815) else Color(0xFFF5F7FF),
+        halo = halo,
+        rope = rope,
+        panel = panel,
+        panelText = panelText,
+        panelTextDim = panelTextDim,
+        actionText = actionText,
+    )
+}
+
+private fun buildPetPalette(edges: EdgeColors): PetPalette {
+    val accent = normalizePetAccent(rgbToColor(pickPetAccent(edges), fallback = PipoColors.Mint))
+    val top = normalizePetAccent(rgbToColor(edges.top, fallback = accent))
+    val faceBase = Color(0xFFE0D9C4)
+    val liftedAccent = when {
+        relativeLuma(accent) < 0.28f -> mixColors(accent, Color.White, 0.58f)
+        relativeLuma(accent) > 0.78f -> mixColors(accent, PipoColors.Bg1, 0.24f)
+        else -> accent
+    }
+    val face = mixColors(faceBase, liftedAccent, 0.76f)
+    val panel = mixColors(PipoColors.Bg1, accent, 0.30f).copy(alpha = 0.92f)
+    return PetPalette(
+        accent = accent,
+        accentTop = top,
+        face = face,
+        faceInk = if (relativeLuma(face) > 0.52f) Color(0xFF1B1815) else Color(0xFFF5F7FF),
+        halo = mixColors(accent, face, 0.34f),
+        rope = mixColors(top, Color.White, 0.45f),
+        panel = panel,
+        panelText = Color(0xF2F5F7FF),
+        panelTextDim = Color(0x99FFFFFF),
+        actionText = if (relativeLuma(accent) > 0.58f) Color(0xFF0A0D14) else Color(0xFFF5F7FF),
+    )
+}
+
+private fun pickPetAccent(edges: EdgeColors): IntArray? {
+    return listOfNotNull(edges.right, edges.bottom, edges.top)
+        .maxByOrNull { rgb ->
+            val luma = rgbLuma(rgb)
+            val sat = rgbSaturation(rgb)
+            val usableLight = 1f - kotlin.math.abs(luma - 0.56f) / 0.56f
+            sat * 0.62f + usableLight.coerceIn(0f, 1f) * 0.38f
+        }
+}
+
+private fun normalizePetAccent(color: Color): Color {
+    var out = color
+    val luma = relativeLuma(out)
+    out = when {
+        luma < 0.18f -> mixColors(out, Color.White, 0.46f)
+        luma > 0.86f -> mixColors(out, PipoColors.Bg1, 0.22f)
+        else -> out
+    }
+    if (colorSaturation(out) < 0.08f) {
+        val rescue = if (relativeLuma(out) > 0.5f) PipoColors.Blue else PipoColors.Mint
+        out = mixColors(out, rescue, 0.48f)
+    }
+    return out
+}
+
+private fun mixColors(a: Color, b: Color, amount: Float): Color {
+    val t = amount.coerceIn(0f, 1f)
+    val inv = 1f - t
+    return Color(
+        red = a.red * inv + b.red * t,
+        green = a.green * inv + b.green * t,
+        blue = a.blue * inv + b.blue * t,
+        alpha = a.alpha * inv + b.alpha * t,
+    )
+}
+
+private fun relativeLuma(color: Color): Float {
+    return (0.299f * color.red + 0.587f * color.green + 0.114f * color.blue).coerceIn(0f, 1f)
+}
+
+private fun colorSaturation(color: Color): Float {
+    val max = maxOf(color.red, color.green, color.blue)
+    val min = minOf(color.red, color.green, color.blue)
+    return if (max <= 0f) 0f else (max - min) / max
+}
+
+private fun rgbLuma(rgb: IntArray): Float {
+    if (rgb.size < 3) return 0.5f
+    return ((0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2]) / 255f).coerceIn(0f, 1f)
+}
+
+private fun rgbSaturation(rgb: IntArray): Float {
+    if (rgb.size < 3) return 0f
+    val r = rgb[0] / 255f
+    val g = rgb[1] / 255f
+    val b = rgb[2] / 255f
+    val max = maxOf(r, g, b)
+    val min = minOf(r, g, b)
+    return if (max <= 0f) 0f else (max - min) / max
+}
+
+@Composable
+internal fun HintBubble(text: String, palette: PetPalette) {
     if (text.isBlank()) return
     Box(
         modifier = Modifier
             .padding(bottom = 8.dp, end = 4.dp)
             .widthIn(max = 240.dp)
             .clip(RoundedCornerShape(14.dp))
-            .background(Color(0xCC0A0D14))
+            .background(palette.panel)
             .drawBehind {
                 drawRect(
                     brush = Brush.verticalGradient(
-                        colors = listOf(Color(0x18FFFFFF), Color.Transparent),
+                        colors = listOf(palette.accent.copy(alpha = 0.24f), Color.Transparent),
                         startY = 0f,
                         endY = 18f,
                     ),
@@ -79,24 +205,24 @@ internal fun HintBubble(text: String) {
     ) {
         Text(
             text = text,
-            color = PipoColors.Ink,
+            color = palette.panelText,
             style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium, lineHeight = 18.sp),
         )
     }
 }
 
 @Composable
-internal fun ReplyBubble(text: String?, tint: Color) {
+internal fun ReplyBubble(text: String?, palette: PetPalette) {
     if (text != null && text.isBlank()) return
     Box(
         modifier = Modifier
             .widthIn(max = 320.dp)
             .clip(RoundedCornerShape(18.dp))
-            .background(Color(0xE60A0D14))
+            .background(palette.panel)
             .drawBehind {
                 drawRect(
                     brush = Brush.verticalGradient(
-                        colors = listOf(tint.copy(alpha = 0.22f), Color.Transparent),
+                        colors = listOf(palette.accent.copy(alpha = 0.24f), Color.Transparent),
                         startY = 0f,
                         endY = 24f,
                     ),
@@ -106,11 +232,11 @@ internal fun ReplyBubble(text: String?, tint: Color) {
         contentAlignment = Alignment.CenterStart,
     ) {
         if (text == null) {
-            ThinkingDots(tint = tint)
+            ThinkingDots(tint = palette.accent)
         } else {
             Text(
                 text = text,
-                color = Color(0xF2F5F7FF),
+                color = palette.panelText,
                 style = TextStyle(
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
@@ -167,16 +293,13 @@ private fun ThinkingDots(tint: Color) {
 
 @Composable
 internal fun PetCommandBar(
-    coverUrl: String?,
+    palette: PetPalette,
     input: String,
     pending: Boolean,
     hintText: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
 ) {
-    val edges = useCoverEdgeColors(coverUrl)
-    val tintColor = rgbToColor(edges.right, fallback = PipoColors.Mint)
-    val tintTop = rgbToColor(edges.top, fallback = PipoColors.Mint)
     val canSend = input.isNotBlank() && !pending
 
     Row(
@@ -185,14 +308,14 @@ internal fun PetCommandBar(
             .padding(horizontal = 12.dp, vertical = 8.dp)
             .heightIn(min = 52.dp)
             .clip(RoundedCornerShape(28.dp))
-            .background(Color(0xE60A0D14))
+            .background(palette.panel)
             .drawBehind {
                 drawRect(
                     brush = Brush.horizontalGradient(
                         colors = listOf(
-                            tintTop.copy(alpha = 0.14f),
+                            palette.accentTop.copy(alpha = 0.16f),
                             Color.Transparent,
-                            tintColor.copy(alpha = 0.14f),
+                            palette.accent.copy(alpha = 0.16f),
                         ),
                     ),
                 )
@@ -211,6 +334,7 @@ internal fun PetCommandBar(
         PetFaceMini(
             modifier = Modifier.size(32.dp),
             pending = pending,
+            palette = palette,
         )
 
         Box(
@@ -224,11 +348,11 @@ internal fun PetCommandBar(
                 onValueChange = onInputChange,
                 singleLine = true,
                 textStyle = LocalTextStyle.current.copy(
-                    color = PipoColors.Ink,
+                    color = palette.panelText,
                     fontSize = 14.sp,
                     letterSpacing = 0.15.sp,
                 ),
-                cursorBrush = SolidColor(tintColor.copy(alpha = 0.85f)),
+                cursorBrush = SolidColor(palette.accent.copy(alpha = 0.85f)),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(
                     onSend = { if (input.isNotBlank() && !pending) onSend() },
@@ -238,7 +362,7 @@ internal fun PetCommandBar(
                     if (input.isEmpty()) {
                         Text(
                             text = hintText,
-                            color = Color(0x80FFFFFF),
+                            color = palette.panelTextDim,
                             style = TextStyle(
                                 fontSize = 14.sp,
                                 letterSpacing = 0.15.sp,
@@ -257,7 +381,7 @@ internal fun PetCommandBar(
                 .size(36.dp)
                 .clip(CircleShape)
                 .background(
-                    if (canSend) tintColor.copy(alpha = 0.85f)
+                    if (canSend) palette.accent.copy(alpha = 0.88f)
                     else Color(0x14FFFFFF),
                 )
                 .clickable(
@@ -271,7 +395,7 @@ internal fun PetCommandBar(
             Icon(
                 Icons.Rounded.ArrowUpward,
                 contentDescription = "发送",
-                tint = if (canSend) Color(0xFF0A0D14) else Color(0x99FFFFFF),
+                tint = if (canSend) palette.actionText else palette.panelTextDim,
                 modifier = Modifier.size(18.dp),
             )
         }
@@ -279,13 +403,11 @@ internal fun PetCommandBar(
 }
 
 @Composable
-private fun PetFaceMini(modifier: Modifier = Modifier, pending: Boolean = false) {
-    val faceCream = Color(0xFFE0D9C4)
-    val faceInk = Color(0xFF1B1815)
+private fun PetFaceMini(modifier: Modifier = Modifier, pending: Boolean = false, palette: PetPalette) {
     Box(
         modifier = modifier
             .clip(CircleShape)
-            .background(faceCream),
+            .background(palette.face),
         contentAlignment = Alignment.Center,
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -296,12 +418,12 @@ private fun PetFaceMini(modifier: Modifier = Modifier, pending: Boolean = false)
             val eyeH = if (pending) s * 0.04f else s * 0.16f
             val eyeY = h * 0.38f
             drawOval(
-                color = faceInk,
+                color = palette.faceInk,
                 topLeft = Offset(w * 0.34f - eyeW / 2, eyeY - eyeH / 2),
                 size = Size(eyeW, eyeH),
             )
             drawOval(
-                color = faceInk,
+                color = palette.faceInk,
                 topLeft = Offset(w * 0.66f - eyeW / 2, eyeY - eyeH / 2),
                 size = Size(eyeW, eyeH),
             )
@@ -323,7 +445,7 @@ private fun PetFaceMini(modifier: Modifier = Modifier, pending: Boolean = false)
             }
             drawPath(
                 path = smile,
-                color = faceInk,
+                color = palette.faceInk,
                 style = Stroke(
                     width = s * 0.075f,
                     cap = StrokeCap.Round,
@@ -340,14 +462,13 @@ internal fun PetOrb(
     sway: Float,
     pulseScale: Float,
     attached: Boolean,
+    palette: PetPalette,
     onClick: () -> Unit,
 ) {
     val haloScale = 1f + haloPulse * 0.3f
     val haloAlpha = 0.4f + (1f - haloPulse) * 0.6f
     val orbSize = 36.dp
     val ropeHeight = 14.dp
-    val faceCream = Color(0xFFE0D9C4)
-    val faceInk = Color(0xFF1B1815)
 
     Column(
         modifier = Modifier.graphicsLayer {
@@ -367,10 +488,10 @@ internal fun PetOrb(
             drawLine(
                 brush = Brush.verticalGradient(
                     colors = listOf(
-                        Color(0x00FFFFFF),
-                        Color(0xCCFFFFFF),
-                        Color(0xCCFFFFFF),
-                        Color(0x00FFFFFF),
+                        palette.rope.copy(alpha = 0f),
+                        palette.rope.copy(alpha = 0.82f),
+                        palette.rope.copy(alpha = 0.82f),
+                        palette.rope.copy(alpha = 0f),
                     ),
                     startY = 0f,
                     endY = size.height,
@@ -403,7 +524,7 @@ internal fun PetOrb(
                     .background(
                         Brush.radialGradient(
                             colors = listOf(
-                                faceCream.copy(alpha = 0.45f),
+                                palette.halo.copy(alpha = 0.72f),
                                 Color.Transparent,
                             ),
                         ),
@@ -413,7 +534,15 @@ internal fun PetOrb(
                 modifier = Modifier
                     .size(orbSize)
                     .clip(CircleShape)
-                    .background(faceCream)
+                    .background(
+                        Brush.radialGradient(
+                            colors = listOf(
+                                mixColors(palette.face, Color.White, 0.18f),
+                                mixColors(palette.face, palette.accent, 0.26f),
+                                palette.accent,
+                            ),
+                        ),
+                    )
                     .clickable(onClick = onClick),
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
@@ -427,12 +556,12 @@ internal fun PetOrb(
                     val leftEyeCx = w * 0.34f
                     val rightEyeCx = w * 0.66f
                     drawOval(
-                        color = faceInk,
+                        color = palette.faceInk,
                         topLeft = Offset(leftEyeCx - eyeW / 2, eyeY - eyeH / 2),
                         size = Size(eyeW, eyeH),
                     )
                     drawOval(
-                        color = faceInk,
+                        color = palette.faceInk,
                         topLeft = Offset(rightEyeCx - eyeW / 2, eyeY - eyeH / 2),
                         size = Size(eyeW, eyeH),
                     )
@@ -455,7 +584,7 @@ internal fun PetOrb(
                     }
                     drawPath(
                         path = smilePath,
-                        color = faceInk,
+                        color = palette.faceInk,
                         style = Stroke(
                             width = s * 0.075f,
                             cap = StrokeCap.Round,

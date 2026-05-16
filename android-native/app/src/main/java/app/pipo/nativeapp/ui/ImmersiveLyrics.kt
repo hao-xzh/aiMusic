@@ -72,6 +72,7 @@ import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricChar
@@ -365,7 +366,7 @@ private fun rememberSmoothPositionMs(rawPositionMs: Long, isPlaying: Boolean): S
 }
 
 @Composable
-private fun AppleMusicLyricColumn(
+internal fun AppleMusicLyricColumn(
     lines: List<PipoLyricLine>,
     activeLyricIndex: Int,
     positionMs: Long,
@@ -375,6 +376,7 @@ private fun AppleMusicLyricColumn(
     fgUnsung: Color,
     onSeekToMs: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    horizontalPadding: Dp = 24.dp,
 ) {
     // 把 player 的 30Hz tick 平滑成按帧位置（120Hz 屏丝滑度提升关键）
     val smoothedPositionMs by rememberSmoothPositionMs(positionMs, isPlaying)
@@ -519,7 +521,7 @@ private fun AppleMusicLyricColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp)
+                .padding(horizontal = horizontalPadding)
                 .pointerInput(Unit) {
                     val touchSlopPx = 8.dp.toPx()
                     awaitPointerEventScope {

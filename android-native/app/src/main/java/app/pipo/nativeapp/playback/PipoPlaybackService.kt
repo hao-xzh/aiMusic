@@ -19,6 +19,7 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import app.pipo.nativeapp.data.PipoGraph
 
 /**
  * 镜像 src/lib/player-state.tsx 里的播放器配置：
@@ -31,6 +32,7 @@ import androidx.media3.session.MediaSessionService
 class PipoPlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
     private var notificationPlayer: RecoveringNotificationPlayer? = null
+    private var smartAutoMixer: SmartAutoMixer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastKeepAlivePrepareAtMs: Long = 0L
 
@@ -92,15 +94,24 @@ class PipoPlaybackService : MediaSessionService() {
                 setWakeMode(C.WAKE_MODE_NETWORK)
 
                 addListener(object : Player.Listener {
+                    override fun onMediaItemTransition(
+                        mediaItem: androidx.media3.common.MediaItem?,
+                        reason: Int,
+                    ) {
+                        smartAutoMixer?.onMediaItemTransition(reason)
+                    }
+
                     override fun onPlayerError(error: PlaybackException) {
                         // 恢复策略统一放在 PlayerViewModel。Service 层只记录底层错误，
                         // 避免这里 seek/prepare/play 和 ViewModel 的 URL 重签互相抢状态。
                         Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
+                        smartAutoMixer?.onMainPlayerError()
                         notificationPlayer?.armRecoveryWindow()
                         keepMediaNotificationAlive(this@apply, "error")
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
+                        smartAutoMixer?.onMainPlayerEvent()
                         when (playbackState) {
                             Player.STATE_IDLE -> keepMediaNotificationAlive(this@apply, "idle")
                             Player.STATE_BUFFERING,
@@ -116,6 +127,7 @@ class PipoPlaybackService : MediaSessionService() {
                     }
 
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        smartAutoMixer?.onMainPlayerEvent()
                         if (isPlaying) {
                             notificationPlayer?.clearRecoveryWindow()
                             mediaSession?.let { session ->
@@ -125,6 +137,13 @@ class PipoPlaybackService : MediaSessionService() {
                     }
                 })
             }
+        smartAutoMixer = SmartAutoMixer(
+            context = this,
+            mainPlayer = player,
+            dataSourceFactory = cacheDataSourceFactory,
+            audioAttributes = musicAttrs,
+            featuresStore = PipoGraph.audioFeaturesStore,
+        )
 
         // 通知栏 / 锁屏的"点击区"指回主 Activity —— 没有这条，状态栏播放卡片被
         // 点击后系统找不到目标，整个通知体验不通畅。
@@ -199,6 +218,8 @@ class PipoPlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        smartAutoMixer?.release()
+        smartAutoMixer = null
         mediaSession?.let { session ->
             session.player.release()
             session.release()
