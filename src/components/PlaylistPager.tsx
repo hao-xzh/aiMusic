@@ -33,6 +33,8 @@ type Props = {
   mask?: string;
   /** mask-composite：多 mask 时传 "intersect"，单 mask 默认 "add" */
   maskComposite?: "intersect" | "add";
+  /** Android 歌单页同款：280px 焦点卡、左侧 24px 对齐、右侧露下一张。 */
+  androidFlow?: boolean;
 };
 
 const SWITCH_EASE = "cubic-bezier(0.22, 0.61, 0.36, 1)";
@@ -49,6 +51,7 @@ export function PlaylistPager({
   peek = 0,
   mask,
   maskComposite,
+  androidFlow = false,
 }: Props) {
   const horizontal = orientation === "horizontal";
   const containerRef = useRef<HTMLDivElement>(null);
@@ -79,13 +82,17 @@ export function PlaylistPager({
     return () => ro.disconnect();
   }, []);
 
-  // 焦点 slot 边长。最小 100 防止初次渲染 0 / 0 时 transform 全是 0 看起来诡异
-  const size = horizontal ? Math.max(100, w) : Math.max(100, h - 2 * peek);
+  // 焦点 slot 边长。Android flow 固定 280px 语义，桌面纵向版由容器高度扣 peek 得到。
+  const size = horizontal
+    ? androidFlow
+      ? Math.max(180, Math.min(280, Math.max(0, w - 104)))
+      : Math.max(100, w)
+    : Math.max(100, h - 2 * peek);
 
   const focused = playlists[focusIdx] ?? null;
   const prev = focusIdx > 0 ? playlists[focusIdx - 1] : null;
   const next = focusIdx < playlists.length - 1 ? playlists[focusIdx + 1] : null;
-  const axisStep = horizontal ? size : size * 0.76;
+  const axisStep = horizontal ? size + (androidFlow ? 8 : 0) : size * 0.76;
   const threshold = Math.max(DRAG_THRESHOLD_PX, Math.min(120, axisStep * 0.22));
 
   const finishDrag = (delta: number, dt: number) => {
@@ -217,6 +224,7 @@ export function PlaylistPager({
           dragging={drag.active}
           mask={mask}
           maskComposite={maskComposite}
+          androidFlow={androidFlow}
           onClick={() => onChange(focusIdx - 1)}
         />
       )}
@@ -231,6 +239,7 @@ export function PlaylistPager({
           dragging={drag.active}
           mask={mask}
           maskComposite={maskComposite}
+          androidFlow={androidFlow}
         />
       )}
       {next && (
@@ -244,6 +253,7 @@ export function PlaylistPager({
           dragging={drag.active}
           mask={mask}
           maskComposite={maskComposite}
+          androidFlow={androidFlow}
           onClick={() => onChange(focusIdx + 1)}
         />
       )}
@@ -261,6 +271,7 @@ function Slot({
   dragging,
   mask,
   maskComposite,
+  androidFlow,
   onClick,
 }: {
   playlist: PlaylistInfo;
@@ -272,6 +283,7 @@ function Slot({
   dragging: boolean;
   mask?: string;
   maskComposite?: "intersect" | "add";
+  androidFlow?: boolean;
   onClick?: () => void;
 }) {
   const cover = playlist.coverImgUrl;
@@ -296,7 +308,7 @@ function Slot({
       style={{
         position: "absolute",
         top: "50%",
-        left: "50%",
+        left: horizontal && androidFlow ? 24 + size / 2 : "50%",
         width: size,
         height: size,
         marginTop: -size / 2,
@@ -336,10 +348,10 @@ function Slot({
             objectFit: "cover",
             display: "block",
             userSelect: "none",
-            borderRadius: isFocused ? 0 : 12,
+            borderRadius: 14,
             boxShadow: isFocused
-              ? "0 24px 80px rgba(0,0,0,0.34), 0 0 0 1px rgba(255,255,255,0.08)"
-              : "0 16px 44px rgba(0,0,0,0.46), 0 4px 12px rgba(0,0,0,0.28)",
+              ? "0 18px 56px rgba(0,0,0,0.30), 0 0 0 1px rgba(255,255,255,0.10)"
+              : "0 12px 34px rgba(0,0,0,0.36), 0 0 0 1px rgba(255,255,255,0.08)",
           }}
         />
       ) : (
@@ -349,7 +361,7 @@ function Slot({
             height: "100%",
             background:
               "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02))",
-            borderRadius: isFocused ? 0 : 12,
+            borderRadius: 14,
           }}
         />
       )}

@@ -12,7 +12,7 @@
  * 数据流和老版本一致：cache-first → 后台 SWR → upsert。
  */
 
-import { usePlayer } from "@/lib/player-state";
+import { usePlayer, type Track } from "@/lib/player-state";
 import { cdn } from "@/lib/cdn";
 import {
   cache,
@@ -52,6 +52,26 @@ function cachedToPlaylistInfo(row: CachedPlaylist, uid: number): PlaylistInfo {
     coverImgUrl: row.coverImgUrl,
     userId: uid,
     updateTime: row.updateTime,
+  };
+}
+
+function playerTrackToTrackInfo(track: Track): TrackInfo | null {
+  if (!track.neteaseId) return null;
+  return {
+    id: track.neteaseId,
+    name: track.title,
+    durationMs: Math.max(1, Math.round(track.durationSec * 1000)),
+    artists: track.artist
+      .split(" / ")
+      .filter(Boolean)
+      .map((name, index) => ({ id: -index - 1, name })),
+    album: track.album || track.cover
+      ? {
+          id: -1,
+          name: track.album ?? "",
+          picUrl: track.cover ?? null,
+        }
+      : null,
   };
 }
 
@@ -272,7 +292,7 @@ export default function DistillPage() {
   if (list.kind === "loading") {
     return (
       <PageShell>
-        <FloatingTopBar onBack={() => router.push("/")} />
+        <FloatingTopBar onBack={() => router.push("/")} title="我的歌单" />
         <Placeholder text="正在拉取你的歌单…" />
       </PageShell>
     );
@@ -280,7 +300,7 @@ export default function DistillPage() {
   if (list.kind === "unauth") {
     return (
       <PageShell>
-        <FloatingTopBar onBack={() => router.push("/")} />
+        <FloatingTopBar onBack={() => router.push("/")} title="我的歌单" />
         <UnauthState />
       </PageShell>
     );
@@ -288,7 +308,7 @@ export default function DistillPage() {
   if (list.kind === "error") {
     return (
       <PageShell>
-        <FloatingTopBar onBack={() => router.push("/")} />
+        <FloatingTopBar onBack={() => router.push("/")} title="我的歌单" />
         <Placeholder text={`出错了：${list.message}`} err />
       </PageShell>
     );
@@ -300,6 +320,7 @@ export default function DistillPage() {
         <PlaylistFusionBg src={focusedCover} />
         <FloatingTopBar
           onBack={exitSelectMode}
+          title="挑选歌单"
           backLabel="返回"
           right={
             <button onClick={exitSelectMode} style={ghostPillBtn}>
@@ -392,27 +413,69 @@ function DistillLibraryPage({
   onBack: () => void;
   onEnterSelect: () => void;
 }) {
+  const player = usePlayer();
+  const currentQueueTracks = useMemo(
+    () => player.queue.map(playerTrackToTrackInfo).filter((track): track is TrackInfo => !!track),
+    [player.queue],
+  );
+  const hasCurrentQueue = currentQueueTracks.length > 0;
+  const libraryPages = useMemo<PlaylistInfo[]>(() => {
+    if (!hasCurrentQueue) return playlists;
+    return [
+      {
+        id: -1,
+        name: "当前播放列表",
+        trackCount: currentQueueTracks.length,
+        coverImgUrl: player.current?.cover ?? currentQueueTracks[0]?.album?.picUrl ?? null,
+        userId: null,
+        updateTime: null,
+      },
+      ...playlists,
+    ];
+  }, [currentQueueTracks, hasCurrentQueue, player.current?.cover, playlists]);
+  const [pageFocusIdx, setPageFocusIdx] = useState(0);
+  const focusedPage = libraryPages[pageFocusIdx] ?? null;
+  const isCurrentQueuePage = hasCurrentQueue && pageFocusIdx === 0;
+  const focusedPageCover = focusedPage?.coverImgUrl ?? null;
   // === 跟歌词页同源的色彩管线 ===
-  const coverUrl = focusedCover ? cdn(focusedCover) : null;
+  const coverUrl = focusedPageCover ? cdn(focusedPageCover) : null;
   const edge = useCoverEdgeColors(coverUrl);
   const seamRgb = edge.bottom ?? "8, 10, 18";
   const rightRgb = edge.right ?? seamRgb;
   const tone = computeTone(isDesktop ? rightRgb : seamRgb);
   const fg = pickFg(tone);
   const fgDim = pickFgDim(tone);
+  const visibleTracks = isCurrentQueuePage ? currentQueueTracks : focusedTracks;
+  const visibleLoading = isCurrentQueuePage ? false : tracksLoading;
+  const visibleError = isCurrentQueuePage ? null : tracksError;
 
-  const player = usePlayer();
+  useEffect(() => {
+    if (pageFocusIdx >= libraryPages.length) {
+      setPageFocusIdx(Math.max(0, libraryPages.length - 1));
+    }
+  }, [libraryPages.length, pageFocusIdx]);
+
+  const handleFocusChange = useCallback(
+    (nextIdx: number) => {
+      setPageFocusIdx(nextIdx);
+      if (hasCurrentQueue && nextIdx === 0) return;
+      onFocusChange(hasCurrentQueue ? nextIdx - 1 : nextIdx);
+    },
+    [hasCurrentQueue, onFocusChange],
+  );
+
   const onPlayAll = () => {
-    if (focusedTracks.length === 0) return;
-    const first = focusedTracks[0]!;
-    void player.playNetease(first, focusedTracks);
+    if (visibleTracks.length === 0) return;
+    const first = visibleTracks[0]!;
+    void player.playNetease(first, visibleTracks);
   };
 
   return (
     <PageShell>
-      <PlaylistFusionBg src={focusedCover} />
+      <PlaylistFusionBg src={focusedPageCover ?? focusedCover} />
       <FloatingTopBar
         onBack={onBack}
+        title="我的歌单"
         fg={fg}
         right={
           <div style={{ display: "flex", gap: 8 }}>
@@ -453,23 +516,23 @@ function DistillLibraryPage({
         </div>
       )}
 
-      {playlists.length === 0 ? (
+      {libraryPages.length === 0 ? (
         <div style={{ paddingTop: 120 }}>
           <Placeholder text="你还没有歌单" />
         </div>
       ) : (
         <ImmersiveLayout
-          playlists={playlists}
-          focusIdx={focusIdx}
-          onFocusChange={onFocusChange}
-          focused={focused}
-          tracks={focusedTracks}
-          loading={tracksLoading}
-          error={tracksError}
+          playlists={libraryPages}
+          focusIdx={pageFocusIdx}
+          onFocusChange={handleFocusChange}
+          focused={focusedPage}
+          tracks={visibleTracks}
+          loading={visibleLoading}
+          error={visibleError}
           fg={fg}
           fgDim={fgDim}
           isDesktop={isDesktop}
-          canPlay={focusedTracks.length > 0}
+          canPlay={visibleTracks.length > 0}
           onPlayAll={onPlayAll}
         />
       )}
@@ -500,11 +563,13 @@ function PageShell({ children }: { children: React.ReactNode }) {
 
 function FloatingTopBar({
   onBack,
+  title = "我的歌单",
   backLabel = "返回",
   right,
   fg = "rgba(255,255,255,0.92)",
 }: {
   onBack: () => void;
+  title?: string;
   backLabel?: string;
   right?: React.ReactNode;
   fg?: string;
@@ -514,10 +579,10 @@ function FloatingTopBar({
   const isWin = platform === "windows";
   const isAndroid = platform === "android";
   const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
-  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "48px";
+  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "58px";
   const contentTop = isAndroid ? safeTop : "0px";
-  const leftInset = isMac ? 88 : 14;
-  const rightInset = isWin ? 154 : 14;
+  const leftInset = isMac ? 112 : 16;
+  const rightInset = isWin ? 158 : 18;
   return (
     <div
       data-tauri-drag-region
@@ -536,13 +601,22 @@ function FloatingTopBar({
         gap: 12,
         boxSizing: "border-box",
         background:
-          "linear-gradient(180deg, rgba(6,8,14,0.30) 0%, rgba(6,8,14,0.14) 58%, rgba(6,8,14,0) 100%)",
-        backdropFilter: "blur(12px)",
-        WebkitBackdropFilter: "blur(12px)",
-        zIndex: 10,
+          "linear-gradient(180deg, rgba(8,9,12,0.52) 0%, rgba(8,9,12,0.38) 100%)",
+        borderBottom: "1px solid rgba(255,255,255,0.075)",
+        backdropFilter: "blur(18px) saturate(1.18)",
+        WebkitBackdropFilter: "blur(18px) saturate(1.18)",
+        zIndex: 20,
       }}
     >
-      <div style={toolbarCluster}>
+      <div
+        style={{
+          minWidth: 0,
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          height: 38,
+        }}
+      >
         <button
           onClick={onBack}
           style={chipStyle(fg)}
@@ -551,8 +625,27 @@ function FloatingTopBar({
         >
           <BackIcon />
         </button>
+        <div
+          style={{
+            minWidth: 0,
+            color: fg,
+            fontSize: 14,
+            fontWeight: 650,
+            letterSpacing: 0.2,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            textShadow: isDarkTextColor(fg)
+              ? "0 1px 2px rgba(255,255,255,0.28)"
+              : "0 1px 3px rgba(0,0,0,0.38)",
+          }}
+        >
+          {title}
+        </div>
       </div>
-      <div style={toolbarCluster}>{right}</div>
+      <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        {right}
+      </div>
     </div>
   );
 }
@@ -572,6 +665,7 @@ const LIST_MASK =
   "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)";
 const TRACK_ROW_HEIGHT = 58;
 const TRACK_ROW_OVERSCAN = 8;
+const PIPO_MINT = "#9BE3C6";
 
 function ImmersiveLayout({
   playlists,
@@ -601,64 +695,79 @@ function ImmersiveLayout({
   onPlayAll: () => void;
 }) {
   if (isDesktop) {
-    const W = "min(46vw, 70vh, 540px)";
-    const titleBlockH = "clamp(92px, 12vh, 122px)";
-    const gapBelow = "clamp(36px, 5.4vh, 60px)";
-    const totalH = `calc(${W} + ${gapBelow} + ${titleBlockH})`;
-    const top = `calc((100vh - ${totalH}) / 2)`;
-    const left = "clamp(24px, 6vw, 80px)";
-    const lyricLeft = `calc(${left} + ${W} + clamp(40px, 6vw, 100px))`;
-    const lyricRight = "clamp(24px, 6vw, 80px)";
+    const coverSize = "clamp(280px, 29vw, 380px)";
     return (
-      <>
+      <div
+        style={{
+          position: "absolute",
+          top: 58,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          display: "grid",
+          gridTemplateColumns:
+            "minmax(300px, clamp(340px, 34vw, 450px)) minmax(420px, 640px)",
+          justifyContent: "center",
+          alignItems: "start",
+          gap: "clamp(44px, 7vw, 110px)",
+          padding: "clamp(28px, 4vh, 54px) clamp(32px, 6vw, 96px) clamp(28px, 4vh, 48px)",
+          boxSizing: "border-box",
+        }}
+      >
         <div
-          // 桌面下封面区也算窗口拖动区（用户拖封面 = 拖窗口，不是拖图片）；
-          // PlaylistPager 内部的 onWheel 仍然生效，按钮 / 链接 Tauri 自动豁免
           data-tauri-drag-region
-          style={{ position: "absolute", top, left, width: W, height: W }}
+          style={{
+            width: coverSize,
+            maxWidth: "100%",
+            justifySelf: "end",
+          }}
         >
-          <PlaylistPager
-            playlists={playlists}
-            focusIdx={focusIdx}
-            onChange={onFocusChange}
-            orientation="vertical"
-          />
-        </div>
-        {focused && (
           <div
-            key={focused.id}
             style={{
-              position: "absolute",
-              top: `calc(${top} + ${W} + ${gapBelow})`,
-              left,
-              width: W,
-              animation: "metaFade 380ms cubic-bezier(0.22,0.61,0.36,1) both",
-              display: "flex",
-              alignItems: "center",
-              gap: 16,
+              width: "100%",
+              height: `calc(${coverSize} + 112px)`,
             }}
           >
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ ...titleStyleLarge, color: fg }} title={focused.name}>
-                {focused.name}
-              </div>
-              <div style={{ ...subtitleStyleLarge, color: fgDim }}>
-                {focused.trackCount} TRACKS
-              </div>
-            </div>
-            <PlayAllBtn fg={fg} canPlay={canPlay} onPlayAll={onPlayAll} />
+            <PlaylistPager
+              playlists={playlists}
+              focusIdx={focusIdx}
+              onChange={onFocusChange}
+              orientation="vertical"
+              peek={56}
+            />
           </div>
-        )}
+          {focused && (
+            <div
+              key={focused.id}
+              style={{
+                marginTop: 18,
+                animation: "metaFade 180ms ease both",
+                display: "flex",
+                alignItems: "center",
+                gap: 14,
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ ...titleStyleLarge, color: fg }} title={focused.name}>
+                  {focused.name}
+                </div>
+                <div style={{ ...subtitleStyleLarge, color: fgDim }}>
+                  {focused.trackCount} 首
+                </div>
+              </div>
+              <PlayAllBtn fg={fg} canPlay={canPlay} onPlayAll={onPlayAll} />
+            </div>
+          )}
+        </div>
         <div
           style={{
-            position: "absolute",
-            top: "8vh",
-            left: lyricLeft,
-            right: lyricRight,
-            height: "84vh",
+            position: "relative",
+            height: "calc(100vh - 58px - clamp(56px, 8vh, 96px))",
+            minHeight: 420,
+            maxHeight: 760,
+            alignSelf: "stretch",
             overflow: "hidden",
-            WebkitMaskImage: LIST_MASK,
-            maskImage: LIST_MASK,
+            borderLeft: "1px solid rgba(255,255,255,0.06)",
           }}
         >
           <TrackListImmersive
@@ -668,26 +777,35 @@ function ImmersiveLayout({
             error={error}
             fg={fg}
             fgDim={fgDim}
+            androidDensity
           />
         </div>
-      </>
+      </div>
     );
   }
 
-  // ---- mobile stacked ----
-  const W = "min(100vw, 78vh, 700px)";
-  // cap 收到 8px：原先 32px 让封面顶离窗顶太远，跟标题"也跟着压下去一截"
-  const top = `clamp(0px, calc((100vw - ${W}) / 2), 8px)`;
-  const left = `calc((100vw - ${W}) / 2)`;
-  const titlePadX = "clamp(20px, 5vw, 36px)";
-  const lyricTop = `calc(${top} + ${W} + clamp(8px, 1.6vh, 16px))`;
+  // ---- mobile stacked: mirror Android DistillLibrary ----
   return (
-    <>
+    <div
+      style={{
+        position: "absolute",
+        top: "calc(max(env(safe-area-inset-top), 28px) + 58px)",
+        left: 0,
+        right: 0,
+        bottom: 0,
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        paddingBottom: 60,
+      }}
+    >
       <div
-        // 在 Android 上 data-tauri-drag-region 无副作用；桌面（窄窗 = mobile 布局）
-        // 也能用拖动来移窗
         data-tauri-drag-region
-        style={{ position: "absolute", top, left, width: W, height: W }}
+        style={{
+          height: 310,
+          width: "100%",
+          flexShrink: 0,
+        }}
       >
         <PlaylistPager
           playlists={playlists}
@@ -695,21 +813,19 @@ function ImmersiveLayout({
           onChange={onFocusChange}
           orientation="horizontal"
           peek={0}
-          mask={COVER_MASK_MOBILE}
+          androidFlow
         />
       </div>
       {focused && (
         <div
           key={focused.id}
           style={{
-            position: "absolute",
-            top: `calc(${top} + ${W} * 0.82)`,
-            left: `calc(${left} + ${titlePadX})`,
-            width: `calc(${W} - 2 * ${titlePadX})`,
-            animation: "metaFade 380ms cubic-bezier(0.22,0.61,0.36,1) both",
+            padding: "12px 24px 0",
+            animation: "metaFade 180ms ease both",
             display: "flex",
             alignItems: "center",
             gap: 12,
+            flexShrink: 0,
           }}
         >
           <div style={{ flex: 1, minWidth: 0 }}>
@@ -717,7 +833,7 @@ function ImmersiveLayout({
               {focused.name}
             </div>
             <div style={{ ...subtitleStyle, color: fgDim }}>
-              {focused.trackCount} TRACKS
+              {focused.trackCount} 首
             </div>
           </div>
           <PlayAllBtn fg={fg} canPlay={canPlay} onPlayAll={onPlayAll} compact />
@@ -725,14 +841,11 @@ function ImmersiveLayout({
       )}
       <div
         style={{
-          position: "absolute",
-          top: lyricTop,
-          left,
-          width: W,
-          bottom: "clamp(8px, 2vh, 24px)",
+          position: "relative",
+          flex: "1 1 auto",
+          minHeight: 0,
+          marginTop: 12,
           overflow: "hidden",
-          WebkitMaskImage: LIST_MASK,
-          maskImage: LIST_MASK,
         }}
       >
         <TrackListImmersive
@@ -742,9 +855,10 @@ function ImmersiveLayout({
           error={error}
           fg={fg}
           fgDim={fgDim}
+          androidDensity
         />
       </div>
-    </>
+    </div>
   );
 }
 
@@ -808,6 +922,7 @@ function TrackListImmersive({
   error,
   fg,
   fgDim,
+  androidDensity = false,
 }: {
   focusedKey: number | undefined;
   tracks: TrackInfo[];
@@ -815,6 +930,7 @@ function TrackListImmersive({
   error: string | null;
   fg: string;
   fgDim: string;
+  androidDensity?: boolean;
 }) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -860,7 +976,7 @@ function TrackListImmersive({
         inset: 0,
         overflowY: "auto",
         WebkitOverflowScrolling: "touch",
-        padding: "clamp(20px, 4vh, 36px) clamp(20px, 5vw, 36px)",
+        padding: androidDensity ? "0 0 24px" : "clamp(20px, 4vh, 36px) clamp(20px, 5vw, 36px)",
       }}
     >
       <div
@@ -884,6 +1000,7 @@ function TrackListImmersive({
             fgDim={fgDim}
             scrollTop={scrollTop}
             viewportHeight={viewportHeight}
+            androidDensity={androidDensity}
           />
         )}
       </div>
@@ -893,37 +1010,35 @@ function TrackListImmersive({
 
 // 跟 PlayerCard 的 immersive title / subtitle 同款字号、同款字重、同款 letterSpacing
 const titleStyle: React.CSSProperties = {
-  fontSize: "clamp(16px, 4.4vw, 20px)",
-  fontWeight: 700,
+  fontSize: "clamp(17px, 4.4vw, 20px)",
+  fontWeight: 650,
   letterSpacing: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
 };
 const subtitleStyle: React.CSSProperties = {
-  marginTop: 5,
-  fontSize: "clamp(11px, 2.6vw, 12px)",
+  marginTop: 4,
+  fontSize: "12px",
   fontWeight: 500,
-  letterSpacing: 2.4,
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  letterSpacing: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
 };
 const titleStyleLarge: React.CSSProperties = {
-  fontSize: "clamp(20px, 2.2vw, 28px)",
-  fontWeight: 700,
+  fontSize: "clamp(18px, 1.45vw, 22px)",
+  fontWeight: 650,
   letterSpacing: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
 };
 const subtitleStyleLarge: React.CSSProperties = {
-  marginTop: 6,
-  fontSize: "clamp(12px, 1.2vw, 14px)",
+  marginTop: 4,
+  fontSize: "12px",
   fontWeight: 500,
-  letterSpacing: 2.4,
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  letterSpacing: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
@@ -935,12 +1050,14 @@ function FusionTrackList({
   fgDim,
   scrollTop,
   viewportHeight,
+  androidDensity,
 }: {
   tracks: TrackInfo[];
   fg: string;
   fgDim: string;
   scrollTop: number;
   viewportHeight: number;
+  androidDensity: boolean;
 }) {
   const player = usePlayer();
   const [pendingTrackId, setPendingTrackId] = useState<number | null>(null);
@@ -973,13 +1090,13 @@ function FusionTrackList({
   const endIndex = Math.min(tracks.length, startIndex + visibleCount);
   const visibleTracks = tracks.slice(startIndex, endIndex);
   return (
-    <div style={{ position: "relative", height: totalHeight, padding: "0 4px" }}>
+    <div style={{ position: "relative", height: totalHeight, padding: androidDensity ? 0 : "0 4px" }}>
       <div
         style={{
           position: "absolute",
           top: startIndex * TRACK_ROW_HEIGHT,
-          left: 4,
-          right: 4,
+          left: androidDensity ? 0 : 4,
+          right: androidDensity ? 0 : 4,
         }}
       >
         {visibleTracks.map((t) => (
@@ -991,6 +1108,7 @@ function FusionTrackList({
             player={player}
             pending={pendingTrackId === t.id}
             onRequestPlay={requestPlay}
+            androidDensity={androidDensity}
           />
         ))}
       </div>
@@ -1005,6 +1123,7 @@ function TrackRow({
   player,
   pending,
   onRequestPlay,
+  androidDensity,
 }: {
   track: TrackInfo;
   fg: string;
@@ -1012,12 +1131,15 @@ function TrackRow({
   player: ReturnType<typeof usePlayer>;
   pending: boolean;
   onRequestPlay: (track: TrackInfo) => void;
+  androidDensity: boolean;
 }) {
   const active = player.current?.neteaseId === track.id;
   const isPlayingThis = active && player.isPlaying;
   const visuallyActive = active || pending;
   const showIndicator = visuallyActive;
-  const rowBaseBg = visuallyActive ? rowActiveBg(fg) : "rgba(255,255,255,0)";
+  const rowBaseBg = visuallyActive
+    ? androidDensity ? "rgba(155,227,198,0.10)" : rowActiveBg(fg)
+    : "rgba(255,255,255,0)";
 
   const onRowClick = () => {
     // 单击播放：active 行就 toggle，非 active 直接切歌
@@ -1046,14 +1168,14 @@ function TrackRow({
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 14,
+        gap: androidDensity ? 12 : 14,
         height: TRACK_ROW_HEIGHT,
-        padding: "7px 6px",
+        padding: androidDensity ? "9px 16px 9px 24px" : "7px 6px",
         boxSizing: "border-box",
         cursor: pending ? "progress" : "pointer",
-        borderRadius: 8,
+        borderRadius: androidDensity ? 0 : 8,
         background: rowBaseBg,
-        boxShadow: visuallyActive
+        boxShadow: visuallyActive && !androidDensity
           ? `inset 3px 0 0 ${fg}, 0 8px 22px ${rowGlowBg(fg)}`
           : "none",
         transition: "opacity 160ms ease, background 160ms ease, box-shadow 160ms ease",
@@ -1064,7 +1186,9 @@ function TrackRow({
       onMouseEnter={(e) => {
         if (!visuallyActive) {
           e.currentTarget.style.opacity = "0.94";
-          e.currentTarget.style.background = rowHoverBg(fg);
+          e.currentTarget.style.background = androidDensity
+            ? "rgba(255,255,255,0.045)"
+            : rowHoverBg(fg);
         }
       }}
       onMouseLeave={(e) => {
@@ -1074,25 +1198,12 @@ function TrackRow({
         }
       }}
     >
-      {/* 不再显示序号；左侧固定 12px 指示槽，active/inactive 不挤动文字。 */}
-      <div
-        style={{
-          width: 12,
-          display: "flex",
-          justifyContent: "center",
-          flexShrink: 0,
-          opacity: showIndicator ? 1 : 0,
-        }}
-      >
-        <PlayingMark fg={fg} playing={isPlayingThis || pending} />
-      </div>
-
       <div style={{ flex: 1, minWidth: 0 }}>
         <div
           style={{
-            color: fg,
+            color: visuallyActive && androidDensity ? PIPO_MINT : fg,
             fontSize: 14,
-            fontWeight: visuallyActive ? 650 : 500,
+            fontWeight: 600,
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -1103,10 +1214,10 @@ function TrackRow({
         </div>
         <div
           style={{
-            color: visuallyActive ? fg : fgDim,
+            color: fgDim,
             fontSize: 12,
             marginTop: 2,
-            opacity: visuallyActive ? 0.72 : 1,
+            opacity: visuallyActive ? 0.78 : 1,
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -1116,30 +1227,22 @@ function TrackRow({
         </div>
       </div>
 
-      <div
-        style={{
-          color: fgDim,
-          fontSize: 11,
-          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-          flexShrink: 0,
-        }}
-      >
-        {fmtMs(track.durationMs)}
-      </div>
-
-      {/* 播放按钮：用户明确要求每行有；active 时切成暂停 */}
       <button
         onClick={onPlayClick}
         aria-label={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
         title={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
         disabled={pending}
         style={{
-          ...playBtn(fg),
+          ...playBtn(androidDensity && visuallyActive ? PIPO_MINT : fg),
           flexShrink: 0,
           opacity: pending ? 0.62 : 1,
         }}
       >
-        {isPlayingThis ? <PauseIcon /> : <PlayIcon />}
+        {showIndicator ? (
+          <PlayingMark fg={androidDensity ? PIPO_MINT : fg} playing={isPlayingThis || pending} />
+        ) : (
+          <PlayIcon />
+        )}
       </button>
     </div>
   );
@@ -1289,19 +1392,19 @@ const toolbarCluster: React.CSSProperties = {
   boxShadow: "0 8px 24px rgba(0,0,0,0.16)",
 };
 
-/** 顶部 titlebar 按钮：32x32，和 macOS 交通灯 / Windows caption row 同一高度节奏。 */
+/** 顶部 titlebar 按钮：参考 Codex 桌面栏的轻量 icon button。 */
 function chipStyle(fg: string): React.CSSProperties {
   const isDarkText = isDarkTextColor(fg);
   const shadow = isDarkText
-    ? "drop-shadow(0 1px 3px rgba(255,255,255,0.45))"
-    : "drop-shadow(0 1px 4px rgba(0,0,0,0.45))";
+    ? "drop-shadow(0 1px 2px rgba(255,255,255,0.36))"
+    : "drop-shadow(0 1px 3px rgba(0,0,0,0.34))";
   return {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: 32,
-    height: 28,
-    borderRadius: 7,
+    width: 34,
+    height: 34,
+    borderRadius: 9,
     border: "none",
     background: "transparent",
     color: fg,
@@ -1309,8 +1412,8 @@ function chipStyle(fg: string): React.CSSProperties {
     textDecoration: "none",
     filter: shadow,
     WebkitTapHighlightColor: "transparent",
-    transition:
-      "background 160ms ease, transform 160ms cubic-bezier(0.22,0.61,0.36,1), opacity 160ms ease",
+    opacity: 0.92,
+    transition: "background 140ms ease, opacity 140ms ease",
   };
 }
 

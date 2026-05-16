@@ -97,7 +97,26 @@ async fn handle(
         }
     }
 
-    // ---- 3) Miss：走 cdn helper 拉上游 ----
+    // ---- 3) Miss + Range：优先只拉浏览器要的片段，让 <audio> 能快速起声。
+    //
+    // 旧逻辑在 miss 时无视 Range，整首下载完才响应；桌面端点歌就会卡在
+    // “下载完整文件 + WebAudio decode 完整文件”之后才出声。这里对媒体元素的
+    // Range 请求先按 1MB 小片透传，完整缓存仍留给后续无 Range 的 decode/fetch 路径。
+    if let Some(range) = range_header
+        .as_deref()
+        .and_then(|range| bounded_upstream_range(range, 1_048_576))
+    {
+        log::debug!("[audio_cache] MISS track={track_id} range={range}");
+        let resp = cdn_get(&upstream_url, Some(&range), None, None).await?;
+        let mut builder = Response::builder().status(resp.status);
+        builder = passthrough_headers(builder, &resp.headers);
+        builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+        return builder
+            .body(resp.body)
+            .map_err(|e| anyhow::anyhow!("build ranged response: {e}"));
+    }
+
+    // ---- 4) Miss：走 cdn helper 拉完整上游并落盘 ----
     log::debug!("[audio_cache] MISS track={track_id} fetching upstream");
     // 注意：缓存写入时不带 Range（要的是完整文件）。webview 给的 Range 在响应阶段单独处理。
     let resp = cdn_get(&upstream_url, None, None, None).await?;
@@ -119,7 +138,7 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // ---- 4) 写缓存（best-effort） ----
+    // ---- 5) 写缓存（best-effort） ----
     let format = infer_ext_from_url(&upstream).or_else(|| {
         content_type
             .as_deref()
@@ -137,7 +156,7 @@ async fn handle(
         }
     }
 
-    // ---- 5) 回响应 ----
+    // ---- 6) 回响应 ----
     Ok(local_response(bytes, format.as_deref(), range_header.as_deref()))
 }
 
@@ -212,6 +231,37 @@ fn content_type_from_ext(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// 把浏览器的开放 Range（常见 `bytes=0-`）收束成小片请求，避免 miss 时又整首下载。
+/// 多段 range 不支持；解析失败时返回 None，调用方回退完整路径。
+fn bounded_upstream_range(value: &str, max_bytes: u64) -> Option<String> {
+    let v = value.trim();
+    let v = v.strip_prefix("bytes=")?;
+    let mut parts = v.split('-');
+    let start_s = parts.next()?.trim();
+    let end_s = parts.next()?.trim();
+    if !start_s.is_empty() {
+        let start: u64 = start_s.parse().ok()?;
+        let requested_end = if end_s.is_empty() {
+            start.saturating_add(max_bytes.saturating_sub(1))
+        } else {
+            end_s.parse().ok()?
+        };
+        let bounded_end = requested_end.min(start.saturating_add(max_bytes.saturating_sub(1)));
+        if bounded_end < start {
+            return None;
+        }
+        return Some(format!("bytes={start}-{bounded_end}"));
+    }
+    if !end_s.is_empty() {
+        let suffix: u64 = end_s.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        return Some(format!("bytes=-{}", suffix.min(max_bytes)));
+    }
+    None
+}
+
 /// 解析最简单的 `bytes=start-end` / `bytes=start-` —— 不支持多段 / suffix。
 /// 返回 `(start, end_inclusive)`。失败 / 越界 → None，调用方退回完整响应。
 fn parse_range(value: &str, total: u64) -> Option<(u64, u64)> {
@@ -254,4 +304,3 @@ fn error_response(code: StatusCode, msg: &str) -> Response<Vec<u8>> {
         .body(format!("claudio-audio: {msg}").into_bytes())
         .expect("build error response")
 }
-

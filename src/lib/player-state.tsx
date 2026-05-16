@@ -331,6 +331,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const masterGainRef = useRef<GainNode | null>(null);
   const schedulerRef = useRef<AudioScheduler | null>(null);
   const bufferCacheRef = useRef<TrackBufferCache | null>(null);
+  const streamAudioRef = useRef<HTMLAudioElement | null>(null);
+  const streamSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const streamingTrackIdRef = useRef<number | null>(null);
+  const streamingGenRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
 
   // ---- 用户意图 + 最后已知位置 ----
@@ -422,6 +426,36 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     startRafTick();
   }, []);
 
+  const stopStreamingPlayback = useCallback(() => {
+    const el = streamAudioRef.current;
+    streamingTrackIdRef.current = null;
+    streamingGenRef.current = null;
+    if (!el) return;
+    el.onended = null;
+    el.onerror = null;
+    try { el.pause(); } catch {}
+    try {
+      el.removeAttribute("src");
+      el.load();
+    } catch {}
+  }, []);
+
+  const ensureStreamAudio = useCallback((): HTMLAudioElement | null => {
+    const ctx = ctxRef.current;
+    const out = masterGainRef.current;
+    if (!ctx || !out) return null;
+    if (!streamAudioRef.current) {
+      const el = new Audio();
+      el.preload = "auto";
+      streamAudioRef.current = el;
+    }
+    if (!streamSourceRef.current) {
+      streamSourceRef.current = ctx.createMediaElementSource(streamAudioRef.current);
+      streamSourceRef.current.connect(out);
+    }
+    return streamAudioRef.current;
+  }, []);
+
   // ============================================================
   // RAF tick：位置同步 + 可视化幅度 + 自动排下一首
   // ============================================================
@@ -450,10 +484,19 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       const amp = clamp(0.25 + mix * 3.2, 0.15, 0.95);
       (window as unknown as { __claudioAmp?: number }).__claudioAmp = amp;
 
-      // 位置同步
-      if (sched.getIsPlaying()) {
-        const pos = sched.getPositionSec();
-        const dur = sched.getDurationSec();
+      // 位置同步：手动点歌先走 HTMLAudio 流式起声，后台 decode 完再切回
+      // AudioScheduler；两种 current 共享同一套 UI position / mediaSession。
+      const streamEl = streamAudioRef.current;
+      const streamPlaying =
+        !!streamEl &&
+        streamingTrackIdRef.current != null &&
+        !streamEl.paused &&
+        !streamEl.ended;
+      if (sched.getIsPlaying() || streamPlaying) {
+        const pos = streamPlaying ? streamEl.currentTime : sched.getPositionSec();
+        const dur = streamPlaying
+          ? Number.isFinite(streamEl.duration) ? streamEl.duration : stateRef.current.current?.durationSec ?? 0
+          : sched.getDurationSec();
         lastKnownPositionRef.current = pos;
         setState((s) => (Math.abs(s.positionSec - pos) < 0.05 ? s : { ...s, positionSec: pos }));
 
@@ -479,8 +522,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
         // 播放过半或临近曲尾 → 排下一首，并轻量预热后续一首。
         // 这样对齐 Android 的 prewarm 思路：连续播放够稳，但不在开歌瞬间抢资源。
-        const remain = sched.getRemainingSec() ?? Infinity;
+        const remain = streamPlaying && dur > 0
+          ? Math.max(0, dur - pos)
+          : sched.getRemainingSec() ?? Infinity;
         if (
+          !streamPlaying &&
           shouldPrepareUpcoming(pos, dur, remain) &&
           userIntendedPlayingRef.current
         ) {
@@ -973,8 +1019,8 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       lastKnownPositionRef.current = resumeFrom;
 
       try {
-        const playback = await decodeForPlayback(neteaseId, bufCache);
-        if (!playback) {
+        const fetched = await fetchUrl(neteaseId);
+        if (!fetched) {
           setState((s) => {
             if (gen !== generationRef.current) return s;
             return {
@@ -991,14 +1037,115 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
           return;
         }
-        const { url, decoded } = playback;
         // 期间用户切歌了
         if (gen !== generationRef.current) {
           if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
           return;
         }
 
+        const streamEl = ensureStreamAudio();
+        if (streamEl) {
+          try {
+            sched.destroy();
+            stopStreamingPlayback();
+            scheduledNextIdRef.current = null;
+            schedulingForRef.current = null;
+            streamingTrackIdRef.current = neteaseId;
+            streamingGenRef.current = gen;
+            streamEl.src = fetched.url;
+            try {
+              if (resumeFrom > 0) streamEl.currentTime = resumeFrom;
+            } catch {}
+            streamEl.onended = () => {
+              if (
+                streamingGenRef.current === gen &&
+                streamingTrackIdRef.current === neteaseId
+              ) {
+                streamingTrackIdRef.current = null;
+                streamingGenRef.current = null;
+                onSchedulerEnded(neteaseId);
+              }
+            };
+            streamEl.onerror = () => {
+              if (gen !== generationRef.current) return;
+              setState((s) => ({
+                ...s,
+                error: "这首歌暂时无法流式播放",
+                isPlaying: false,
+                aiStatus: "—",
+              }));
+              userIntendedPlayingRef.current = false;
+              if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
+            };
+            await streamEl.play();
+
+            currentAudioUrlRef.current = fetched.url;
+            setState((s) => {
+              if (gen !== generationRef.current) return s;
+              return {
+                ...s,
+                ...playbackStateForTrack(track, resumeFrom, "播放中"),
+              };
+            });
+            cache.setState(LAST_TRACK_KEY, JSON.stringify(track)).catch(() => {});
+            cache.setState(LAST_POSITION_KEY, String(resumeFrom)).catch(() => {});
+            if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
+
+            window.setTimeout(() => {
+              if (gen === generationRef.current) void getOrAnalyze(neteaseId, fetched.url);
+            }, 0);
+            void loadLyricFor(track);
+            void loadDjLineFor(track);
+
+            // 流式音频先出声；完整文件解码完成后再切回 WebAudio scheduler，
+            // 后续 prewarm / gapless 才能继续接管。
+            void (async () => {
+              try {
+                const decoded = await bufCache.ensure(neteaseId, fetched.url);
+                if (
+                  gen !== generationRef.current ||
+                  streamingGenRef.current !== gen ||
+                  streamingTrackIdRef.current !== neteaseId
+                ) {
+                  return;
+                }
+                const handoffAt = Math.max(
+                  0,
+                  Math.min(
+                    streamEl.currentTime || lastKnownPositionRef.current || 0,
+                    Math.max(0, decoded.buffer.duration - 0.05),
+                  ),
+                );
+                stopStreamingPlayback();
+                sched.play({
+                  trackId: neteaseId,
+                  buffer: decoded.buffer,
+                  transition: { mode: "cold" },
+                  fromOffset: handoffAt,
+                });
+                lastKnownPositionRef.current = handoffAt;
+                setState((s) => {
+                  if (gen !== generationRef.current) return s;
+                  return { ...s, positionSec: handoffAt, isPlaying: true, aiStatus: "播放中" };
+                });
+              } catch (e) {
+                console.debug("[claudio] background decode after stream failed", e);
+              }
+            })();
+            return;
+          } catch (e) {
+            console.debug("[claudio] stream start failed, fallback to WebAudio decode", e);
+            stopStreamingPlayback();
+          }
+        }
+
+        const decoded = await bufCache.ensure(neteaseId, fetched.url);
+        if (gen !== generationRef.current) {
+          if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
+          return;
+        }
         const isCold = sched.getCurrentTrackId() == null;
+        stopStreamingPlayback();
         sched.play({
           trackId: neteaseId,
           buffer: decoded.buffer,
@@ -1007,7 +1154,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             : { mode: "manualCut", durationS: MANUAL_CROSSFADE_S },
           fromOffset: resumeFrom,
         });
-        currentAudioUrlRef.current = url;
+        currentAudioUrlRef.current = fetched.url;
 
         setState((s) => {
           if (gen !== generationRef.current) return s;
@@ -1023,7 +1170,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
         // 起播之后再做 JS 分析，避免手动切歌时同一首歌被 fetch 两遍拖慢首响。
         window.setTimeout(() => {
-          if (gen === generationRef.current) void getOrAnalyze(neteaseId, url);
+          if (gen === generationRef.current) void getOrAnalyze(neteaseId, fetched.url);
         }, 0);
 
         // 异步歌词 + DJ 旁白
@@ -1047,7 +1194,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
       }
     },
-    [ensureAudio, decodeForPlayback, loadLyricFor, loadDjLineFor],
+    [
+      ensureAudio,
+      ensureStreamAudio,
+      fetchUrl,
+      loadLyricFor,
+      loadDjLineFor,
+      onSchedulerEnded,
+      stopStreamingPlayback,
+    ],
   );
 
   // ============================================================
@@ -1144,6 +1299,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     pendingJudgmentRef.current = null;
     pendingMixPlanRef.current = null;
     schedulerRef.current?.pause();
+    try { streamAudioRef.current?.pause(); } catch {}
     setState((s) => ({ ...s, isPlaying: false }));
     (window as unknown as { __claudioAmp?: number }).__claudioAmp = 0;
   }, []);
@@ -1162,6 +1318,18 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     userIntendedPlayingRef.current = true;
     if (ctx.state === "suspended") {
       try { await ctx.resume(); } catch {}
+    }
+    const streamEl = streamAudioRef.current;
+    if (
+      streamEl &&
+      streamingTrackIdRef.current != null &&
+      stateRef.current.current?.neteaseId === streamingTrackIdRef.current
+    ) {
+      try {
+        await streamEl.play();
+        setState((s) => ({ ...s, isPlaying: true }));
+        return;
+      } catch {}
     }
     if (sched.getCurrentTrackId() != null) {
       sched.resume();
@@ -1186,6 +1354,19 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     pendingPlaybackGenRef.current = null;
     pendingJudgmentRef.current = null;
     pendingMixPlanRef.current = null;
+    const streamEl = streamAudioRef.current;
+    if (
+      streamEl &&
+      streamingTrackIdRef.current != null &&
+      stateRef.current.current?.neteaseId === streamingTrackIdRef.current
+    ) {
+      try {
+        streamEl.currentTime = Math.max(0, sec);
+        lastKnownPositionRef.current = Math.max(0, sec);
+        setState((s) => ({ ...s, positionSec: Math.max(0, sec) }));
+        return;
+      } catch {}
+    }
     schedulerRef.current?.seek(Math.max(0, sec));
   }, []);
 
@@ -1475,12 +1656,13 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     return () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      stopStreamingPlayback();
       schedulerRef.current?.destroy();
       bufferCacheRef.current?.clear();
       ctxRef.current?.close().catch(() => {});
       (window as unknown as { __claudioAmp?: number }).__claudioAmp = 0;
     };
-  }, []);
+  }, [stopStreamingPlayback]);
 
   const api = useMemo<PlayerAPI>(
     () => ({
