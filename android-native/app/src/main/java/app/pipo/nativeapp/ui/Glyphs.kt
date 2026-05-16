@@ -233,6 +233,76 @@ private val ListIconVector: ImageVector by lazy {
     }
 }
 
+private val LocateCurrentIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(20f, 12f)
+            arcToRelative(8f, 8f, 0f, true, true, -16f, 0f)
+            arcToRelative(8f, 8f, 0f, true, true, 16f, 0f)
+            close()
+            moveTo(12f, 2.75f); verticalLineToRelative(2.5f)
+            moveTo(12f, 18.75f); verticalLineToRelative(2.5f)
+            moveTo(2.75f, 12f); horizontalLineToRelative(2.5f)
+            moveTo(18.75f, 12f); horizontalLineToRelative(2.5f)
+        }
+        path(fill = SolidColor(Color.White)) {
+            moveTo(14.15f, 12f)
+            arcToRelative(2.15f, 2.15f, 0f, true, true, -4.3f, 0f)
+            arcToRelative(2.15f, 2.15f, 0f, true, true, 4.3f, 0f)
+            close()
+        }
+    }
+}
+
+private val RepeatModeIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(7f, 7.5f)
+            horizontalLineToRelative(8.6f)
+            arcToRelative(3.4f, 3.4f, 0f, false, true, 3.4f, 3.4f)
+            verticalLineToRelative(0.9f)
+            moveTo(16.1f, 4.6f)
+            lineTo(19f, 7.5f)
+            lineToRelative(-2.9f, 2.9f)
+
+            moveTo(17f, 16.5f)
+            horizontalLineToRelative(-8.6f)
+            arcToRelative(3.4f, 3.4f, 0f, false, true, -3.4f, -3.4f)
+            verticalLineToRelative(-0.9f)
+            moveTo(7.9f, 19.4f)
+            lineTo(5f, 16.5f)
+            lineToRelative(2.9f, -2.9f)
+        }
+    }
+}
+
+private val OrderModeIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(5f, 6.5f); horizontalLineToRelative(9.4f)
+            moveTo(5f, 12f); horizontalLineToRelative(8f)
+            moveTo(5f, 17.5f); horizontalLineToRelative(6.2f)
+            moveTo(17.8f, 5.4f); verticalLineTo(18.6f)
+            moveTo(14.8f, 15.8f); lineTo(17.8f, 18.6f); lineTo(20.8f, 15.8f)
+        }
+    }
+}
+
 /**
  * 真正的 Lucide Settings 齿轮（与 React `<NavGearIcon>` 路径 1:1）。
  * 8 颗"鼓出来的圆齿"，中间一个 r=3 的圆。
@@ -414,6 +484,30 @@ fun ListIcon(
     modifier: Modifier = Modifier.size(20.dp),
 ) {
     Icon(imageVector = ListIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun LocateCurrentIcon(
+    color: Color = Color(0xD1F5F7FF),
+    modifier: Modifier = Modifier.size(20.dp),
+) {
+    Icon(imageVector = LocateCurrentIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun RepeatModeIcon(
+    color: Color = Color(0xD1F5F7FF),
+    modifier: Modifier = Modifier.size(20.dp),
+) {
+    Icon(imageVector = RepeatModeIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun OrderModeIcon(
+    color: Color = Color(0xD1F5F7FF),
+    modifier: Modifier = Modifier.size(20.dp),
+) {
+    Icon(imageVector = OrderModeIconVector, contentDescription = null, tint = color, modifier = modifier)
 }
 
 @Composable

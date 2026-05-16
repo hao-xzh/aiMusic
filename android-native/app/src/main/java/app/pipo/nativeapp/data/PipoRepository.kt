@@ -91,11 +91,17 @@ data class AudioFeatures(
     val tailSilenceS: Double,
 )
 
+enum class PipoLyricTiming {
+    Line,
+    Word,
+}
+
 data class PipoLyricLine(
     val startMs: Long,
     val durationMs: Long,
     val text: String,
     val chars: List<PipoLyricChar> = emptyList(),
+    val timing: PipoLyricTiming = if (chars.isEmpty()) PipoLyricTiming.Line else PipoLyricTiming.Word,
 )
 
 data class PipoLyricChar(
@@ -129,6 +135,7 @@ interface PipoRepository {
     val aiConfig: Flow<AiConfigView>
 
     suspend fun refreshAccount()
+    suspend fun logout()
     suspend fun startQrLogin(): QrLoginStart
     suspend fun checkQrLogin(key: String): QrLoginStatus
     suspend fun sendPhoneCaptcha(phone: String, countryCode: Int = 86): CaptchaSentStatus
@@ -158,4 +165,3 @@ interface PipoRepository {
      */
     suspend fun aiEmbed(inputs: List<String>): List<FloatArray>
 }
-

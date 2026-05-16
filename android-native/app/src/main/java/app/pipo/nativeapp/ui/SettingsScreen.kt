@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.ui
 
+import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -83,18 +84,22 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                         val startResult = runCatching { repository.startQrLogin() }
                         val start = startResult.getOrNull()
                         if (start == null || start.qrContent.isBlank()) {
-                            val err = startResult.exceptionOrNull()
-                            loginStatus = if (err != null) {
-                                "扫码失败:${err.javaClass.simpleName}: ${err.message ?: "未知"}"
-                            } else {
-                                "扫码失败 —— bridge 返回空"
+                            startResult.exceptionOrNull()?.let { err ->
+                                Log.w("PipoSettings", "start QR login failed", err)
                             }
+                            loginStatus = "二维码加载失败，检查网络后刷新"
                             return@launch
                         }
                         qrContent = start.qrContent
                         loginStatus = "等待扫码"
                         repeat(30) {
-                            val status = repository.checkQrLogin(start.key)
+                            val statusResult = runCatching { repository.checkQrLogin(start.key) }
+                            val status = statusResult.getOrElse { err ->
+                                Log.w("PipoSettings", "check QR login failed", err)
+                                loginStatus = "登录状态获取失败，稍等后刷新"
+                                qrContent = null
+                                return@launch
+                            }
                             loginStatus = when (status.code) {
                                 801 -> "等待扫码"
                                 802 -> "等待手机端确认"
@@ -125,8 +130,10 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                     TextButton(onClick = {
                         scope.launch {
                             qrContent = null
+                            repository.logout()
+                            runCatching { PipoGraph.lastPlayback.clear() }
+                            runCatching { PipoGraph.library.invalidate() }
                             loginStatus = "已退出"
-                            // TODO: 后端支持退出 cookie 后接上(目前只清前端 state)
                         }
                     }) { Text("退出", color = PipoColors.TextDim) }
                 }

@@ -63,27 +63,37 @@ class LastPlaybackStore(context: Context) {
         if (now - prev < THROTTLE_MS) return
         // CAS:只有第一个跨越节流窗口的调用会通过;其它在窗口期内的并发调用全 skip
         if (!lastSavedAtMs.compareAndSet(prev, now)) return
-        // 主线程只做一次 list 浅拷贝（List 不可变，元素是 data class，安全）
-        val snap = queue.take(MAX_QUEUE)
-        ioScope.launch { writeSnapshot(snap, currentIndex, positionMs) }
+        // 主线程只做一次窗口浅拷贝：长歌单保留当前曲附近，而不是永远截前 200 首。
+        val (snap, snapIndex) = snapshotWindow(queue, currentIndex)
+        ioScope.launch { writeSnapshot(snap, snapIndex, positionMs) }
     }
 
     /** 强制落盘（用户主动切歌 / 应用进入后台时调）—— 同样异步，不阻塞调用方 */
     fun save(queue: List<NativeTrack>, currentIndex: Int, positionMs: Long) {
         if (queue.isEmpty()) return
-        val snap = queue.take(MAX_QUEUE)
-        ioScope.launch { writeSnapshot(snap, currentIndex, positionMs) }
+        val (snap, snapIndex) = snapshotWindow(queue, currentIndex)
+        ioScope.launch { writeSnapshot(snap, snapIndex, positionMs) }
     }
 
     private fun writeSnapshot(queue: List<NativeTrack>, currentIndex: Int, positionMs: Long) {
         val arr = JSONArray()
         queue.forEach { arr.put(encodeTrack(it)) }
+        val safeIndex = if (queue.isEmpty()) 0 else currentIndex.coerceIn(0, queue.size - 1)
         val obj = JSONObject()
             .put("queue", arr)
-            .put("currentIndex", currentIndex.coerceAtLeast(0))
+            .put("currentIndex", safeIndex)
             .put("positionMs", positionMs.coerceAtLeast(0))
             .put("savedAtMs", System.currentTimeMillis())
         prefs.edit().putString(KEY, obj.toString()).apply()
+    }
+
+    private fun snapshotWindow(queue: List<NativeTrack>, currentIndex: Int): Pair<List<NativeTrack>, Int> {
+        if (queue.isEmpty()) return emptyList<NativeTrack>() to 0
+        val safeIndex = currentIndex.coerceIn(0, queue.size - 1)
+        if (queue.size <= MAX_QUEUE) return queue.toList() to safeIndex
+        val start = (safeIndex - MAX_QUEUE / 2).coerceIn(0, queue.size - MAX_QUEUE)
+        val snap = queue.subList(start, start + MAX_QUEUE).toList()
+        return snap to (safeIndex - start)
     }
 
     fun clear() {

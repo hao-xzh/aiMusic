@@ -5,6 +5,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -24,12 +25,15 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -217,8 +221,14 @@ fun PlayerScreen(
                                 enabled = state.queue.isNotEmpty(),
                                 size = clampDp(64.dp, viewportW * 0.155f, 80.dp),
                             ) {
-                                if (state.isPlaying) PauseGlyph(modifier = Modifier.size(clampDp(44.dp, viewportW * 0.12f, 60.dp)))
-                                else PlayGlyph(modifier = Modifier.size(clampDp(44.dp, viewportW * 0.12f, 60.dp)))
+                                val centerGlyphSize = clampDp(44.dp, viewportW * 0.12f, 60.dp)
+                                if (state.isLoading) {
+                                    LoadingRing(modifier = Modifier.size(centerGlyphSize * 0.68f))
+                                } else if (state.isPlaying) {
+                                    PauseGlyph(modifier = Modifier.size(centerGlyphSize))
+                                } else {
+                                    PlayGlyph(modifier = Modifier.size(centerGlyphSize))
+                                }
                             }
                         },
                         c = {
@@ -321,31 +331,73 @@ private fun CompactCover(coverUrl: String?, isPlaying: Boolean, hidden: Boolean)
  */
 @Composable
 private fun PipoProgressBar(progress: Float, onSeek: (Float) -> Unit) {
+    var draggingProgress by remember { mutableStateOf<Float?>(null) }
+    val displayProgress = (draggingProgress ?: progress).coerceIn(0f, 1f)
     val animated by animateFloatAsState(
-        targetValue = progress.coerceIn(0f, 1f),
-        animationSpec = tween(durationMillis = 120),
+        targetValue = displayProgress,
+        animationSpec = tween(durationMillis = if (draggingProgress == null) 120 else 0),
         label = "progress",
     )
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(4.dp)
-            .clip(RoundedCornerShape(50))
-            .background(Color(0x1FE9EFFF))
-            .pointerInput(Unit) {
+            .height(24.dp)
+            .pointerInput(onSeek) {
                 detectTapGestures { offset ->
-                    onSeek((offset.x / size.width.toFloat()).coerceIn(0f, 1f))
+                    val target = progressFromOffset(offset.x, size.width)
+                    draggingProgress = target
+                    onSeek(target)
+                    draggingProgress = null
+                }
+            }
+            .pointerInput(onSeek) {
+                detectDragGestures(
+                    onDragStart = { offset ->
+                        draggingProgress = progressFromOffset(offset.x, size.width)
+                    },
+                    onDragCancel = { draggingProgress = null },
+                    onDragEnd = {
+                        draggingProgress?.let(onSeek)
+                        draggingProgress = null
+                    },
+                ) { change, _ ->
+                    draggingProgress = progressFromOffset(change.position.x, size.width)
+                    change.consume()
                 }
             },
+        contentAlignment = Alignment.CenterStart,
     ) {
         Box(
             modifier = Modifier
-                .fillMaxWidth(fraction = animated)
+                .fillMaxWidth()
                 .height(4.dp)
                 .clip(RoundedCornerShape(50))
-                .background(Color(0xEBF5F7FF)),
-        )
+                .background(Color(0x1FE9EFFF)),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(fraction = animated)
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color(0xEBF5F7FF)),
+            )
+        }
     }
+}
+
+private fun progressFromOffset(x: Float, width: Int): Float {
+    if (width <= 0) return 0f
+    return (x / width.toFloat()).coerceIn(0f, 1f)
+}
+
+@Composable
+private fun LoadingRing(modifier: Modifier = Modifier) {
+    CircularProgressIndicator(
+        modifier = modifier,
+        color = Color(0xFFF5F7FF),
+        strokeWidth = 2.4.dp,
+        trackColor = Color.Transparent,
+    )
 }
 
 @Composable

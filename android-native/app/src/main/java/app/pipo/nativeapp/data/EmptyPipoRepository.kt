@@ -45,6 +45,10 @@ class EmptyPipoRepository : PipoRepository {
     override val aiConfig: Flow<AiConfigView> = aiConfigState.asStateFlow()
 
     override suspend fun refreshAccount() = Unit
+    override suspend fun logout() {
+        accountState.value = null
+        playlistState.value = emptyList()
+    }
     override suspend fun startQrLogin(): QrLoginStart = QrLoginStart(key = "", qrContent = "")
     override suspend fun checkQrLogin(key: String): QrLoginStatus =
         QrLoginStatus(code = -1, message = "Bridge unavailable")

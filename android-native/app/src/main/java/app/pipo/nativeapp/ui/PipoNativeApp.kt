@@ -27,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.viewmodel.compose.viewModel
+import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.playback.PlayerViewModel
 
 /**
@@ -113,26 +114,26 @@ fun PipoNativeApp() {
                 )
 
                 // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
-                // lyricLeadMs：把 positionMs 提前喂给歌词。600ms 是综合：
-                //   - MediaController 通过 IPC 拿 ExoPlayer 位置，本身可能延迟 ~50-100ms
-                //   - 网易 YRC 时间戳本身就偏晚于实际唱速 ~100-200ms
-                //   - 人眼"看到颜色变 → 听到那个字唱出来"之间约 100ms 感知阈值
-                val lyricPositionMs = viewModel.state.positionMs + 600L
-                val activeLyricIndex = viewModel.state.lyrics
-                    .indexOfLast { line -> lyricPositionMs >= line.startMs }
-                    .coerceAtLeast(0)
+                // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
+                val lyricClock = LyricTiming.resolve(
+                    positionMs = viewModel.state.positionMs,
+                    lines = viewModel.state.lyrics,
+                )
                 ImmersiveLyricsOverlay(
                     progress = coverProgress,
                     coverUrl = viewModel.state.artworkUrl,
                     title = viewModel.state.title,
                     artist = viewModel.state.artist,
                     lyrics = viewModel.state.lyrics,
-                    activeLyricIndex = activeLyricIndex,
-                    positionMs = lyricPositionMs,
+                    activeLyricIndex = lyricClock.activeIndex,
+                    positionMs = lyricClock.positionMs,
                     isPlaying = viewModel.state.isPlaying,
                     onClose = { immersive = false },
                     onToggle = viewModel::toggle,
                     onNext = viewModel::next,
+                    onSeekToMs = { targetMs ->
+                        viewModel.seekToMs(targetMs)
+                    },
                 )
 
                 // 子页面 push 动画（distill / settings / taste / login）

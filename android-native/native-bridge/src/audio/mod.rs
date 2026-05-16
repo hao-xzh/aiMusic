@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[path = "../../../../src-tauri/src/audio/analysis.rs"]
 mod analysis;
@@ -125,7 +126,11 @@ impl NativeAudioStore {
             return Err(anyhow!("missing audio url for track {track_id}"));
         }
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(45))
+            .build()
+            .context("build audio http client")?
             .get(url)
             .send()
             .await

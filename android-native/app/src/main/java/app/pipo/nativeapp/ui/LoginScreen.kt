@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.ui
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -149,23 +150,30 @@ private suspend fun runQrFlow(
     val start = startResult.getOrNull()
     if (start == null) {
         onContent(null)
-        // 把真异常的类型 + message 露出来,光说"网络问题"找不到根因
-        val err = startResult.exceptionOrNull()
-        onStatus("拉取二维码失败:${err?.javaClass?.simpleName}: ${err?.message ?: "未知"}")
+        startResult.exceptionOrNull()?.let { err ->
+            Log.w("PipoLogin", "start QR login failed", err)
+        }
+        onStatus("二维码加载失败，检查网络后刷新")
         return
     }
     if (start.qrContent.isBlank()) {
         onContent(null)
-        onStatus("拉取二维码失败 —— bridge 返回空内容(可能 native lib 没加载)")
+        Log.w("PipoLogin", "start QR login returned blank content")
+        onStatus("二维码暂时不可用，请刷新重试")
         return
     }
     onContent(start.qrContent)
     onStatus("用网易云 App 扫上面这个码")
     repeat(30) {
         delay(2_000)
-        val s = runCatching { repository.checkQrLogin(start.key) }.getOrNull()
+        val checkResult = runCatching { repository.checkQrLogin(start.key) }
+        val s = checkResult.getOrNull()
         if (s == null) {
-            onStatus("网络异常 —— 稍等再刷新")
+            checkResult.exceptionOrNull()?.let { err ->
+                Log.w("PipoLogin", "check QR login failed", err)
+            }
+            onStatus("登录状态获取失败，稍等后刷新")
+            onContent(null)
             return
         }
         when (s.code) {

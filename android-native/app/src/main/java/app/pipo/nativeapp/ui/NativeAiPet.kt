@@ -39,6 +39,8 @@ import androidx.compose.ui.unit.dp
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.runtime.Amp
+import app.pipo.nativeapp.runtime.AppForeground
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.PI
@@ -59,6 +61,7 @@ fun NativeAiPet(
     val context = LocalContext.current
     val repository = PipoGraph.repository
     val settings by repository.settings.collectAsState(initial = NativeSettings())
+    val appInForeground by AppForeground.isForeground.collectAsState()
     val scope = rememberCoroutineScope()
     val messages = remember { mutableStateListOf<PetMessage>() }
     var open by remember { mutableStateOf(false) }
@@ -179,7 +182,8 @@ fun NativeAiPet(
 
 
     // 每日首开招呼
-    LaunchedEffect(Unit) {
+    LaunchedEffect(settings.aiNarration, appInForeground) {
+        if (!settings.aiNarration || !appInForeground) return@LaunchedEffect
         if (shouldGreetToday(context)) {
             // USER 部分对齐 React generateDailyGreeting：当下 + 天气 + 口味画像 + 跨 session 记忆
             val weather = runCatching { app.pipo.nativeapp.data.Weather.get() }.getOrNull()
@@ -193,14 +197,19 @@ fun NativeAiPet(
                 digest?.let { "TA 的人:$it" } ?: "",
             ).filter { it.isNotEmpty() }.joinToString("\n")
 
-            val text = runCatching {
+            if (!AppForeground.isForeground.value) return@LaunchedEffect
+            val text = try {
                 repository.aiChat(
                     system = GREETING_SYSTEM,
                     user = user.ifBlank { "当下:$ctxLine" },
                     temperature = 0.95f,
                     maxTokens = 80,
                 )
-            }.getOrNull()?.takeIf { it.isNotBlank() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }?.takeIf { it.isNotBlank() }
                 ?.trim()
                 ?.trim('「', '」', '『', '』', '"', '\'', '“', '”')
                 ?.take(80)
@@ -214,8 +223,9 @@ fun NativeAiPet(
     }
 
     // 单曲点评（一首歌一次 AI 调用，跨进出播放页持久 → 见 PetBubbleState 注释）
-    LaunchedEffect(currentTrackKey, open) {
+    LaunchedEffect(currentTrackKey, open, settings.aiNarration, appInForeground, isPlaying) {
         val key = currentTrackKey ?: return@LaunchedEffect
+        if (!settings.aiNarration || !appInForeground || !isPlaying) return@LaunchedEffect
         if (open) return@LaunchedEffect
         // 这首歌已经评过 → 直接返回，不再 burn AI
         if (PetBubbleState.lastCommentedKey == key) return@LaunchedEffect
@@ -237,13 +247,12 @@ fun NativeAiPet(
 
         delay(1500)
         if (open) return@LaunchedEffect
+        if (!AppForeground.isForeground.value || !isPlaying) return@LaunchedEffect
         // delay 完再 check 一次：可能 1.5s 内用户连切歌，被新一轮处理掉了
         if (PetBubbleState.lastCommentedKey == key) return@LaunchedEffect
 
         val prev = PetBubbleState.previousTrack
-        PetBubbleState.previousTrack = currentTitle to currentArtist
-        PetBubbleState.positionInQueue += 1
-        PetBubbleState.lastCommentedKey = key
+        val nextPositionInQueue = PetBubbleState.positionInQueue + 1
 
         // USER 部分对齐 React commentOnTrack：当下 + 天气 + 记忆 + 这首特征 + TA 之前说 + 上一首 + 是否开场
         val weather = runCatching { app.pipo.nativeapp.data.Weather.get() }.getOrNull()
@@ -251,7 +260,7 @@ fun NativeAiPet(
         val digest = app.pipo.nativeapp.data.AppContext.memoryDigest(settings.userFacts)
         val semantic = currentTrack?.id?.let { PipoGraph.trackSemanticStore.get(it) }
         val tagsLine = semantic?.briefForComment()
-        val isOpener = PetBubbleState.positionInQueue <= 1
+        val isOpener = nextPositionInQueue <= 1
         val userPrompt = buildString {
             append("当下：$ctxLine\n")
             digest?.let { append("TA 的人:$it\n") }
@@ -259,21 +268,29 @@ fun NativeAiPet(
             tagsLine?.let { append("这首特征：$it\n") }
             PetBubbleState.lastUserContext?.let { append("TA 之前说：「$it」\n") }
             prev?.let { append("刚刚那首：${it.first} — ${it.second}\n") }
-            append(if (isOpener) "这是开场。" else "这是接歌(队列第 ${PetBubbleState.positionInQueue} 首)。")
+            append(if (isOpener) "这是开场。" else "这是接歌(队列第 $nextPositionInQueue 首)。")
         }
 
-        val text = runCatching {
+        if (!AppForeground.isForeground.value || !isPlaying) return@LaunchedEffect
+        PetBubbleState.previousTrack = currentTitle to currentArtist
+        PetBubbleState.positionInQueue = nextPositionInQueue
+        PetBubbleState.lastCommentedKey = key
+        val text = try {
             repository.aiChat(
                 system = TRACK_COMMENT_SYSTEM,
                 user = userPrompt,
                 temperature = 0.95f,
                 maxTokens = 60,
             )
-        }.getOrNull()?.takeIf { it.isNotBlank() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }?.takeIf { it.isNotBlank() }
             ?.trim()
             ?.trim('「', '」', '『', '』', '"', '\'', '“', '”', '-', '—', ' ')
             ?.take(30)
-        if (text != null && !open) {
+        if (text != null && !open && AppForeground.isForeground.value) {
             hint = text
             delay(6000)
             hint = null

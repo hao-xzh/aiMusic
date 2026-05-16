@@ -558,6 +558,10 @@ export function AiPet() {
         // 触发播放
         if (res.play && res.resolvedTracks.length > 0) {
           const [head, ...rest] = res.resolvedTracks;
+          if (res.queueAction === "insert") {
+            await player.insertNext(head);
+            return;
+          }
           // pet-agent 内部已经跑过 smoothQueue，不要再来一遍
           // 传 continuous: 队列接近末尾时 player 自己会调它续杯。
           // null 时 player 走普通模式（modulo 循环老队列）—— 适合用户明说"排5首"那种场景

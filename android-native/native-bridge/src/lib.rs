@@ -82,6 +82,10 @@ fn dispatch(command: &str, args: Value) -> String {
             let account = netease_client().account().await?;
             Ok(serde_json::to_value(account)?)
         }),
+        "netease_logout" => match netease_client().logout() {
+            Ok(()) => "null".to_string(),
+            Err(e) => error_json(e.to_string()),
+        },
         "netease_user_playlists" => {
             let uid = args.get("uid").and_then(Value::as_i64).unwrap_or(0);
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(1000);

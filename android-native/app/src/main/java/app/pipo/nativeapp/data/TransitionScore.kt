@@ -7,8 +7,8 @@ import kotlin.math.min
  * 两两曲目接续风险评分 —— 镜像 src/lib/transition-score.ts。
  *
  * Android AudioFeatures 字段比 React TrackAnalysis 少（没有 introVocalDensity /
- * outroLowEnergy / vocalEntryS / drumEntryS / energyPerSec），所以 vocalClash /
- * lowClash 等高级评分回退成中性。等 Rust 端补上对应字段后，自动就生效。
+ * outroLowEnergy / vocalEntryS / drumEntryS / energyPerSec），这里先用 BPM、
+ * 头尾静音和 intro/outro 能量判断连续性。等 Rust 端补上更多字段后，可继续加权。
  */
 object TransitionScore {
 
@@ -48,7 +48,6 @@ object TransitionScore {
         risk -= fit.score * 0.85
 
         if (sameArtistPenalty > 0 && sameArtist(a.track, b.track)) risk += sameArtistPenalty
-        if (sameAlbum(a.track, b.track)) risk -= 0.2
 
         return kotlin.math.max(-1.2, risk)
     }
@@ -62,16 +61,10 @@ object TransitionScore {
         val bpmReliable = aa.bpm != null && bb.bpm != null &&
             aa.bpmConfidence > 0.25 && bb.bpmConfidence > 0.25
         val energyDelta = abs(aa.outroEnergy - bb.introEnergy)
-        // 没有 vocalDensity / lowEnergy 字段时按"中性"处理
-        val vocalClash = 0.0
-        val lowClash = 0.0
-        val cleanOutro = aa.tailSilenceS > 0.2
-        val playableIntro = bb.headSilenceS > 0.2
+        val boundaryIsTight = aa.tailSilenceS <= 0.45 && bb.headSilenceS <= 0.45
 
-        if (sameAlbum(a.track, b.track) && cleanOutro && playableIntro &&
-            energyDelta <= 0.24 && vocalClash <= 0.08
-        ) {
-            return FitScore(0.98, "同专辑边界干净", TransitionStyle.HardCut)
+        if (boundaryIsTight && energyDelta <= 0.16 && (!bpmReliable || bpmDelta <= 6.0)) {
+            return FitScore(0.98, "边界连续", TransitionStyle.HardCut)
         }
         if (energyDelta >= 0.34) {
             val penalty = clamp01((energyDelta - 0.25) * 1.4)
@@ -93,8 +86,8 @@ object TransitionScore {
             energyDelta <= 0.2 -> score += 0.12
             energyDelta > 0.28 -> score -= 0.15
         }
-        if (cleanOutro && playableIntro) { score += 0.18; reasons.add("尾头干净") }
-        else if (cleanOutro || playableIntro) score += 0.08
+        if (boundaryIsTight) { score += 0.18; reasons.add("边界紧密") }
+        else if (aa.tailSilenceS <= 0.8 || bb.headSilenceS <= 0.8) score += 0.08
 
         val style = if (bpmReliable && bpmDelta <= 8 && energyDelta <= 0.22)
             TransitionStyle.Tight else TransitionStyle.Soft
@@ -110,12 +103,6 @@ object TransitionScore {
         val aArtists = a.artist.split("/", "&", ",").map { it.trim().lowercase() }.toSet()
         val bArtists = b.artist.split("/", "&", ",").map { it.trim().lowercase() }.toSet()
         return aArtists.any { it.isNotBlank() && it in bArtists }
-    }
-
-    private fun sameAlbum(a: NativeTrack, b: NativeTrack): Boolean {
-        val an = a.album.trim().lowercase()
-        val bn = b.album.trim().lowercase()
-        return an.isNotBlank() && an == bn
     }
 
     private fun clamp01(x: Double): Double = if (x < 0) 0.0 else if (x > 1) 1.0 else x

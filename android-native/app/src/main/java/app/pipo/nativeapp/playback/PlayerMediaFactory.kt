@@ -13,7 +13,11 @@ import kotlin.math.min
 internal class PlayerMediaFactory(
     private val featuresStore: AudioFeaturesStore,
 ) {
-    fun toMediaItem(track: NativeTrack): MediaItem {
+    fun toMediaItem(
+        track: NativeTrack,
+        preserveHeadBoundary: Boolean = false,
+        preserveTailBoundary: Boolean = false,
+    ): MediaItem {
         val metadata = MediaMetadata.Builder()
             .setTitle(track.title)
             .setArtist(track.artist)
@@ -31,8 +35,8 @@ internal class PlayerMediaFactory(
             val headMs = (features.headSilenceS * 1000).toLong().coerceAtLeast(0L)
             val tailMs = (features.tailSilenceS * 1000).toLong().coerceAtLeast(0L)
             val durMs = (features.durationS * 1000).toLong()
-            val headSafe = headMs in 1L..min(5000L, (durMs * 0.10).toLong())
-            val tailSafe = tailMs in 1L..min(8000L, (durMs * 0.15).toLong())
+            val headSafe = !preserveHeadBoundary && headMs in 1L..min(5000L, (durMs * 0.10).toLong())
+            val tailSafe = !preserveTailBoundary && tailMs in 1L..min(8000L, (durMs * 0.15).toLong())
             val canTrim = durMs >= 30_000L && (headSafe || tailSafe) &&
                 (durMs - (if (headSafe) headMs else 0L) - (if (tailSafe) tailMs else 0L)) >= 20_000L
             if (canTrim) {

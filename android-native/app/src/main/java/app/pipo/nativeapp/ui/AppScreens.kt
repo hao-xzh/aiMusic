@@ -1,10 +1,19 @@
 package app.pipo.nativeapp.ui
 
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +35,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -43,14 +53,20 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.data.PipoPlaylist
 import app.pipo.nativeapp.data.PipoRepository
+import app.pipo.nativeapp.playback.PlaybackQueueMode
 import app.pipo.nativeapp.playback.PlayerViewModel
+import kotlinx.coroutines.launch
 
 /** 子页面用的返回回调 —— PipoNativeApp 在 push 进入前提供，返回到 Player root。 */
 val LocalOnBack = staticCompositionLocalOf<(() -> Unit)?> { null }
@@ -92,32 +108,128 @@ fun DistillScreen(repository: PipoRepository = PipoGraph.repository) {
     DistillLibrary(playlists = playlists, repository = repository)
 }
 
+private sealed class LibraryPage(
+    val title: String,
+    val trackCount: Int,
+    val coverUrl: String?,
+) {
+    data class CurrentQueue(
+        val queue: List<NativeTrack>,
+        val currentIndex: Int,
+        val artworkUrl: String?,
+    ) : LibraryPage(
+        title = "当前播放列表",
+        trackCount = queue.size,
+        coverUrl = artworkUrl
+            ?: queue.getOrNull(currentIndex)?.artworkUrl
+            ?: queue.firstOrNull()?.artworkUrl,
+    )
+
+    data class PlaylistItem(
+        val playlist: PipoPlaylist,
+    ) : LibraryPage(
+        title = playlist.name,
+        trackCount = playlist.trackCount,
+        coverUrl = playlist.coverUrl,
+    )
+}
+
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun DistillLibrary(
-    playlists: List<app.pipo.nativeapp.data.PipoPlaylist>,
+    playlists: List<PipoPlaylist>,
     repository: PipoRepository,
 ) {
+    val playerVm: PlayerViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val playerState = playerVm.state
+    val libraryPages = remember(
+        playlists,
+        playerState.queue,
+        playerState.currentIndex,
+        playerState.artworkUrl,
+    ) {
+        buildList {
+            if (playerState.queue.isNotEmpty()) {
+                add(
+                    LibraryPage.CurrentQueue(
+                        queue = playerState.queue,
+                        currentIndex = playerState.currentIndex,
+                        artworkUrl = playerState.artworkUrl,
+                    ),
+                )
+            }
+            addAll(playlists.map { LibraryPage.PlaylistItem(it) })
+        }
+    }
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(
         initialPage = 0,
-        pageCount = { playlists.size },
+        pageCount = { libraryPages.size },
     )
     // 列表长度变化(歌单删除 / 网易云端少了一张)时,如果 currentPage 已经越界,
     // pagerState.currentPage 会停留在旧 index → focused 永远 null →
     // 曲目列表静默不更新。强制 scroll 回 0 让 focused 恢复有效。
-    LaunchedEffect(playlists.size) {
-        if (playlists.isNotEmpty() && pagerState.currentPage >= playlists.size) {
+    LaunchedEffect(libraryPages.size) {
+        if (libraryPages.isNotEmpty() && pagerState.currentPage >= libraryPages.size) {
             pagerState.scrollToPage(0)
         }
     }
-    val focused = playlists.getOrNull(pagerState.currentPage)
-    var tracks by remember { mutableStateOf<List<app.pipo.nativeapp.data.NativeTrack>>(emptyList()) }
+    val focused = libraryPages.getOrNull(pagerState.currentPage)
+    var tracks by remember { mutableStateOf<List<NativeTrack>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
-    LaunchedEffect(focused?.id) {
-        val id = focused?.id ?: return@LaunchedEffect
-        loading = true
-        tracks = runCatching { repository.tracksForPlaylist(id) }.getOrDefault(emptyList())
-        loading = false
+    val trackListState = rememberLazyListState()
+    var pendingLocateCurrent by remember { mutableStateOf(false) }
+    val focusedListKey = when (val page = focused) {
+        is LibraryPage.CurrentQueue -> "current"
+        is LibraryPage.PlaylistItem -> "playlist:${page.playlist.id}"
+        null -> "none"
+    }
+    val focusedQueue = (focused as? LibraryPage.CurrentQueue)?.queue
+    val focusedPlaylist = (focused as? LibraryPage.PlaylistItem)?.playlist
+    val trackListTransitionAlpha = remember { Animatable(1f) }
+    LaunchedEffect(focusedListKey) {
+        if (!pendingLocateCurrent) {
+            trackListState.scrollToItem(0)
+        }
+        trackListTransitionAlpha.snapTo(0.88f)
+        trackListTransitionAlpha.animateTo(1f, tween(durationMillis = 160))
+    }
+    LaunchedEffect(focusedListKey, focusedQueue, focusedPlaylist) {
+        when (val page = focused) {
+            is LibraryPage.CurrentQueue -> {
+                loading = false
+                tracks = page.queue
+            }
+            is LibraryPage.PlaylistItem -> {
+                loading = true
+                tracks = runCatching { repository.tracksForPlaylist(page.playlist.id) }.getOrDefault(emptyList())
+                loading = false
+            }
+            null -> {
+                loading = false
+                tracks = emptyList()
+            }
+        }
+    }
+    val currentTrackId = playerState.queue.getOrNull(playerState.currentIndex)?.id
+    val currentTrackIndexInVisibleTracks = remember(tracks, currentTrackId) {
+        currentTrackId?.let { id -> tracks.indexOfFirst { it.id == id } } ?: -1
+    }
+    val isCurrentTrackVisible by remember(trackListState, currentTrackId) {
+        derivedStateOf {
+            currentTrackId != null &&
+                trackListState.layoutInfo.visibleItemsInfo.any { it.key == currentTrackId }
+        }
+    }
+    val shouldShowLocateCurrent = currentTrackId != null &&
+        (currentTrackIndexInVisibleTracks < 0 || !isCurrentTrackVisible) &&
+        libraryPages.any { it is LibraryPage.CurrentQueue }
+    LaunchedEffect(pendingLocateCurrent, tracks, currentTrackId) {
+        if (!pendingLocateCurrent) return@LaunchedEffect
+        val idx = currentTrackId?.let { id -> tracks.indexOfFirst { it.id == id } } ?: -1
+        if (idx >= 0) {
+            trackListState.animateScrollToItem(idx)
+            pendingLocateCurrent = false
+        }
     }
 
     // ---- 蒸馏状态 + 进度 + 多选模式 ----
@@ -325,7 +437,6 @@ private fun DistillLibrary(
                 //   - contentPadding 不对称：左 24dp 让焦点 cover 左边沿恰好对齐下方"歌单标题"的左边沿
                 //     右 80dp 让"下一张"以小片露出来作为下一页提示（Apple Music 风）
                 //   - pageSpacing 缩小到 8dp，左右两侧的封面更紧凑
-                val playerVm: PlayerViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
                 androidx.compose.foundation.pager.HorizontalPager(
                     state = pagerState,
                     pageSize = androidx.compose.foundation.pager.PageSize.Fixed(280.dp),
@@ -349,7 +460,7 @@ private fun DistillLibrary(
                             )
                         },
                 ) { index ->
-                    val playlist = playlists[index]
+                    val page = libraryPages[index]
                     val pageOffset = (
                         (pagerState.currentPage - index) + pagerState.currentPageOffsetFraction
                     ).coerceIn(-1f, 1f)
@@ -370,10 +481,10 @@ private fun DistillLibrary(
                             .clip(RoundedCornerShape(14.dp))
                             .background(Color(0x16FFFFFF)),
                     ) {
-                        if (!playlist.coverUrl.isNullOrBlank()) {
+                        if (!page.coverUrl.isNullOrBlank()) {
                             coil.compose.AsyncImage(
-                                model = playlist.coverUrl,
-                                contentDescription = playlist.name,
+                                model = page.coverUrl,
+                                contentDescription = page.title,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize(),
                             )
@@ -386,7 +497,7 @@ private fun DistillLibrary(
                 // 焦点歌单标题 —— 左边沿严格对齐 cover 左边沿 24dp
                 if (focused != null) {
                     Text(
-                        text = focused.name,
+                        text = focused.title,
                         color = PipoColors.Ink,
                         style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.SemiBold),
                         modifier = Modifier
@@ -403,78 +514,90 @@ private fun DistillLibrary(
                             .fillMaxWidth()
                             .padding(start = 24.dp, end = 24.dp, top = 4.dp),
                     )
+                    if (focused is LibraryPage.CurrentQueue) {
+                        PlaybackModeStrip(
+                            mode = playerState.playbackMode,
+                            onMode = playerVm::setPlaybackMode,
+                            modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 10.dp),
+                        )
+                    }
                 }
 
                 // 曲目列表 —— LazyColumn + weight(1f)，铺到屏幕底部不截断、不限 80 首
                 val onBack = LocalOnBack.current
-                LazyColumn(
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
                         .padding(top = 12.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp),
                 ) {
-                    when {
-                        loading -> item {
-                            Text(
-                                "加载中…",
-                                color = PipoColors.TextDim,
-                                style = TextStyle(fontSize = 13.sp),
-                                modifier = Modifier.padding(start = 24.dp),
-                            )
-                        }
-                        tracks.isEmpty() -> item {
-                            Text(
-                                "这张歌单是空的",
-                                color = PipoColors.TextDim,
-                                style = TextStyle(fontSize = 13.sp),
-                                modifier = Modifier.padding(start = 24.dp),
-                            )
-                        }
-                        else -> {
-                            items(
-                                items = tracks,
-                                key = { it.id },
-                            ) { t ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        // 整条 row 可点 —— 不再仅 icon 触发，符合"点哪首播哪首"的直觉
-                                        .clickable {
+                    LazyColumn(
+                        state = trackListState,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer { alpha = trackListTransitionAlpha.value },
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp),
+                    ) {
+                        when {
+                            loading -> item {
+                                Text(
+                                    "加载中…",
+                                    color = PipoColors.TextDim,
+                                    style = TextStyle(fontSize = 13.sp),
+                                    modifier = Modifier.padding(start = 24.dp),
+                                )
+                            }
+                            tracks.isEmpty() -> item {
+                                Text(
+                                    "这张歌单是空的",
+                                    color = PipoColors.TextDim,
+                                    style = TextStyle(fontSize = 13.sp),
+                                    modifier = Modifier.padding(start = 24.dp),
+                                )
+                            }
+                            else -> {
+                                items(
+                                    items = tracks,
+                                    key = { it.id },
+                                ) { t ->
+                                    TrackListRow(
+                                        track = t,
+                                        isCurrentTrack = t.id == currentTrackId,
+                                        isPlaying = playerState.isPlaying,
+                                        onClick = {
                                             playerVm.playTrack(t, tracks)
                                             onBack?.invoke()
-                                        }
-                                        .padding(start = 24.dp, end = 16.dp, top = 9.dp, bottom = 9.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            t.title,
-                                            color = PipoColors.Ink,
-                                            style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        Text(
-                                            t.artist,
-                                            color = PipoColors.TextDim,
-                                            style = TextStyle(fontSize = 12.sp),
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                    // 右侧 play 图标只是视觉提示，整条 row 已经响应点击
-                                    Box(
-                                        modifier = Modifier.size(36.dp),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        PlayGlyph(
-                                            color = PipoColors.Ink,
-                                            modifier = Modifier.size(20.dp),
-                                        )
-                                    }
+                                        },
+                                    )
                                 }
                             }
+                        }
+                    }
+                    if (shouldShowLocateCurrent) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(end = 18.dp, bottom = 18.dp)
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .background(PipoColors.Mint.copy(alpha = 0.18f))
+                                .semantics { contentDescription = "定位到当前播放" }
+                                .clickable {
+                                    scope.launch {
+                                        if (currentTrackIndexInVisibleTracks >= 0) {
+                                            trackListState.animateScrollToItem(currentTrackIndexInVisibleTracks)
+                                        } else {
+                                            val queuePage = libraryPages.indexOfFirst { it is LibraryPage.CurrentQueue }
+                                            if (queuePage >= 0) {
+                                                pendingLocateCurrent = true
+                                                pagerState.animateScrollToPage(queuePage)
+                                            }
+                                        }
+                                    }
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            LocateCurrentIcon(color = PipoColors.Ink, modifier = Modifier.size(21.dp))
                         }
                     }
                 }
@@ -482,6 +605,171 @@ private fun DistillLibrary(
 
             // 蒸馏全屏遮罩已删除 —— 蒸馏在 DistillCoordinator 后台跑，
             // 进度由 shell 层（PipoNativeApp）统一画一条小浮条
+        }
+    }
+}
+
+@Composable
+private fun TrackListRow(
+    track: NativeTrack,
+    isCurrentTrack: Boolean,
+    isPlaying: Boolean,
+    onClick: () -> Unit,
+) {
+    val rowBackground by animateColorAsState(
+        targetValue = if (isCurrentTrack) PipoColors.Mint.copy(alpha = 0.10f) else Color.Transparent,
+        animationSpec = tween(durationMillis = 180),
+        label = "trackRowBackground",
+    )
+    val titleColor by animateColorAsState(
+        targetValue = if (isCurrentTrack) PipoColors.Mint else PipoColors.Ink,
+        animationSpec = tween(durationMillis = 180),
+        label = "trackTitleColor",
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(rowBackground)
+            .clickable(onClick = onClick)
+            .padding(start = 24.dp, end = 16.dp, top = 9.dp, bottom = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                track.title,
+                color = titleColor,
+                style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                track.artist,
+                color = PipoColors.TextDim,
+                style = TextStyle(fontSize = 12.sp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Box(
+            modifier = Modifier.size(36.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Crossfade(
+                targetState = isCurrentTrack,
+                animationSpec = tween(durationMillis = 160),
+                label = "trackNowIndicator",
+            ) { isCurrent ->
+                if (isCurrent) {
+                    PlayingWaveIndicator(
+                        isPlaying = isPlaying,
+                        color = PipoColors.Mint,
+                    )
+                } else {
+                    PlayGlyph(
+                        color = PipoColors.Ink,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaybackModeStrip(
+    mode: PlaybackQueueMode,
+    onMode: (PlaybackQueueMode) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        PlaybackModeChip(
+            label = "列表循环",
+            selected = mode == PlaybackQueueMode.PlaylistLoop,
+            onClick = { onMode(PlaybackQueueMode.PlaylistLoop) },
+        ) { tint ->
+            RepeatModeIcon(color = tint, modifier = Modifier.size(19.dp))
+        }
+        PlaybackModeChip(
+            label = "顺序播放",
+            selected = mode == PlaybackQueueMode.OrderOnce,
+            onClick = { onMode(PlaybackQueueMode.OrderOnce) },
+        ) { tint ->
+            OrderModeIcon(color = tint, modifier = Modifier.size(19.dp))
+        }
+        PlaybackModeChip(
+            label = "AI 电台",
+            selected = mode == PlaybackQueueMode.AiRadio,
+            onClick = { onMode(PlaybackQueueMode.AiRadio) },
+        ) { tint ->
+            SparkIcon(color = tint, modifier = Modifier.size(18.dp))
+        }
+    }
+}
+
+@Composable
+private fun PlaybackModeChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    icon: @Composable (Color) -> Unit,
+) {
+    val tint by animateColorAsState(
+        targetValue = if (selected) PipoColors.Mint else PipoColors.TextDim,
+        animationSpec = tween(durationMillis = 160),
+        label = "playbackModeTint",
+    )
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(if (selected) PipoColors.Mint.copy(alpha = 0.18f) else Color(0x14FFFFFF))
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = label }
+            .size(34.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        icon(tint)
+    }
+}
+
+@Composable
+private fun PlayingWaveIndicator(
+    isPlaying: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val transition = rememberInfiniteTransition(label = "playlistWave")
+
+    @Composable
+    fun barHeight(index: Int, idle: Float): Float {
+        val value by transition.animateFloat(
+            initialValue = 0.35f + index * 0.14f,
+            targetValue = 1f - index * 0.10f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 520, delayMillis = index * 110),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "bar$index",
+        )
+        return if (isPlaying) value.coerceIn(0.25f, 1f) else idle
+    }
+
+    Row(
+        modifier = modifier.size(width = 18.dp, height = 18.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        listOf(0.45f, 0.72f, 0.55f).forEachIndexed { idx, idle ->
+            Box(
+                modifier = Modifier
+                    .width(3.dp)
+                    .height((16f * barHeight(idx, idle)).dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(color),
+            )
         }
     }
 }

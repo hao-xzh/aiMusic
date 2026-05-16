@@ -25,6 +25,10 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         )
     }
 
+    override suspend fun neteaseLogout() {
+        callRaw("netease_logout")
+    }
+
     override suspend fun neteaseUserPlaylists(userId: Long): List<PipoPlaylist> {
         val arr = callArray("netease_user_playlists", jsonObject("uid" to userId, "limit" to 1000))
         return List(arr.length()) { i ->
@@ -324,18 +328,21 @@ class RustBridgeException(command: String, message: String) : RuntimeException("
 
 private object LrcParser {
     private val stamp = Regex("""\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?]""")
+    private val offsetTag = Regex("""\[(?:offset|offsetMs)\s*:\s*([+-]?\d+)]""", RegexOption.IGNORE_CASE)
 
     fun parse(lrc: String): List<PipoLyricLine> {
+        val offsetMs = offsetTag.find(lrc)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
         val points = lrc.lineSequence().flatMap { line ->
-            val text = stamp.replace(line, "").trim()
+            val text = offsetTag.replace(stamp.replace(line, ""), "").trim()
             stamp.findAll(line).mapNotNull { match ->
                 val min = match.groupValues[1].toLongOrNull() ?: return@mapNotNull null
                 val sec = match.groupValues[2].toLongOrNull() ?: return@mapNotNull null
                 val frac = match.groupValues[3].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
                 PipoLyricLine(
-                    startMs = min * 60_000L + sec * 1000L + frac,
+                    startMs = (min * 60_000L + sec * 1000L + frac + offsetMs).coerceAtLeast(0L),
                     durationMs = 0L,
                     text = text,
+                    timing = PipoLyricTiming.Line,
                 )
             }
         }.sortedBy { it.startMs }.toList()

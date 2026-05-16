@@ -4,7 +4,7 @@ package app.pipo.nativeapp.data
  * 接歌美学判断 —— 镜像 src/lib/transition-judge.ts 的本地分支。
  *
  * 不再请求 AI（播放链路要求零 AI 调用）；纯靠 audio features 给出 4 种风格：
- *   - hard_cut: 同专辑边界干净 → 0ms
+ *   - hard_cut: 音频边界足够连续 → 0ms
  *   - silence_breath: 能量 / 人声反差大 → 900ms 短停顿
  *   - tight: BPM 接近 → 3200ms + EQ ducking
  *   - soft (默认): 慢溶 3600-4800ms
@@ -29,21 +29,20 @@ data class TransitionJudgment(
 
 object TransitionJudge {
     /**
-     * @param fromAlbum 上一首专辑（用来判断同专辑无缝接）
-     * @param toAlbum 下一首专辑
+     * @param fromAlbum 保留参数兼容旧调用；连续判断不再依赖专辑
+     * @param toAlbum 保留参数兼容旧调用；连续判断不再依赖专辑
      * @param fromFeatures 上一首 Symphonia 特征
      * @param toFeatures 下一首 Symphonia 特征
      */
     fun judge(
+        @Suppress("UNUSED_PARAMETER")
         fromAlbum: String?,
+        @Suppress("UNUSED_PARAMETER")
         toAlbum: String?,
         fromFeatures: AudioFeatures?,
         toFeatures: AudioFeatures?,
     ): TransitionJudgment {
         if (fromFeatures == null || toFeatures == null) return TransitionJudgment.Default
-
-        val sameAlbum = !fromAlbum.isNullOrBlank() && !toAlbum.isNullOrBlank() &&
-            fromAlbum.trim().equals(toAlbum.trim(), ignoreCase = true)
 
         val energyDelta = kotlin.math.abs(fromFeatures.outroEnergy - toFeatures.introEnergy)
 
@@ -55,13 +54,15 @@ object TransitionJudge {
             fromFeatures.bpmConfidence > 0.25 &&
             toFeatures.bpmConfidence > 0.25
 
-        // 同专辑且边界干净 → hard cut
-        if (sameAlbum && energyDelta <= 0.24) {
+        val boundaryIsTight = fromFeatures.tailSilenceS <= 0.45 && toFeatures.headSilenceS <= 0.45
+
+        // 只看音频特征是否能连续，不再用同专辑作为捷径。
+        if (boundaryIsTight && energyDelta <= 0.16 && (!bpmReliable || bpmDelta <= 6.0)) {
             return TransitionJudgment(
                 style = TransitionStyle.HardCut,
                 durationMs = 0L,
                 eqDuck = false,
-                rationale = "同专辑边界干净",
+                rationale = "边界连续",
             )
         }
         // 能量反差大 → 短停顿呼吸

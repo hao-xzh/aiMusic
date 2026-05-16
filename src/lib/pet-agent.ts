@@ -312,6 +312,8 @@ export type AgentResponse = {
   play: PlayPlan | null;
   /** 若 play 有值，配合返回去重 + 校验过的真 TrackInfo[]（按 trackIds 顺序） */
   resolvedTracks: TrackInfo[];
+  /** insert = 单曲插队；replace = 换整条队列 */
+  queueAction?: "insert" | "replace";
   /** 续杯式推荐：队列接近末尾时由 player-state 调用，返回下一批同口味的歌 */
   continuous?: ContinuousSource | null;
 };
@@ -434,9 +436,44 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
   // 多少次都不会跟初始批撞同一首歌的另一版本（VIP 重唱 / Live / Remix 等），
   // 因为 dedupe 是在切批之前一次性做完的。
   const allRankedTracks = ranked.map((c) => c.track);
-  const dedupedAll = queryAsksForSpecificVersion(intent)
+  const dedupedBase = queryAsksForSpecificVersion(intent)
     ? allRankedTracks
     : dedupeTrackInfos(allRankedTracks);
+  const isInsert = intent.queueIntent.action === "insert";
+
+  if (isInsert) {
+    const picked = dedupedBase[0] ?? ranked[0]?.track;
+    if (!picked) {
+      return {
+        text: `${replyText}（这首我没在库里抓准。）`,
+        play: null,
+        resolvedTracks: [],
+        queueAction: "insert",
+      };
+    }
+    void logRecommendations([picked.id], "pet");
+    void writeDebugRecord({
+      userText: input.userText,
+      intent,
+      candidateCount: candidates.length,
+      rankedCount: ranked.length,
+      finalTrackIds: [picked.id],
+      reply: replyText,
+      reason: "queueAction: insert",
+    });
+    return {
+      text: replyText,
+      play: {
+        trackIds: [picked.id],
+        reason: "insert",
+      },
+      resolvedTracks: [picked],
+      queueAction: "insert",
+      continuous: null,
+    };
+  }
+
+  const dedupedAll = diversifyTrackInfos(dedupedBase, intent);
 
   // 初始批刻意压短（≤15 首）—— 续杯模式下队列本来就会随播随长,
   // 留尽量多的歌在 reservoir 里,fetchMore 才有得喂。
@@ -513,6 +550,7 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
       reason: `${intent.softPreferences.moods.slice(0, 2).join(" · ")} · ${intent.queueIntent.orderStyle}`,
     },
     resolvedTracks: smoothed,
+    queueAction: "replace",
     continuous,
   };
 }
@@ -606,6 +644,43 @@ function buildContinuousSource(args: {
   };
 
   return { fetchMore };
+}
+
+function diversifyTrackInfos(items: TrackInfo[], intent: MusicIntent): TrackInfo[] {
+  // 用户明确点艺人时，同艺人扎堆不是问题；否则做一层轻量多样性，贴 Android
+  // RecommendEngine 的“同 artist 上限 2、同 songKey 不重复”思路。
+  const artistLocked =
+    intent.hardConstraints.artists.length > 0 ||
+    intent.textHints.artists.length > 0;
+  if (artistLocked) return items;
+
+  const seenSongs = new Set<string>();
+  const artistCounts = new Map<string, number>();
+  const primary: TrackInfo[] = [];
+  const overflow: TrackInfo[] = [];
+
+  for (const track of items) {
+    const sk = songKey(track);
+    if (seenSongs.has(sk)) continue;
+    seenSongs.add(sk);
+
+    const ak = normalizeArtistKey(track);
+    const count = artistCounts.get(ak) ?? 0;
+    if (ak && count >= 2) {
+      overflow.push(track);
+      continue;
+    }
+    if (ak) artistCounts.set(ak, count + 1);
+    primary.push(track);
+  }
+
+  return [...primary, ...overflow];
+}
+
+function normalizeArtistKey(track: TrackInfo): string {
+  return (track.artists[0]?.name ?? "")
+    .toLowerCase()
+    .replace(/[\s'"`·・\-－—_,，。.、!?！？]+/g, "");
 }
 
 // ---------- 调试记录 ----------

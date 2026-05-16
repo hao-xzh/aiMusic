@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 //
 // --- 二维码登录 ---
@@ -146,6 +147,12 @@ pub struct TrackInfo {
     pub album: Option<AlbumShort>,
 }
 
+impl TrackInfo {
+    pub fn by_id(tracks: &[TrackInfo]) -> HashMap<i64, TrackInfo> {
+        tracks.iter().cloned().map(|track| (track.id, track)).collect()
+    }
+}
+
 fn unknown_track_name() -> String {
     "未知曲目".into()
 }
@@ -164,6 +171,9 @@ pub struct PlaylistDetail {
     // 单条 track 解析失败时跳过那一条，不让整张歌单挂掉。
     #[serde(default, deserialize_with = "deserialize_tracks_lenient")]
     pub tracks: Vec<TrackInfo>,
+    // 大歌单的 tracks 可能被接口按 n 截断，完整顺序在 trackIds 里。
+    #[serde(default, rename = "trackIds", deserialize_with = "deserialize_track_ids_lenient")]
+    pub track_ids: Vec<i64>,
 }
 
 /// "宽松反序列化"：先吃成 Value 数组，再逐个尝试转 TrackInfo，
@@ -190,10 +200,45 @@ where
     Ok(out)
 }
 
+fn deserialize_track_ids_lenient<'de, D>(d: D) -> Result<Vec<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(d)?;
+    let arr = match v {
+        Some(Value::Array(a)) => a,
+        _ => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        match item {
+            Value::Number(n) => {
+                if let Some(id) = n.as_i64() {
+                    out.push(id);
+                }
+            }
+            Value::Object(o) => {
+                if let Some(id) = o.get("id").and_then(Value::as_i64) {
+                    out.push(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PlaylistDetailResp {
     pub code: i32,
     pub playlist: PlaylistDetail,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SongDetailResp {
+    pub code: i32,
+    #[serde(default)]
+    pub songs: Vec<TrackInfo>,
 }
 
 //

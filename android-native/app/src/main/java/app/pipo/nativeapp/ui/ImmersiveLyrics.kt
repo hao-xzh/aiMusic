@@ -3,6 +3,7 @@ package app.pipo.nativeapp.ui
 import android.graphics.RenderEffect as AndroidRenderEffect
 import android.graphics.RuntimeShader
 import android.os.Build
+import android.os.SystemClock
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Easing
@@ -34,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
@@ -60,18 +62,23 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
+import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.progress
+import kotlinx.coroutines.delay
 
 /**
  * 沉浸式歌词层 —— 镜像 src/components/PlayerCard.tsx ImmersiveLyrics 的非封面部分。
@@ -169,6 +176,7 @@ fun ImmersiveLyricsOverlay(
     onClose: () -> Unit,
     onToggle: () -> Unit,
     onNext: () -> Unit,
+    onSeekToMs: (Long) -> Unit,
 ) {
     if (progress <= 0.001f) return
 
@@ -202,13 +210,18 @@ fun ImmersiveLyricsOverlay(
         modifier = Modifier
             .fillMaxSize()
             // progress 控制 immersive 进出整体透明度，contentFade 控制切歌时内容淡入淡出
-            .graphicsLayer { alpha = progress * contentFade.value }
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClose,
-            ),
+            .graphicsLayer { alpha = progress * contentFade.value },
     ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(coverAreaHeight)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClose,
+                ),
+        )
         // 内容用绝对定位（Box.padding(top=...)），不再用 Column 顺序排：
         //   - 标题压在封面下 1/4 处（progress=1 时 y ≈ coverArea - 80dp，叠在封面之上）
         //   - 歌词从 coverArea - 28dp 开始（轻微"啃"进封面底）
@@ -269,6 +282,7 @@ fun ImmersiveLyricsOverlay(
             fg = fg,
             fgDim = fgDim,
             fgUnsung = fgUnsung,
+            onSeekToMs = onSeekToMs,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
@@ -299,6 +313,8 @@ private fun ImmersiveIconButton(onClick: () -> Unit, content: @Composable () -> 
 
 // ---------- Apple Music 风格歌词列 ----------
 
+private const val MANUAL_LYRIC_SCROLL_HOLD_MS = 2_000L
+
 /**
  * 把 player 的 30Hz 离散 raw 位置流，转成按帧平滑且**始终跟踪音频**的连续位置 ——
  * 字符级 sweep / lift wave 的时间源。
@@ -317,8 +333,11 @@ private fun rememberSmoothPositionMs(rawPositionMs: Long, isPlaying: Boolean): S
     val output = remember { mutableStateOf(rawPositionMs) }
     // raw 来一拍就更新 anchor（值 + 当时 monotonic nanos），coroutine 内按帧读最新。
     val rawAnchor = remember { mutableStateOf(rawPositionMs to System.nanoTime()) }
-    LaunchedEffect(rawPositionMs) {
+    LaunchedEffect(rawPositionMs, isPlaying) {
         rawAnchor.value = rawPositionMs to System.nanoTime()
+        if (!isPlaying) {
+            output.value = rawPositionMs
+        }
     }
 
     LaunchedEffect(isPlaying) {
@@ -354,10 +373,12 @@ private fun AppleMusicLyricColumn(
     fg: Color,
     fgDim: Color,
     fgUnsung: Color,
+    onSeekToMs: (Long) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // 把 player 的 30Hz tick 平滑成按帧位置（120Hz 屏丝滑度提升关键）
     val smoothedPositionMs by rememberSmoothPositionMs(positionMs, isPlaying)
+    val haptics = LocalHapticFeedback.current
     if (lines.isEmpty()) {
         Box(
             modifier = modifier
@@ -386,6 +407,19 @@ private fun AppleMusicLyricColumn(
     var containerHeightPx by remember { mutableStateOf(0) }
 
     val listState = rememberLazyListState()
+    var manualScrollHoldUntilMs by remember { mutableStateOf(0L) }
+    val focusOffsetPx = (containerHeightPx * 0.11f).toInt()
+    val manualFocusIndex by remember(listState, focusOffsetPx) {
+        derivedStateOf {
+            if (manualScrollHoldUntilMs <= 0L || focusOffsetPx <= 0) {
+                null
+            } else {
+                listState.layoutInfo.visibleItemsInfo.minByOrNull { item ->
+                    kotlin.math.abs((item.offset + item.size / 2) - focusOffsetPx)
+                }?.index
+            }
+        }
+    }
 
     // ---- 滚动 / 焦点切换的 lookahead ----
     // 之前是 500ms：滚动比 alpha/blur 早 500ms 触发。Spring 滚动 ~360ms 内就稳了，
@@ -396,26 +430,43 @@ private fun AppleMusicLyricColumn(
     val scrollLookaheadMs = 100L
     val scrollTargetIdx = remember(positionMs, lines) {
         if (lines.isEmpty()) 0
-        else lines.indexOfLast { line -> positionMs + scrollLookaheadMs >= line.startMs }
+        else lines.indexOfLast { line -> positionMs + scrollLookaheadMs >= LyricTiming.audioStartMs(line) }
             .coerceAtLeast(0)
     }
 
     // ---- Apple Music 风滚动：~720ms FastOutSlowIn，CSS ease 同曲线 ----
     // animateScrollToItem 默认是 spring，对长歌词来说太弹；这里手写 tween 让滚动更线性 + 后段缓收。
-    LaunchedEffect(scrollTargetIdx, containerHeightPx) {
+    LaunchedEffect(scrollTargetIdx, containerHeightPx, manualScrollHoldUntilMs) {
         if (scrollTargetIdx !in lines.indices || containerHeightPx == 0) return@LaunchedEffect
-        // 焦点位置：容器顶 18%
+        val waitMs = manualScrollHoldUntilMs - SystemClock.elapsedRealtime()
+        val returningFromManualScroll = waitMs > 0L
+        if (waitMs > 0L) delay(waitMs)
+        if (listState.isScrollInProgress) {
+            manualScrollHoldUntilMs = SystemClock.elapsedRealtime() + 250L
+            return@LaunchedEffect
+        }
         // 焦点位置：容器顶 11%，正好让活动行上方只露出 1 句历史歌词
-        val focusOffsetPx = (containerHeightPx * 0.11f).toInt()
         val info = listState.layoutInfo
         val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == scrollTargetIdx }
         if (visibleHit == null) {
-            // 不在可视区：先 snap 到大致位置，避免跨太大段做长动画
-            listState.scrollToItem(scrollTargetIdx, scrollOffset = -focusOffsetPx)
+            if (returningFromManualScroll) {
+                listState.animateScrollToItem(scrollTargetIdx, scrollOffset = -focusOffsetPx)
+                if (manualScrollHoldUntilMs <= SystemClock.elapsedRealtime()) {
+                    manualScrollHoldUntilMs = 0L
+                }
+            } else {
+                // 正常播放跨很远切句时先 snap 到大致位置，避免一段超长滚动追不上音频。
+                listState.scrollToItem(scrollTargetIdx, scrollOffset = -focusOffsetPx)
+            }
             return@LaunchedEffect
         }
         val delta = (visibleHit.offset - focusOffsetPx).toFloat()
-        if (kotlin.math.abs(delta) <= 1f) return@LaunchedEffect
+        if (kotlin.math.abs(delta) <= 1f) {
+            if (returningFromManualScroll && manualScrollHoldUntilMs <= SystemClock.elapsedRealtime()) {
+                manualScrollHoldUntilMs = 0L
+            }
+            return@LaunchedEffect
+        }
         // tween 720ms FastOutSlowIn 跑增量积分：每帧给 LazyListState 一个 scrollBy(d-prev)
         var prev = 0f
         animate(
@@ -430,6 +481,9 @@ private fun AppleMusicLyricColumn(
             prev = value
             // suspend 不能直接调，但 listState.dispatchRawDelta 是同步的
             listState.dispatchRawDelta(step)
+        }
+        if (returningFromManualScroll && manualScrollHoldUntilMs <= SystemClock.elapsedRealtime()) {
+            manualScrollHoldUntilMs = 0L
         }
     }
 
@@ -465,30 +519,61 @@ private fun AppleMusicLyricColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp),
+                .padding(horizontal = 24.dp)
+                .pointerInput(Unit) {
+                    val touchSlopPx = 8.dp.toPx()
+                    awaitPointerEventScope {
+                        var downY: Float? = null
+                        var hasDragged = false
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.pressed || it.previousPressed }
+                                ?: continue
+                            if (change.pressed && !change.previousPressed) {
+                                downY = change.position.y
+                                hasDragged = false
+                            }
+                            if (change.pressed) {
+                                val startY = downY
+                                if (
+                                    startY != null &&
+                                    kotlin.math.abs(change.position.y - startY) > touchSlopPx
+                                ) {
+                                    hasDragged = true
+                                }
+                            }
+                            if (hasDragged) {
+                                manualScrollHoldUntilMs =
+                                    SystemClock.elapsedRealtime() + MANUAL_LYRIC_SCROLL_HOLD_MS
+                            }
+                            if (!change.pressed && change.previousPressed) {
+                                if (hasDragged) {
+                                    manualScrollHoldUntilMs =
+                                        SystemClock.elapsedRealtime() + MANUAL_LYRIC_SCROLL_HOLD_MS
+                                }
+                                downY = null
+                                hasDragged = false
+                            }
+                        }
+                    }
+                },
             contentPadding = androidx.compose.foundation.layout.PaddingValues(
                 top = topPadDp,
                 bottom = bottomPadDp,
             ),
-            // 关掉 user 滚动，让歌词只跟着进度走（避免用户误触把活动行甩出 30% 位置）
-            userScrollEnabled = false,
+            userScrollEnabled = true,
         ) {
-            // PlayerViewModel 算 activeLyricIndex 时用 coerceAtLeast(0)：歌还没开始就把
-            // line 0 强制标成 active，导致 song start 时 line 0 立刻进入"焦点动效"，等到
-            // 真正开唱时 sweep 又触发字符级 wave —— 看起来像同一句**播放了两遍**。
-            // 这里复用 scroll lookahead（100ms）做 effective active 门：
-            //   smoothPos + 100ms 还没到 line[0].startMs → effectiveActiveIdx = -1（无 active）
-            //   到了再切到真正的 activeLyricIndex
-            // 100ms 足够覆盖到歌真正开始时的进入态，不会过早触发焦点 / sweep 双动画。
-            val effectiveActiveIdx = if (smoothedPositionMs + scrollLookaheadMs >= lines.first().startMs) {
+            // LyricTiming 会在第一句真正到达前返回 -1；这里仍保留 100ms 的滚动 lookahead，
+            // 只让列表提前进入位置，不提前触发逐字 sweep。
+            val playbackActiveIdx = if (smoothedPositionMs + scrollLookaheadMs >= LyricTiming.audioStartMs(lines.first())) {
                 activeLyricIndex
-            } else {
-                -1
-            }
+            } else -1
+            val effectiveActiveIdx = manualFocusIndex ?: playbackActiveIdx
             itemsIndexed(
                 items = lines,
                 key = { _, line -> line.startMs },
             ) { idx, line ->
+                val isManualFocusLine = manualFocusIndex == idx
                 val distance = if (effectiveActiveIdx < 0) {
                     idx + 1   // 整列都按"未来"摊开，line 0 距离 1, line 1 距离 2, ...
                 } else {
@@ -496,7 +581,20 @@ private fun AppleMusicLyricColumn(
                 }
                 // heightIn(min) 而不是 height(fixed) —— 长歌词自然换行成两行不被切。
                 // LazyColumn 内部支持变高 item，animateScrollToItem 仍能按 idx 定位。
-                Box(modifier = Modifier.heightIn(min = rowHeightDp)) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = rowHeightDp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                manualScrollHoldUntilMs = 0L
+                                onSeekToMs(LyricTiming.audioStartMs(line).coerceAtLeast(0L))
+                            },
+                        ),
+                ) {
                     AppleMusicLyricRow(
                         line = line,
                         isActive = idx == effectiveActiveIdx,
@@ -504,7 +602,7 @@ private fun AppleMusicLyricColumn(
                         distance = distance,
                         // 活动行的字符级 sweep / lift 用按帧外插的 smoothed 位置，颤动消失；
                         // 非活动行其实只用 isActive/isPast 派生状态，跟 positionMs 精度关系不大。
-                        positionMs = smoothedPositionMs,
+                        positionMs = if (isManualFocusLine) completedLinePositionMs(line) else smoothedPositionMs,
                         fg = fg,
                         fgUnsung = fgUnsung,
                     )
@@ -512,6 +610,12 @@ private fun AppleMusicLyricColumn(
             }
         }
     }
+}
+
+private fun completedLinePositionMs(line: PipoLyricLine): Long {
+    val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs }
+    val lineEnd = line.startMs + line.durationMs
+    return maxOf(charEnd ?: lineEnd, lineEnd, line.startMs + 1L)
 }
 
 @Composable
@@ -524,19 +628,52 @@ private fun AppleMusicLyricRow(
     fg: Color,
     fgUnsung: Color,
 ) {
+    var wasActive by remember(line.startMs) { mutableStateOf(isActive) }
+    var becamePastAtRealtime by remember(line.startMs) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(isActive, isPast) {
+        val now = SystemClock.elapsedRealtime()
+        if (wasActive && !isActive && isPast) {
+            becamePastAtRealtime = now
+        }
+        if (isActive || !isPast) {
+            becamePastAtRealtime = null
+        }
+        wasActive = isActive
+    }
+
+    val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
     // 行级焦点过渡：整行作为单一图层平滑进入焦点。
     // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
     //
     // alpha 关键约束：**past line（distance=1）必须比 fgUnsung（active 行未唱字符）更暗**。
     // pickFgUnsung 现在是 0.40（深底）/ 0.43（浅底），所以 distance=1 必须 < 0.40。
     // 整体提一档，过去/未来行更亮更可读，仍守住"past 不亮于 active 未唱"红线。
-    val targetAlpha = when (distance) {
+    val baseTargetAlpha = when (distance) {
         0 -> 1.0f
         1 -> 0.36f
         2 -> 0.27f
         3 -> 0.20f
         4 -> 0.15f
         else -> 0.11f
+    }
+    val targetAlpha = remember(
+        baseTargetAlpha,
+        becamePastAtRealtime,
+        distance,
+        isPast,
+        positionMs,
+        cssEase,
+    ) {
+        val enteredAt = becamePastAtRealtime
+        if (isPast && distance == 1 && enteredAt != null) {
+            val elapsed = (SystemClock.elapsedRealtime() - enteredAt).coerceAtLeast(0L)
+            val t = (elapsed.toFloat() / 820f).coerceIn(0f, 1f)
+            val eased = cssEase.transform(t)
+            val exitStartAlpha = 0.82f
+            baseTargetAlpha + (exitStartAlpha - baseTargetAlpha) * (1f - eased)
+        } else {
+            baseTargetAlpha
+        }
     }
     // 模糊：只给"列首尾"（distance ≥ 2 的远端行）。
     // 之前给所有非活动行加 blur 是错的 —— Apple Music 实际是焦点附近清晰、远端模糊（焦距感），
@@ -553,7 +690,6 @@ private fun AppleMusicLyricRow(
     // 默认 CSS `ease` = cubic-bezier(0.25, 0.1, 0.25, 1)。**根本不是 spring**。
     // spring 物理感只用在滚动 posY 上（行间相对位移），切句的 alpha/blur/lift 都是 tween。
     // 之前误把 spring 全套给 alpha → 视觉上有 bouncy 感，不是 Apple Music。
-    val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
     val alphaSpec: AnimationSpec<Float> = remember(cssEase) {
         tween(durationMillis = 250, easing = cssEase)    // AMLL: opacity 0.25s
     }
@@ -623,7 +759,7 @@ private fun AppleMusicLyricRow(
     // → 整行空白，直到行变 past、baseColor 切回 fg 才触发测量。
     // 现在永远用 fgUnsung 作为 active YRC 的底层颜色（非 0 alpha 强制 Compose 真正测量布局），
     // 隐藏由 drawWithContent 里**跳过 drawContent()** 完成 —— 这样 overlay 也不会双重绘制。
-    val overlayDrawing = isYrcLine && liftEnvelope > 0.001f
+    val overlayDrawing = isYrcLine && (isActiveYrc || liftEnvelope > 0.001f)
     val baseColor = when {
         isPast -> fg
         isActiveLrc -> fg
@@ -635,7 +771,7 @@ private fun AppleMusicLyricRow(
     }
 
     // shader 路径已禁用 —— 多次尝试（state-tracked / Offscreen / 多行扩展 / 类型修复）后仍有
-    // 颜色异常或闪退问题，移动 GPU 驱动对 AGSL 的支持差异太大不可控。统一走 fallback per-char clipRect。
+    // 颜色异常或闪退问题，移动 GPU 驱动对 AGSL 的支持差异太大不可控。统一走 fallback 视觉单元绘制。
     @Suppress("UNUSED_VARIABLE")
     val cur = layout
     val canUseShader = false
@@ -856,19 +992,98 @@ private fun DrawScope.drawPerCharColorOnly(
 /** CSS `ease-out` = cubic-bezier(0, 0, 0.58, 1) —— AMLL 的 float 动画用的就是这条。 */
 private val EaseOutCss: Easing = CubicBezierEasing(0f, 0f, 0.58f, 1f)
 
+private data class LyricDrawUnit(
+    val timing: PipoLyricChar,
+    val line: Int,
+    val left: Float,
+    val right: Float,
+    val segmentStartProgress: Float,
+    val segmentEndProgress: Float,
+)
+
+private fun lyricDrawUnits(layout: TextLayoutResult, chars: List<PipoLyricChar>): List<LyricDrawUnit> {
+    val text = layout.layoutInput.text.text
+    if (text.isEmpty() || chars.isEmpty()) return emptyList()
+    val units = ArrayList<LyricDrawUnit>(chars.size)
+    var cursor = 0
+    chars.forEach { timing ->
+        val start = cursor.coerceAtMost(text.length)
+        val end = (cursor + timing.text.length).coerceAtMost(text.length)
+        cursor = end
+        if (start >= end) return@forEach
+        val tokenStart = start
+        val tokenEnd = end
+
+        val firstLine = layout.getLineForOffset(start)
+        val lastLine = layout.getLineForOffset(end - 1)
+        if (firstLine != lastLine) {
+            var segmentStart = start
+            while (segmentStart < end) {
+                val line = layout.getLineForOffset(segmentStart)
+                val lineEnd = minOf(end, layout.getLineEnd(line, visibleEnd = true).coerceAtLeast(segmentStart + 1))
+                addLyricDrawUnit(units, layout, timing, segmentStart, lineEnd, tokenStart, tokenEnd, line)
+                segmentStart = lineEnd
+            }
+        } else {
+            addLyricDrawUnit(units, layout, timing, start, end, tokenStart, tokenEnd, firstLine)
+        }
+    }
+    return units
+}
+
+private fun addLyricDrawUnit(
+    out: MutableList<LyricDrawUnit>,
+    layout: TextLayoutResult,
+    timing: PipoLyricChar,
+    start: Int,
+    end: Int,
+    tokenStart: Int,
+    tokenEnd: Int,
+    line: Int,
+) {
+    var left = Float.POSITIVE_INFINITY
+    var right = Float.NEGATIVE_INFINITY
+    for (i in start until end) {
+        val box = layout.getBoundingBox(i)
+        if (box.right <= box.left) continue
+        left = minOf(left, box.left)
+        right = maxOf(right, box.right)
+    }
+    if (left.isFinite() && right.isFinite() && right > left) {
+        val tokenLength = (tokenEnd - tokenStart).coerceAtLeast(1)
+        val startProgress = ((start - tokenStart).toFloat() / tokenLength.toFloat()).coerceIn(0f, 1f)
+        val endProgress = ((end - tokenStart).toFloat() / tokenLength.toFloat()).coerceIn(startProgress, 1f)
+        out.add(
+            LyricDrawUnit(
+                timing = timing,
+                line = line,
+                left = left,
+                right = right,
+                segmentStartProgress = startProgress,
+                segmentEndProgress = endProgress,
+            ),
+        )
+    }
+}
+
+private data class LyricWordPalette(
+    val unsung: Color,
+    val sung: Color,
+)
+
+private fun lyricWordPalette(fg: Color, fgUnsung: Color): LyricWordPalette {
+    return LyricWordPalette(
+        // 单词内部也沿用行级对比：未唱用行级未唱色，已唱必须回到完整高亮色。
+        // 变色动画仍走原来的横向 sweep，只替换颜色本身。
+        unsung = fgUnsung,
+        sung = fg.copy(alpha = 1f),
+    )
+}
+
 /**
- * 逐字符 "颜色 + 上浮"：
- *
- *   颜色（per-pixel sweep，AMLL 风）：之前是"每字一个 colorProgress 然后整字 lerp 一个色"——
- *     视觉上是"字一个一个跳变"，没有 sweep 流过的连续感。换成 **horizontal gradient brush**：
- *     用 Brush.horizontalGradient 跨整行做 fg→fgUnsung 的渐变，过渡带宽 6dp，居中于 sweep.x。
- *     这样**每个像素**的颜色都是连续插值，sweep 是一道丝滑的左→右扫过，跟 Apple Music 一致。
- *
- *   上浮（per-char temporal ramp）：每个字符独立时间轴——开唱触发，duration=max(1000ms, 字时长)，
- *     CSS ease-out → translateY 0 → -1.4dp。详见函数体注释。
- *     这是 Apple Music"歌词随音乐在动"的真正来源 —— 节奏锚到字的演唱时长。
- *
- *   字符之间没有 scale / blur / fontWeight 差异，只有颜色 brush + translateY。
+ * 视觉单元级 "颜色 + 上浮"：
+ *   仍按原来的横向 sweep 动画变色，只把未唱 / 已唱色阶收敛到行级对比。
+ *   单词只保留轻微上浮，不再做发光或硬分界扫色。
  */
 private fun DrawScope.drawPerCharLiftedSweep(
     layout: TextLayoutResult,
@@ -878,83 +1093,103 @@ private fun DrawScope.drawPerCharLiftedSweep(
     fgUnsung: Color,
     envelope: Float = 1f,                       // 0 = 完全无 lift；1 = 完整波形
 ) {
-    val sweep = computeSweepPos(layout, chars, positionMs)
-    val text = layout.layoutInput.text.text
-    // 1.6dp 上浮峰值（AMLL 是 0.05em ≈ 1.4dp，这里上调到 ~0.057em，幅度稍微更明显一点）
-    val liftPeakPx = (-1.6f).dp.toPx() * envelope
-    // AMLL `Math.max(1000, word.duration)` —— 短字至少演 1 秒
-    val minRampMs = 1000L
+    val units = lyricDrawUnits(layout, chars)
+    val wordPalette = lyricWordPalette(fg, fgUnsung)
+    // 保留单词上浮手感；不再叠加发光，避免模糊/描边破坏歌词质感。
+    val liftPeakPx = (-0.95f).dp.toPx() * envelope
 
-    // text 是 chars.joinToString("") { it.text } 拼出来的，
-    // 这里反向给每个 text-index 标上它属于第几个 PipoLyricChar，方便 O(1) 查 timing。
-    val charIdxByTextIdx = IntArray(text.length) { -1 }
-    run {
-        var cursor = 0
-        chars.forEachIndexed { idx, c ->
-            val end = (cursor + c.text.length).coerceAtMost(text.length)
-            for (k in cursor until end) charIdxByTextIdx[k] = idx
-            cursor = end
-        }
-    }
-
-    // sweep 边缘的软过渡带宽：6dp 给"丝滑"，太大会糊成一团，太小又退化回硬切。
     val fadeWidthPx = 6.dp.toPx()
-    // 当前 sweep 落在的那条视觉行用 horizontal gradient brush；其它视觉行用纯色。
-    // 关键：fade band **整段在 sweep 之后**（startX = sweep.x），不再居中于 sweep。
-    // 这样 sweep 左侧（含正在唱的字本身）全是 fg 全亮色，gradient 只发生在前方
-    // 还没到的字上。之前居中时 sweep 那一点是 50/50 混色，正在变化的字看起来比
-    // 已唱完的字暗 → "已经放完的颜色比正在变化的亮" 的反直觉感就来自这里。
-    val activeBrush: Brush = if (!sweep.notStarted && !sweep.allDone) {
-        Brush.horizontalGradient(
-            colors = listOf(fg, fgUnsung),
-            startX = sweep.x,
-            endX = sweep.x + fadeWidthPx,
-        )
-    } else {
-        SolidColor(if (sweep.allDone) fg else fgUnsung)
-    }
 
-    for (i in text.indices) {
-        val box = layout.getBoundingBox(i)
-        if (box.right <= box.left) continue   // 行末空白等零宽字符，跳过
-        val charLine = layout.getLineForOffset(i)
+    for (idx in units.indices) {
+        val unit = units[idx]
+        val durationMs = unit.timing.durationMs.coerceAtLeast(1L)
+        val elapsedMs = positionMs - unit.timing.startMs
+        val liftT = lyricLiftEnvelope(durationMs, elapsedMs)
+        val ty = snapTextOffset(liftPeakPx * liftT)
+        val segmentProgress = lyricUnitSegmentProgress(unit, positionMs)
 
-        // 上浮：per-char 时间轴 ramp，不是 sweep 几何驱动
-        val charIdx = charIdxByTextIdx.getOrElse(i) { -1 }
-        val ty = if (charIdx >= 0) {
-            val pc = chars[charIdx]
-            val rampMs = maxOf(minRampMs, pc.durationMs)
-            val rawT = ((positionMs - pc.startMs).toFloat() / rampMs).coerceIn(0f, 1f)
-            val eased = EaseOutCss.transform(rawT)
-            liftPeakPx * eased
-        } else {
-            0f
-        }
-
-        // 选当前字符这帧应该用的 brush：
-        //   - sweep 之前的视觉行 → 已唱完，纯 fg
-        //   - sweep 当前行       → activeBrush（per-pixel 软过渡）
-        //   - sweep 之后的视觉行 → 还没唱到，纯 fgUnsung
-        val brush: Brush = when {
-            sweep.notStarted -> SolidColor(fgUnsung)
-            sweep.allDone -> SolidColor(fg)
-            charLine < sweep.line -> SolidColor(fg)
-            charLine > sweep.line -> SolidColor(fgUnsung)
-            else -> activeBrush
-        }
-
-        // 多行文本严格按所在行 box clip，避免相邻行 ghost。
+        // 按视觉单元 clip，而不是按单个字母 clip：
+        // 英文单词会作为一个整体上浮和重绘，避免字母之间因 clip 边缘抗锯齿出现裂缝。
+        // 左右边界使用相邻视觉单元之间的空白中线，避免上一版 padding 造成首尾双层叠色。
         // lineHeight 44sp > fontSize 28sp，行 box 内部上下各 ~8sp 空白能吸收 ±dp 位移。
+        val previous = units.getOrNull(idx - 1)?.takeIf { it.line == unit.line }
+        val next = units.getOrNull(idx + 1)?.takeIf { it.line == unit.line }
+        val gapToPrevious = if (previous != null) unit.left - previous.right else 0f
+        val gapToNext = if (next != null) next.left - unit.right else 0f
+        val clipLeft = when {
+            previous == null -> layout.getLineLeft(unit.line)
+            gapToPrevious >= 0f -> previous.right + gapToPrevious / 2f
+            else -> unit.left
+        }
+        val clipRight = when {
+            next == null -> layout.getLineRight(unit.line)
+            gapToNext >= 0f -> unit.right + gapToNext / 2f
+            else -> unit.right
+        }
         clipRect(
-            left = box.left,
-            top = layout.getLineTop(charLine),
-            right = box.right,
-            bottom = layout.getLineBottom(charLine),
+            left = clipLeft,
+            top = layout.getLineTop(unit.line),
+            right = clipRight,
+            bottom = layout.getLineBottom(unit.line),
             clipOp = ClipOp.Intersect,
         ) {
-            drawText(layout, brush = brush, topLeft = Offset(0f, ty))
+            drawText(layout, color = wordPalette.unsung, topLeft = Offset(0f, ty))
+        }
+        if (segmentProgress > 0f) {
+            val sweepX = unit.left + (unit.right - unit.left) * segmentProgress
+            val sungRight = sweepX.coerceIn(clipLeft, clipRight)
+            if (sungRight > clipLeft) {
+                clipRect(
+                    left = clipLeft,
+                    top = layout.getLineTop(unit.line),
+                    right = sungRight,
+                    bottom = layout.getLineBottom(unit.line),
+                    clipOp = ClipOp.Intersect,
+                ) {
+                    drawText(layout, color = wordPalette.sung, topLeft = Offset(0f, ty))
+                }
+            }
+            if (segmentProgress < 1f) {
+                val fadeRight = (sweepX + fadeWidthPx).coerceAtMost(clipRight)
+                if (fadeRight > sweepX) {
+                    clipRect(
+                        left = sweepX.coerceAtLeast(clipLeft),
+                        top = layout.getLineTop(unit.line),
+                        right = fadeRight,
+                        bottom = layout.getLineBottom(unit.line),
+                        clipOp = ClipOp.Intersect,
+                    ) {
+                        drawText(
+                            layout,
+                            brush = Brush.horizontalGradient(
+                                colors = listOf(wordPalette.sung, Color.Transparent),
+                                startX = sweepX,
+                                endX = sweepX + fadeWidthPx,
+                            ),
+                            topLeft = Offset(0f, ty),
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
+private fun lyricUnitSegmentProgress(unit: LyricDrawUnit, positionMs: Long): Float {
+    val tokenProgress = unit.timing.progress(positionMs).coerceIn(0f, 1f)
+    val start = unit.segmentStartProgress
+    val end = unit.segmentEndProgress
+    if (tokenProgress <= start) return 0f
+    if (tokenProgress >= end) return 1f
+    return ((tokenProgress - start) / (end - start).coerceAtLeast(0.001f)).coerceIn(0f, 1f)
+}
 
+private fun lyricLiftEnvelope(durationMs: Long, elapsedMs: Long): Float {
+    if (elapsedMs <= 0L) return 0f
+    val riseMs = maxOf(280L, minOf(durationMs, 900L))
+    return EaseOutCss.transform((elapsedMs.toFloat() / riseMs.toFloat()).coerceIn(0f, 1f))
+}
+
+private fun snapTextOffset(value: Float): Float {
+    return kotlin.math.round(value * 2f) / 2f
+}

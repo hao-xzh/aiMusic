@@ -11,9 +11,12 @@ package app.pipo.nativeapp.data
 object YrcParser {
     private val lineHeader = Regex("""^\[(\d+),(\d+)]""")
     private val tokenRegex = Regex("""\((\d+),(\d+),(?:-?\d+)\)([^()\[\]]*)""")
+    private val offsetTag = Regex("""\[(?:offset|offsetMs)\s*:\s*([+-]?\d+)]""", RegexOption.IGNORE_CASE)
+    private val jsonOffset = Regex(""""offset"\s*:\s*([+-]?\d+)""", RegexOption.IGNORE_CASE)
 
     fun parse(raw: String): List<PipoLyricLine> {
         val lines = mutableListOf<PipoLyricLine>()
+        val offsetMs = parseOffsetMs(raw)
         for (rawLine in raw.split('\n')) {
             val line = rawLine.trim().trimEnd('\r')
             if (line.isEmpty()) continue
@@ -21,13 +24,13 @@ object YrcParser {
             if (line.startsWith("{")) continue
 
             val header = lineHeader.find(line) ?: continue
-            val lineStart = header.groupValues[1].toLongOrNull() ?: continue
+            val lineStart = ((header.groupValues[1].toLongOrNull() ?: continue) + offsetMs).coerceAtLeast(0L)
             val lineDur = header.groupValues[2].toLongOrNull() ?: continue
 
             val rest = line.substring(header.range.last + 1)
             val chars = mutableListOf<PipoLyricChar>()
             tokenRegex.findAll(rest).forEach { m ->
-                val tokenStart = m.groupValues[1].toLongOrNull() ?: return@forEach
+                val tokenStart = ((m.groupValues[1].toLongOrNull() ?: return@forEach) + offsetMs).coerceAtLeast(0L)
                 val tokenDur = m.groupValues[2].toLongOrNull() ?: return@forEach
                 val text = m.groupValues[3]
                 if (text.isEmpty()) return@forEach
@@ -48,15 +51,17 @@ object YrcParser {
                 }
             }
 
-            val text = if (chars.isNotEmpty()) chars.joinToString("") { it.text } else ""
-            if (chars.isEmpty() && text.isEmpty()) continue
+            val mergedChars = mergeAdjacentAsciiLyricChars(chars)
+            val text = if (mergedChars.isNotEmpty()) mergedChars.joinToString("") { it.text } else ""
+            if (mergedChars.isEmpty() && text.isEmpty()) continue
 
             lines.add(
                 PipoLyricLine(
                     startMs = lineStart,
                     durationMs = lineDur,
                     text = text,
-                    chars = chars,
+                    chars = mergedChars,
+                    timing = PipoLyricTiming.Word,
                 )
             )
         }
@@ -71,6 +76,55 @@ object YrcParser {
         }
         return dedup
     }
+
+    private fun parseOffsetMs(raw: String): Long {
+        return offsetTag.find(raw)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            ?: jsonOffset.find(raw)?.groupValues?.getOrNull(1)?.toLongOrNull()
+            ?: 0L
+    }
+}
+
+private fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoLyricChar> {
+    if (chars.size <= 1) return chars
+    val merged = ArrayList<PipoLyricChar>(chars.size)
+    for (char in chars) {
+        val prev = merged.lastOrNull()
+        if (prev != null && shouldMergeAsciiFragments(prev.text, char.text)) {
+            val start = minOf(prev.startMs, char.startMs)
+            val end = maxOf(prev.startMs + prev.durationMs, char.startMs + char.durationMs)
+            merged[merged.lastIndex] = PipoLyricChar(
+                startMs = start,
+                durationMs = (end - start).coerceAtLeast(1L),
+                text = prev.text + char.text,
+            )
+        } else {
+            merged.add(char)
+        }
+    }
+    return merged
+}
+
+private fun shouldMergeAsciiFragments(left: String, right: String): Boolean {
+    if (!isAsciiWordFragment(left) || !isAsciiWordFragment(right)) return false
+    if (left.lastOrNull()?.isWhitespace() == true || right.firstOrNull()?.isWhitespace() == true) return false
+    val leftTail = left.lastOrNull() ?: return false
+    val rightHead = right.firstOrNull() ?: return false
+    return isAsciiWordJoiner(leftTail) || isAsciiWordJoiner(rightHead) ||
+        (leftTail.isLetterOrDigit() && rightHead.isLetterOrDigit())
+}
+
+private fun isAsciiWordFragment(value: String): Boolean {
+    var hasAsciiWord = false
+    for (c in value) {
+        val asciiWord = c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
+        if (asciiWord) hasAsciiWord = true
+        if (c in '一'..'鿿' || c in '぀'..'ヿ' || c in '가'..'힣') return false
+    }
+    return hasAsciiWord
+}
+
+private fun isAsciiWordJoiner(c: Char): Boolean {
+    return c == '\'' || c == '’' || c == '-' || c.isLetterOrDigit()
 }
 
 /**

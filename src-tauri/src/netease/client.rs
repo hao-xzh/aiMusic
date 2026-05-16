@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
@@ -31,6 +32,16 @@ const HOST: &str = "https://music.163.com";
 /// 随便填一个中国大陆公网 IP 就能绕过 `-462 风控触发`。
 /// （这是社区通行做法，YesPlayMusic / NeteaseCloudMusicApi 也这么干。）
 const FAKE_REAL_IP: &str = "116.25.146.177";
+const SEED_COOKIES: &[&str] = &[
+    "os=pc",
+    "osver=Microsoft-Windows-10-Professional-build-22631",
+    "appver=2.10.2",
+    "channel=netease",
+    "versioncode=140",
+    "buildver=1700000000",
+    "mobilename=",
+    "resolution=1920x1080",
+];
 
 pub struct NeteaseClient {
     http: Client,
@@ -68,22 +79,7 @@ impl NeteaseClient {
 
         // 2. 再把 PC 身份种子 cookie 插进去（存在就覆盖；不存在就新增）。
         //    这些是网易云 PC 客户端每次请求都带的"身份信标"，跟 realIP 一起骗过 -462。
-        let seed_url = Url::parse(HOST)?;
-        let seeds = [
-            "os=pc",
-            "osver=Microsoft-Windows-10-Professional-build-22631",
-            "appver=2.10.2",
-            "channel=netease",
-            "versioncode=140",
-            "buildver=1700000000",
-            "mobilename=",
-            "resolution=1920x1080",
-        ];
-        for c in seeds {
-            store
-                .parse(&format!("{c}; Path=/"), &seed_url)
-                .map_err(|e| anyhow!("seed {c}: {e}"))?;
-        }
+        seed_identity_cookies(&mut store)?;
 
         let cookies = Arc::new(CookieStoreMutex::new(store));
 
@@ -91,6 +87,8 @@ impl NeteaseClient {
             .cookie_provider(cookies.clone())
             .user_agent(UA)
             .gzip(true)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("build reqwest client")?;
 
@@ -124,6 +122,23 @@ impl NeteaseClient {
         drop(file);
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        Ok(())
+    }
+
+    /// 退出登录：清空网易云登录 cookie 和磁盘持久化，只保留 PC 身份种子 cookie。
+    pub fn logout(&self) -> Result<()> {
+        {
+            let mut store = self
+                .cookies
+                .lock()
+                .map_err(|_| anyhow!("cookie store poisoned"))?;
+            store.clear();
+            seed_identity_cookies(&mut *store)?;
+        }
+        if let Some(path) = self.persist_path.as_ref() {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+        }
         Ok(())
     }
 
@@ -193,6 +208,16 @@ impl NeteaseClient {
             .map(|c| (c.name().to_string(), c.value().to_string()))
             .collect()
     }
+}
+
+fn seed_identity_cookies(store: &mut cookie_store::CookieStore) -> Result<()> {
+    let seed_url = Url::parse(HOST)?;
+    for c in SEED_COOKIES {
+        store
+            .parse(&format!("{c}; Path=/"), &seed_url)
+            .map_err(|e| anyhow!("seed {c}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn truncate(s: &str, n: usize) -> String {

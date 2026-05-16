@@ -2,6 +2,7 @@ package app.pipo.nativeapp.playback
 
 import android.app.Application
 import android.content.ComponentName
+import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -21,7 +22,9 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.TrackDedupe
+import app.pipo.nativeapp.data.TransitionScore
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -45,9 +48,17 @@ data class PlayerUiState(
     val durationMs: Long = 0L,
     val lyrics: List<PipoLyricLine> = emptyList(),
     val isReady: Boolean = false,
+    val isLoading: Boolean = false,
+    val playbackMode: PlaybackQueueMode = PlaybackQueueMode.PlaylistLoop,
 ) {
     val activeLyricIndex: Int
         get() = lyrics.indexOfLast { line -> positionMs >= line.startMs }.coerceAtLeast(0)
+}
+
+enum class PlaybackQueueMode {
+    PlaylistLoop,
+    OrderOnce,
+    AiRadio,
 }
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
@@ -76,7 +87,7 @@ class PlayerViewModel(
     private var playGen: Int = 0
 
     // 之前这里有副 ExoPlayer (OverlapPlayer) 做 crossfade 风格的两曲叠声接歌。
-    // 用户反馈"听感混乱"——他们要的是 gapless（专辑模式无缝接，前一首尾巴拼下一首开头），
+    // 用户反馈"听感混乱"——他们要的是 gapless（连续边界无缝接，前一首尾巴拼下一首开头），
     // 不是 DJ 风格 crossfade。所以删掉副 player + 所有重叠淡入淡出逻辑，
     // 改用 ExoPlayer 自带 gapless transition + ClippingConfiguration 裁头尾静音
     // （toMediaItem 里已经做了）。这才是 iTunes / 网易 那种"接得像同一首"的体验。
@@ -155,8 +166,12 @@ class PlayerViewModel(
     private var nextPrewarmJob: Job? = null
     private var prewarmingNextKey: String? = null
     private var prewarmedNextKey: String? = null
+    private val prewarmFailureBackoffUntilMs = HashMap<String, Long>()
+    private var queueExtendBackoffUntilMs = 0L
+    private var queueExtendFailureCount = 0
     private var stablePlaybackResetJob: Job? = null
     private var userPausedPlayback = false
+    private var resolvingPlayback = false
 
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
@@ -249,16 +264,21 @@ class PlayerViewModel(
         val resumePosMs = maxOf(player.currentPosition, state.positionMs).coerceAtLeast(0L)
         val targetTrackId = track.id
         transientRetryJob?.cancel()
+        setResolvingPlayback(true)
         transientRetryJob = viewModelScope.launch {
-            delay((attempt * 1200L).coerceAtMost(3500L))
-            val livePlayer = controller ?: return@launch
-            val targetIdx = livePlayer.indexOfMediaId(targetTrackId) ?: return@launch
-            if (currentTrackFor(livePlayer)?.id != targetTrackId) return@launch
-            livePlayer.repeatMode = Player.REPEAT_MODE_ALL
-            livePlayer.seekTo(targetIdx, resumePosMs)
-            livePlayer.prepare()
-            livePlayer.play()
-            Log.w("PlayerVM", "network retry #$attempt for ${track.title}: ${error.errorCodeName}")
+            try {
+                delay((attempt * 1200L).coerceAtMost(3500L))
+                val livePlayer = controller ?: return@launch
+                val targetIdx = livePlayer.indexOfMediaId(targetTrackId) ?: return@launch
+                if (currentTrackFor(livePlayer)?.id != targetTrackId) return@launch
+                applyPlaybackMode(livePlayer)
+                livePlayer.seekTo(targetIdx, resumePosMs)
+                livePlayer.prepare()
+                livePlayer.play()
+                Log.w("PlayerVM", "network retry #$attempt for ${track.title}: ${error.errorCodeName}")
+            } finally {
+                setResolvingPlayback(false)
+            }
         }
     }
 
@@ -301,6 +321,7 @@ class PlayerViewModel(
         val resumePosMs = resumePositionMs
             ?: maxOf(player.currentPosition, state.positionMs).coerceAtLeast(0L)
         val targetTrackId = track.id
+        setResolvingPlayback(true)
         viewModelScope.launch {
             try {
                 val fresh = fetchPlayableUrl(ne)
@@ -327,14 +348,18 @@ class PlayerViewModel(
                     if (force) {
                         val startPosition = resumePosMs.takeIf { it > 1000L } ?: 0L
                         livePlayer.setMediaItems(listOf(toMediaItem(updated)), 0, startPosition)
-                        livePlayer.repeatMode = Player.REPEAT_MODE_ALL
+                        applyPlaybackMode(livePlayer)
                         livePlayer.prepare()
                         userPausedPlayback = false
                         livePlayer.play()
                     }
                     return@launch
                 }
-                livePlayer.replaceMediaItem(updatedIdx, toMediaItem(updated))
+                val updatedQueueIndex = state.queue.indexOfFirst { it.id == targetTrackId }
+                livePlayer.replaceMediaItem(
+                    updatedIdx,
+                    if (updatedQueueIndex >= 0) toMediaItem(updated, state.queue, updatedQueueIndex) else toMediaItem(updated),
+                )
                 // 只有 player 还停在被重签的这首上(没自动跳走)才接续播放;
                 // 已经在播下一首时不去打断 —— replaceMediaItem 已把 URL 更新,
                 // 下次 wraparound / 用户手动回来时直接是新 URL。
@@ -350,6 +375,7 @@ class PlayerViewModel(
                 }
             } finally {
                 refreshingUrlForTrack = null
+                setResolvingPlayback(false)
             }
         }
     }
@@ -357,8 +383,9 @@ class PlayerViewModel(
     private fun recoverEndedPlaybackState() {
         val player = controller ?: return
         if (state.queue.isEmpty() || userPausedPlayback) return
+        if (state.playbackMode == PlaybackQueueMode.OrderOnce) return
         Log.w("PlayerVM", "player reached STATE_ENDED, forcing repeat recovery")
-        player.repeatMode = Player.REPEAT_MODE_ALL
+        applyPlaybackMode(player)
         if (player.mediaItemCount <= 1 && recoverFromStateQueue(player, offset = 1)) return
         if (player.mediaItemCount == 0) {
             recoverForManualPlay(player)
@@ -392,6 +419,14 @@ class PlayerViewModel(
             ?: state.queue.getOrNull(player.currentMediaItemIndex.coerceAtLeast(0))
     }
 
+    private fun currentQueueIndexFor(player: Player, queue: List<NativeTrack> = state.queue): Int {
+        val mediaId = player.currentMediaItem?.mediaId
+        val mapped = mediaId?.let { id -> queue.indexOfFirst { it.id == id } } ?: -1
+        if (mapped >= 0) return mapped
+        if (queue.isEmpty()) return 0
+        return player.currentMediaItemIndex.coerceIn(0, queue.lastIndex)
+    }
+
     private fun Player.indexOfMediaId(mediaId: String): Int? {
         return (0 until mediaItemCount).firstOrNull { i -> getMediaItemAt(i).mediaId == mediaId }
     }
@@ -407,10 +442,14 @@ class PlayerViewModel(
             return
         }
         if (p.mediaItemCount > 1) {
-            recoverySkipCount += 1
-            p.repeatMode = Player.REPEAT_MODE_ALL
             val currentIdx = p.currentMediaItemIndex.coerceIn(0, p.mediaItemCount - 1)
-            val nextIdx = if (currentIdx + 1 < p.mediaItemCount) currentIdx + 1 else 0
+            val nextIdx = offsetTargetIndex(currentIdx, p.mediaItemCount, offset = 1) ?: run {
+                p.pause()
+                syncFrom(p)
+                return
+            }
+            recoverySkipCount += 1
+            applyPlaybackMode(p)
             p.seekTo(nextIdx, 0L)
             p.prepare()
             p.play()
@@ -475,14 +514,14 @@ class PlayerViewModel(
                                     // 冷启动：恢复后仍保持队列循环，避免播完一次就停。
                                     state = state.copy(queue = resolved, currentIndex = targetIdx)
                                     player.setMediaItems(
-                                        resolved.map(::toMediaItem),
+                                        toMediaItems(resolved),
                                         targetIdx,
                                         safeResumePosition(
                                             snap.positionMs,
                                             resolved.getOrNull(targetIdx)?.durationMs ?: 0L,
                                         ),
                                     )
-                                    player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+                                    applyPlaybackMode(player)
                                     player.prepare()
                                     // 不要 play()——等用户点
                                     syncFrom(player)
@@ -499,8 +538,8 @@ class PlayerViewModel(
                                         .filter { it.streamUrl.isNotBlank() }
                                     if (tracks.isEmpty()) return@runCatching
                                     state = state.copy(queue = tracks)
-                                    player.setMediaItems(tracks.map(::toMediaItem))
-                                    player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+                                    player.setMediaItems(toMediaItems(tracks))
+                                    applyPlaybackMode(player)
                                     player.prepare()
                                     syncFrom(player)
                                 }
@@ -571,40 +610,55 @@ class PlayerViewModel(
      */
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun insertNext(track: NativeTrack) {
-        val player = controller ?: return
+        if (controller == null) return
+        val gen = ++playGen
+        setResolvingPlayback(true)
         viewModelScope.launch {
-            val resolved = if (track.streamUrl.isNotBlank()) {
-                track
-            } else {
-                val id = track.neteaseId ?: return@launch
-                val url = fetchPlayableUrl(id) ?: return@launch
-                track.copy(streamUrl = url)
-            }
-            val live = controller ?: return@launch
-            // 当前队列空（还没开始放过）→ 退化成"装队列 + 播"，避免插队进虚空
-            if (live.mediaItemCount == 0) {
-                state = state.copy(queue = listOf(resolved), currentIndex = 0)
-                live.setMediaItems(listOf(toMediaItem(resolved)), 0, 0L)
-                live.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
-                live.volume = 1f
-                live.prepare()
+            try {
+                val resolved = if (track.streamUrl.isNotBlank()) {
+                    track
+                } else {
+                    val id = track.neteaseId ?: return@launch
+                    val url = fetchPlayableUrl(id) ?: return@launch
+                    track.copy(streamUrl = url)
+                }
+                if (gen != playGen) return@launch
+                val live = controller ?: return@launch
+                // 当前队列空（还没开始放过）→ 退化成"装队列 + 播"，避免插队进虚空
+                if (live.mediaItemCount == 0) {
+                    val singleQueue = listOf(resolved)
+                    state = state.copy(queue = singleQueue, currentIndex = 0)
+                    live.setMediaItems(listOf(toMediaItem(resolved, singleQueue, 0)), 0, 0L)
+                    applyPlaybackMode(live)
+                    live.volume = 1f
+                    live.prepare()
+                    userPausedPlayback = false
+                    live.play()
+                    return@launch
+                }
+                val curIdx = live.currentMediaItemIndex.coerceAtLeast(0)
+                val insertIdx = (curIdx + 1).coerceAtMost(live.mediaItemCount)
+                // state.queue 跟着 player 队列一起插
+                val newQueue = state.queue.toMutableList().apply {
+                    add(insertIdx.coerceAtMost(size), resolved)
+                }
+                state = state.copy(queue = newQueue)
+                live.addMediaItem(insertIdx, toMediaItem(resolved, newQueue, insertIdx.coerceIn(0, newQueue.lastIndex)))
+                val previousIdx = insertIdx - 1
+                if (previousIdx in newQueue.indices && hasContinuousAudioNeighbor(newQueue, previousIdx)) {
+                    runCatching {
+                        live.replaceMediaItem(previousIdx, toMediaItem(newQueue[previousIdx], newQueue, previousIdx))
+                    }
+                }
+                // 跳过去立刻播 —— "插队"语义是"我现在就要听 X"
+                live.seekTo(insertIdx, 0L)
+                ensurePlayerLive(live)
+                applyPlaybackMode(live)
                 userPausedPlayback = false
                 live.play()
-                return@launch
+            } finally {
+                setResolvingPlayback(false)
             }
-            val curIdx = live.currentMediaItemIndex.coerceAtLeast(0)
-            val insertIdx = (curIdx + 1).coerceAtMost(live.mediaItemCount)
-            live.addMediaItem(insertIdx, toMediaItem(resolved))
-            // state.queue 跟着 player 队列一起插
-            val newQueue = state.queue.toMutableList().apply {
-                add(insertIdx.coerceAtMost(size), resolved)
-            }
-            state = state.copy(queue = newQueue)
-            // 跳过去立刻播 —— "插队"语义是"我现在就要听 X"
-            live.seekTo(insertIdx, 0L)
-            ensurePlayerLive(live)
-            userPausedPlayback = false
-            live.play()
         }
     }
 
@@ -617,45 +671,62 @@ class PlayerViewModel(
         // 我们这次的 phase-2 拿到 gen != playGen 就放弃 addMediaItems,避免把
         // "上一次歌单的剩余歌" 追到 "这一次新歌单" 的尾部 → 队列脏掉。
         val gen = ++playGen
+        setResolvingPlayback(true)
         viewModelScope.launch {
-            // -------- 阶段 1：解析第 1 首立刻播 --------
-            val first = initialBatch.first()
-            val firstResolved: NativeTrack = if (first.streamUrl.isNotBlank()) {
-                first
-            } else {
-                val id = first.neteaseId ?: return@launch
-                val url = fetchPlayableUrl(id) ?: return@launch
-                first.copy(streamUrl = url)
+            var firstResolvedForAppend: NativeTrack? = null
+            try {
+                // -------- 阶段 1：解析第 1 首立刻播 --------
+                val first = initialBatch.first()
+                val firstResolved: NativeTrack = if (first.streamUrl.isNotBlank()) {
+                    first
+                } else {
+                    val id = first.neteaseId ?: return@launch
+                    val url = fetchPlayableUrl(id) ?: return@launch
+                    first.copy(streamUrl = url)
+                }
+                if (gen != playGen) return@launch
+                firstResolvedForAppend = firstResolved
+                continuousSource = source
+                app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
+                val pendingQueue = listOf(firstResolved) + initialBatch.drop(1)
+                state = state.copy(
+                    queue = pendingQueue,
+                    currentIndex = 0,
+                    playbackMode = if (source != null) PlaybackQueueMode.AiRadio else PlaybackQueueMode.PlaylistLoop,
+                )
+                player.setMediaItems(listOf(toMediaItem(firstResolved, pendingQueue, 0)), 0, 0L)
+                applyPlaybackMode(player)
+                player.volume = 1f
+                player.prepare()
+                userPausedPlayback = false
+                player.play()
+            } finally {
+                setResolvingPlayback(false)
             }
-            if (gen != playGen) return@launch
-            continuousSource = source
-            app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
-            val pendingQueue = listOf(firstResolved) + initialBatch.drop(1)
-            state = state.copy(queue = pendingQueue, currentIndex = 0)
-            player.setMediaItems(listOf(toMediaItem(firstResolved)), 0, 0L)
-            player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
-            player.volume = 1f
-            player.prepare()
-            userPausedPlayback = false
-            player.play()
 
             // -------- 阶段 2：后台补 batch 剩下歌 --------
+            val firstResolved = firstResolvedForAppend ?: return@launch
             val rest = initialBatch.drop(1)
             if (rest.isEmpty()) return@launch
-            val resolvedRest = resolvePlayableQueue(rest).filter { it.streamUrl.isNotBlank() }
-            if (resolvedRest.isEmpty()) return@launch
-            // generation 检查:resolvePlayableQueue 期间用户可能已切到别的歌单,
-            // 此时 playGen 已被 bump,我们这次 phase-2 是过期的,放弃追加。
-            if (gen != playGen) return@launch
-            // 重新拿一遍 controller —— phase-1 之后 service 可能已经 rebind/release
-            val livePlayer = controller ?: return@launch
-            livePlayer.addMediaItems(resolvedRest.map(::toMediaItem))
-            // 用 player 实际的 currentMediaItemIndex 写 state.currentIndex —— phase-1/2
-            // 之间用户可能已经按过 next（或自然播放结束），player 已经在 index 0 之外
+            val plannedQueue = listOf(firstResolved) + rest
             state = state.copy(
-                queue = listOf(firstResolved) + resolvedRest,
-                currentIndex = livePlayer.currentMediaItemIndex.coerceAtLeast(0),
+                queue = plannedQueue,
+                currentIndex = 0,
+                playbackMode = if (source != null) PlaybackQueueMode.AiRadio else PlaybackQueueMode.PlaylistLoop,
             )
+            for (chunk in appendResolveChunks(rest)) {
+                val resolvedChunk = resolvePlayableQueue(chunk).filter { it.streamUrl.isNotBlank() }
+                if (gen != playGen || resolvedChunk.isEmpty()) continue
+                val livePlayer = controller ?: return@launch
+                livePlayer.addMediaItems(toMediaItems(resolvedChunk, state.queue))
+                val mergedQueue = mergeResolvedTracks(state.queue, resolvedChunk)
+                state = state.copy(
+                    queue = mergedQueue,
+                    currentIndex = currentQueueIndexFor(livePlayer, mergedQueue),
+                    playbackMode = if (source != null) PlaybackQueueMode.AiRadio else PlaybackQueueMode.PlaylistLoop,
+                )
+                maybePrewarmNextTrack(livePlayer)
+            }
         }
     }
 
@@ -677,68 +748,82 @@ class PlayerViewModel(
         if (playable.isEmpty()) return
         // 同 playFromAgent 注释:phase-2 过程中用户可能再启播,gen 不一致就放弃。
         val gen = ++playGen
+        setResolvingPlayback(true)
         viewModelScope.launch {
-            // -------- 阶段 1：立刻开播"那一首" --------
-            // 优先用已有 streamUrl；没有就只为这 1 个 id 发 1 次 songUrls 请求
-            val pickedResolved: NativeTrack = if (track.streamUrl.isNotBlank()) {
-                track
-            } else {
-                val id = track.neteaseId ?: return@launch
-                val url = fetchPlayableUrl(id) ?: return@launch
-                track.copy(streamUrl = url)
-            }
-            if (gen != playGen) return@launch
-            // phase-1 期间显式 null —— 此时 queue 只有 1 首，开 continuous 会立刻触发
-            // maybeExtendQueue（remaining=0 ≤ 阈值 3），跟 phase-2 的 addMediaItems 抢插。
-            // phase-2 完成后再切回 RecommendEngine，让 "歌单播完接续相似歌" 这条 UX 也能用上。
-            continuousSource = null
-            app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
-            // 播放器先只装第一首以尽快出声，但 state 保留完整候选队列。
-            // 如果 phase-2 网络慢/失败，ENDED/next 仍能从 state 里找到下一首并单独解析。
-            val pickedIdxInPlayable = playable.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-            val phaseOneQueue = listOf(pickedResolved) +
-                playable.drop(pickedIdxInPlayable + 1) +
-                playable.take(pickedIdxInPlayable)
-            state = state.copy(queue = phaseOneQueue, currentIndex = 0)
-            player.setMediaItems(listOf(toMediaItem(pickedResolved)), 0, 0L)
-            player.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
-            player.volume = 1f
-            player.prepare()
-            userPausedPlayback = false
-            player.play()
-
-            // -------- 阶段 2：后台补完整队列 --------
-            // 解析剩下歌的 URL（分批 ≤ 50 个），smooth 排序，append 到播放器
-            // 这一段几秒钟内完成，期间用户已经在听；REPEAT_MODE_ALL 会自然衔接
-            val rest = playable.filter { it.id != track.id }
-            if (rest.isEmpty()) return@launch
-            val resolvedRest = resolvePlayableQueue(rest).filter { it.streamUrl.isNotBlank() }
-            if (resolvedRest.isEmpty()) return@launch
-            // 同 playFromAgent:resolvePlayableQueue 期间用户可能切到别的歌单
-            if (gen != playGen) return@launch
-            val full = listOf(pickedResolved) + resolvedRest
-            val ordered = if (smooth) {
-                app.pipo.nativeapp.data.SmoothQueue.smooth(
-                    tracks = full,
-                    featuresStore = featuresStore,
-                    startTrackId = track.id,
-                    mode = app.pipo.nativeapp.data.SmoothQueue.Mode.Library,
+            var pickedResolvedForAppend: NativeTrack? = null
+            try {
+                // -------- 阶段 1：立刻开播"那一首" --------
+                // 优先用已有 streamUrl；没有就只为这 1 个 id 发 1 次 songUrls 请求
+                val pickedResolved: NativeTrack = if (track.streamUrl.isNotBlank()) {
+                    track
+                } else {
+                    val id = track.neteaseId ?: return@launch
+                    val url = fetchPlayableUrl(id) ?: return@launch
+                    track.copy(streamUrl = url)
+                }
+                if (gen != playGen) return@launch
+                pickedResolvedForAppend = pickedResolved
+                // phase-1 期间显式 null —— 此时 queue 只有 1 首，开 continuous 会立刻触发
+                // maybeExtendQueue（remaining=0 ≤ 阈值 3），跟 phase-2 的 addMediaItems 抢插。
+                // phase-2 完成后再切回 RecommendEngine，让 "歌单播完接续相似歌" 这条 UX 也能用上。
+                continuousSource = null
+                app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
+                // 播放器先只装第一首以尽快出声，但 state 保留完整候选队列。
+                // 如果 phase-2 网络慢/失败，ENDED/next 仍能从 state 里找到下一首并单独解析。
+                val pickedIdxInPlayable = playable.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+                val continuousRun = continuousAudioTail(playable, pickedIdxInPlayable)
+                    .mapIndexed { idx, candidate -> if (idx == 0) pickedResolved else candidate }
+                val continuousRunIds = continuousRun.mapTo(HashSet()) { it.id }
+                val phaseOneQueue = continuousRun +
+                    playable.filter { it.id !in continuousRunIds }
+                state = state.copy(
+                    queue = phaseOneQueue,
+                    currentIndex = 0,
+                    playbackMode = PlaybackQueueMode.PlaylistLoop,
                 )
-            } else full
-            // 把 picked 之后的 + 之前的（环形）依次 append。SmoothQueue 通常把
-            // startTrackId 放在 index 0，但保险起见按实际位置切
-            val pickIdxInOrdered = ordered.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-            val tail = ordered.drop(pickIdxInOrdered + 1) + ordered.take(pickIdxInOrdered)
-            // 重新拿 controller —— suspend 期间 service 可能已经 rebind/release
-            val livePlayer = controller ?: return@launch
-            if (tail.isNotEmpty()) {
-                livePlayer.addMediaItems(tail.map(::toMediaItem))
+                player.setMediaItems(listOf(toMediaItem(pickedResolved, phaseOneQueue, 0)), 0, 0L)
+                applyPlaybackMode(player)
+                player.volume = 1f
+                player.prepare()
+                userPausedPlayback = false
+                player.play()
+            } finally {
+                setResolvingPlayback(false)
             }
-            // 用 player 实际 currentMediaItemIndex —— phase-1/2 之间用户可能按过 next
-            state = state.copy(
-                queue = listOf(pickedResolved) + tail,
-                currentIndex = livePlayer.currentMediaItemIndex.coerceAtLeast(0),
-            )
+
+            // -------- 阶段 2：后台分批补完整队列 --------
+            val pickedResolved = pickedResolvedForAppend ?: return@launch
+            val pickedIdxInPlayable = playable.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+            val continuousRun = continuousAudioTail(playable, pickedIdxInPlayable)
+                .mapIndexed { idx, candidate -> if (idx == 0) pickedResolved else candidate }
+            val continuousRunIds = continuousRun.mapTo(HashSet()) { it.id }
+            val rest = playable.filter { it.id !in continuousRunIds }
+            if (rest.isEmpty()) return@launch
+            val smoothAnchor = continuousRun.last()
+            val orderedRest = if (smooth) {
+                app.pipo.nativeapp.data.SmoothQueue.smooth(
+                    tracks = listOf(smoothAnchor) + rest,
+                    featuresStore = featuresStore,
+                    startTrackId = smoothAnchor.id,
+                    mode = app.pipo.nativeapp.data.SmoothQueue.Mode.Library,
+                ).filter { it.id != smoothAnchor.id }
+            } else rest
+            val plannedQueue = continuousRun + orderedRest
+            state = state.copy(queue = plannedQueue, currentIndex = 0)
+            val tailCandidates = plannedQueue.drop(1)
+            for (chunk in appendResolveChunks(tailCandidates)) {
+                // 同 playFromAgent:resolvePlayableQueue 期间用户可能切到别的歌单
+                if (gen != playGen) return@launch
+                val resolvedChunk = resolvePlayableQueue(chunk).filter { it.streamUrl.isNotBlank() }
+                if (resolvedChunk.isEmpty()) continue
+                if (gen != playGen) return@launch
+                val livePlayer = controller ?: return@launch
+                livePlayer.addMediaItems(toMediaItems(resolvedChunk, state.queue))
+                // state.queue 保留完整计划队列，只把已解析到 URL 的条目替换进去。
+                val mergedQueue = mergeResolvedTracks(state.queue, resolvedChunk)
+                state = state.copy(queue = mergedQueue, currentIndex = currentQueueIndexFor(livePlayer, mergedQueue))
+                maybePrewarmNextTrack(livePlayer)
+            }
             // continuousSource 保持 null —— 歌单 tap = 就播这张歌单，REPEAT_MODE_ALL
             // 在尾部循环。不挂任何"相似续杯"，那是 explicit Discovery 入口的事
         }
@@ -774,10 +859,18 @@ class PlayerViewModel(
             recoverForManualPlay(p)
             return
         }
-        p.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
         val count = p.mediaItemCount
         val currentIdx = p.currentMediaItemIndex.coerceIn(0, count - 1)
-        val targetIdx = Math.floorMod(currentIdx + offset, count)
+        val targetIdx = offsetTargetIndex(currentIdx, count, offset) ?: run {
+            if (offset < 0) {
+                p.seekTo(0L)
+            } else {
+                p.pause()
+            }
+            syncFrom(p)
+            return
+        }
+        applyPlaybackMode(p)
         p.seekTo(targetIdx, 0L)
         p.prepare()
         p.play()
@@ -792,7 +885,7 @@ class PlayerViewModel(
             ?.let { id -> queue.indexOfFirst { it.id == id } }
             ?.takeIf { it >= 0 }
             ?: state.currentIndex.coerceIn(0, queue.lastIndex)
-        val targetIdx = Math.floorMod(currentIdx + offset, queue.size)
+        val targetIdx = offsetTargetIndex(currentIdx, queue.size, offset) ?: return false
         val rotated = queue.drop(targetIdx) + queue.take(targetIdx)
         val gen = ++playGen
         viewModelScope.launch {
@@ -805,21 +898,25 @@ class PlayerViewModel(
                 rotated.take(resolvedIdx)
             state = state.copy(queue = pendingQueue, currentIndex = 0)
             live.setMediaItems(listOf(toMediaItem(firstResolved)), 0, 0L)
-            live.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+            applyPlaybackMode(live)
             live.volume = 1f
             live.prepare()
             userPausedPlayback = false
             live.play()
 
             val rest = pendingQueue.drop(1)
-            val resolvedRest = resolvePlayableQueue(rest).filter { it.streamUrl.isNotBlank() }
-            if (gen != playGen || resolvedRest.isEmpty()) return@launch
-            val liveAfterResolve = controller ?: return@launch
-            liveAfterResolve.addMediaItems(resolvedRest.map(::toMediaItem))
-            state = state.copy(
-                queue = listOf(firstResolved) + resolvedRest,
-                currentIndex = liveAfterResolve.currentMediaItemIndex.coerceAtLeast(0),
-            )
+            for (chunk in appendResolveChunks(rest)) {
+                val resolvedChunk = resolvePlayableQueue(chunk).filter { it.streamUrl.isNotBlank() }
+                if (gen != playGen || resolvedChunk.isEmpty()) continue
+                val liveAfterResolve = controller ?: return@launch
+                liveAfterResolve.addMediaItems(resolvedChunk.map(::toMediaItem))
+                val mergedQueue = mergeResolvedTracks(state.queue, resolvedChunk)
+                state = state.copy(
+                    queue = mergedQueue,
+                    currentIndex = currentQueueIndexFor(liveAfterResolve, mergedQueue),
+                )
+                maybePrewarmNextTrack(liveAfterResolve)
+            }
         }
         return true
     }
@@ -833,9 +930,7 @@ class PlayerViewModel(
         when (p.playbackState) {
             Player.STATE_IDLE -> p.prepare()
             Player.STATE_ENDED -> {
-                // ENDED + REPEAT_MODE_OFF 时 hasNextMediaItem=false → seekToNext no-op。
-                // 强制开循环 + seek 回首项让 next 也能"绕回去"
-                p.repeatMode = androidx.media3.common.Player.REPEAT_MODE_ALL
+                applyPlaybackMode(p)
                 p.seekToDefaultPosition(p.currentMediaItemIndex.coerceAtLeast(0))
                 p.prepare()
             }
@@ -850,6 +945,37 @@ class PlayerViewModel(
         syncFrom(player)
     }
 
+    fun seekToMs(positionMs: Long) {
+        val player = controller ?: return
+        val duration = player.duration.takeIf { it > 0 } ?: state.durationMs
+        val targetMs = if (duration > 0L) {
+            positionMs.coerceIn(0L, duration)
+        } else {
+            positionMs.coerceAtLeast(0L)
+        }
+        player.seekTo(targetMs)
+        syncFrom(player)
+    }
+
+    private fun setResolvingPlayback(value: Boolean) {
+        resolvingPlayback = value
+        val player = controller
+        state = state.copy(
+            isLoading = value || (
+                player != null &&
+                    player.playbackState == Player.STATE_BUFFERING &&
+                    player.playWhenReady &&
+                    player.mediaItemCount > 0
+            ),
+        )
+    }
+
+    fun setPlaybackMode(mode: PlaybackQueueMode) {
+        continuousSource = if (mode == PlaybackQueueMode.AiRadio) defaultContinuousSource else null
+        state = state.copy(playbackMode = mode)
+        controller?.let(::applyPlaybackMode)
+    }
+
     fun refreshPosition() {
         controller?.let(::syncFrom)
     }
@@ -859,7 +985,7 @@ class PlayerViewModel(
             val q = state.queue
             if (q.isNotEmpty()) {
                 runCatching {
-                    lastPlaybackStore.save(q, p.currentMediaItemIndex.coerceAtLeast(0), p.currentPosition.coerceAtLeast(0))
+                    lastPlaybackStore.save(q, currentQueueIndexFor(p, q), p.currentPosition.coerceAtLeast(0))
                 }
             }
         }
@@ -873,13 +999,13 @@ class PlayerViewModel(
     }
 
     private fun syncFrom(player: Player) {
-        val index = player.currentMediaItemIndex.coerceAtLeast(0)
         val queue = state.queue
         // 关键：trackId 以 player.currentMediaItem.mediaId 为权威源，不再相信 state.queue[index]。
         // 之前 phase-1/phase-2 期间（state.queue 还没追上 player 实际队列）会出现
         // "用 queue 里的旧 track.id 拉歌词、配上 player 实际在播的另一首" → 歌词不对。
         val playerMediaId = player.currentMediaItem?.mediaId
-        val track = queue.getOrNull(index)
+        val index = currentQueueIndexFor(player, queue)
+        val track = playerMediaId?.let { id -> queue.firstOrNull { it.id == id } } ?: queue.getOrNull(index)
         val authoritativeTrackId = playerMediaId ?: track?.id
         if (authoritativeTrackId != null && loadedLyricsFor != authoritativeTrackId) {
             loadedLyricsFor = authoritativeTrackId
@@ -918,9 +1044,14 @@ class PlayerViewModel(
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = player.duration.takeIf { it > 0 } ?: track?.durationMs ?: 0L,
             isReady = true,
+            isLoading = resolvingPlayback || (
+                player.playbackState == Player.STATE_BUFFERING &&
+                    player.playWhenReady &&
+                    player.mediaItemCount > 0
+            ),
         )
         // 续杯：current 后剩 < 阈值时调一次 fetchMore
-        maybeExtendQueue(player)
+        maybeExtendQueue()
         maybePrewarmNextTrack(player)
         // 节流持久化：杀掉冷启动黑屏 + 跳到 playlist[0] 的尴尬
         if (queue.isNotEmpty()) {
@@ -938,6 +1069,11 @@ class PlayerViewModel(
             remainingMs <= PREWARM_WHEN_REMAINING_MS
         if (!shouldPrewarm) return
         val nextTrack = nextTrackFor(player) ?: return
+        val now = SystemClock.elapsedRealtime()
+        prewarmFailureBackoffUntilMs[nextTrack.id]?.let { until ->
+            if (now < until) return
+            prewarmFailureBackoffUntilMs.remove(nextTrack.id)
+        }
         val nextKey = prewarmKey(nextTrack)
         if (nextKey == prewarmedNextKey || nextKey == prewarmingNextKey) return
 
@@ -946,6 +1082,8 @@ class PlayerViewModel(
         prewarmingNextKey = nextKey
         nextPrewarmJob = viewModelScope.launch {
             val playable = refreshTrackForPrewarm(nextTrack) ?: run {
+                prewarmFailureBackoffUntilMs[nextTrack.id] =
+                    SystemClock.elapsedRealtime() + PREWARM_FAILURE_BACKOFF_MS
                 if (prewarmingNextKey == nextKey) prewarmingNextKey = null
                 return@launch
             }
@@ -958,6 +1096,10 @@ class PlayerViewModel(
             }
             if (warmed) {
                 prewarmedNextKey = playableKey
+                prewarmFailureBackoffUntilMs.remove(playable.id)
+            } else {
+                prewarmFailureBackoffUntilMs[playable.id] =
+                    SystemClock.elapsedRealtime() + PREWARM_FAILURE_BACKOFF_MS
             }
             if (prewarmingNextKey == nextKey || prewarmingNextKey == playableKey) {
                 prewarmingNextKey = null
@@ -991,24 +1133,54 @@ class PlayerViewModel(
             ?.let { id -> queue.indexOfFirst { it.id == id } }
             ?.takeIf { it >= 0 }
             ?: state.currentIndex.coerceIn(0, queue.lastIndex)
-        val nextIndex = if (currentIndex + 1 < queue.size) currentIndex + 1 else 0
+        val nextIndex = offsetTargetIndex(currentIndex, queue.size, offset = 1) ?: return null
         if (nextIndex == currentIndex) return null
         return queue.getOrNull(nextIndex)
     }
 
     private fun prewarmKey(track: NativeTrack): String = "${track.id}:${track.streamUrl}"
 
-    private fun maybeExtendQueue(player: Player) {
+    private fun applyPlaybackMode(player: Player) {
+        player.repeatMode = when (state.playbackMode) {
+            PlaybackQueueMode.OrderOnce -> Player.REPEAT_MODE_OFF
+            PlaybackQueueMode.PlaylistLoop,
+            PlaybackQueueMode.AiRadio -> Player.REPEAT_MODE_ALL
+        }
+    }
+
+    private fun offsetTargetIndex(currentIdx: Int, count: Int, offset: Int): Int? {
+        if (count <= 0) return null
+        val raw = currentIdx + offset
+        if (state.playbackMode != PlaybackQueueMode.OrderOnce) {
+            return Math.floorMod(raw, count)
+        }
+        return raw.takeIf { it in 0 until count }
+    }
+
+    private fun maybeExtendQueue() {
         if (fetchingMore) return
-        val source = continuousSource ?: return
-        val queue = state.queue
-        val remaining = queue.size - state.currentIndex - 1
+        val sourceSnapshot = continuousSource ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (now < queueExtendBackoffUntilMs) return
+        val queueSnapshot = state.queue
+        val mediaCountSnapshot = controller?.mediaItemCount ?: return
+        if (mediaCountSnapshot < queueSnapshot.size) return
+        val remaining = queueSnapshot.size - state.currentIndex - 1
         if (remaining > extendThreshold) return
+        val gen = playGen
         fetchingMore = true
         viewModelScope.launch {
             try {
-                val excludeIds = queue.mapNotNull { it.neteaseId }.toSet()
-                val more = source.fetchMore(excludeIds)
+                val excludeIds = queueSnapshot.mapNotNull { it.neteaseId }.toSet()
+                val more = try {
+                    sourceSnapshot.fetchMore(excludeIds)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    armQueueExtendBackoff()
+                    return@launch
+                }
+                if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) return@launch
                 if (more.isEmpty()) {
                     // source 跑空了 —— 不关闭循环。
                     // 之前这里关闭循环，导致：当前队列播完
@@ -1016,20 +1188,151 @@ class PlayerViewModel(
                     // "播完就停，next 也按不动，要重启 app"。
                     // 现在改成：拆掉 source（不再尝试续杯）但保留 REPEAT_MODE_ALL，
                     // 让现有队列继续循环，至少能听。
-                    continuousSource = null
+                    if (continuousSource === sourceSnapshot) {
+                        continuousSource = null
+                    }
+                    resetQueueExtendBackoff()
                     return@launch
                 }
-                val resolved = resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }
-                if (resolved.isEmpty()) return@launch
-                state = state.copy(queue = queue + resolved)
-                player.addMediaItems(resolved.map(::toMediaItem))
+                val resolved = try {
+                    resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    armQueueExtendBackoff()
+                    return@launch
+                }
+                if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) return@launch
+                if (resolved.isEmpty()) {
+                    armQueueExtendBackoff()
+                    return@launch
+                }
+                val currentQueue = state.queue
+                val existingSongKeys = currentQueue.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+                val append = resolved.filter { existingSongKeys.add(TrackDedupe.songKey(it)) }
+                if (append.isEmpty()) {
+                    armQueueExtendBackoff()
+                    return@launch
+                }
+                val live = controller ?: return@launch
+                if (live.mediaItemCount < currentQueue.size) return@launch
+                state = state.copy(queue = currentQueue + append)
+                live.addMediaItems(append.map(::toMediaItem))
+                resetQueueExtendBackoff()
             } finally {
                 fetchingMore = false
             }
         }
     }
 
+    private fun isQueueExtendStillCurrent(
+        gen: Int,
+        sourceSnapshot: ContinuousQueueSource,
+        queueSnapshot: List<NativeTrack>,
+    ): Boolean {
+        return gen == playGen &&
+            continuousSource === sourceSnapshot &&
+            sameQueueOrder(queueSnapshot, state.queue)
+    }
+
+    private fun sameQueueOrder(left: List<NativeTrack>, right: List<NativeTrack>): Boolean {
+        if (left.size != right.size) return false
+        return left.indices.all { idx -> left[idx].id == right[idx].id }
+    }
+
+    private fun mergeResolvedTracks(queue: List<NativeTrack>, resolved: List<NativeTrack>): List<NativeTrack> {
+        if (queue.isEmpty() || resolved.isEmpty()) return queue
+        val byId = resolved.associateBy { it.id }
+        return queue.map { track -> byId[track.id] ?: track }
+    }
+
+    private fun appendResolveChunks(tracks: List<NativeTrack>): List<List<NativeTrack>> {
+        if (tracks.isEmpty()) return emptyList()
+        val firstSize = minOf(INITIAL_APPEND_RESOLVE_CHUNK_SIZE, tracks.size)
+        return buildList {
+            add(tracks.take(firstSize))
+            tracks.drop(firstSize).chunked(PLAYLIST_APPEND_RESOLVE_CHUNK_SIZE).forEach(::add)
+        }
+    }
+
+    private fun armQueueExtendBackoff() {
+        val nextCount = (queueExtendFailureCount + 1).coerceAtMost(6)
+        queueExtendFailureCount = nextCount
+        val factor = 1L shl (nextCount - 1)
+        val delayMs = minOf(QUEUE_EXTEND_BACKOFF_MAX_MS, QUEUE_EXTEND_BACKOFF_BASE_MS * factor)
+        queueExtendBackoffUntilMs = SystemClock.elapsedRealtime() + delayMs
+    }
+
+    private fun resetQueueExtendBackoff() {
+        queueExtendFailureCount = 0
+        queueExtendBackoffUntilMs = 0L
+    }
+
     private fun toMediaItem(track: NativeTrack) = mediaFactory.toMediaItem(track)
+
+    private fun toMediaItem(track: NativeTrack, queueContext: List<NativeTrack>, index: Int): androidx.media3.common.MediaItem {
+        val prev = queueContext.getOrNull(index - 1)
+        val next = queueContext.getOrNull(index + 1)
+        return mediaFactory.toMediaItem(
+            track = track,
+            preserveHeadBoundary = prev != null && strongAudioContinuity(prev, track),
+            preserveTailBoundary = next != null && strongAudioContinuity(track, next),
+        )
+    }
+
+    private fun toMediaItems(
+        tracks: List<NativeTrack>,
+        queueContext: List<NativeTrack> = tracks,
+    ): List<androidx.media3.common.MediaItem> {
+        return tracks.mapIndexed { fallbackIndex, track ->
+            val contextIndex = queueContext.indexOfFirst { it.id == track.id }
+                .takeIf { it >= 0 }
+                ?: fallbackIndex.coerceIn(0, queueContext.lastIndex.coerceAtLeast(0))
+            toMediaItem(track, queueContext, contextIndex)
+        }
+    }
+
+    private fun continuousAudioTail(queue: List<NativeTrack>, startIndex: Int): List<NativeTrack> {
+        if (startIndex !in queue.indices) return emptyList()
+        val out = ArrayList<NativeTrack>()
+        out.add(queue[startIndex])
+        var idx = startIndex + 1
+        while (idx in queue.indices && strongAudioContinuity(queue[idx - 1], queue[idx])) {
+            out.add(queue[idx])
+            idx += 1
+        }
+        return out
+    }
+
+    private fun hasContinuousAudioNeighbor(queue: List<NativeTrack>, index: Int): Boolean {
+        if (index !in queue.indices) return false
+        val prev = queue.getOrNull(index - 1)
+        val next = queue.getOrNull(index + 1)
+        val cur = queue[index]
+        return (prev != null && strongAudioContinuity(prev, cur)) ||
+            (next != null && strongAudioContinuity(cur, next))
+    }
+
+    private fun strongAudioContinuity(a: NativeTrack, b: NativeTrack): Boolean {
+        val af = featuresStore.get(a.id) ?: return false
+        val bf = featuresStore.get(b.id) ?: return false
+        if (af.durationS < 20.0 || bf.durationS < 20.0) return false
+
+        val bpmReliable = af.bpm != null && bf.bpm != null &&
+            af.bpmConfidence > 0.25 && bf.bpmConfidence > 0.25
+        val bpmClose = !bpmReliable || kotlin.math.abs(af.bpm!! - bf.bpm!!) <= 6.0
+        val energyDelta = kotlin.math.abs(af.outroEnergy - bf.introEnergy)
+        val boundaryIsTight = af.tailSilenceS <= 0.45 && bf.headSilenceS <= 0.45
+        val fit = TransitionScore.fitScore(
+            TransitionScore.Scored(a, af),
+            TransitionScore.Scored(b, bf),
+        )
+        return boundaryIsTight &&
+            bpmClose &&
+            energyDelta <= 0.18 &&
+            fit.style != TransitionScore.TransitionStyle.SilenceBreath &&
+            fit.score >= 0.68
+    }
 
     /** 已经分析过的 Symphonia 特征—— 全局 AudioFeaturesStore（跨 session 持久 + 蒸馏复用） */
     private val featuresStore by lazy { PipoGraph.audioFeaturesStore }
@@ -1062,6 +1365,11 @@ class PlayerViewModel(
         private const val PREWARM_AFTER_PROGRESS = 0.55f
         private const val PREWARM_WHEN_REMAINING_MS = 90_000L
         private const val NEXT_PREWARM_TIMEOUT_MS = 20_000L
+        private const val PREWARM_FAILURE_BACKOFF_MS = 3 * 60_000L
+        private const val QUEUE_EXTEND_BACKOFF_BASE_MS = 30_000L
+        private const val QUEUE_EXTEND_BACKOFF_MAX_MS = 5 * 60_000L
+        private const val PLAYLIST_APPEND_RESOLVE_CHUNK_SIZE = 40
+        private const val INITIAL_APPEND_RESOLVE_CHUNK_SIZE = 8
         private const val STABLE_PLAYBACK_RESET_MS = 12_000L
         private const val END_POSITION_TOLERANCE_MS = 1_500L
         private const val RECOVERY_SCAN_LIMIT = 8

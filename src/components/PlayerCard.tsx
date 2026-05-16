@@ -18,7 +18,7 @@
 import { Waveform } from "./Waveform";
 import { usePlayer } from "@/lib/player-state";
 import { type LrcLine } from "@/lib/lrc";
-import { type YrcLine } from "@/lib/yrc";
+import { charProgress, type YrcLine } from "@/lib/yrc";
 import { cdn } from "@/lib/cdn";
 import { useIsDesktop } from "@/lib/use-is-desktop";
 import { useCoverEdgeColors, computeTone } from "@/lib/cover-color";
@@ -1425,6 +1425,7 @@ function useLyricView(p: LyricViewParams): {
   for (let i = 0; i < total; i++) {
     const isActive = i === safeIdx;
     const isScrollTarget = i === safeScrollIdx;
+    const distance = Math.abs(i - safeIdx);
     if (useYrc) {
       const line = p.yrcLines[i]!;
       rowEls.push(
@@ -1433,6 +1434,7 @@ function useLyricView(p: LyricViewParams): {
           line={line}
           isActive={isActive}
           isScrollTarget={isScrollTarget}
+          distance={distance}
           positionSec={isActive ? p.positionSec : undefined}
           rowH={p.rowH}
           activeFs={p.activeFs}
@@ -1460,6 +1462,7 @@ function useLyricView(p: LyricViewParams): {
           text={ln.text}
           isActive={isActive}
           isScrollTarget={isScrollTarget}
+          distance={distance}
           progress={lineProgress}
           rowH={p.rowH}
           activeFs={p.activeFs}
@@ -1499,6 +1502,7 @@ type RowCommon = {
   /** 是否是"该被滚到焦点位置"的行 —— 通常等于 isActive，但在 lookahead 窗口内
    *  会比 active 早一行打 true，让 column 提前滚动 */
   isScrollTarget: boolean;
+  distance: number;
   rowH: string;
   activeFs: string;
   dimFs: string;
@@ -1512,6 +1516,7 @@ const YrcRow = React.memo(function YrcRow({
   line,
   isActive,
   isScrollTarget,
+  distance,
   positionSec,
   rowH,
   activeFs,
@@ -1528,7 +1533,7 @@ const YrcRow = React.memo(function YrcRow({
     <div
       data-active={isActive ? "1" : "0"}
       data-scroll-target={isScrollTarget ? "1" : "0"}
-      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive)}
+      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance)}
     >
       <div style={lineInner()}>
         {isActive ? (
@@ -1557,6 +1562,7 @@ const LrcRow = React.memo(function LrcRow({
   text,
   isActive,
   isScrollTarget,
+  distance,
   progress,
   rowH,
   activeFs,
@@ -1571,7 +1577,7 @@ const LrcRow = React.memo(function LrcRow({
     <div
       data-active={isActive ? "1" : "0"}
       data-scroll-target={isScrollTarget ? "1" : "0"}
-      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive)}
+      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance)}
     >
       <div style={lineInner()}>
         {isActive ? (
@@ -1622,59 +1628,44 @@ function YrcActiveLine({
     );
   }
 
-  const currentIdx = chars.findIndex((c) => positionSec < c.startSec + c.durSec);
-  if (currentIdx === -1) {
-    return (
-      <span style={{ color: fgColor, whiteSpace: "break-spaces" }}>
-        {line.text}
-      </span>
-    );
-  }
-
-  const current = chars[currentIdx]!;
-  let before = "";
-  let after = "";
-  for (let i = 0; i < currentIdx; i++) before += chars[i]!.text;
-  for (let i = currentIdx + 1; i < chars.length; i++) after += chars[i]!.text;
-
-  let progress = 0;
-  if (positionSec >= current.startSec + current.durSec) progress = 1;
-  else if (positionSec > current.startSec)
-    progress = (positionSec - current.startSec) / Math.max(0.001, current.durSec);
-
-  const beingSung = progress > 0 && progress < 1;
-  const sung = progress >= 1;
-
   return (
     <>
-      {before && (
-        <span style={{ color: fgColor, whiteSpace: "break-spaces" }}>
-          {before}
-        </span>
-      )}
-      <span
-        style={{
-          position: "relative",
-          display: "inline-block",
-          whiteSpace: "break-spaces",
-          color: sung ? fgColor : fgUnsungColor,
-          backgroundImage: beingSung
-            ? `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${progress * 100}%, ${fgUnsungColor} ${progress * 100 + 1}%, ${fgUnsungColor} 100%)`
-            : "none",
-          WebkitBackgroundClip: beingSung ? "text" : "border-box",
-          backgroundClip: beingSung ? "text" : "border-box",
-          WebkitTextFillColor: beingSung ? "transparent" : "currentColor",
-        }}
-      >
-        {current.text}
-      </span>
-      {after && (
-        <span style={{ color: fgUnsungColor, whiteSpace: "break-spaces" }}>
-          {after}
-        </span>
-      )}
+      {chars.map((char, idx) => {
+        const progress = charProgress(char, positionSec);
+        const beingSung = progress > 0 && progress < 1;
+        const sung = progress >= 1;
+        const elapsed = Math.max(0, positionSec - char.startSec);
+        const riseSec = Math.max(0.28, Math.min(char.durSec, 0.9));
+        const liftT = easeOutCss(Math.min(1, elapsed / riseSec));
+        const liftPx = -0.95 * liftT;
+        const stop = Math.min(100, Math.max(0, progress * 100));
+        return (
+          <span
+            key={`${idx}-${char.startSec}-${char.text}`}
+            style={{
+              position: "relative",
+              display: "inline-block",
+              whiteSpace: "break-spaces",
+              color: sung ? fgColor : fgUnsungColor,
+              transform: `translate3d(0, ${liftPx.toFixed(2)}px, 0)`,
+              backgroundImage: beingSung
+                ? `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${stop}%, ${fgUnsungColor} ${Math.min(100, stop + 1)}%, ${fgUnsungColor} 100%)`
+                : "none",
+              WebkitBackgroundClip: beingSung ? "text" : "border-box",
+              backgroundClip: beingSung ? "text" : "border-box",
+              WebkitTextFillColor: beingSung ? "transparent" : "currentColor",
+            }}
+          >
+            {char.text}
+          </span>
+        );
+      })}
     </>
   );
+}
+
+function easeOutCss(t: number): number {
+  return 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
 }
 
 function lineFrame(
@@ -1683,13 +1674,24 @@ function lineFrame(
   activeFs: string,
   dimFs: string,
   immersive: boolean,
+  distance: number,
 ): React.CSSProperties {
   // transition 写在"目标态"上，进 / 出 active 用不同时间窗。
   // immersive 不再变 fontSize（active/inactive 同号），但仍保留 transition
   // 兼容 compact 模式以及未来重新启用尺寸切换的可能。
   const transition = isActive
-    ? "font-size 280ms cubic-bezier(0.22, 1, 0.36, 1) 80ms, opacity 360ms cubic-bezier(0.22, 1, 0.36, 1) 40ms, color 320ms cubic-bezier(0.22, 1, 0.36, 1)"
-    : "font-size 200ms cubic-bezier(0.4, 0, 0.6, 1), opacity 280ms cubic-bezier(0.4, 0, 0.6, 1), color 280ms cubic-bezier(0.4, 0, 0.6, 1)";
+    ? "font-size 280ms cubic-bezier(0.22, 1, 0.36, 1) 80ms, opacity 250ms ease, filter 200ms ease, color 320ms cubic-bezier(0.22, 1, 0.36, 1)"
+    : "font-size 200ms cubic-bezier(0.4, 0, 0.6, 1), opacity 250ms ease, filter 200ms ease, color 280ms cubic-bezier(0.4, 0, 0.6, 1)";
+  const immersiveOpacity = isActive
+    ? 1
+    : distance === 1
+      ? 0.38
+      : distance === 2
+        ? 0.28
+        : 0.18;
+  const immersiveBlur = !immersive || isActive || distance <= 1
+    ? "none"
+    : `blur(${distance === 2 ? 1.2 : 2}px)`;
 
   return {
     // 用 minHeight 而非 height —— 长歌词换行后行高自然增长，不会跟下一行重叠。
@@ -1705,14 +1707,13 @@ function lineFrame(
     //   "色彩对比 + 逐字 wipe" 凸显，不靠字重切换。
     // compact: 仍保持 active 加粗 / inactive 细体，节省竖向空间。
     fontWeight: immersive ? 700 : isActive ? 600 : 400,
-    // 大字号 + Heavy 配紧字距，避免字符间空气感稀释主体
-    letterSpacing: immersive ? "-0.012em" : 0,
+    letterSpacing: 0,
     lineHeight: immersive ? 1.32 : undefined,
     transformOrigin: "left center",
-    filter: "none",
+    filter: immersiveBlur,
     // 非 active 行：immersive 显著压暗（0.32）形成强对比；compact 保留较亮
     // （0.42）让 3 行带子整体可读。
-    opacity: isActive ? 1 : immersive ? 0.32 : 0.42,
+    opacity: immersive ? immersiveOpacity : isActive ? 1 : 0.42,
     overflow: "visible",
     padding: immersive ? "10px 4px" : "2px 12px",
     textAlign: immersive ? "left" : "center",
@@ -1925,7 +1926,7 @@ const titleTextCol: React.CSSProperties = {
 const titleStyle: React.CSSProperties = {
   fontSize: TITLE_FS,
   fontWeight: 600,
-  letterSpacing: -0.4,
+  letterSpacing: 0,
   lineHeight: 1.25,
   color: "#f5f7ff",
   overflow: "hidden",
@@ -2033,7 +2034,7 @@ const errorBar: React.CSSProperties = {
 const immersiveTitle: React.CSSProperties = {
   fontSize: "clamp(16px, 4.4vw, 20px)",
   fontWeight: 700,
-  letterSpacing: "-0.005em",
+  letterSpacing: 0,
   color: "rgba(255,255,255,0.96)",
   overflow: "hidden",
   textOverflow: "ellipsis",
@@ -2054,7 +2055,7 @@ const immersiveSubtitle: React.CSSProperties = {
 const immersiveTitleLarge: React.CSSProperties = {
   fontSize: "clamp(20px, 2.2vw, 28px)",
   fontWeight: 700,
-  letterSpacing: "-0.01em",
+  letterSpacing: 0,
   color: "rgba(255,255,255,0.96)",
   overflow: "hidden",
   textOverflow: "ellipsis",
@@ -2132,4 +2133,3 @@ function NavGearIcon() {
     </svg>
   );
 }
-

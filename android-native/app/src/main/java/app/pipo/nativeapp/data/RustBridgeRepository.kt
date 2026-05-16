@@ -72,20 +72,29 @@ class RustBridgeRepository(
     override val aiConfig: Flow<AiConfigView> = aiConfigState.asStateFlow()
 
     override suspend fun refreshAccount() {
-        val acc = safe({ bridge.neteaseAccount() }, { null })
+        val acc = try {
+            bridge.neteaseAccount()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return
+        }
         accountState.value = acc
         // 换账号 / 退登检查：当前 userId 跟上次缓存不匹配 → 清掉旧用户的歌单 + tracks
         val newUserId = acc?.userId
         val oldUserId = cachedUserId
-        if (newUserId != null && oldUserId != null && newUserId != oldUserId) {
-            playlistState.value = emptyList()
-            synchronized(tracksCacheLock) {
-                tracksMemoryCache.clear()
-            }
-            playlistCache?.clear()
-            cachedUserId = null
-            cacheStale = false
+        if (
+            (newUserId == null && (oldUserId != null || playlistState.value.isNotEmpty())) ||
+            (newUserId != null && oldUserId != null && newUserId != oldUserId)
+        ) {
+            clearAccountCaches()
         }
+    }
+
+    override suspend fun logout() {
+        safe({ bridge.neteaseLogout() }, { Unit })
+        accountState.value = null
+        clearAccountCaches()
     }
 
     override suspend fun startQrLogin(): QrLoginStart {
@@ -304,6 +313,16 @@ class RustBridgeRepository(
         return safe({ bridge.aiEmbed(inputs) }, { fallback.aiEmbed(inputs) })
     }
 
+    private fun clearAccountCaches() {
+        playlistState.value = emptyList()
+        synchronized(tracksCacheLock) {
+            tracksMemoryCache.clear()
+        }
+        playlistCache?.clear()
+        cachedUserId = null
+        cacheStale = false
+    }
+
     private suspend fun <T> safe(call: suspend () -> T, fallbackCall: suspend () -> T): T {
         return try {
             call()
@@ -317,6 +336,7 @@ class RustBridgeRepository(
 
 interface RustPipoBridge {
     suspend fun neteaseAccount(): PipoAccount?
+    suspend fun neteaseLogout()
     suspend fun neteaseUserPlaylists(userId: Long): List<PipoPlaylist>
     suspend fun neteasePlaylistTracks(playlistId: Long): List<NativeTrack>
     suspend fun neteaseSearch(query: String, limit: Int): List<NativeTrack>

@@ -173,16 +173,19 @@ function pushNativeState(playing: boolean, positionSec: number) {
 
 // ---- 调度参数 ----
 //
-// 提前多久开始解码 + 排下一首。MP3 解码 ~150-300ms + fetch 弱网最长 ~10s，
-// 留 25s 余量保证排程时下一首 buffer 已经 ready。
-const PRELOAD_LEAD_S = 999_999;
+// Android 端的稳定版已经证明：不要在一开歌时就把整条后续链路拉满，
+// 否则弱网 / 解码 / 分析会和当前播放抢资源。桌面 WebAudio 仍需要提前排程，
+// 但触发语义对齐为“当前歌过半后，或剩余不足 90 秒时”。
+const NEXT_PREPARE_PROGRESS = 0.55;
+const NEXT_PREPARE_REMAIN_S = 90;
+const PREFETCH_AHEAD_OFFSETS = [2] as const;
 
 // 手动 next/prev 的短淡入淡出（防 click）。gapless 自动接歌不走这个。
 const MANUAL_CROSSFADE_S = 0.4;
 // 续杯阈值：current 后面剩 < N 首时触发续杯。3 = 至少留 2 首缓冲，
 // 给续杯异步往返时间，避免播放等待。
 const CONTINUOUS_EXTEND_THRESHOLD = 3;
-const PLAYBACK_LEVELS = ["lossless", "exhigh"] as const;
+const PLAYBACK_LEVELS = ["lossless", "exhigh", "higher", "standard"] as const;
 type PlaybackLevel = (typeof PLAYBACK_LEVELS)[number];
 
 export type Track = {
@@ -249,6 +252,7 @@ export type PlayerAPI = PlayerState & {
     contextQueue?: TrackInfo[],
     opts?: PlayNeteaseOptions,
   ) => Promise<void>;
+  insertNext: (t: TrackInfo) => Promise<void>;
   pause: () => void;
   resume: () => void;
   toggle: () => void;
@@ -283,6 +287,12 @@ function neteaseToTrack(t: TrackInfo): Track {
 
 function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
+}
+
+function shouldPrepareUpcoming(positionSec: number, durationSec: number, remainingSec: number): boolean {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) return false;
+  if (remainingSec <= NEXT_PREPARE_REMAIN_S) return true;
+  return positionSec / durationSec >= NEXT_PREPARE_PROGRESS;
 }
 
 function playbackStateForTrack(
@@ -453,10 +463,15 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           pushNativeState(true, pos);
         }
 
-        // 临近曲尾 → 排下一首
+        // 播放过半或临近曲尾 → 排下一首，并轻量预热后续一首。
+        // 这样对齐 Android 的 prewarm 思路：连续播放够稳，但不在开歌瞬间抢资源。
         const remain = sched.getRemainingSec() ?? Infinity;
-        if (remain < PRELOAD_LEAD_S && userIntendedPlayingRef.current) {
-          maybeScheduleNext();
+        if (
+          shouldPrepareUpcoming(pos, dur, remain) &&
+          userIntendedPlayingRef.current
+        ) {
+          void maybeScheduleNext();
+          void prefetchAhead();
         }
       }
 
@@ -478,12 +493,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   //   - lossless   16-bit/44.1kHz CD 级 FLAC（黑胶 VIP 全量）
   //   - exhigh     320kbps mp3（全用户兜底）
   //
-  // 串行: lossless → exhigh。
+  // 串行: lossless → exhigh → higher → standard。
   //
   // 跳过 hires —— 99% 专辑没母带版,网易云 API 对 hires 请求会默默降级返回 mp3 url,
   // 之前的逻辑误以为拿到 hires 就用,结果用户听到 320kbps mp3 的沙沙噪声。
   //
-  // 不并行 —— songUrls 只是拿 URL metadata(~1KB JSON),lossless/exhigh API 响应速度
+  // 不并行 —— songUrls 只是拿 URL metadata(~1KB JSON),各档 API 响应速度
   // 几乎一样;并行除了 VIP 用户偶尔遇到没 lossless 的歌时省一个 RTT,其它 99% 时间
   // 是浪费 API quota(exhigh 结果会被丢弃)。VIP 用户的 lossless 命中率本身就高,
   // 串行简单稳。
@@ -527,7 +542,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       } catch (e) {
         console.warn(`[claudio] decode failed at ${level}, fallback`, trackId, e);
         await audio.clearCacheEntry(trackId).catch(() => {});
-        if (level === "exhigh") throw e;
       }
     }
     console.debug("[claudio] no playable url", trackId, tried);
@@ -658,11 +672,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   }, [decodeForPlayback]);
 
   // ============================================================
-  // 预测预取：把队列里 i+2 / i+3 的字节灌进磁盘缓存
+  // 预测预取：把队列里 i+2 的字节灌进磁盘缓存
   // ============================================================
   //
-  // maybeScheduleNext 已经在播 N 时把 N+1 解码好了；这里再多走一步，把 N+2 / N+3
-  // 的原始字节（mp3/flac）拉进 Rust 端磁盘缓存，但不解码、不占内存。
+  // maybeScheduleNext 会在播 N 的后半段把 N+1 解码并排好；这里再多走一步，把 N+2
+  // 的原始字节拉进 Rust 端磁盘缓存，但不解码、不占内存。触发点同样在后半段，
+  // 避免一开歌就做 queue-wide 预取。
   //
   // 命中检测交给 Rust 端的 audio_prefetch（已缓存就立刻返回 true）。
   // 同一 session 同一首只触发一次（prefetchedSetRef 去重），队列变更时清掉，
@@ -673,7 +688,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const i = queue.findIndex((t) => t.id === current.id);
     if (i < 0) return;
 
-    for (let offset = 2; offset <= 3; offset++) {
+    for (const offset of PREFETCH_AHEAD_OFFSETS) {
       const t = queue[(i + offset) % queue.length];
       if (!t?.neteaseId || t.id === current.id) continue;
       if (prefetchedSetRef.current.has(t.neteaseId)) continue;
@@ -682,14 +697,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       // 不 await —— 串行节流交给 Rust 端 cdn_client 的连接池
       void (async () => {
         try {
-          const urls = await netease.songUrls([t.neteaseId!], "lossless");
-          const u = urls[0];
-          // VIP 限制时退到 exhigh
-          const finalUrl = u?.url
-            ? u.url
-            : (await netease.songUrls([t.neteaseId!], "exhigh"))[0]?.url;
-          if (!finalUrl) return;
-          const hit = await audio.prefetch(t.neteaseId!, finalUrl);
+          const fetched = await fetchUrl(t.neteaseId!);
+          if (!fetched) return;
+          const hit = await audio.prefetch(t.neteaseId!, fetched.url);
           console.debug("[claudio] prefetch", t.neteaseId, hit ? "(hit)" : "(stored)");
         } catch (e) {
           console.debug("[claudio] prefetch failed", t.neteaseId, e);
@@ -698,7 +708,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         }
       })();
     }
-  }, []);
+  }, [fetchUrl]);
 
   // ============================================================
   // 续杯：current 后面剩 <THRESHOLD 首时,从 continuousSourceRef 拉下一批 append
@@ -1051,6 +1061,38 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     [playTrackInternal],
   );
 
+  const insertNext = useCallback(
+    async (t: TrackInfo) => {
+      const inserted = neteaseToTrack(t);
+      const { current, queue } = stateRef.current;
+
+      if (!current || queue.length === 0) {
+        await playNetease(t, [t], { smooth: false });
+        return;
+      }
+
+      const currentIdx = queue.findIndex((item) => item.id === current.id);
+      if (currentIdx < 0) {
+        await playNetease(t, [t], { smooth: false });
+        return;
+      }
+
+      // 单曲插队保留原队列和续杯 source：播完插入歌后，自动回到原本的下一首。
+      const withoutDuplicate = queue.filter((item) => item.id !== inserted.id);
+      const currentIdxAfterDedupe = withoutDuplicate.findIndex((item) => item.id === current.id);
+      const insertAt = currentIdxAfterDedupe + 1;
+      const nextQueue = [
+        ...withoutDuplicate.slice(0, insertAt),
+        inserted,
+        ...withoutDuplicate.slice(insertAt),
+      ];
+      setState((s) => ({ ...s, queue: nextQueue }));
+      cache.setState(LAST_QUEUE_KEY, JSON.stringify(nextQueue)).catch(() => {});
+      await playTrackInternal(inserted, { manualCut: true });
+    },
+    [playNetease, playTrackInternal],
+  );
+
   const pause = useCallback(() => {
     userIntendedPlayingRef.current = false;
     generationRef.current++;
@@ -1265,18 +1307,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   // ============================================================
   // MediaSession：耳机 / 系统媒体键
   // ============================================================
-  // 当前曲目变了 → 队列后面再多 prefetch 两首字节进盘
-  // 不依赖 isPlaying，单纯跟着 current 走；用户在 UI 里翻队列时也会触发预热
-  useEffect(() => {
-    if (!state.current) return;
-    void prefetchAhead();
-  }, [state.current?.id, prefetchAhead]);
-
   // 队列整体换了 → 清掉 prefetch 去重集（之前的歌不再相关）
   useEffect(() => {
     prefetchedSetRef.current.clear();
-    // 第一首 prefetch 由 current 那个 effect 触发；这里只重置
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.queue.length, state.queue[0]?.id]);
 
   useEffect(() => {
@@ -1411,6 +1444,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     () => ({
       ...state,
       playNetease,
+      insertNext,
       pause,
       resume,
       toggle,
@@ -1422,7 +1456,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       like,
       dislike,
     }),
-    [state, playNetease, pause, resume, toggle, next, prev, seek, setAiStatus, setMood, like, dislike],
+    [state, playNetease, insertNext, pause, resume, toggle, next, prev, seek, setAiStatus, setMood, like, dislike],
   );
 
   return <PlayerCtx.Provider value={api}>{children}</PlayerCtx.Provider>;

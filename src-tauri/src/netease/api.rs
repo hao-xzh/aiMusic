@@ -111,7 +111,60 @@ impl NeteaseClient {
         if resp.code != 200 {
             return Err(anyhow!("playlist_detail code={}", resp.code));
         }
-        Ok(resp.playlist)
+        self.hydrate_playlist_tracks(resp.playlist).await
+    }
+
+    async fn hydrate_playlist_tracks(&self, mut playlist: PlaylistDetail) -> Result<PlaylistDetail> {
+        if playlist.track_ids.is_empty() || playlist.tracks.len() >= playlist.track_ids.len() {
+            return Ok(playlist);
+        }
+
+        let mut by_id = TrackInfo::by_id(&playlist.tracks);
+        let missing_ids = playlist
+            .track_ids
+            .iter()
+            .copied()
+            .filter(|id| !by_id.contains_key(id))
+            .collect::<Vec<_>>();
+
+        for chunk in missing_ids.chunks(200) {
+            for track in self.song_detail(chunk).await? {
+                by_id.insert(track.id, track);
+            }
+        }
+
+        let ordered = playlist
+            .track_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).cloned())
+            .collect::<Vec<_>>();
+        if !ordered.is_empty() {
+            playlist.tracks = ordered;
+        }
+        Ok(playlist)
+    }
+
+    pub async fn song_detail(&self, ids: &[i64]) -> Result<Vec<TrackInfo>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = ids
+            .iter()
+            .map(|id| json!({ "id": id }))
+            .collect::<Vec<_>>();
+        let resp: SongDetailResp = self
+            .weapi(
+                "v3/song/detail",
+                json!({
+                    "c": serde_json::to_string(&c)?,
+                    "ids": serde_json::to_string(ids)?,
+                }),
+            )
+            .await?;
+        if resp.code != 200 {
+            return Err(anyhow!("song_detail code={}", resp.code));
+        }
+        Ok(resp.songs)
     }
 
     /// 拿歌曲直链。`level` 可取 "standard" / "higher" / "exhigh" / "lossless"...

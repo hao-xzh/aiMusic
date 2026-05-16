@@ -32,7 +32,7 @@ import { usePlatform } from "@/lib/use-platform";
 import { useCoverEdgeColors, computeTone, pickFg, pickFgDim } from "@/lib/cover-color";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 type Load<T> =
   | { kind: "loading" }
@@ -576,6 +576,8 @@ const COVER_MASK_DESKTOP =
   "linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%)";
 const LIST_MASK =
   "linear-gradient(180deg, transparent 0%, #000 18%, #000 82%, transparent 100%)";
+const TRACK_ROW_HEIGHT = 58;
+const TRACK_ROW_OVERSCAN = 8;
 
 function ImmersiveLayout({
   playlists,
@@ -823,8 +825,45 @@ function TrackListImmersive({
   fg: string;
   fgDim: string;
 }) {
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [scrollTop, setScrollTop] = useState(0);
+
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const update = () => setViewportHeight(el.clientHeight);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: 0 });
+    setScrollTop(0);
+  }, [focusedKey]);
+
+  useEffect(() => {
+    return () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
   return (
     <div
+      ref={scrollerRef}
+      onScroll={(e) => {
+        const top = e.currentTarget.scrollTop;
+        if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+        rafRef.current = requestAnimationFrame(() => {
+          rafRef.current = null;
+          setScrollTop(top);
+        });
+      }}
       style={{
         position: "absolute",
         inset: 0,
@@ -848,7 +887,13 @@ function TrackListImmersive({
           </div>
         )}
         {tracks.length > 0 && (
-          <FusionTrackList tracks={tracks} fg={fg} fgDim={fgDim} />
+          <FusionTrackList
+            tracks={tracks}
+            fg={fg}
+            fgDim={fgDim}
+            scrollTop={scrollTop}
+            viewportHeight={viewportHeight}
+          />
         )}
       </div>
     </div>
@@ -859,7 +904,7 @@ function TrackListImmersive({
 const titleStyle: React.CSSProperties = {
   fontSize: "clamp(16px, 4.4vw, 20px)",
   fontWeight: 700,
-  letterSpacing: "-0.005em",
+  letterSpacing: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
@@ -877,7 +922,7 @@ const subtitleStyle: React.CSSProperties = {
 const titleStyleLarge: React.CSSProperties = {
   fontSize: "clamp(20px, 2.2vw, 28px)",
   fontWeight: 700,
-  letterSpacing: "-0.01em",
+  letterSpacing: 0,
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
@@ -897,24 +942,46 @@ function FusionTrackList({
   tracks,
   fg,
   fgDim,
+  scrollTop,
+  viewportHeight,
 }: {
   tracks: TrackInfo[];
   fg: string;
   fgDim: string;
+  scrollTop: number;
+  viewportHeight: number;
 }) {
   const player = usePlayer();
+  const totalHeight = tracks.length * TRACK_ROW_HEIGHT;
+  const startIndex = Math.max(
+    0,
+    Math.floor(scrollTop / TRACK_ROW_HEIGHT) - TRACK_ROW_OVERSCAN,
+  );
+  const visibleCount = Math.ceil(Math.max(viewportHeight, TRACK_ROW_HEIGHT) / TRACK_ROW_HEIGHT) +
+    TRACK_ROW_OVERSCAN * 2;
+  const endIndex = Math.min(tracks.length, startIndex + visibleCount);
+  const visibleTracks = tracks.slice(startIndex, endIndex);
   return (
-    <div style={{ padding: "0 4px" }}>
-      {tracks.map((t) => (
-        <TrackRow
-          key={t.id}
-          track={t}
-          tracks={tracks}
-          fg={fg}
-          fgDim={fgDim}
-          player={player}
-        />
-      ))}
+    <div style={{ position: "relative", height: totalHeight, padding: "0 4px" }}>
+      <div
+        style={{
+          position: "absolute",
+          top: startIndex * TRACK_ROW_HEIGHT,
+          left: 4,
+          right: 4,
+        }}
+      >
+        {visibleTracks.map((t) => (
+          <TrackRow
+            key={t.id}
+            track={t}
+            tracks={tracks}
+            fg={fg}
+            fgDim={fgDim}
+            player={player}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -962,7 +1029,9 @@ function TrackRow({
         display: "flex",
         alignItems: "center",
         gap: 14,
-        padding: "8px 6px",
+        height: TRACK_ROW_HEIGHT,
+        padding: "7px 6px",
+        boxSizing: "border-box",
         cursor: "pointer",
         background: "transparent",
         transition: "opacity 160ms ease",
@@ -977,19 +1046,18 @@ function TrackRow({
         if (!active) e.currentTarget.style.opacity = "0.78";
       }}
     >
-      {/* 不再显示序号；仅当当前正在播放才左侧 8px 留一道动效 bar 当指示 */}
-      {isPlayingThis && (
-        <div
-          style={{
-            width: 12,
-            display: "flex",
-            justifyContent: "center",
-            flexShrink: 0,
-          }}
-        >
-          <PlayingMark fg={fg} />
-        </div>
-      )}
+      {/* 不再显示序号；左侧固定 12px 指示槽，active/inactive 不挤动文字。 */}
+      <div
+        style={{
+          width: 12,
+          display: "flex",
+          justifyContent: "center",
+          flexShrink: 0,
+          opacity: isPlayingThis ? 1 : 0,
+        }}
+      >
+        <PlayingMark fg={fg} />
+      </div>
 
       <div style={{ flex: 1, minWidth: 0 }}>
         <div

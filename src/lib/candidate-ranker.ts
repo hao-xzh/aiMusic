@@ -84,6 +84,12 @@ export function rankCandidates(
     ) {
       continue;
     }
+    if (
+      options.recentRecommendation?.last24hTrackIds.has(c.track.id) &&
+      !explicitlyMentioned
+    ) {
+      continue;
+    }
 
     const intentScore = clamp01(c.sourceScores.text ?? 0);
     const tagScore = clamp01((c.sourceScores.tag ?? 0) / 1.6);
