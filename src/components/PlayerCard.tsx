@@ -620,9 +620,8 @@ function ImmersiveLyrics({
         />
       </div>
 
-      {/* 封面边缘融合层：跟清晰封面同尺寸、同轨迹，但在封面下方多扩散一圈。
-          它只负责把封面外沿的真实色彩带到采样色云里，不参与主体视觉，也不改变
-          歌词 / 标题布局。这样比单纯加重背景 blur 更稳：中心仍然干净，接缝更少。 */}
+      {/* 封面边缘融合层：只保留中间一圈过渡带，外缘必须归零到 transparent。
+          这样边界处露出来的是背景色彩云，而不是一圈模糊封面贴片。 */}
       {coverUrl && (
         <div
           ref={coverHaloRef}
@@ -861,24 +860,25 @@ function computeLayout(
         width: W,
         height: `calc(100vh - (${lyricTop}) - clamp(8px, 2vh, 24px))`,
       },
-      // 多 stop 平滑底部溶解（跟 Android TransitioningCover 同曲线）：
-      //   0..45% 全亮 → 65% α0.5 → 82% α0.15 → 95% ~0 → 100% 彻底透明
-      // 之前 #000 55%, transparent 100% 是单段线性，过渡比较"硬"；
-      // 多 stop 配上长 fade band 让底部完全融进色彩云背景，没有可见接缝
+      // 多 stop 平滑底部溶解：
+      // 0..38% 全亮，然后快速落到 0；最外缘必须透明，避免封面边界像贴片。
       coverMask:
         "linear-gradient(to bottom, " +
         "rgba(0,0,0,1) 0%, " +
-        "rgba(0,0,0,1) 45%, " +
-        "rgba(0,0,0,0.5) 65%, " +
-        "rgba(0,0,0,0.15) 82%, " +
-        "rgba(0,0,0,0.02) 95%, " +
+        "rgba(0,0,0,1) 38%, " +
+        "rgba(0,0,0,0.62) 54%, " +
+        "rgba(0,0,0,0.26) 68%, " +
+        "rgba(0,0,0,0.07) 82%, " +
+        "transparent 94%, " +
         "transparent 100%)",
       coverHaloMask:
         "linear-gradient(to bottom, " +
         "transparent 0%, " +
-        "rgba(0,0,0,0.12) 34%, " +
-        "rgba(0,0,0,0.72) 66%, " +
-        "#000 100%)",
+        "transparent 38%, " +
+        "rgba(0,0,0,0.34) 56%, " +
+        "rgba(0,0,0,0.42) 72%, " +
+        "rgba(0,0,0,0.16) 86%, " +
+        "transparent 100%)",
       coverMaskComposite: "add",
       bgGradient:
         `linear-gradient(180deg, ` +
@@ -923,18 +923,20 @@ function computeLayout(
       width: `calc(100vw - ${lyricLeft} - ${lyricRight})`,
       height: "84vh",
     },
-    // 桌面四向 mask（mask-composite: intersect）：
-    //   - 横向：左 4% / 右 35% 渐隐 → 右侧主溶进歌词区，左侧柔化进模糊 backdrop
-    //   - 纵向：上下各 5% 渐隐 → 上下边都溶进模糊 backdrop，没有矩形硬边
-    // 配合"模糊封面同源 backdrop"，渐隐区显出的颜色 == 当前像素的模糊版，
-    // 视觉上完全没有"封面卡进背景"的方块感。
+    // 桌面四向 mask：左右上下边界都归零到 transparent，中间保留主体。
+    // 右侧靠近歌词区的 fade 更长，避免封面矩形边缘压到歌词背景上。
     coverMask:
-      "linear-gradient(to right, transparent 0%, #000 4%, #000 65%, transparent 100%), " +
-      "linear-gradient(to bottom, transparent 0%, #000 5%, #000 95%, transparent 100%)",
+      "linear-gradient(to right, " +
+      "transparent 0%, rgba(0,0,0,0.12) 5%, rgba(0,0,0,0.72) 12%, #000 18%, " +
+      "#000 50%, rgba(0,0,0,0.72) 63%, rgba(0,0,0,0.22) 76%, transparent 90%, transparent 100%), " +
+      "linear-gradient(to bottom, " +
+      "transparent 0%, rgba(0,0,0,0.5) 6%, #000 12%, #000 86%, rgba(0,0,0,0.32) 94%, transparent 100%)",
     coverHaloMask:
       "radial-gradient(closest-side at 50% 50%, " +
-      "transparent 0%, transparent 48%, " +
-      "rgba(0,0,0,0.58) 72%, #000 100%)",
+      "transparent 0%, transparent 42%, " +
+      "rgba(0,0,0,0.34) 60%, " +
+      "rgba(0,0,0,0.24) 78%, " +
+      "transparent 100%)",
     coverMaskComposite: "intersect",
     // 桌面 bg：模糊封面拉不到时的兜底纯色 gradient（采样色驱动）
     bgGradient:
