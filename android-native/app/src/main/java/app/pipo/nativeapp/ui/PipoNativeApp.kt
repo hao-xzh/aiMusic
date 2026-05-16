@@ -28,6 +28,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.playback.PlayerViewModel
@@ -92,6 +95,22 @@ fun PipoNativeApp() {
             }
             onDispose {
                 window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+
+        val hideSystemBars = route == Route.Player && isLandscape
+        DisposableEffect(hideSystemBars) {
+            val window = (view.context as? Activity)?.window
+            val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+            if (hideSystemBars) {
+                controller?.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller?.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller?.show(WindowInsetsCompat.Type.systemBars())
+            }
+            onDispose {
+                controller?.show(WindowInsetsCompat.Type.systemBars())
             }
         }
 
