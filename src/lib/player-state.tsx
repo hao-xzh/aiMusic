@@ -285,6 +285,20 @@ function neteaseToTrack(t: TrackInfo): Track {
   };
 }
 
+function rotateTrackInfoQueue(queue: TrackInfo[], startTrack: TrackInfo): TrackInfo[] {
+  const start = queue.findIndex((track) => track.id === startTrack.id);
+  const ordered =
+    start < 0
+      ? [startTrack, ...queue.filter((track) => track.id !== startTrack.id)]
+      : [...queue.slice(start), ...queue.slice(0, start)];
+  const seen = new Set<number>();
+  return ordered.filter((track) => {
+    if (seen.has(track.id)) return false;
+    seen.add(track.id);
+    return true;
+  });
+}
+
 function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
@@ -916,6 +930,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
       // 切歌前记一笔旧曲目的行为日志（除非是同一首循环 / 冷启动恢复）
       const prior = stateRef.current.current;
+      const priorLyric = stateRef.current.lyric;
       if (
         prior &&
         prior.neteaseId &&
@@ -948,20 +963,30 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
       setState((s) => ({
         ...s,
+        current: track,
+        positionSec: resumeFrom,
         error: null,
         aiStatus: isReplacingAudibleTrack ? "正在准备下一首…" : "正在解码…",
-        isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
+        isPlaying: isReplacingAudibleTrack ? s.isPlaying : true,
+        lyric: s.current?.neteaseId === neteaseId ? s.lyric : null,
       }));
+      lastKnownPositionRef.current = resumeFrom;
 
       try {
         const playback = await decodeForPlayback(neteaseId, bufCache);
         if (!playback) {
-          setState((s) => ({
-            ...s,
-            error: "这首歌拿不到直链（可能需要 VIP 或已下架）",
-            isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
-            aiStatus: "—",
-          }));
+          setState((s) => {
+            if (gen !== generationRef.current) return s;
+            return {
+              ...s,
+              current: isReplacingAudibleTrack ? prior : track,
+              positionSec: isReplacingAudibleTrack ? sched.getPositionSec() : resumeFrom,
+              lyric: isReplacingAudibleTrack ? priorLyric : null,
+              error: "这首歌拿不到直链（可能需要 VIP 或已下架）",
+              isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
+              aiStatus: isReplacingAudibleTrack ? "播放中" : "—",
+            };
+          });
           if (!isReplacingAudibleTrack) userIntendedPlayingRef.current = false;
           if (pendingPlaybackGenRef.current === gen) pendingPlaybackGenRef.current = null;
           return;
@@ -1010,9 +1035,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           if (gen !== generationRef.current) return s;
           return {
             ...s,
+            current: isReplacingAudibleTrack ? prior : track,
+            positionSec: isReplacingAudibleTrack ? sched.getPositionSec() : resumeFrom,
+            lyric: isReplacingAudibleTrack ? priorLyric : null,
             error: e instanceof Error ? e.message : String(e),
             isPlaying: isReplacingAudibleTrack ? s.isPlaying : false,
-            aiStatus: "—",
+            aiStatus: isReplacingAudibleTrack ? "播放中" : "—",
           };
         });
         if (!isReplacingAudibleTrack) userIntendedPlayingRef.current = false;
@@ -1040,23 +1068,37 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       noLoopRef.current = false;
       fetchingMoreRef.current = false;
 
+      const picked = neteaseToTrack(t);
+      let queueForSmooth: TrackInfo[] | null = null;
       if (contextQueue) {
-        let queueSource = contextQueue;
-        if (opts?.smooth !== false && contextQueue.length > 2) {
-          try {
-            queueSource = await smoothQueue(contextQueue, {
-              startTrackId: t.id,
-              mode: opts?.smoothMode ?? "library",
-            });
-          } catch (e) {
-            console.debug("[claudio] smoothQueue 失败，回退原顺序", e);
-          }
-        }
-        const q = queueSource.map(neteaseToTrack);
+        queueForSmooth = rotateTrackInfoQueue(contextQueue, t);
+        const q = queueForSmooth.map(neteaseToTrack);
         setState((s) => ({ ...s, queue: q }));
         cache.setState(LAST_QUEUE_KEY, JSON.stringify(q)).catch(() => {});
       }
-      await playTrackInternal(neteaseToTrack(t));
+
+      const playPromise = playTrackInternal(picked);
+      if (queueForSmooth && opts?.smooth !== false && queueForSmooth.length > 2) {
+        const smoothInput = queueForSmooth;
+        const smoothGen = generationRef.current;
+        void (async () => {
+          try {
+            const queueSource = await smoothQueue(smoothInput, {
+              startTrackId: t.id,
+              mode: opts?.smoothMode ?? "library",
+            });
+            if (smoothGen !== generationRef.current) return;
+            const q = queueSource.map(neteaseToTrack);
+            const currentId = stateRef.current.current?.id;
+            if (!currentId || !q.some((item) => item.id === currentId)) return;
+            setState((s) => ({ ...s, queue: q }));
+            cache.setState(LAST_QUEUE_KEY, JSON.stringify(q)).catch(() => {});
+          } catch (e) {
+            console.debug("[claudio] smoothQueue 失败，保留即时队列", e);
+          }
+        })();
+      }
+      await playPromise;
     },
     [playTrackInternal],
   );

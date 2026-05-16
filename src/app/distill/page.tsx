@@ -32,7 +32,7 @@ import { usePlatform } from "@/lib/use-platform";
 import { useCoverEdgeColors, computeTone, pickFg, pickFgDim } from "@/lib/cover-color";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 type Load<T> =
   | { kind: "loading" }
@@ -943,6 +943,26 @@ function FusionTrackList({
   viewportHeight: number;
 }) {
   const player = usePlayer();
+  const [pendingTrackId, setPendingTrackId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (pendingTrackId != null && player.current?.neteaseId === pendingTrackId) {
+      setPendingTrackId(null);
+    }
+  }, [pendingTrackId, player.current?.neteaseId]);
+
+  const requestPlay = useCallback(
+    async (track: TrackInfo) => {
+      setPendingTrackId(track.id);
+      try {
+        await player.playNetease(track, tracks);
+      } finally {
+        setPendingTrackId((id) => (id === track.id ? null : id));
+      }
+    },
+    [player, tracks],
+  );
+
   const totalHeight = tracks.length * TRACK_ROW_HEIGHT;
   const startIndex = Math.max(
     0,
@@ -966,10 +986,11 @@ function FusionTrackList({
           <TrackRow
             key={t.id}
             track={t}
-            tracks={tracks}
             fg={fg}
             fgDim={fgDim}
             player={player}
+            pending={pendingTrackId === t.id}
+            onRequestPlay={requestPlay}
           />
         ))}
       </div>
@@ -979,25 +1000,30 @@ function FusionTrackList({
 
 function TrackRow({
   track,
-  tracks,
   fg,
   fgDim,
   player,
+  pending,
+  onRequestPlay,
 }: {
   track: TrackInfo;
-  tracks: TrackInfo[];
   fg: string;
   fgDim: string;
   player: ReturnType<typeof usePlayer>;
+  pending: boolean;
+  onRequestPlay: (track: TrackInfo) => void;
 }) {
   const active = player.current?.neteaseId === track.id;
   const isPlayingThis = active && player.isPlaying;
-  const rowBaseBg = active ? rowActiveBg(fg) : "rgba(255,255,255,0)";
+  const visuallyActive = active || pending;
+  const showIndicator = visuallyActive;
+  const rowBaseBg = visuallyActive ? rowActiveBg(fg) : "rgba(255,255,255,0)";
 
   const onRowClick = () => {
     // 单击播放：active 行就 toggle，非 active 直接切歌
+    if (pending) return;
     if (active) player.toggle();
-    else void player.playNetease(track, tracks);
+    else onRequestPlay(track);
   };
   const onPlayClick = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1024,22 +1050,25 @@ function TrackRow({
         height: TRACK_ROW_HEIGHT,
         padding: "7px 6px",
         boxSizing: "border-box",
-        cursor: "pointer",
+        cursor: pending ? "progress" : "pointer",
         borderRadius: 8,
         background: rowBaseBg,
-        transition: "opacity 160ms ease, background 160ms ease",
-        opacity: active ? 1 : 0.78,
+        boxShadow: visuallyActive
+          ? `inset 3px 0 0 ${fg}, 0 8px 22px ${rowGlowBg(fg)}`
+          : "none",
+        transition: "opacity 160ms ease, background 160ms ease, box-shadow 160ms ease",
+        opacity: visuallyActive ? 1 : 0.78,
         WebkitTapHighlightColor: "transparent",
         outline: "none",
       }}
       onMouseEnter={(e) => {
-        if (!active) {
+        if (!visuallyActive) {
           e.currentTarget.style.opacity = "0.94";
           e.currentTarget.style.background = rowHoverBg(fg);
         }
       }}
       onMouseLeave={(e) => {
-        if (!active) {
+        if (!visuallyActive) {
           e.currentTarget.style.opacity = "0.78";
           e.currentTarget.style.background = "rgba(255,255,255,0)";
         }
@@ -1052,10 +1081,10 @@ function TrackRow({
           display: "flex",
           justifyContent: "center",
           flexShrink: 0,
-          opacity: isPlayingThis ? 1 : 0,
+          opacity: showIndicator ? 1 : 0,
         }}
       >
-        <PlayingMark fg={fg} />
+        <PlayingMark fg={fg} playing={isPlayingThis || pending} />
       </div>
 
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -1063,7 +1092,7 @@ function TrackRow({
           style={{
             color: fg,
             fontSize: 14,
-            fontWeight: active ? 600 : 500,
+            fontWeight: visuallyActive ? 650 : 500,
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -1074,9 +1103,10 @@ function TrackRow({
         </div>
         <div
           style={{
-            color: fgDim,
+            color: visuallyActive ? fg : fgDim,
             fontSize: 12,
             marginTop: 2,
+            opacity: visuallyActive ? 0.72 : 1,
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -1100,11 +1130,13 @@ function TrackRow({
       {/* 播放按钮：用户明确要求每行有；active 时切成暂停 */}
       <button
         onClick={onPlayClick}
-        aria-label={active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
-        title={active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
+        aria-label={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
+        title={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
+        disabled={pending}
         style={{
           ...playBtn(fg),
           flexShrink: 0,
+          opacity: pending ? 0.62 : 1,
         }}
       >
         {isPlayingThis ? <PauseIcon /> : <PlayIcon />}
@@ -1113,7 +1145,7 @@ function TrackRow({
   );
 }
 
-function PlayingMark({ fg }: { fg: string }) {
+function PlayingMark({ fg, playing }: { fg: string; playing: boolean }) {
   // 三条 bar 跳动，做成 active 行的"正在播"指示
   return (
     <span
@@ -1125,20 +1157,22 @@ function PlayingMark({ fg }: { fg: string }) {
         height: 12,
       }}
     >
-      <span style={{ ...bar(fg), animationDelay: "0ms" }} />
-      <span style={{ ...bar(fg), animationDelay: "120ms", height: 8 }} />
-      <span style={{ ...bar(fg), animationDelay: "240ms", height: 5 }} />
+      <span style={{ ...bar(fg, playing), animationDelay: "0ms" }} />
+      <span style={{ ...bar(fg, playing), animationDelay: "120ms", height: 8 }} />
+      <span style={{ ...bar(fg, playing), animationDelay: "240ms", height: 5 }} />
     </span>
   );
 }
 
-const bar = (fg: string): React.CSSProperties => ({
+const bar = (fg: string, playing: boolean): React.CSSProperties => ({
   display: "inline-block",
   width: 2,
   height: 10,
   background: fg,
   borderRadius: 1,
   animation: "playingBar 900ms ease-in-out infinite alternate",
+  animationPlayState: playing ? "running" : "paused",
+  opacity: playing ? 1 : 0.78,
 });
 
 function PlayIcon() {
@@ -1175,7 +1209,11 @@ const playBtn = (fg: string): React.CSSProperties => ({
 });
 
 function rowActiveBg(fg: string): string {
-  return isDarkTextColor(fg) ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.08)";
+  return isDarkTextColor(fg) ? "rgba(0,0,0,0.14)" : "rgba(255,255,255,0.14)";
+}
+
+function rowGlowBg(fg: string): string {
+  return isDarkTextColor(fg) ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.055)";
 }
 
 function rowHoverBg(fg: string): string {
