@@ -18,6 +18,7 @@ import app.pipo.nativeapp.data.BehaviorType
 import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.Discovery
 import app.pipo.nativeapp.data.LastPlaybackStore
+import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoLyricLine
@@ -53,7 +54,7 @@ data class PlayerUiState(
     val playbackMode: PlaybackQueueMode = PlaybackQueueMode.PlaylistLoop,
 ) {
     val activeLyricIndex: Int
-        get() = lyrics.indexOfLast { line -> positionMs >= line.startMs }.coerceAtLeast(0)
+        get() = LyricTiming.resolve(positionMs, lyrics).activeIndex.coerceAtLeast(0)
 }
 
 enum class PlaybackQueueMode {

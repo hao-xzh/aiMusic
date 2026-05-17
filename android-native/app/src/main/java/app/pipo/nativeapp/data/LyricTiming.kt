@@ -29,12 +29,22 @@ object LyricTiming {
         )
     }
 
+    fun focusLeadMs(lines: List<PipoLyricLine>): Long {
+        val timing = if (lines.any { it.timing == PipoLyricTiming.Word && it.chars.isNotEmpty() }) {
+            PipoLyricTiming.Word
+        } else {
+            PipoLyricTiming.Line
+        }
+        return focusLeadMs(timing)
+    }
+
     private fun activeIndexFor(
         positionMs: Long,
         lines: List<PipoLyricLine>,
         timing: PipoLyricTiming,
     ): Int {
-        val idx = lines.indexOfLast { line -> positionMs >= audioStartMs(line, timing) }
+        val ledPositionMs = positionMs + focusLeadMs(timing)
+        val idx = lines.indexOfLast { line -> ledPositionMs >= audioStartMs(line, timing) }
         return idx
     }
 
@@ -51,4 +61,10 @@ object LyricTiming {
         if (timing != PipoLyricTiming.Word || line.chars.isEmpty()) return line.startMs
         return line.chars.firstOrNull()?.startMs ?: line.startMs
     }
+
+    private fun focusLeadMs(timing: PipoLyricTiming): Long {
+        return if (timing == PipoLyricTiming.Line) LINE_FOCUS_LEAD_MS else 0L
+    }
+
+    private const val LINE_FOCUS_LEAD_MS = 220L
 }

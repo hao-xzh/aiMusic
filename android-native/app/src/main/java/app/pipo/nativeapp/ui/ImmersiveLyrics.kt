@@ -4,6 +4,7 @@ import android.graphics.RenderEffect as AndroidRenderEffect
 import android.graphics.RuntimeShader
 import android.os.Build
 import android.os.SystemClock
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Easing
@@ -28,9 +29,9 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -316,6 +317,7 @@ private fun ImmersiveIconButton(onClick: () -> Unit, content: @Composable () -> 
 // ---------- Apple Music 风格歌词列 ----------
 
 private const val MANUAL_LYRIC_SCROLL_HOLD_MS = 2_000L
+private const val CLICK_SEEK_SCROLL_HOLD_MS = 1_100L
 
 /**
  * 把 player 的 30Hz 离散 raw 位置流，转成按帧平滑且**始终跟踪音频**的连续位置 ——
@@ -330,32 +332,70 @@ private const val MANUAL_LYRIC_SCROLL_HOLD_MS = 2_000L
  *
  * 稳态滞后 ≈ 40ms（视觉上无感，远低于人眼 80ms 同步阈值）；不漂移、不抖动。
  */
+private data class SmoothPositionAnchor(
+    val positionMs: Long,
+    val capturedAtNanos: Long,
+    val resetToken: Long,
+)
+
+private fun lyricColumnSessionKey(lines: List<PipoLyricLine>): String {
+    val first = lines.firstOrNull()
+    val last = lines.lastOrNull()
+    return "${lines.size}:${first?.startMs}:${first?.text.hashCode()}:${last?.startMs}:${last?.text.hashCode()}"
+}
+
 @Composable
-private fun rememberSmoothPositionMs(rawPositionMs: Long, isPlaying: Boolean): State<Long> {
-    val output = remember { mutableStateOf(rawPositionMs) }
+private fun rememberSmoothPositionMs(
+    rawPositionMs: Long,
+    isPlaying: Boolean,
+    sessionKey: String,
+): State<Long> {
+    val output = remember(sessionKey) { mutableStateOf(rawPositionMs) }
     // raw 来一拍就更新 anchor（值 + 当时 monotonic nanos），coroutine 内按帧读最新。
-    val rawAnchor = remember { mutableStateOf(rawPositionMs to System.nanoTime()) }
-    LaunchedEffect(rawPositionMs, isPlaying) {
-        rawAnchor.value = rawPositionMs to System.nanoTime()
-        if (!isPlaying) {
+    val rawAnchor = remember(sessionKey) {
+        mutableStateOf(
+            SmoothPositionAnchor(
+                positionMs = rawPositionMs,
+                capturedAtNanos = System.nanoTime(),
+                resetToken = 0L,
+            )
+        )
+    }
+    LaunchedEffect(rawPositionMs, isPlaying, sessionKey) {
+        val previous = rawAnchor.value
+        val jumpedBackward = rawPositionMs + SMOOTH_POSITION_BACKWARD_RESET_MS < previous.positionMs
+        val jumpedFar = kotlin.math.abs(rawPositionMs - output.value) > SMOOTH_POSITION_HARD_RESET_MS
+        val shouldReset = jumpedBackward || jumpedFar
+        rawAnchor.value = SmoothPositionAnchor(
+            positionMs = rawPositionMs,
+            capturedAtNanos = System.nanoTime(),
+            resetToken = if (shouldReset) previous.resetToken + 1L else previous.resetToken,
+        )
+        if (!isPlaying || shouldReset) {
             output.value = rawPositionMs
         }
     }
 
-    LaunchedEffect(isPlaying) {
+    LaunchedEffect(isPlaying, sessionKey) {
         if (!isPlaying) {
-            output.value = rawAnchor.value.first
+            output.value = rawAnchor.value.positionMs
             return@LaunchedEffect
         }
-        var smoothed = rawAnchor.value.first.toFloat()
+        var smoothed = rawAnchor.value.positionMs.toFloat()
+        var seenResetToken = rawAnchor.value.resetToken
         while (true) {
             withFrameNanos { frameNanos ->
-                val (lastRaw, lastRawNanos) = rawAnchor.value
-                val target = lastRaw.toFloat() +
-                    (frameNanos - lastRawNanos).toFloat() / 1_000_000f
+                val anchor = rawAnchor.value
+                if (anchor.resetToken != seenResetToken) {
+                    seenResetToken = anchor.resetToken
+                    smoothed = anchor.positionMs.toFloat()
+                }
+                val target = anchor.positionMs.toFloat() +
+                    (frameNanos - anchor.capturedAtNanos).toFloat() / 1_000_000f
                 val diff = target - smoothed
                 when {
-                    kotlin.math.abs(diff) > 500f -> smoothed = target           // seek
+                    kotlin.math.abs(diff) > SMOOTH_POSITION_HARD_RESET_MS.toFloat() -> smoothed = target
+                    diff < -SMOOTH_POSITION_BACKWARD_RESET_MS.toFloat() -> smoothed = target
                     diff > 0f -> smoothed += diff * 0.4f                        // 前进追赶
                     // diff <= 0：target 比 smoothed 落后（线程抖动 / 短暂停拍），原地等。
                 }
@@ -365,6 +405,9 @@ private fun rememberSmoothPositionMs(rawPositionMs: Long, isPlaying: Boolean): S
     }
     return output
 }
+
+private const val SMOOTH_POSITION_HARD_RESET_MS = 500L
+private const val SMOOTH_POSITION_BACKWARD_RESET_MS = 120L
 
 @Composable
 internal fun AppleMusicLyricColumn(
@@ -386,8 +429,9 @@ internal fun AppleMusicLyricColumn(
     bottomFadeStart: Float = 0.80f,
     bottomFadeSoftEnd: Float = 0.94f,
 ) {
+    val lyricSessionKey = remember(lines) { lyricColumnSessionKey(lines) }
     // 把 player 的 30Hz tick 平滑成按帧位置（120Hz 屏丝滑度提升关键）
-    val smoothedPositionMs by rememberSmoothPositionMs(positionMs, isPlaying)
+    val smoothedPositionMs by rememberSmoothPositionMs(positionMs, isPlaying, lyricSessionKey)
     val haptics = LocalHapticFeedback.current
     if (lines.isEmpty()) {
         Box(
@@ -415,8 +459,10 @@ internal fun AppleMusicLyricColumn(
     val density = LocalDensity.current
     var containerHeightPx by remember { mutableStateOf(0) }
 
-    val listState = rememberLazyListState()
-    var manualScrollHoldUntilMs by remember { mutableStateOf(0L) }
+    val listState = remember(lyricSessionKey) { LazyListState() }
+    var manualScrollHoldUntilMs by remember(lyricSessionKey) { mutableStateOf(0L) }
+    var clickSeekHoldUntilMs by remember(lyricSessionKey) { mutableStateOf(0L) }
+    var clickSeekFocusIndex by remember(lyricSessionKey) { mutableStateOf<Int?>(null) }
     val focusOffsetPx = (containerHeightPx * 0.11f).toInt()
     val manualFocusIndex by remember(listState, focusOffsetPx) {
         derivedStateOf {
@@ -434,20 +480,39 @@ internal fun AppleMusicLyricColumn(
     // 之前是 500ms：滚动比 alpha/blur 早 500ms 触发。Spring 滚动 ~360ms 内就稳了，
     // 但 alpha/blur 要等到 sing boundary 才开始（再 250ms），中间有 ~140ms 的"空窗"——
     // 用户看到的现象就是"滚上去 → 顿一下 → 突然加模糊"。
-    // 改成 100ms：滚动和 alpha/blur 几乎同时启动（差 100ms 内），两段动画并行进行，
-    // 滚动到位 ≈ alpha/blur 完成，整个过渡是一段连续的"渐入/渐出+滑动"，没有突变感。
-    val scrollLookaheadMs = 100L
-    val scrollTargetIdx = remember(positionMs, lines) {
+    // 行级歌词没有逐字时间轴，高亮本身有 250ms alpha 过渡；焦点需要稍微提前启动，
+    // 让唱到时间戳时视觉基本落位。YRC 仍走真实逐字 timing，只保留 100ms 的滚动准备。
+    val focusLeadMs = remember(lines) { LyricTiming.focusLeadMs(lines) }
+    val scrollLookaheadMs = maxOf(100L, focusLeadMs)
+    val scrollTargetIdx = remember(positionMs, lines, scrollLookaheadMs) {
         if (lines.isEmpty()) 0
         else lines.indexOfLast { line -> positionMs + scrollLookaheadMs >= LyricTiming.audioStartMs(line) }
             .coerceAtLeast(0)
     }
+    LaunchedEffect(scrollTargetIdx, clickSeekFocusIndex, clickSeekHoldUntilMs) {
+        val heldIndex = clickSeekFocusIndex ?: return@LaunchedEffect
+        if (scrollTargetIdx >= heldIndex && clickSeekHoldUntilMs > 0L) {
+            clickSeekHoldUntilMs = 0L
+            clickSeekFocusIndex = null
+        }
+    }
 
     // ---- Apple Music 风滚动：~720ms FastOutSlowIn，CSS ease 同曲线 ----
     // animateScrollToItem 默认是 spring，对长歌词来说太弹；这里手写 tween 让滚动更线性 + 后段缓收。
-    LaunchedEffect(scrollTargetIdx, containerHeightPx, manualScrollHoldUntilMs) {
-        if (scrollTargetIdx !in lines.indices || containerHeightPx == 0) return@LaunchedEffect
-        val waitMs = manualScrollHoldUntilMs - SystemClock.elapsedRealtime()
+    LaunchedEffect(scrollTargetIdx, containerHeightPx, manualScrollHoldUntilMs, clickSeekHoldUntilMs) {
+        val heldClickIndex = clickSeekFocusIndex
+        val now = SystemClock.elapsedRealtime()
+        if (
+            heldClickIndex != null &&
+            clickSeekHoldUntilMs > now &&
+            scrollTargetIdx < heldClickIndex
+        ) {
+            return@LaunchedEffect
+        }
+
+        val targetIdx = scrollTargetIdx
+        if (targetIdx !in lines.indices || containerHeightPx == 0) return@LaunchedEffect
+        val waitMs = manualScrollHoldUntilMs - now
         val returningFromManualScroll = waitMs > 0L
         if (waitMs > 0L) delay(waitMs)
         if (listState.isScrollInProgress) {
@@ -456,16 +521,16 @@ internal fun AppleMusicLyricColumn(
         }
         // 焦点位置：容器顶 11%，正好让活动行上方只露出 1 句历史歌词
         val info = listState.layoutInfo
-        val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == scrollTargetIdx }
+        val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == targetIdx }
         if (visibleHit == null) {
             if (returningFromManualScroll) {
-                listState.animateScrollToItem(scrollTargetIdx, scrollOffset = -focusOffsetPx)
+                listState.animateScrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
                 if (manualScrollHoldUntilMs <= SystemClock.elapsedRealtime()) {
                     manualScrollHoldUntilMs = 0L
                 }
             } else {
                 // 正常播放跨很远切句时先 snap 到大致位置，避免一段超长滚动追不上音频。
-                listState.scrollToItem(scrollTargetIdx, scrollOffset = -focusOffsetPx)
+                listState.scrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
             }
             return@LaunchedEffect
         }
@@ -582,7 +647,7 @@ internal fun AppleMusicLyricColumn(
             val effectiveActiveIdx = manualFocusIndex ?: playbackActiveIdx
             itemsIndexed(
                 items = lines,
-                key = { _, line -> line.startMs },
+                key = { idx, line -> lyricLineRenderKey(idx, line) },
             ) { idx, line ->
                 val isManualFocusLine = manualFocusIndex == idx
                 val distance = if (effectiveActiveIdx < 0) {
@@ -592,6 +657,7 @@ internal fun AppleMusicLyricColumn(
                 }
                 // heightIn(min) 而不是 height(fixed) —— 长歌词自然换行成两行不被切。
                 // LazyColumn 内部支持变高 item，animateScrollToItem 仍能按 idx 定位。
+                val hasCompanionCue = hasVisibleCompanionLyric(line, smoothedPositionMs)
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -602,6 +668,9 @@ internal fun AppleMusicLyricColumn(
                             onClick = {
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 manualScrollHoldUntilMs = 0L
+                                clickSeekFocusIndex = idx
+                                clickSeekHoldUntilMs =
+                                    SystemClock.elapsedRealtime() + CLICK_SEEK_SCROLL_HOLD_MS
                                 onSeekToMs(LyricTiming.audioStartMs(line).coerceAtLeast(0L))
                             },
                         ),
@@ -613,7 +682,11 @@ internal fun AppleMusicLyricColumn(
                         distance = distance,
                         // 活动行的字符级 sweep / lift 用按帧外插的 smoothed 位置，颤动消失；
                         // 非活动行其实只用 isActive/isPast 派生状态，跟 positionMs 精度关系不大。
-                        positionMs = if (isManualFocusLine) completedLinePositionMs(line) else smoothedPositionMs,
+                        positionMs = if ((isManualFocusLine || idx < effectiveActiveIdx) && !hasCompanionCue) {
+                            completedLinePositionMs(line)
+                        } else {
+                            smoothedPositionMs
+                        },
                         fg = fg,
                         fgUnsung = fgUnsung,
                         fontSize = lyricFontSize,
@@ -627,9 +700,17 @@ internal fun AppleMusicLyricColumn(
     }
 }
 
+private fun lyricLineRenderKey(index: Int, line: PipoLyricLine): String {
+    return "${line.startMs}:$index:${line.text.hashCode()}"
+}
+
 private fun completedLinePositionMs(line: PipoLyricLine): Long {
-    val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs }
-    val lineEnd = line.startMs + line.durationMs
+    val charEnd = (line.chars + line.companionLines.flatMap { it.chars })
+        .maxOfOrNull { it.startMs + it.durationMs }
+    val lineEnd = maxOf(
+        line.startMs + line.durationMs,
+        line.companionLines.maxOfOrNull { it.startMs + it.durationMs } ?: line.startMs,
+    )
     return maxOf(charEnd ?: lineEnd, lineEnd, line.startMs + 1L)
 }
 
@@ -647,8 +728,8 @@ private fun AppleMusicLyricRow(
     fontWeight: FontWeight,
     verticalPadding: Dp,
 ) {
-    var wasActive by remember(line.startMs) { mutableStateOf(isActive) }
-    var becamePastAtRealtime by remember(line.startMs) { mutableStateOf<Long?>(null) }
+    var wasActive by remember(line.startMs, line.text) { mutableStateOf(isActive) }
+    var becamePastAtRealtime by remember(line.startMs, line.text) { mutableStateOf<Long?>(null) }
     LaunchedEffect(isActive, isPast) {
         val now = SystemClock.elapsedRealtime()
         if (wasActive && !isActive && isPast) {
@@ -661,19 +742,26 @@ private fun AppleMusicLyricRow(
     }
 
     val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
+    val hasCompanionCue = line.companionLines.any {
+        shouldRenderCompanionLyric(it, positionMs) && !isCompanionLyricPast(it, positionMs)
+    }
     // 行级焦点过渡：整行作为单一图层平滑进入焦点。
     // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
     //
     // alpha 关键约束：**past line（distance=1）必须比 fgUnsung（active 行未唱字符）更暗**。
     // pickFgUnsung 现在是 0.40（深底）/ 0.43（浅底），所以 distance=1 必须 < 0.40。
     // 整体提一档，过去/未来行更亮更可读，仍守住"past 不亮于 active 未唱"红线。
-    val baseTargetAlpha = when (distance) {
-        0 -> 1.0f
-        1 -> 0.36f
-        2 -> 0.27f
-        3 -> 0.20f
-        4 -> 0.15f
-        else -> 0.11f
+    val baseTargetAlpha = if (hasCompanionCue) {
+        1.0f
+    } else {
+        when (distance) {
+            0 -> 1.0f
+            1 -> 0.36f
+            2 -> 0.27f
+            3 -> 0.20f
+            4 -> 0.15f
+            else -> 0.11f
+        }
     }
     val targetAlpha = remember(
         baseTargetAlpha,
@@ -698,6 +786,7 @@ private fun AppleMusicLyricRow(
     // 之前给所有非活动行加 blur 是错的 —— Apple Music 实际是焦点附近清晰、远端模糊（焦距感），
     // 不是"非焦点全模糊"。distance=1 的邻句（上 / 下一句）保持清晰，给读者扫读余光。
     val targetBlur = when {
+        hasCompanionCue -> 0f
         distance == 0 -> 0f
         distance == 1 -> 0f          // 紧邻焦点：不模糊，只是 alpha 减弱
         distance == 2 -> 1.2f        // 开始模糊
@@ -720,7 +809,6 @@ private fun AppleMusicLyricRow(
         animationSpec = alphaSpec,
         label = "lyricAlpha",
     )
-    val isYrcLineForFocus = line.chars.isNotEmpty()
     // 行级 translateY：归零，让 scale + alpha 承担"焦点层次"。
     // Apple Music / AMLL 的做法就是这样 —— 非活动行不靠位移区分，靠**比例缩小 + 透明度降低**，
     // 加上 scale 的弹簧落地感，整体"对齐感"比原来"future +2dp / past -1dp"那种位移要干净。
@@ -742,58 +830,6 @@ private fun AppleMusicLyricRow(
         animationSpec = blurSpec,
         label = "lyricBlur",
     )
-    // Apple Music 28sp Black 风格。
-    //
-    // ⚠ 不能用负 letterSpacing —— Compose 的 letter-spacing 是 per-glyph-run 应用的：
-    //   inactive 所有字同色 → Compose 合并成 1 个 run → letter-spacing 在 N-1 个间隙
-    //   都生效（紧凑）。Active 第一个字符颜色一变 → run 数增多 → run 间不应用 letter-spacing
-    //   → 整行变宽几像素，看起来"右边抖一下"。letterSpacing = 0 让两态宽度一致。
-    val style = TextStyle(
-        fontSize = fontSize,
-        // ExtraBold (800) 比 Black (900) 细一度，视觉上不那么"压迫"，更接近 Apple Music
-        fontWeight = fontWeight,
-        lineHeight = lineHeight,
-        lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
-            alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
-            trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
-        ),
-        platformStyle = androidx.compose.ui.text.PlatformTextStyle(
-            includeFontPadding = false,
-        ),
-    )
-
-    // 渲染策略：
-    //   - 非 active YRC（即 future / past / active LRC）走单层 Text：颜色由 baseColor 决定，
-    //     位移由 rowTy（恒为 0）决定，最朴素。
-    //   - active YRC：底层 Text 透明（只用来跑 layout/measure），覆一层 drawWithContent，
-    //     按字符索引逐个 clip 出该字符的横向条带，每条带内的整行文本被 translateY (per-char)
-    //     上移到对应位置。**每字符独立时间轴 ramp**：开唱即触发，
-    //     duration=max(1000ms, 字时长)，ease-out 曲线 → translateY 0 → -1.4dp。
-    //     详见 drawPerCharLiftedSweep。
-    //
-    // 字符之间没有 fontWeight / scale / blur 差异，只有颜色和 translateY，避免单字跳跃感。
-    // baseColor —— **永远给一个真实颜色**，不再用 Color.Transparent。
-    // 之前 active YRC 用 Color.Transparent，Compose 检测到完全透明会**跳过 Text 测量**
-    // → onTextLayout 不触发 → layout 永远是 null → 上层 overlay 因为 cur2 == null 不绘制
-    // → 整行空白，直到行变 past、baseColor 切回 fg 才触发测量。
-    // 现在永远用 fgUnsung 作为 active YRC 的底层颜色（非 0 alpha 强制 Compose 真正测量布局），
-    // 隐藏由 drawWithContent 里**跳过 drawContent()** 完成 —— 这样 overlay 也不会双重绘制。
-    val overlayDrawing = isYrcLine && (isActiveYrc || liftEnvelope > 0.001f)
-    val baseColor = when {
-        isPast -> fg
-        isActiveLrc -> fg
-        isActiveYrc -> fgUnsung   // 仅作为 layout 测量用的"占位色"，drawWithContent 里被跳过
-        else -> fgUnsung
-    }
-    var layout by remember(line.text) {
-        androidx.compose.runtime.mutableStateOf<TextLayoutResult?>(null)
-    }
-
-    // shader 路径已禁用 —— 多次尝试（state-tracked / Offscreen / 多行扩展 / 类型修复）后仍有
-    // 颜色异常或闪退问题，移动 GPU 驱动对 AGSL 的支持差异太大不可控。统一走 fallback 视觉单元绘制。
-    @Suppress("UNUSED_VARIABLE")
-    val cur = layout
-    val canUseShader = false
 
     Box(
         modifier = Modifier
@@ -806,28 +842,132 @@ private fun AppleMusicLyricRow(
             .blur(rowBlurDp.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
             .padding(vertical = verticalPadding),
     ) {
-        Text(
-            text = line.text,
-            color = baseColor,
-            style = style,
-            onTextLayout = { layout = it },
-            modifier = if (isActiveYrc || liftEnvelope > 0.001f) {
-                Modifier.drawWithContent {
-                    // overlayDrawing 时跳过 drawContent —— 不画底层 Text，避免双重绘制 +
-                    // 同时保证 Text 已被测量（用 fgUnsung 占位色）以拿到 layout。
-                    if (!overlayDrawing) drawContent()
-                    val cur2 = layout
-                    if (cur2 != null) {
-                        drawPerCharLiftedSweep(
-                            cur2, line.chars, positionMs, fg, fgUnsung,
-                            envelope = liftEnvelope,
-                        )
-                    }
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = tween(durationMillis = 260, easing = cssEase),
+                ),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+        ) {
+            AppleMusicLyricText(
+                line = line,
+                isActive = isActive,
+                isPast = isPast,
+                positionMs = positionMs,
+                fg = fg,
+                fgUnsung = fgUnsung,
+                fontSize = fontSize,
+                lineHeight = lineHeight,
+                fontWeight = fontWeight,
+                liftEnvelope = liftEnvelope,
+            )
+            line.companionLines.forEach { companion ->
+                if (shouldRenderCompanionLyric(companion, positionMs)) {
+                    val companionActive = isCompanionLyricActive(companion, positionMs)
+                    AppleMusicLyricText(
+                        line = companion,
+                        isActive = companionActive,
+                        isPast = isCompanionLyricPast(companion, positionMs),
+                        positionMs = positionMs,
+                        fg = fg,
+                        fgUnsung = fgUnsung,
+                        fontSize = fontSize * 0.76f,
+                        lineHeight = lineHeight * 0.76f,
+                        fontWeight = FontWeight.SemiBold,
+                        liftEnvelope = if (companionActive) 1f else liftEnvelope,
+                    )
                 }
-            } else Modifier,
-        )
+            }
+        }
     }
 }
+
+private fun shouldRenderCompanionLyric(
+    line: PipoLyricLine,
+    positionMs: Long,
+): Boolean {
+    return positionMs >= LyricTiming.audioStartMs(line) - COMPANION_LYRIC_LEAD_MS
+}
+
+private fun hasVisibleCompanionLyric(line: PipoLyricLine, positionMs: Long): Boolean {
+    return line.companionLines.any { companion ->
+        shouldRenderCompanionLyric(companion, positionMs) && !isCompanionLyricPast(companion, positionMs)
+    }
+}
+
+private fun isCompanionLyricActive(line: PipoLyricLine, positionMs: Long): Boolean {
+    return positionMs >= LyricTiming.audioStartMs(line) && positionMs < companionLyricEndMs(line)
+}
+
+private fun isCompanionLyricPast(line: PipoLyricLine, positionMs: Long): Boolean {
+    return positionMs >= companionLyricEndMs(line)
+}
+
+private fun companionLyricEndMs(line: PipoLyricLine): Long {
+    val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs }
+    return maxOf(charEnd ?: line.startMs, line.startMs + line.durationMs)
+}
+
+@Composable
+private fun AppleMusicLyricText(
+    line: PipoLyricLine,
+    isActive: Boolean,
+    isPast: Boolean,
+    positionMs: Long,
+    fg: Color,
+    fgUnsung: Color,
+    fontSize: TextUnit,
+    lineHeight: TextUnit,
+    fontWeight: FontWeight,
+    liftEnvelope: Float,
+) {
+    val isYrcLine = line.chars.isNotEmpty()
+    val isActiveYrc = isActive && isYrcLine
+    val isActiveLrc = isActive && !isYrcLine
+    val style = TextStyle(
+        fontSize = fontSize,
+        fontWeight = fontWeight,
+        lineHeight = lineHeight,
+        lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
+            alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
+            trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
+        ),
+        platformStyle = androidx.compose.ui.text.PlatformTextStyle(
+            includeFontPadding = false,
+        ),
+    )
+    val overlayDrawing = isYrcLine && (isActiveYrc || liftEnvelope > 0.001f)
+    val baseColor = when {
+        isPast -> fg
+        isActiveLrc -> fg
+        isActiveYrc -> fgUnsung
+        else -> fgUnsung
+    }
+    var layout by remember(line.startMs, line.text) {
+        androidx.compose.runtime.mutableStateOf<TextLayoutResult?>(null)
+    }
+
+    Text(
+        text = line.text,
+        color = baseColor,
+        style = style,
+        onTextLayout = { layout = it },
+        modifier = if (overlayDrawing) {
+            Modifier.drawWithContent {
+                val cur = layout
+                if (cur != null) {
+                    drawPerCharLiftedSweep(
+                        cur, line.chars, positionMs, fg, fgUnsung,
+                        envelope = liftEnvelope,
+                    )
+                }
+            }
+        } else Modifier,
+    )
+}
+
+private const val COMPANION_LYRIC_LEAD_MS = 450L
 
 /**
  * AGSL（Android Graphics Shading Language，API 33+）shader：lift + color 都在 GPU 里
@@ -1110,7 +1250,7 @@ private fun lyricWordPalette(fg: Color, fgUnsung: Color): LyricWordPalette {
         // 单词内部也沿用行级对比：未唱用行级未唱色，已唱必须回到完整高亮色。
         // 变色动画仍走原来的横向 sweep，只替换颜色本身。
         unsung = fgUnsung,
-        sung = fg.copy(alpha = 1f),
+        sung = fg,
     )
 }
 

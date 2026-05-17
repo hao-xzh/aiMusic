@@ -98,7 +98,7 @@ class PipoPlaybackService : MediaSessionService() {
                         mediaItem: androidx.media3.common.MediaItem?,
                         reason: Int,
                     ) {
-                        smartAutoMixer?.onMediaItemTransition(reason)
+                        smartAutoMixer?.onMediaItemTransition(mediaItem, reason)
                     }
 
                     override fun onPlayerError(error: PlaybackException) {

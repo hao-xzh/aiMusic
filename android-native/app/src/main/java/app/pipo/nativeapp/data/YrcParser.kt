@@ -51,7 +51,14 @@ object YrcParser {
                 }
             }
 
-            val mergedChars = mergeAdjacentAsciiLyricChars(chars)
+            val rawMergedChars = mergeAdjacentAsciiLyricChars(chars)
+            val rawText = if (rawMergedChars.isNotEmpty()) rawMergedChars.joinToString("") { it.text } else ""
+            val mergedChars = normalizeYrcLineTimings(
+                chars = rawMergedChars,
+                lineStartMs = lineStart,
+                lineDurationMs = lineDur,
+                tightenInternalDurations = isParentheticalLine(rawText),
+            )
             val text = if (mergedChars.isNotEmpty()) mergedChars.joinToString("") { it.text } else ""
             if (mergedChars.isEmpty() && text.isEmpty()) continue
 
@@ -67,14 +74,7 @@ object YrcParser {
         }
         lines.sortBy { it.startMs }
 
-        // 翻译行去重：网易云对带翻译的歌会把翻译塞进 yrc，下一行起点几乎相同
-        val dedup = mutableListOf<PipoLyricLine>()
-        for (l in lines) {
-            val prev = dedup.lastOrNull()
-            if (prev != null && kotlin.math.abs(l.startMs - prev.startMs) < 50) continue
-            dedup.add(l)
-        }
-        return dedup
+        return mergeSimultaneousYrcLines(lines)
     }
 
     private fun parseOffsetMs(raw: String): Long {
@@ -82,6 +82,165 @@ object YrcParser {
             ?: jsonOffset.find(raw)?.groupValues?.getOrNull(1)?.toLongOrNull()
             ?: 0L
     }
+}
+
+private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyricLine> {
+    if (lines.size <= 1) return lines
+
+    val primaryLines = mutableListOf<PipoLyricLine>()
+    val companionCandidates = mutableListOf<PipoLyricLine>()
+    for (line in lines) {
+        if (isParentheticalLine(line.text)) {
+            companionCandidates.add(line)
+        } else {
+            val previousPrimary = primaryLines.lastOrNull()
+            if (
+                previousPrimary == null ||
+                kotlin.math.abs(line.startMs - previousPrimary.startMs) >= NEAR_SIMULTANEOUS_LINE_MS
+            ) {
+                primaryLines.add(line)
+            }
+        }
+    }
+    if (primaryLines.isEmpty()) return lines
+
+    val attached = List(primaryLines.size) { mutableListOf<PipoLyricLine>() }
+    val orphans = mutableListOf<PipoLyricLine>()
+    for (companion in companionCandidates) {
+        val hostIndex = findCompanionHostIndex(companion, primaryLines)
+        if (hostIndex >= 0) {
+            attached[hostIndex].add(companion)
+        } else {
+            orphans.add(companion)
+        }
+    }
+
+    return (primaryLines.mapIndexed { idx, line ->
+        val companions = attached[idx]
+            .sortedBy { audioStartMs(it) }
+            .take(MAX_COMPANION_LYRIC_LINES)
+        if (companions.isEmpty()) line else line.copy(companionLines = line.companionLines + companions)
+    } + orphans).sortedBy { it.startMs }
+}
+
+private fun findCompanionHostIndex(
+    companion: PipoLyricLine,
+    primaryLines: List<PipoLyricLine>,
+): Int {
+    val companionStart = audioStartMs(companion)
+    val companionEnd = audioEndMs(companion)
+    var bestIndex = -1
+    var bestScore = Long.MIN_VALUE
+    primaryLines.forEachIndexed { idx, primary ->
+        val primaryStart = audioStartMs(primary)
+        val primaryEnd = audioEndMs(primary)
+        val nextPrimaryStart = primaryLines.getOrNull(idx + 1)?.let { audioStartMs(it) }
+        val hostWindowEnd = nextPrimaryStart?.let { nextStart ->
+            minOf(primaryEnd + COMPANION_HOST_SLOP_MS, nextStart - 1L)
+        } ?: (primaryEnd + COMPANION_HOST_SLOP_MS)
+        val overlap = minOf(companionEnd, hostWindowEnd) -
+            maxOf(companionStart, primaryStart - COMPANION_HOST_SLOP_MS)
+        if (overlap <= 0L) return@forEachIndexed
+
+        val midpointDistance = kotlin.math.abs(
+            ((companionStart + companionEnd) / 2L) - ((primaryStart + hostWindowEnd) / 2L),
+        )
+        val score = overlap * 10L - midpointDistance
+        if (score > bestScore) {
+            bestScore = score
+            bestIndex = idx
+        }
+    }
+    return bestIndex
+}
+
+private fun audioStartMs(line: PipoLyricLine): Long {
+    return line.chars.firstOrNull()?.startMs ?: line.startMs
+}
+
+private fun audioEndMs(line: PipoLyricLine): Long {
+    val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs }
+    return maxOf(charEnd ?: line.startMs, line.startMs + line.durationMs)
+}
+
+private fun normalizeYrcLineTimings(
+    chars: List<PipoLyricChar>,
+    lineStartMs: Long,
+    lineDurationMs: Long,
+    tightenInternalDurations: Boolean,
+): List<PipoLyricChar> {
+    if (chars.isEmpty()) return chars
+    val normalizedChars = if (tightenInternalDurations) {
+        clampDurationsToNextTokenStart(chars)
+    } else {
+        chars
+    }
+    val lineEndMs = lineStartMs + lineDurationMs
+    val last = normalizedChars.last()
+    val lastEndMs = last.startMs + last.durationMs
+    val tailFromLastStartMs = lineEndMs - last.startMs
+    val previousTypicalMs = typicalPreviousTokenDurationMs(normalizedChars.dropLast(1))
+    val estimatedLastMs = estimateSungTokenDurationMs(last.text)
+    val maxVisualLastMs = maxOf(
+        estimatedLastMs,
+        (previousTypicalMs * 1.55f).toLong(),
+    ).coerceIn(MIN_LAST_TOKEN_VISUAL_MS, MAX_LAST_TOKEN_VISUAL_MS)
+
+    val looksLikeLineTailPackedIntoLast =
+        tailFromLastStartMs >= LONG_TAIL_AFTER_LAST_TOKEN_MS &&
+            kotlin.math.abs(lastEndMs - lineEndMs) <= LINE_END_SLOP_MS &&
+            last.durationMs > maxOf(maxVisualLastMs * 2L, previousTypicalMs * 2L)
+
+    if (!looksLikeLineTailPackedIntoLast) return normalizedChars
+
+    val cappedLast = last.copy(durationMs = maxVisualLastMs.coerceAtLeast(1L))
+    return normalizedChars.dropLast(1) + cappedLast
+}
+
+private fun clampDurationsToNextTokenStart(chars: List<PipoLyricChar>): List<PipoLyricChar> {
+    if (chars.size <= 1) return chars
+    return chars.mapIndexed { idx, char ->
+        val next = chars.getOrNull(idx + 1) ?: return@mapIndexed char
+        val maxDurationMs = (next.startMs - char.startMs).coerceAtLeast(1L)
+        if (char.durationMs > maxDurationMs) {
+            char.copy(durationMs = maxDurationMs)
+        } else {
+            char
+        }
+    }
+}
+
+private fun typicalPreviousTokenDurationMs(chars: List<PipoLyricChar>): Long {
+    val values = chars
+        .map { it.durationMs }
+        .filter { it in 80L..2_200L }
+        .sorted()
+    if (values.isEmpty()) return DEFAULT_TOKEN_VISUAL_MS
+    return values[values.size / 2]
+}
+
+private fun estimateSungTokenDurationMs(text: String): Long {
+    val trimmed = text.trim()
+    if (trimmed.isEmpty()) return DEFAULT_TOKEN_VISUAL_MS
+    val asciiCount = trimmed.count { it in 'a'..'z' || it in 'A'..'Z' || it.isDigit() }
+    val cjkCount = trimmed.count { it in '一'..'鿿' || it in '぀'..'ヿ' || it in '가'..'힣' }
+    val raw = when {
+        asciiCount > 0 -> 520L + asciiCount.coerceAtMost(12) * 38L
+        cjkCount > 0 -> cjkCount * 280L
+        else -> DEFAULT_TOKEN_VISUAL_MS
+    }
+    return raw.coerceIn(MIN_LAST_TOKEN_VISUAL_MS, MAX_LAST_TOKEN_VISUAL_MS)
+}
+
+private fun isParentheticalLine(text: String): Boolean {
+    val s = text.trim()
+    if (s.length < 2) return false
+    val first = s.first()
+    val last = s.last()
+    return (first == '(' && last == ')') ||
+        (first == '（' && last == '）') ||
+        (first == '[' && last == ']') ||
+        (first == '【' && last == '】')
 }
 
 private fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoLyricChar> {
@@ -181,3 +340,12 @@ fun PipoLyricChar.progress(positionMs: Long): Float {
     if (durationMs <= 0L) return 1f
     return ((positionMs - startMs).toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
 }
+
+private const val NEAR_SIMULTANEOUS_LINE_MS = 80L
+private const val MAX_COMPANION_LYRIC_LINES = 2
+private const val COMPANION_HOST_SLOP_MS = 650L
+private const val LONG_TAIL_AFTER_LAST_TOKEN_MS = 1_800L
+private const val LINE_END_SLOP_MS = 120L
+private const val DEFAULT_TOKEN_VISUAL_MS = 520L
+private const val MIN_LAST_TOKEN_VISUAL_MS = 320L
+private const val MAX_LAST_TOKEN_VISUAL_MS = 1_550L

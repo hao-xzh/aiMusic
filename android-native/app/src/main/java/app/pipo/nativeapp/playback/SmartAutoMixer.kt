@@ -18,9 +18,11 @@ import app.pipo.nativeapp.data.AudioFeatures
 import app.pipo.nativeapp.data.AudioFeaturesStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.TransitionScore
+import app.pipo.nativeapp.runtime.Amp
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.min
 import kotlin.math.roundToLong
 import kotlin.math.sin
 
@@ -70,11 +72,23 @@ internal class SmartAutoMixer(
         cancel("main-error", keepMainVolume = true)
     }
 
-    fun onMediaItemTransition(reason: Int) {
+    fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         val running = active
-        if (running?.handoffStartedAtMs != null) return
-        if (running != null && reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-            cancel("manual-transition", keepMainVolume = true)
+        if (running != null) {
+            if (running.handoffStartedAtMs != null) return
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
+                mediaItem?.mediaId == running.plan.nextId
+            ) {
+                // The main player has naturally advanced to B while the shadow deck is already
+                // playing B. Mute it immediately and snap it to the shadow position so the intro
+                // hook cannot leak twice before the handoff ramp begins.
+                mainPlayer.volume = 0f
+                beginHandoff(running)
+                return
+            }
+            if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                cancel("manual-transition", keepMainVolume = true)
+            }
             return
         }
         val waiting = armed
@@ -149,6 +163,7 @@ internal class SmartAutoMixer(
             return
         }
         if (waiting.shadow.playbackState != Player.STATE_READY) return
+        if (!tailSignalAllowsMix(waiting, remainingMs)) return
 
         waiting.shadow.volume = 0f
         waiting.shadow.play()
@@ -192,12 +207,19 @@ internal class SmartAutoMixer(
     private fun beginHandoff(running: ActiveMix) {
         if (running.handoffStartedAtMs != null) return
         val plan = running.plan
+        val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
         running.handoffStartedAtMs = SystemClock.elapsedRealtime()
         mainPlayer.volume = 0f
-        mainPlayer.seekTo(plan.nextIndex, running.shadow.currentPosition.coerceAtLeast(0L))
-        mainPlayer.prepare()
+        if (mainPlayer.currentMediaItem?.mediaId == plan.nextId) {
+            mainPlayer.seekTo(shadowPositionMs)
+        } else {
+            mainPlayer.seekTo(plan.nextIndex, shadowPositionMs)
+        }
+        if (mainPlayer.playbackState == Player.STATE_IDLE) {
+            mainPlayer.prepare()
+        }
         mainPlayer.play()
-        Log.d(TAG, "handoff ${plan.nextTitle} at ${running.shadow.currentPosition}ms")
+        Log.d(TAG, "handoff ${plan.nextTitle} at ${shadowPositionMs}ms")
     }
 
     private fun updateHandoff(running: ActiveMix) {
@@ -253,6 +275,8 @@ internal class SmartAutoMixer(
             currentTitle = currentTrack.title,
             nextTitle = nextTrack.title,
             mixMs = mix.mixMs,
+            requiresTailDip = mix.requiresTailDip,
+            tailAmpThreshold = mix.tailAmpThreshold,
             reason = mix.reason,
         )
     }
@@ -265,12 +289,7 @@ internal class SmartAutoMixer(
         currentDurationMs: Long,
     ): MixWindow? {
         if (currentDurationMs in 1L until MIN_CURRENT_DURATION_MS) return null
-        if (currentFeatures == null || nextFeatures == null) {
-            return MixWindow(
-                mixMs = FALLBACK_MIX_MS,
-                reason = "fallback-no-analysis",
-            )
-        }
+        if (currentFeatures == null || nextFeatures == null) return null
         if (currentFeatures.durationS < MIN_TRACK_DURATION_S || nextFeatures.durationS < MIN_TRACK_DURATION_S) return null
         val fit = TransitionScore.fitScore(
             TransitionScore.Scored(currentTrack, currentFeatures),
@@ -286,41 +305,81 @@ internal class SmartAutoMixer(
         if (bpmReliable && bpmDelta > MAX_BPM_DELTA) return null
 
         val energyDelta = abs(currentFeatures.outroEnergy - nextFeatures.introEnergy)
+        val boundaryIsTight = currentFeatures.tailSilenceS <= TIGHT_SILENCE_S &&
+            nextFeatures.headSilenceS <= TIGHT_SILENCE_S
+        val busyOutgoingTail = currentFeatures.tailSilenceS < BUSY_TAIL_SILENCE_S &&
+            currentFeatures.outroEnergy >= BUSY_OUTRO_ENERGY
+        val tailNeedsLiveDip = currentFeatures.tailSilenceS < BUSY_TAIL_SILENCE_S &&
+            currentFeatures.outroEnergy >= TAIL_DIP_MIN_OUTRO_ENERGY
+        val busyIncomingHead = nextFeatures.headSilenceS < BUSY_HEAD_SILENCE_S &&
+            nextFeatures.introEnergy >= BUSY_INTRO_ENERGY
+        val clashRisk = tailNeedsLiveDip && busyIncomingHead
         if (energyDelta > MAX_ENERGY_DELTA) {
-            val hasBreathableBoundary = currentFeatures.tailSilenceS <= 1.2 || nextFeatures.headSilenceS <= 1.2
+            val hasBreathableBoundary = currentFeatures.tailSilenceS >= BREATHABLE_SILENCE_S ||
+                nextFeatures.headSilenceS >= BREATHABLE_SILENCE_S
             if (!hasBreathableBoundary) return null
             return MixWindow(
                 mixMs = BREATH_MIX_MS,
+                requiresTailDip = tailNeedsLiveDip,
+                tailAmpThreshold = tailAmpThreshold(currentFeatures),
                 reason = "${fit.style} breath energyDelta=${"%.2f".format(energyDelta)}",
             )
         }
         if (fit.score < MIN_FIT_SCORE && fit.style != TransitionScore.TransitionStyle.SilenceBreath) {
-            return MixWindow(
-                mixMs = FALLBACK_MIX_MS,
-                reason = "${fit.style} low-fit score=${"%.2f".format(fit.score)}",
-            )
+            return null
         }
 
         val avgBpm = if (bpmReliable) ((bpmA!! + bpmB!!) / 2.0).coerceIn(70.0, 180.0) else null
         val phraseMs = avgBpm?.let { bpm ->
             val beats = when {
-                fit.style == TransitionScore.TransitionStyle.HardCut -> 8
-                bpmDelta <= 4.0 && energyDelta <= 0.16 -> 16
-                else -> 12
+                clashRisk -> 2
+                busyOutgoingTail -> 4
+                fit.style == TransitionScore.TransitionStyle.HardCut -> 4
+                bpmDelta <= 4.0 && energyDelta <= 0.16 && boundaryIsTight -> 8
+                else -> 4
             }
             ((60_000.0 / bpm) * beats).roundToLong()
         }
         val fallbackMs = when (fit.style) {
-            TransitionScore.TransitionStyle.HardCut -> 4_800L
-            TransitionScore.TransitionStyle.Tight -> 7_200L
-            TransitionScore.TransitionStyle.Soft -> 5_800L
+            TransitionScore.TransitionStyle.HardCut -> 1_400L
+            TransitionScore.TransitionStyle.Tight -> 2_200L
+            TransitionScore.TransitionStyle.Soft -> 2_600L
             TransitionScore.TransitionStyle.SilenceBreath -> BREATH_MIX_MS
         }
-        val mixMs = (phraseMs ?: fallbackMs).coerceIn(MIN_MIX_MS, MAX_MIX_MS)
+        val maxByBoundary = when {
+            clashRisk -> MAX_CLASH_MIX_MS
+            busyOutgoingTail -> MAX_BUSY_TAIL_MIX_MS
+            boundaryIsTight -> MAX_TIGHT_MIX_MS
+            else -> MAX_SOFT_MIX_MS
+        }
+        val mixMs = min(phraseMs ?: fallbackMs, maxByBoundary).coerceIn(MIN_MIX_MS, MAX_MIX_MS)
         return MixWindow(
             mixMs = mixMs,
-            reason = "${fit.style} score=${"%.2f".format(fit.score)} bpmDelta=${"%.1f".format(bpmDelta)} energyDelta=${"%.2f".format(energyDelta)}",
+            requiresTailDip = tailNeedsLiveDip,
+            tailAmpThreshold = tailAmpThreshold(currentFeatures),
+            reason = "${fit.style} score=${"%.2f".format(fit.score)} bpmDelta=${"%.1f".format(bpmDelta)} energyDelta=${"%.2f".format(energyDelta)} boundary=${if (boundaryIsTight) "tight" else "soft"}",
         )
+    }
+
+    private fun tailSignalAllowsMix(waiting: ArmedMix, remainingMs: Long): Boolean {
+        val plan = waiting.plan
+        if (!plan.requiresTailDip) return true
+
+        val liveAmp = Amp.flow.value
+        val hasTailDip = liveAmp <= plan.tailAmpThreshold
+        if (hasTailDip) {
+            waiting.tailDipTicks += 1
+        } else {
+            waiting.tailDipTicks = 0
+        }
+
+        if (waiting.tailDipTicks >= REQUIRED_TAIL_DIP_TICKS) return true
+        return remainingMs <= TAIL_DIP_LAST_CHANCE_MS
+    }
+
+    private fun tailAmpThreshold(features: AudioFeatures): Float {
+        val energyBased = (features.outroEnergy * 0.72).toFloat()
+        return energyBased.coerceIn(MIN_TAIL_AMP_THRESHOLD, MAX_TAIL_AMP_THRESHOLD)
     }
 
     private fun nextIndex(currentIndex: Int): Int? {
@@ -396,7 +455,12 @@ internal class SmartAutoMixer(
 
     private data class Gains(val current: Float, val next: Float)
 
-    private data class MixWindow(val mixMs: Long, val reason: String)
+    private data class MixWindow(
+        val mixMs: Long,
+        val requiresTailDip: Boolean,
+        val tailAmpThreshold: Float,
+        val reason: String,
+    )
 
     private data class AutoMixPlan(
         val key: String,
@@ -408,12 +472,15 @@ internal class SmartAutoMixer(
         val currentTitle: String,
         val nextTitle: String,
         val mixMs: Long,
+        val requiresTailDip: Boolean,
+        val tailAmpThreshold: Float,
         val reason: String,
     )
 
     private data class ArmedMix(
         val plan: AutoMixPlan,
         val shadow: ExoPlayer,
+        var tailDipTicks: Int = 0,
     )
 
     private data class ActiveMix(
@@ -435,13 +502,27 @@ internal class SmartAutoMixer(
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
         private const val MIN_TRACK_DURATION_S = 35.0
-        private const val MIN_BPM_CONFIDENCE = 0.2
-        private const val MIN_FIT_SCORE = 0.48
+        private const val MIN_BPM_CONFIDENCE = 0.28
+        private const val MIN_FIT_SCORE = 0.56
         private const val MAX_BPM_DELTA = 12.0
         private const val MAX_ENERGY_DELTA = 0.38
-        private const val MIN_MIX_MS = 4_800L
-        private const val MAX_MIX_MS = 9_200L
-        private const val FALLBACK_MIX_MS = 5_800L
-        private const val BREATH_MIX_MS = 4_200L
+        private const val MIN_MIX_MS = 900L
+        private const val MAX_MIX_MS = 3_200L
+        private const val MAX_CLASH_MIX_MS = 1_100L
+        private const val MAX_BUSY_TAIL_MIX_MS = 1_600L
+        private const val MAX_TIGHT_MIX_MS = 2_600L
+        private const val MAX_SOFT_MIX_MS = 3_200L
+        private const val BREATH_MIX_MS = 1_200L
+        private const val TIGHT_SILENCE_S = 0.45
+        private const val BREATHABLE_SILENCE_S = 0.85
+        private const val BUSY_TAIL_SILENCE_S = 0.8
+        private const val BUSY_HEAD_SILENCE_S = 0.6
+        private const val BUSY_OUTRO_ENERGY = 0.10
+        private const val BUSY_INTRO_ENERGY = 0.10
+        private const val TAIL_DIP_MIN_OUTRO_ENERGY = 0.05
+        private const val MIN_TAIL_AMP_THRESHOLD = 0.035f
+        private const val MAX_TAIL_AMP_THRESHOLD = 0.095f
+        private const val REQUIRED_TAIL_DIP_TICKS = 2
+        private const val TAIL_DIP_LAST_CHANCE_MS = 950L
     }
 }

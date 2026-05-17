@@ -102,6 +102,7 @@ data class PipoLyricLine(
     val text: String,
     val chars: List<PipoLyricChar> = emptyList(),
     val timing: PipoLyricTiming = if (chars.isEmpty()) PipoLyricTiming.Line else PipoLyricTiming.Word,
+    val companionLines: List<PipoLyricLine> = emptyList(),
 )
 
 data class PipoLyricChar(
