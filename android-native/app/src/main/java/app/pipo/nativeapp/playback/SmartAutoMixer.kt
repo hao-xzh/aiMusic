@@ -65,7 +65,9 @@ internal class SmartAutoMixer(
     fun onMainPlayerEvent() {
         val running = active
         if (running != null) {
-            if (mainPlayer.playbackState == Player.STATE_ENDED) {
+            if (running.handoffStartedAtMs != null && mainPlayerReadyForHandoff(running)) {
+                updateHandoff(running)
+            } else if (mainPlayer.playbackState == Player.STATE_ENDED) {
                 maybeBeginHandoff(running, trigger = "main-ended-event")
             } else if (!mainPlayer.playWhenReady || mainPlayer.playbackState == Player.STATE_IDLE) {
                 cancel("main-not-playing", keepMainVolume = true)
@@ -302,7 +304,8 @@ internal class SmartAutoMixer(
         val plan = running.plan
         val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
         val minPositionMs = minSafeHandoffPositionMs(plan)
-        if (shadowPositionMs < minPositionMs) {
+        val mainAlreadyOnNext = mainPlayer.currentMediaItem?.mediaId == plan.nextId
+        if (shadowPositionMs < minPositionMs && !mainAlreadyOnNext) {
             mainPlayer.volume = 0f
             running.shadow.volume = 1f
             if (!running.handoffPositionWaitLogged) {
@@ -314,6 +317,7 @@ internal class SmartAutoMixer(
                         "trigger" to trigger,
                         "shadowPositionMs" to shadowPositionMs,
                         "minPositionMs" to minPositionMs,
+                        "mainAlreadyOnNext" to mainAlreadyOnNext,
                         "mainState" to playbackStateName(mainPlayer.playbackState),
                     ),
                 )
@@ -353,24 +357,21 @@ internal class SmartAutoMixer(
             mapOf(
                 "shadowPositionMs" to shadowPositionMs,
                 "targetPositionMs" to targetPositionMs,
+                "minPositionMs" to minSafeHandoffPositionMs(plan),
                 "trigger" to trigger,
                 "mainState" to playbackStateName(mainPlayer.playbackState),
                 "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
                 "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
                 "elapsedMixMs" to (now - running.startedAtMs),
                 "remainingMs" to remainingMs(),
-                "syncSeekDone" to running.handoffSyncSeekDone,
             ),
         )
     }
 
     private fun updateHandoff(running: ActiveMix) {
         val started = running.handoffStartedAtMs ?: return
-        val mainReady = mainPlayer.currentMediaItem?.mediaId == running.plan.nextId &&
-            mainPlayer.playbackState == Player.STATE_READY &&
-            mainPlayer.playWhenReady
         val now = SystemClock.elapsedRealtime()
-        if (!mainReady) {
+        if (!mainPlayerReadyForHandoff(running)) {
             mainPlayer.volume = 0f
             running.shadow.volume = 1f
             if (now - started >= HANDOFF_RETRY_PREPARE_MS) {
@@ -390,7 +391,6 @@ internal class SmartAutoMixer(
                             "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
                             "requestedPositionMs" to running.handoffRequestedPositionMs,
                             "elapsedHandoffMs" to (now - started),
-                            "syncSeekDone" to running.handoffSyncSeekDone,
                         ),
                     )
                 }
@@ -401,34 +401,17 @@ internal class SmartAutoMixer(
         maybeCompleteHandoff(running, now)
     }
 
+    private fun mainPlayerReadyForHandoff(running: ActiveMix): Boolean {
+        return mainPlayer.currentMediaItem?.mediaId == running.plan.nextId &&
+            mainPlayer.playbackState == Player.STATE_READY &&
+            mainPlayer.playWhenReady
+    }
+
     private fun maybeCompleteHandoff(running: ActiveMix, now: Long) {
         val plan = running.plan
         val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
         val mainPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
         val deltaMs = mainPositionMs - shadowPositionMs
-        if (abs(deltaMs) > HANDOFF_CUTOVER_TOLERANCE_MS && !running.handoffSyncSeekDone) {
-            val targetPositionMs = shadowPositionMs + HANDOFF_SYNC_LEAD_MS
-            running.handoffSyncSeekDone = true
-            running.handoffRequestedPositionMs = targetPositionMs
-            mainPlayer.volume = 0f
-            running.shadow.volume = 1f
-            mainPlayer.seekTo(targetPositionMs)
-            mainPlayer.play()
-            logMixEvent(
-                "handoff_single_sync_seek",
-                plan,
-                mapOf(
-                    "mainPositionMs" to mainPositionMs,
-                    "shadowPositionMs" to shadowPositionMs,
-                    "targetPositionMs" to targetPositionMs,
-                    "deltaMs" to deltaMs,
-                    "elapsedHandoffMs" to (now - (running.handoffStartedAtMs ?: now)),
-                    "syncSeekDone" to running.handoffSyncSeekDone,
-                ),
-            )
-            return
-        }
-
         lastCompletedKey = plan.key
         lastCompletedAtMs = now
         cleanupShadow(running.shadow)
@@ -445,7 +428,7 @@ internal class SmartAutoMixer(
                 "requestedPositionMs" to running.handoffRequestedPositionMs,
                 "handoffMode" to "dual-deck-cutover",
                 "elapsedHandoffMs" to (now - (running.handoffStartedAtMs ?: now)),
-                "syncSeekDone" to running.handoffSyncSeekDone,
+                "offsetOutsideTolerance" to (abs(deltaMs) > HANDOFF_CUTOVER_TOLERANCE_MS),
             ),
         )
     }
@@ -479,7 +462,9 @@ internal class SmartAutoMixer(
             mixMs = mix.mixMs,
             requiresTailDip = mix.requiresTailDip,
             tailAmpThreshold = mix.tailAmpThreshold,
+            policy = mix.policy,
             reason = mix.reason,
+            diagnostics = mix.diagnostics,
         )
     }
 
@@ -509,6 +494,8 @@ internal class SmartAutoMixer(
         val energyDelta = abs(currentFeatures.outroEnergy - nextFeatures.introEnergy)
         val boundaryIsTight = currentFeatures.tailSilenceS <= TIGHT_SILENCE_S &&
             nextFeatures.headSilenceS <= TIGHT_SILENCE_S
+        val hasBreathableBoundary = currentFeatures.tailSilenceS >= BREATHABLE_SILENCE_S ||
+            nextFeatures.headSilenceS >= BREATHABLE_SILENCE_S
         val busyOutgoingTail = currentFeatures.tailSilenceS < BUSY_TAIL_SILENCE_S &&
             currentFeatures.outroEnergy >= BUSY_OUTRO_ENERGY
         val tailNeedsLiveDip = currentFeatures.tailSilenceS < BUSY_TAIL_SILENCE_S &&
@@ -516,19 +503,48 @@ internal class SmartAutoMixer(
         val busyIncomingHead = nextFeatures.headSilenceS < BUSY_HEAD_SILENCE_S &&
             nextFeatures.introEnergy >= BUSY_INTRO_ENERGY
         val clashRisk = tailNeedsLiveDip && busyIncomingHead
+        val diagnostics = mixDiagnostics(
+            fit = fit,
+            bpmDelta = bpmDelta,
+            energyDelta = energyDelta,
+            boundaryIsTight = boundaryIsTight,
+            hasBreathableBoundary = hasBreathableBoundary,
+            clashRisk = clashRisk,
+            requiresTailDip = tailNeedsLiveDip,
+            currentFeatures = currentFeatures,
+            nextFeatures = nextFeatures,
+        )
         if (energyDelta > MAX_ENERGY_DELTA) {
-            val hasBreathableBoundary = currentFeatures.tailSilenceS >= BREATHABLE_SILENCE_S ||
-                nextFeatures.headSilenceS >= BREATHABLE_SILENCE_S
             if (!hasBreathableBoundary) return null
             return MixWindow(
                 mixMs = BREATH_MIX_MS,
                 requiresTailDip = tailNeedsLiveDip,
                 tailAmpThreshold = tailAmpThreshold(currentFeatures),
+                policy = "silence-breath",
                 reason = "${fit.style} breath energyDelta=${"%.2f".format(energyDelta)}",
+                diagnostics = diagnostics,
             )
         }
-        if (fit.score < MIN_FIT_SCORE && fit.style != TransitionScore.TransitionStyle.SilenceBreath) {
-            return null
+        val policy = when (fit.style) {
+            TransitionScore.TransitionStyle.HardCut -> {
+                if (fit.score < MIN_TIGHT_DJ_SCORE) return null
+                "hard-cut"
+            }
+            TransitionScore.TransitionStyle.Tight -> {
+                when {
+                    boundaryIsTight && fit.score >= MIN_TIGHT_DJ_SCORE -> "tight-boundary"
+                    fit.score >= MIN_LOOSE_TIGHT_DJ_SCORE -> "tight-short"
+                    else -> return null
+                }
+            }
+            TransitionScore.TransitionStyle.Soft -> {
+                if (fit.score < MIN_SOFT_DJ_SCORE || !hasBreathableBoundary || clashRisk) return null
+                "soft-breathable"
+            }
+            TransitionScore.TransitionStyle.SilenceBreath -> {
+                if (!hasBreathableBoundary) return null
+                "silence-breath"
+            }
         }
 
         val avgBpm = if (bpmReliable) ((bpmA!! + bpmB!!) / 2.0).coerceIn(70.0, 180.0) else null
@@ -542,16 +558,18 @@ internal class SmartAutoMixer(
             }
             ((60_000.0 / bpm) * beats).roundToLong()
         }
-        val fallbackMs = when (fit.style) {
-            TransitionScore.TransitionStyle.HardCut -> 1_400L
-            TransitionScore.TransitionStyle.Tight -> 2_200L
-            TransitionScore.TransitionStyle.Soft -> 2_600L
-            TransitionScore.TransitionStyle.SilenceBreath -> BREATH_MIX_MS
+        val fallbackMs = when (policy) {
+            "tight-boundary" -> 2_200L
+            "tight-short" -> 1_800L
+            "soft-breathable" -> 1_400L
+            "silence-breath" -> BREATH_MIX_MS
+            else -> 1_400L
         }
         val maxByBoundary = when {
             clashRisk -> MAX_CLASH_MIX_MS
             busyOutgoingTail -> MAX_BUSY_TAIL_MIX_MS
             boundaryIsTight -> MAX_TIGHT_MIX_MS
+            fit.style == TransitionScore.TransitionStyle.Tight -> MAX_LOOSE_TIGHT_MIX_MS
             else -> MAX_SOFT_MIX_MS
         }
         val mixMs = min(phraseMs ?: fallbackMs, maxByBoundary).coerceIn(MIN_MIX_MS, MAX_MIX_MS)
@@ -559,7 +577,9 @@ internal class SmartAutoMixer(
             mixMs = mixMs,
             requiresTailDip = tailNeedsLiveDip,
             tailAmpThreshold = tailAmpThreshold(currentFeatures),
-            reason = "${fit.style} score=${"%.2f".format(fit.score)} bpmDelta=${"%.1f".format(bpmDelta)} energyDelta=${"%.2f".format(energyDelta)} boundary=${if (boundaryIsTight) "tight" else "soft"}",
+            policy = policy,
+            reason = "${fit.style} policy=$policy score=${"%.2f".format(fit.score)} bpmDelta=${"%.1f".format(bpmDelta)} energyDelta=${"%.2f".format(energyDelta)} boundary=${if (boundaryIsTight) "tight" else "soft"}",
+            diagnostics = diagnostics,
         )
     }
 
@@ -576,12 +596,52 @@ internal class SmartAutoMixer(
         }
 
         if (waiting.tailDipTicks >= REQUIRED_TAIL_DIP_TICKS) return true
-        return remainingMs <= TAIL_DIP_LAST_CHANCE_MS
+        if (remainingMs <= TAIL_DIP_LAST_CHANCE_MS) {
+            logMixEvent(
+                "tail_dip_missing",
+                plan,
+                mapOf(
+                    "remainingMs" to remainingMs,
+                    "liveAmp" to liveAmp,
+                    "tailAmpThreshold" to plan.tailAmpThreshold,
+                    "tailDipTicks" to waiting.tailDipTicks,
+                ),
+            )
+            cancel("tail-dip-missing", keepMainVolume = true)
+        }
+        return false
     }
 
     private fun tailAmpThreshold(features: AudioFeatures): Float {
         val energyBased = (features.outroEnergy * 0.72).toFloat()
         return energyBased.coerceIn(MIN_TAIL_AMP_THRESHOLD, MAX_TAIL_AMP_THRESHOLD)
+    }
+
+    private fun mixDiagnostics(
+        fit: TransitionScore.FitScore,
+        bpmDelta: Double,
+        energyDelta: Double,
+        boundaryIsTight: Boolean,
+        hasBreathableBoundary: Boolean,
+        clashRisk: Boolean,
+        requiresTailDip: Boolean,
+        currentFeatures: AudioFeatures,
+        nextFeatures: AudioFeatures,
+    ): Map<String, Any?> {
+        return mapOf(
+            "fitStyle" to fit.style.name,
+            "fitScore" to "%.2f".format(fit.score),
+            "bpmDelta" to "%.1f".format(bpmDelta),
+            "energyDelta" to "%.2f".format(energyDelta),
+            "boundary" to if (boundaryIsTight) "tight" else "soft",
+            "breathableBoundary" to hasBreathableBoundary,
+            "clashRisk" to clashRisk,
+            "tailDipRequired" to requiresTailDip,
+            "tailSilenceS" to "%.2f".format(currentFeatures.tailSilenceS),
+            "headSilenceS" to "%.2f".format(nextFeatures.headSilenceS),
+            "outroEnergy" to "%.2f".format(currentFeatures.outroEnergy),
+            "introEnergy" to "%.2f".format(nextFeatures.introEnergy),
+        )
     }
 
     private fun nextIndex(currentIndex: Int): Int? {
@@ -667,7 +727,9 @@ internal class SmartAutoMixer(
                 "nextId" to plan.nextId,
                 "currentTitle" to plan.currentTitle,
                 "nextTitle" to plan.nextTitle,
-            ) + extra,
+                "mixPolicy" to plan.policy,
+                "mixReason" to plan.reason,
+            ) + plan.diagnostics + extra,
         )
     }
 
@@ -710,7 +772,9 @@ internal class SmartAutoMixer(
         val mixMs: Long,
         val requiresTailDip: Boolean,
         val tailAmpThreshold: Float,
+        val policy: String,
         val reason: String,
+        val diagnostics: Map<String, Any?>,
     )
 
     private data class AutoMixPlan(
@@ -725,7 +789,9 @@ internal class SmartAutoMixer(
         val mixMs: Long,
         val requiresTailDip: Boolean,
         val tailAmpThreshold: Float,
+        val policy: String,
         val reason: String,
+        val diagnostics: Map<String, Any?>,
     )
 
     private data class ArmedMix(
@@ -744,7 +810,6 @@ internal class SmartAutoMixer(
         var handoffRequestedPositionMs: Long = 0L,
         var handoffPositionWaitLogged: Boolean = false,
         var handoffWaitLogged: Boolean = false,
-        var handoffSyncSeekDone: Boolean = false,
     )
 
     private companion object {
@@ -760,26 +825,28 @@ internal class SmartAutoMixer(
         private const val MIN_REMAINING_TO_ARM_MS = 1_200L
         private const val MIN_REMAINING_TO_START_MS = 750L
         private const val LATE_SHADOW_READY_TOLERANCE_MS = 260L
-        private const val HANDOFF_REMAINING_MS = 120L
-        private const val HANDOFF_POSITION_TOLERANCE_MS = 180L
-        private const val HANDOFF_SYNC_LEAD_MS = 420L
+        private const val HANDOFF_REMAINING_MS = 520L
+        private const val HANDOFF_POSITION_TOLERANCE_MS = 900L
         private const val HANDOFF_CUTOVER_TOLERANCE_MS = 140L
-        private const val MIN_SAFE_HANDOFF_POSITION_MS = 900L
-        private const val MAX_SAFE_HANDOFF_POSITION_MS = 2_400L
+        private const val MIN_SAFE_HANDOFF_POSITION_MS = 650L
+        private const val MAX_SAFE_HANDOFF_POSITION_MS = 1_600L
         private const val HANDOFF_RETRY_PREPARE_MS = 1_000L
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
         private const val MIN_TRACK_DURATION_S = 35.0
         private const val MIN_BPM_CONFIDENCE = 0.28
-        private const val MIN_FIT_SCORE = 0.56
+        private const val MIN_TIGHT_DJ_SCORE = 0.72
+        private const val MIN_LOOSE_TIGHT_DJ_SCORE = 0.82
+        private const val MIN_SOFT_DJ_SCORE = 0.74
         private const val MAX_BPM_DELTA = 12.0
         private const val MAX_ENERGY_DELTA = 0.38
         private const val MIN_MIX_MS = 900L
-        private const val MAX_MIX_MS = 3_200L
+        private const val MAX_MIX_MS = 2_600L
         private const val MAX_CLASH_MIX_MS = 1_100L
-        private const val MAX_BUSY_TAIL_MIX_MS = 1_600L
-        private const val MAX_TIGHT_MIX_MS = 2_600L
-        private const val MAX_SOFT_MIX_MS = 3_200L
+        private const val MAX_BUSY_TAIL_MIX_MS = 1_400L
+        private const val MAX_TIGHT_MIX_MS = 2_400L
+        private const val MAX_LOOSE_TIGHT_MIX_MS = 1_800L
+        private const val MAX_SOFT_MIX_MS = 1_400L
         private const val BREATH_MIX_MS = 1_200L
         private const val TIGHT_SILENCE_S = 0.45
         private const val BREATHABLE_SILENCE_S = 0.85
