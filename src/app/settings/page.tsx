@@ -14,6 +14,7 @@ import {
 import { useAppSettings } from "@/lib/app-settings";
 import { BackButton } from "@/components/BackButton";
 import { DotText } from "@/components/DotText";
+import { usePlatform } from "@/lib/use-platform";
 import {
   useAnalysisProgress,
   startBackgroundAnalysis,
@@ -50,19 +51,16 @@ export default function SettingsPage() {
   }, []);
 
   return (
-    <div
-      style={{
-        padding: "clamp(8px, 2vw, 16px) clamp(12px, 4vw, 24px) 60px",
-        maxWidth: 760,
-        margin: "0 auto",
-        width: "100%",
-      }}
-    >
-      {/* BackButton 单独一行，hero 居中 —— 跟 /login 同款"DotText 大标题 + 副标题"
-          的版式。原来那个小 SETTINGS 在三列 grid 里看起来是注释，不是页眉。 */}
-      <div className="safe-top" style={{ display: "flex", paddingTop: 4 }}>
-        <BackButton href="/" />
-      </div>
+    <>
+      <SettingsTopBar />
+      <div
+        style={{
+          padding: "clamp(54px, 7vh, 72px) clamp(12px, 4vw, 24px) 60px",
+          maxWidth: 760,
+          margin: "0 auto",
+          width: "100%",
+        }}
+      >
       <div
         style={{
           display: "flex",
@@ -120,6 +118,44 @@ export default function SettingsPage() {
 
       <div style={footerNote}>
         登录 cookie & API key 仅保存在本机 · 不上传
+      </div>
+      </div>
+    </>
+  );
+}
+
+function SettingsTopBar() {
+  const platform = usePlatform();
+  const isMac = platform === "mac";
+  const isWin = platform === "windows";
+  const isAndroid = platform === "android";
+  const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
+  const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "40px";
+  const contentTop = isAndroid ? safeTop : "4px";
+  const leftInset = isMac ? 112 : 18;
+  const rightInset = isWin ? 158 : 24;
+
+  return (
+    <div
+      data-tauri-drag-region
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        height: barHeight,
+        display: "flex",
+        alignItems: "center",
+        paddingTop: contentTop,
+        paddingLeft: leftInset,
+        paddingRight: rightInset,
+        boxSizing: "border-box",
+        background: "transparent",
+        zIndex: 40,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", height: 30 }}>
+        <BackButton href="/" />
       </div>
     </div>
   );

@@ -17,10 +17,10 @@ type Props = {
 export function BackButton({ href, label = "返回" }: Props) {
   const router = useRouter();
 
-  // 跟 distill 顶部 BackIcon 严格同源（22 svg + 1.9 stroke + 8x14 chevron）—— 否则
+  // 跟 distill 顶部 BackIcon 严格同源（18 svg + 1.85 stroke + 8x14 chevron）—— 否则
   // /settings、/taste、/login 几页的返回图标会比 distill 一眼小一圈，体验不齐
   const inner = (
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.85" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <path d="M16 5l-8 7 8 7" />
     </svg>
   );
@@ -39,14 +39,14 @@ export function BackButton({ href, label = "返回" }: Props) {
   );
 }
 
-// 34x34 透明 icon button，跟 distill 顶部 chipStyle 同款
+// 30x30 透明 icon button，跟 distill 顶部 chipStyle 同款
 const chip: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
-  width: 34,
-  height: 34,
-  borderRadius: 9,
+  width: 30,
+  height: 30,
+  borderRadius: 8,
   border: "none",
   background: "transparent",
   color: "rgba(245,247,255,0.86)",
