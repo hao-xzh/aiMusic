@@ -30,9 +30,10 @@ import kotlin.math.sin
 /**
  * Service-side dual-deck AutoMix.
  *
- * The MediaSession player remains the only authoritative player. This helper only brings in a
- * silent secondary ExoPlayer for a short, high-confidence overlap, then hands playback back to the
- * main player at the same position in the next track.
+ * The MediaSession player remains the only authoritative player. During an AutoMix transition the
+ * main player advances into the full next track immediately, while a short-lived secondary deck only
+ * carries the outgoing tail. The next song is therefore never played once by the shadow deck and then
+ * replayed by the main deck.
  */
 @UnstableApi
 internal class SmartAutoMixer(
@@ -65,12 +66,10 @@ internal class SmartAutoMixer(
     fun onMainPlayerEvent() {
         val running = active
         if (running != null) {
-            if (running.handoffStartedAtMs != null && mainPlayerReadyForHandoff(running)) {
-                updateHandoff(running)
-            } else if (mainPlayer.playbackState == Player.STATE_ENDED) {
-                maybeBeginHandoff(running, trigger = "main-ended-event")
-            } else if (!mainPlayer.playWhenReady || mainPlayer.playbackState == Player.STATE_IDLE) {
+            if (!mainPlayer.playWhenReady || mainPlayer.playbackState == Player.STATE_IDLE) {
                 cancel("main-not-playing", keepMainVolume = true)
+            } else {
+                updateActiveMix(running)
             }
             if (shouldKeepTicking()) scheduleTick()
             return
@@ -88,15 +87,8 @@ internal class SmartAutoMixer(
     fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         val running = active
         if (running != null) {
-            if (running.handoffStartedAtMs != null) return
-            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
-                mediaItem?.mediaId == running.plan.nextId
-            ) {
-                // The main player has naturally advanced to B while the shadow deck is already
-                // playing B. Mute it immediately and snap it to the shadow position so the intro
-                // hook cannot leak twice before the handoff ramp begins.
-                mainPlayer.volume = 0f
-                maybeBeginHandoff(running, trigger = "auto-transition")
+            if (mediaItem?.mediaId == running.plan.nextId) {
+                updateActiveMix(running)
                 return
             }
             if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
@@ -152,7 +144,7 @@ internal class SmartAutoMixer(
         ) return
 
         val shadow = buildShadowPlayer()
-        shadow.setMediaItem(plan.nextItem, plan.nextStartPositionMs)
+        shadow.setMediaItem(plan.currentItem, plan.currentTailStartPositionMs)
         shadow.volume = 0f
         shadow.prepare()
         armed = ArmedMix(plan = plan, shadow = shadow)
@@ -165,6 +157,8 @@ internal class SmartAutoMixer(
                 "reason" to plan.reason,
                 "remainingMs" to remainingMs,
                 "prepareLeadMs" to prepareLeadMs,
+                "transitionMode" to "main-next-shadow-tail",
+                "currentTailStartPositionMs" to plan.currentTailStartPositionMs,
             ),
         )
     }
@@ -220,23 +214,48 @@ internal class SmartAutoMixer(
         }
         if (!tailSignalAllowsMix(waiting, remainingMs)) return
 
-        waiting.shadow.volume = 0f
-        waiting.shadow.play()
+        startMainNextMix(waiting, remainingMs)
+    }
+
+    private fun startMainNextMix(waiting: ArmedMix, remainingMs: Long) {
+        val plan = waiting.plan
+        val outgoingPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
         val startedAtMs = SystemClock.elapsedRealtime()
+        waiting.shadow.seekTo(outgoingPositionMs)
+        waiting.shadow.volume = 1f
+        waiting.shadow.play()
+
         active = ActiveMix(
             plan = plan,
             shadow = waiting.shadow,
             startedAtMs = startedAtMs,
         )
         armed = null
+
+        mainPlayer.volume = 0f
+        if (mainPlayer.currentMediaItem?.mediaId == plan.nextId) {
+            mainPlayer.seekTo(plan.nextStartPositionMs)
+        } else {
+            mainPlayer.seekTo(plan.nextIndex, plan.nextStartPositionMs)
+        }
+        if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
+            mainPlayer.prepare()
+        }
+        mainPlayer.play()
+
         Log.d(TAG, "started ${plan.currentTitle} -> ${plan.nextTitle}")
         logMixEvent(
             "started",
             plan,
             mapOf(
+                "transitionMode" to "main-next-shadow-tail",
                 "remainingMs" to remainingMs,
                 "tailDipTicks" to waiting.tailDipTicks,
-                "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
+                "outgoingPositionMs" to outgoingPositionMs,
+                "mainTargetIndex" to plan.nextIndex,
+                "mainTargetPositionMs" to plan.nextStartPositionMs,
+                "mainState" to playbackStateName(mainPlayer.playbackState),
+                "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
                 "shadowPositionMs" to waiting.shadow.currentPosition.coerceAtLeast(0L),
                 "shadowState" to playbackStateName(waiting.shadow.playbackState),
             ),
@@ -245,173 +264,85 @@ internal class SmartAutoMixer(
 
     private fun updateActiveMix(running: ActiveMix) {
         val plan = running.plan
-        if (running.handoffStartedAtMs != null) {
-            updateHandoff(running)
-            return
-        }
-        if (mainPlayer.playbackState == Player.STATE_ENDED) {
-            maybeBeginHandoff(running, trigger = "main-ended-tick")
-            return
-        }
-
         val currentId = mainPlayer.currentMediaItem?.mediaId
-        if (currentId != plan.currentId) {
-            if (currentId == plan.nextId) {
-                maybeBeginHandoff(running, trigger = "current-is-next")
-            } else {
-                cancel("active-current-changed", keepMainVolume = true)
-            }
-            return
-        }
-
-        val elapsed = SystemClock.elapsedRealtime() - running.startedAtMs
-        val p = (elapsed.toFloat() / plan.mixMs.toFloat()).coerceIn(0f, 1f)
-        val gains = equalPowerGains(p)
-        mainPlayer.volume = gains.current
-        running.shadow.volume = gains.next
-
-        val remaining = remainingMs() ?: 0L
-        if ((p >= 1f || remaining <= HANDOFF_REMAINING_MS) &&
-            shouldAbortLaggingShadow(running, elapsed, remaining)
-        ) {
-            logMixEvent(
-                "shadow_position_lag",
-                plan,
-                mapOf(
-                    "elapsedMs" to elapsed,
-                    "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
-                    "remainingMs" to remaining,
-                ),
-            )
-            cancel("shadow-position-lag", keepMainVolume = true)
-            return
-        }
-        if (p >= 1f || remaining <= HANDOFF_REMAINING_MS) {
-            maybeBeginHandoff(running, trigger = if (p >= 1f) "mix-complete" else "tail-threshold")
-        }
-    }
-
-    private fun shouldAbortLaggingShadow(running: ActiveMix, elapsedMs: Long, remainingMs: Long): Boolean {
-        if (remainingMs <= 0L) return false
-        if (elapsedMs < MIN_SHADOW_PROGRESS_CHECK_MS) return false
-        val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
-        return shadowPositionMs < MIN_SHADOW_HANDOFF_POSITION_MS &&
-            shadowPositionMs * 100L < elapsedMs * MIN_SHADOW_PROGRESS_PCT
-    }
-
-    private fun maybeBeginHandoff(running: ActiveMix, trigger: String): Boolean {
-        if (running.handoffStartedAtMs != null) return true
-        val plan = running.plan
-        val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
-        val minPositionMs = minSafeHandoffPositionMs(plan)
-        val mainAlreadyOnNext = mainPlayer.currentMediaItem?.mediaId == plan.nextId
-        if (shadowPositionMs < minPositionMs && !mainAlreadyOnNext) {
+        if (currentId != plan.nextId) {
             mainPlayer.volume = 0f
             running.shadow.volume = 1f
-            if (!running.handoffPositionWaitLogged) {
-                running.handoffPositionWaitLogged = true
+            if (!running.mainNextWaitLogged &&
+                SystemClock.elapsedRealtime() - running.startedAtMs >= MAIN_NEXT_WAIT_LOG_MS
+            ) {
+                running.mainNextWaitLogged = true
                 logMixEvent(
-                    "handoff_delayed_shadow_position",
+                    "main_next_waiting",
                     plan,
                     mapOf(
-                        "trigger" to trigger,
-                        "shadowPositionMs" to shadowPositionMs,
-                        "minPositionMs" to minPositionMs,
-                        "mainAlreadyOnNext" to mainAlreadyOnNext,
+                        "transitionMode" to "main-next-shadow-tail",
+                        "mainMediaId" to currentId,
                         "mainState" to playbackStateName(mainPlayer.playbackState),
+                        "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
+                        "elapsedMs" to (SystemClock.elapsedRealtime() - running.startedAtMs),
                     ),
                 )
             }
-            return false
+            return
         }
-        beginHandoff(running, trigger, shadowPositionMs)
-        return true
-    }
 
-    private fun minSafeHandoffPositionMs(plan: AutoMixPlan): Long {
-        val byMix = plan.mixMs - HANDOFF_POSITION_TOLERANCE_MS
-        return byMix.coerceIn(MIN_SAFE_HANDOFF_POSITION_MS, MAX_SAFE_HANDOFF_POSITION_MS)
-    }
-
-    private fun beginHandoff(running: ActiveMix, trigger: String, shadowPositionMs: Long) {
-        if (running.handoffStartedAtMs != null) return
-        val plan = running.plan
-        val targetPositionMs = shadowPositionMs
         val now = SystemClock.elapsedRealtime()
-        running.handoffStartedAtMs = now
-        running.handoffRequestedPositionMs = targetPositionMs
-        mainPlayer.volume = 0f
-        if (mainPlayer.currentMediaItem?.mediaId == plan.nextId) {
-            mainPlayer.seekTo(targetPositionMs)
-        } else {
-            mainPlayer.seekTo(plan.nextIndex, targetPositionMs)
-        }
-        if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
-            mainPlayer.prepare()
-        }
-        mainPlayer.play()
-        Log.d(TAG, "handoff ${plan.nextTitle} at ${shadowPositionMs}ms")
-        logMixEvent(
-            "handoff",
-            plan,
-            mapOf(
-                "shadowPositionMs" to shadowPositionMs,
-                "targetPositionMs" to targetPositionMs,
-                "minPositionMs" to minSafeHandoffPositionMs(plan),
-                "trigger" to trigger,
-                "mainState" to playbackStateName(mainPlayer.playbackState),
-                "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
-                "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
-                "elapsedMixMs" to (now - running.startedAtMs),
-                "remainingMs" to remainingMs(),
-            ),
-        )
-    }
-
-    private fun updateHandoff(running: ActiveMix) {
-        val started = running.handoffStartedAtMs ?: return
-        val now = SystemClock.elapsedRealtime()
-        if (!mainPlayerReadyForHandoff(running)) {
+        val mainReady = mainPlayer.playbackState == Player.STATE_READY && mainPlayer.playWhenReady
+        if (!mainReady) {
             mainPlayer.volume = 0f
             running.shadow.volume = 1f
-            if (now - started >= HANDOFF_RETRY_PREPARE_MS) {
-                if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
-                    mainPlayer.prepare()
-                }
-                mainPlayer.play()
-                if (!running.handoffWaitLogged) {
-                    running.handoffWaitLogged = true
-                    logMixEvent(
-                        "handoff_waiting_main",
-                        running.plan,
-                        mapOf(
-                            "mainState" to playbackStateName(mainPlayer.playbackState),
-                            "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
-                            "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
-                            "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
-                            "requestedPositionMs" to running.handoffRequestedPositionMs,
-                            "elapsedHandoffMs" to (now - started),
-                        ),
-                    )
-                }
+            if (!running.mainNextWaitLogged && now - running.startedAtMs >= MAIN_NEXT_WAIT_LOG_MS) {
+                running.mainNextWaitLogged = true
+                logMixEvent(
+                    "main_next_waiting",
+                    plan,
+                    mapOf(
+                        "transitionMode" to "main-next-shadow-tail",
+                        "mainState" to playbackStateName(mainPlayer.playbackState),
+                        "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
+                        "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
+                        "elapsedMs" to (now - running.startedAtMs),
+                    ),
+                )
             }
             return
         }
 
-        maybeCompleteHandoff(running, now)
+        if (running.fadeStartedAtMs == null) {
+            running.fadeStartedAtMs = now
+            if (!running.mainNextReadyLogged) {
+                running.mainNextReadyLogged = true
+                logMixEvent(
+                    "main_next_ready",
+                    plan,
+                    mapOf(
+                        "transitionMode" to "main-next-shadow-tail",
+                        "elapsedToReadyMs" to (now - running.startedAtMs),
+                        "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
+                        "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
+                        "shadowState" to playbackStateName(running.shadow.playbackState),
+                    ),
+                )
+            }
+        }
+
+        val fadeStartedAtMs = running.fadeStartedAtMs ?: now
+        val fadeElapsed = now - fadeStartedAtMs
+        val p = (fadeElapsed.toFloat() / plan.mixMs.toFloat()).coerceIn(0f, 1f)
+        val gains = equalPowerGains(p)
+        running.shadow.volume = gains.current
+        mainPlayer.volume = gains.next
+
+        if (p >= 1f || running.shadow.playbackState == Player.STATE_ENDED) {
+            completeMainNextMix(running, now, fadeElapsed)
+        }
     }
 
-    private fun mainPlayerReadyForHandoff(running: ActiveMix): Boolean {
-        return mainPlayer.currentMediaItem?.mediaId == running.plan.nextId &&
-            mainPlayer.playbackState == Player.STATE_READY &&
-            mainPlayer.playWhenReady
-    }
-
-    private fun maybeCompleteHandoff(running: ActiveMix, now: Long) {
+    private fun completeMainNextMix(running: ActiveMix, now: Long, fadeElapsedMs: Long) {
         val plan = running.plan
         val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
         val mainPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
-        val deltaMs = mainPositionMs - shadowPositionMs
         lastCompletedKey = plan.key
         lastCompletedAtMs = now
         cleanupShadow(running.shadow)
@@ -422,13 +353,13 @@ internal class SmartAutoMixer(
             "completed",
             plan,
             mapOf(
+                "transitionMode" to "main-next-shadow-tail",
                 "mainPositionMs" to mainPositionMs,
                 "shadowPositionMs" to shadowPositionMs,
-                "deltaMs" to deltaMs,
-                "requestedPositionMs" to running.handoffRequestedPositionMs,
-                "handoffMode" to "dual-deck-cutover",
-                "elapsedHandoffMs" to (now - (running.handoffStartedAtMs ?: now)),
-                "offsetOutsideTolerance" to (abs(deltaMs) > HANDOFF_CUTOVER_TOLERANCE_MS),
+                "elapsedToReadyMs" to ((running.fadeStartedAtMs ?: now) - running.startedAtMs),
+                "fadeElapsedMs" to fadeElapsedMs,
+                "continuityMode" to "main-next-continuous",
+                "offsetOutsideTolerance" to false,
             ),
         )
     }
@@ -454,9 +385,11 @@ internal class SmartAutoMixer(
             key = "${currentTrack.id}->${nextTrack.id}",
             currentId = currentTrack.id,
             nextId = nextTrack.id,
+            currentItem = currentItem,
             nextIndex = nextIndex,
-            nextItem = nextItem,
             nextStartPositionMs = 0L,
+            currentTailStartPositionMs = (currentDurationMs - mix.mixMs - CURRENT_TAIL_PREROLL_MS)
+                .coerceAtLeast(0L),
             currentTitle = currentTrack.title,
             nextTitle = nextTrack.title,
             mixMs = mix.mixMs,
@@ -781,9 +714,10 @@ internal class SmartAutoMixer(
         val key: String,
         val currentId: String,
         val nextId: String,
+        val currentItem: MediaItem,
         val nextIndex: Int,
-        val nextItem: MediaItem,
         val nextStartPositionMs: Long,
+        val currentTailStartPositionMs: Long,
         val currentTitle: String,
         val nextTitle: String,
         val mixMs: Long,
@@ -806,10 +740,9 @@ internal class SmartAutoMixer(
         val plan: AutoMixPlan,
         val shadow: ExoPlayer,
         val startedAtMs: Long,
-        var handoffStartedAtMs: Long? = null,
-        var handoffRequestedPositionMs: Long = 0L,
-        var handoffPositionWaitLogged: Boolean = false,
-        var handoffWaitLogged: Boolean = false,
+        var fadeStartedAtMs: Long? = null,
+        var mainNextReadyLogged: Boolean = false,
+        var mainNextWaitLogged: Boolean = false,
     )
 
     private companion object {
@@ -817,6 +750,8 @@ internal class SmartAutoMixer(
         private const val TICK_MS = 180L
         private const val SHORT_MIX_PREPARE_THRESHOLD_MS = 1_500L
         private const val TIGHT_MIX_PREPARE_THRESHOLD_MS = 2_300L
+        private const val CURRENT_TAIL_PREROLL_MS = 600L
+        private const val MAIN_NEXT_WAIT_LOG_MS = 700L
         private const val SHORT_MIX_PREPARE_LEAD_MS = 7_200L
         private const val TIGHT_MIX_PREPARE_LEAD_MS = 6_200L
         private const val SOFT_MIX_PREPARE_LEAD_MS = 5_200L
@@ -825,12 +760,6 @@ internal class SmartAutoMixer(
         private const val MIN_REMAINING_TO_ARM_MS = 1_200L
         private const val MIN_REMAINING_TO_START_MS = 750L
         private const val LATE_SHADOW_READY_TOLERANCE_MS = 260L
-        private const val HANDOFF_REMAINING_MS = 520L
-        private const val HANDOFF_POSITION_TOLERANCE_MS = 900L
-        private const val HANDOFF_CUTOVER_TOLERANCE_MS = 140L
-        private const val MIN_SAFE_HANDOFF_POSITION_MS = 650L
-        private const val MAX_SAFE_HANDOFF_POSITION_MS = 1_600L
-        private const val HANDOFF_RETRY_PREPARE_MS = 1_000L
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
         private const val MIN_TRACK_DURATION_S = 35.0
@@ -859,8 +788,5 @@ internal class SmartAutoMixer(
         private const val MAX_TAIL_AMP_THRESHOLD = 0.095f
         private const val REQUIRED_TAIL_DIP_TICKS = 2
         private const val TAIL_DIP_LAST_CHANCE_MS = 950L
-        private const val MIN_SHADOW_PROGRESS_CHECK_MS = 520L
-        private const val MIN_SHADOW_HANDOFF_POSITION_MS = 320L
-        private const val MIN_SHADOW_PROGRESS_PCT = 45L
     }
 }
