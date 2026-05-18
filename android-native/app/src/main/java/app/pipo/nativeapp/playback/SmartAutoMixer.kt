@@ -220,10 +220,11 @@ internal class SmartAutoMixer(
 
         waiting.shadow.volume = 0f
         waiting.shadow.play()
+        val startedAtMs = SystemClock.elapsedRealtime()
         active = ActiveMix(
             plan = plan,
             shadow = waiting.shadow,
-            startedAtMs = SystemClock.elapsedRealtime(),
+            startedAtMs = startedAtMs,
         )
         armed = null
         Log.d(TAG, "started ${plan.currentTitle} -> ${plan.nextTitle}")
@@ -233,6 +234,9 @@ internal class SmartAutoMixer(
             mapOf(
                 "remainingMs" to remainingMs,
                 "tailDipTicks" to waiting.tailDipTicks,
+                "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
+                "shadowPositionMs" to waiting.shadow.currentPosition.coerceAtLeast(0L),
+                "shadowState" to playbackStateName(waiting.shadow.playbackState),
             ),
         )
     }
@@ -328,13 +332,15 @@ internal class SmartAutoMixer(
     private fun beginHandoff(running: ActiveMix, trigger: String, shadowPositionMs: Long) {
         if (running.handoffStartedAtMs != null) return
         val plan = running.plan
-        running.handoffStartedAtMs = SystemClock.elapsedRealtime()
-        running.handoffRequestedPositionMs = shadowPositionMs
+        val targetPositionMs = shadowPositionMs
+        val now = SystemClock.elapsedRealtime()
+        running.handoffStartedAtMs = now
+        running.handoffRequestedPositionMs = targetPositionMs
         mainPlayer.volume = 0f
         if (mainPlayer.currentMediaItem?.mediaId == plan.nextId) {
-            mainPlayer.seekTo(shadowPositionMs)
+            mainPlayer.seekTo(targetPositionMs)
         } else {
-            mainPlayer.seekTo(plan.nextIndex, shadowPositionMs)
+            mainPlayer.seekTo(plan.nextIndex, targetPositionMs)
         }
         if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
             mainPlayer.prepare()
@@ -346,9 +352,14 @@ internal class SmartAutoMixer(
             plan,
             mapOf(
                 "shadowPositionMs" to shadowPositionMs,
-                "targetPositionMs" to shadowPositionMs,
+                "targetPositionMs" to targetPositionMs,
                 "trigger" to trigger,
                 "mainState" to playbackStateName(mainPlayer.playbackState),
+                "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
+                "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
+                "elapsedMixMs" to (now - running.startedAtMs),
+                "remainingMs" to remainingMs(),
+                "syncSeekDone" to running.handoffSyncSeekDone,
             ),
         )
     }
@@ -374,7 +385,12 @@ internal class SmartAutoMixer(
                         running.plan,
                         mapOf(
                             "mainState" to playbackStateName(mainPlayer.playbackState),
+                            "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
+                            "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
                             "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
+                            "requestedPositionMs" to running.handoffRequestedPositionMs,
+                            "elapsedHandoffMs" to (now - started),
+                            "syncSeekDone" to running.handoffSyncSeekDone,
                         ),
                     )
                 }
@@ -382,76 +398,56 @@ internal class SmartAutoMixer(
             return
         }
 
-        if (!ensureMainSyncedForHandoff(running, now)) return
-
-        val fadeStarted = running.handoffFadeStartedAtMs ?: now.also {
-            running.handoffFadeStartedAtMs = it
-        }
-        val p = ((now - fadeStarted).toFloat() / HANDOFF_FADE_MS.toFloat()).coerceIn(0f, 1f)
-        val smooth = smoothStep(p)
-        mainPlayer.volume = smooth
-        running.shadow.volume = 1f - smooth
-        if (p >= 1f) {
-            lastCompletedKey = running.plan.key
-            lastCompletedAtMs = now
-            cleanupShadow(running.shadow)
-            active = null
-            mainPlayer.volume = 1f
-            Log.d(TAG, "completed ${running.plan.currentTitle} -> ${running.plan.nextTitle}")
-            logMixEvent("completed", running.plan)
-        }
+        maybeCompleteHandoff(running, now)
     }
 
-    private fun ensureMainSyncedForHandoff(running: ActiveMix, now: Long): Boolean {
+    private fun maybeCompleteHandoff(running: ActiveMix, now: Long) {
         val plan = running.plan
         val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
         val mainPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
-        val lagMs = shadowPositionMs - mainPositionMs
-        if (lagMs > HANDOFF_POSITION_TOLERANCE_MS) {
-            val forced = running.handoffResyncCount >= MAX_HANDOFF_RESYNC_ATTEMPTS
-            val seekAheadMs = if (forced) HANDOFF_FORCED_SEEK_AHEAD_MS else HANDOFF_SYNC_SEEK_AHEAD_MS
-            val minSeekIntervalMs = if (forced) HANDOFF_FORCED_RESYNC_INTERVAL_MS else HANDOFF_RESYNC_INTERVAL_MS
-            if (now - running.handoffLastResyncAtMs >= minSeekIntervalMs) {
-                val targetPositionMs = shadowPositionMs + seekAheadMs
-                running.handoffResyncCount += 1
-                running.handoffLastResyncAtMs = now
-                running.handoffRequestedPositionMs = targetPositionMs
-                running.handoffFadeStartedAtMs = null
-                if (forced) running.handoffForcedSyncLogged = true
-                mainPlayer.volume = 0f
-                running.shadow.volume = 1f
-                mainPlayer.seekTo(targetPositionMs)
-                mainPlayer.play()
-                logMixEvent(
-                    if (forced) "handoff_sync_forced_seek" else "handoff_resync",
-                    plan,
-                    mapOf(
-                        "mainPositionMs" to mainPositionMs,
-                        "shadowPositionMs" to shadowPositionMs,
-                        "targetPositionMs" to targetPositionMs,
-                        "lagMs" to lagMs,
-                        "attempt" to running.handoffResyncCount,
-                    ),
-                )
-            }
-            return false
-        }
-
-        if (!running.handoffAlignedLogged) {
-            running.handoffAlignedLogged = true
+        val deltaMs = mainPositionMs - shadowPositionMs
+        if (abs(deltaMs) > HANDOFF_CUTOVER_TOLERANCE_MS && !running.handoffSyncSeekDone) {
+            val targetPositionMs = shadowPositionMs + HANDOFF_SYNC_LEAD_MS
+            running.handoffSyncSeekDone = true
+            running.handoffRequestedPositionMs = targetPositionMs
+            mainPlayer.volume = 0f
+            running.shadow.volume = 1f
+            mainPlayer.seekTo(targetPositionMs)
+            mainPlayer.play()
             logMixEvent(
-                "handoff_aligned",
+                "handoff_single_sync_seek",
                 plan,
                 mapOf(
                     "mainPositionMs" to mainPositionMs,
                     "shadowPositionMs" to shadowPositionMs,
-                    "deltaMs" to (mainPositionMs - shadowPositionMs),
-                    "requestedPositionMs" to running.handoffRequestedPositionMs,
-                    "resyncCount" to running.handoffResyncCount,
+                    "targetPositionMs" to targetPositionMs,
+                    "deltaMs" to deltaMs,
+                    "elapsedHandoffMs" to (now - (running.handoffStartedAtMs ?: now)),
+                    "syncSeekDone" to running.handoffSyncSeekDone,
                 ),
             )
+            return
         }
-        return true
+
+        lastCompletedKey = plan.key
+        lastCompletedAtMs = now
+        cleanupShadow(running.shadow)
+        active = null
+        mainPlayer.volume = 1f
+        Log.d(TAG, "completed ${plan.currentTitle} -> ${plan.nextTitle}")
+        logMixEvent(
+            "completed",
+            plan,
+            mapOf(
+                "mainPositionMs" to mainPositionMs,
+                "shadowPositionMs" to shadowPositionMs,
+                "deltaMs" to deltaMs,
+                "requestedPositionMs" to running.handoffRequestedPositionMs,
+                "handoffMode" to "dual-deck-cutover",
+                "elapsedHandoffMs" to (now - (running.handoffStartedAtMs ?: now)),
+                "syncSeekDone" to running.handoffSyncSeekDone,
+            ),
+        )
     }
 
     private fun buildPlan(): AutoMixPlan? {
@@ -700,11 +696,6 @@ internal class SmartAutoMixer(
         return Gains(current = current, next = next)
     }
 
-    private fun smoothStep(x: Float): Float {
-        val p = x.coerceIn(0f, 1f)
-        return p * p * (3f - 2f * p)
-    }
-
     private fun playbackStateName(state: Int): String = when (state) {
         Player.STATE_IDLE -> "idle"
         Player.STATE_BUFFERING -> "buffering"
@@ -750,14 +741,10 @@ internal class SmartAutoMixer(
         val shadow: ExoPlayer,
         val startedAtMs: Long,
         var handoffStartedAtMs: Long? = null,
-        var handoffFadeStartedAtMs: Long? = null,
         var handoffRequestedPositionMs: Long = 0L,
         var handoffPositionWaitLogged: Boolean = false,
         var handoffWaitLogged: Boolean = false,
-        var handoffAlignedLogged: Boolean = false,
-        var handoffForcedSyncLogged: Boolean = false,
-        var handoffLastResyncAtMs: Long = 0L,
-        var handoffResyncCount: Int = 0,
+        var handoffSyncSeekDone: Boolean = false,
     )
 
     private companion object {
@@ -775,14 +762,10 @@ internal class SmartAutoMixer(
         private const val LATE_SHADOW_READY_TOLERANCE_MS = 260L
         private const val HANDOFF_REMAINING_MS = 120L
         private const val HANDOFF_POSITION_TOLERANCE_MS = 180L
-        private const val HANDOFF_SYNC_SEEK_AHEAD_MS = 220L
-        private const val HANDOFF_FORCED_SEEK_AHEAD_MS = 520L
-        private const val HANDOFF_RESYNC_INTERVAL_MS = 360L
-        private const val HANDOFF_FORCED_RESYNC_INTERVAL_MS = 520L
-        private const val MAX_HANDOFF_RESYNC_ATTEMPTS = 3
+        private const val HANDOFF_SYNC_LEAD_MS = 420L
+        private const val HANDOFF_CUTOVER_TOLERANCE_MS = 140L
         private const val MIN_SAFE_HANDOFF_POSITION_MS = 900L
         private const val MAX_SAFE_HANDOFF_POSITION_MS = 2_400L
-        private const val HANDOFF_FADE_MS = 520L
         private const val HANDOFF_RETRY_PREPARE_MS = 1_000L
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
