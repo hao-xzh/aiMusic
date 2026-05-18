@@ -77,6 +77,9 @@ fun PlayerScreen(
     onOpenDistill: () -> Unit,
     onOpenSettings: () -> Unit,
     immersiveActive: Boolean,
+    showTranslation: Boolean,
+    hasTranslation: Boolean,
+    onToggleTranslation: () -> Unit,
     viewModel: PlayerViewModel = viewModel(),
 ) {
     val state = viewModel.state
@@ -152,8 +155,11 @@ fun PlayerScreen(
                 isPlaying = state.isPlaying,
                 isLoading = state.isLoading,
                 controlsEnabled = state.queue.isNotEmpty(),
+                showTranslation = showTranslation,
+                hasTranslation = hasTranslation,
                 onToggle = viewModel::toggle,
                 onNext = viewModel::next,
+                onToggleTranslation = onToggleTranslation,
                 onSeek = viewModel::seekTo,
                 onSeekToMs = viewModel::seekToMs,
             )

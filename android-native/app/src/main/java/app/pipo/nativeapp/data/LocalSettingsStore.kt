@@ -21,6 +21,7 @@ class LocalSettingsStore(context: Context) {
         prefs.edit()
             .putBoolean(KEY_HIDE_DOTS, next.hideDotPattern)
             .putBoolean(KEY_HIDE_AI_PET_ORB, next.hideAiPetOrb)
+            .putBoolean(KEY_LYRIC_TRANSLATION, next.lyricTranslation)
             .putBoolean(KEY_SMART_SESSION_PLANNER, next.smartSessionPlanner)
             .putBoolean(KEY_WORKDAY_AUTOPLAY, next.workdayAutoplay)
             .putBoolean(KEY_LUNCH_RELAX, next.lunchRelaxMode)
@@ -37,6 +38,7 @@ class LocalSettingsStore(context: Context) {
         return NativeSettings(
             hideDotPattern = prefs.getBoolean(KEY_HIDE_DOTS, false),
             hideAiPetOrb = prefs.getBoolean(KEY_HIDE_AI_PET_ORB, true),
+            lyricTranslation = prefs.getBoolean(KEY_LYRIC_TRANSLATION, false),
             smartSessionPlanner = prefs.getBoolean(KEY_SMART_SESSION_PLANNER, true),
             workdayAutoplay = prefs.getBoolean(KEY_WORKDAY_AUTOPLAY, true),
             lunchRelaxMode = prefs.getBoolean(KEY_LUNCH_RELAX, false),
@@ -52,6 +54,7 @@ class LocalSettingsStore(context: Context) {
     private companion object {
         const val KEY_HIDE_DOTS = "hide-dot-pattern"
         const val KEY_HIDE_AI_PET_ORB = "hide-ai-pet-orb"
+        const val KEY_LYRIC_TRANSLATION = "lyric-translation"
         const val KEY_SMART_SESSION_PLANNER = "smart-session-planner"
         const val KEY_WORKDAY_AUTOPLAY = "workday-autoplay"
         const val KEY_LUNCH_RELAX = "lunch-relax-mode"

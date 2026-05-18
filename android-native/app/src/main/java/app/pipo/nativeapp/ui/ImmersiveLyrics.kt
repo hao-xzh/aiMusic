@@ -80,6 +80,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
+import app.pipo.nativeapp.data.PipoLyricRole
 import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.progress
 import kotlinx.coroutines.delay
@@ -177,9 +178,12 @@ fun ImmersiveLyricsOverlay(
     activeLyricIndex: Int,
     positionMs: Long,
     isPlaying: Boolean,
+    showTranslation: Boolean,
+    hasTranslation: Boolean,
     onClose: () -> Unit,
     onToggle: () -> Unit,
     onNext: () -> Unit,
+    onToggleTranslation: () -> Unit,
     onSeekToMs: (Long) -> Unit,
 ) {
     if (progress <= 0.001f) return
@@ -240,7 +244,11 @@ fun ImmersiveLyricsOverlay(
                 .padding(top = titleTopPadding, start = 24.dp, end = 24.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(modifier = Modifier.padding(end = 12.dp).fillMaxWidth(0.7f)) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 12.dp),
+            ) {
                 Text(
                     text = title.ifBlank { "—" },
                     color = fg,
@@ -264,14 +272,25 @@ fun ImmersiveLyricsOverlay(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Spacer(modifier = Modifier.weight(1f))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (hasTranslation) {
+                    ImmersiveIconButton(
+                        onClick = onToggleTranslation,
+                        active = showTranslation,
+                        activeColor = fg,
+                    ) {
+                        TranslateGlyph(
+                            color = if (showTranslation) fg else fgDim,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                }
                 ImmersiveIconButton(onClick = onToggle) {
-                    if (isPlaying) PauseGlyph(color = fg, modifier = Modifier.size(22.dp))
-                    else PlayGlyph(color = fg, modifier = Modifier.size(22.dp))
+                    if (isPlaying) PauseGlyph(color = fg, modifier = Modifier.size(24.dp))
+                    else PlayGlyph(color = fg, modifier = Modifier.size(24.dp))
                 }
                 ImmersiveIconButton(onClick = onNext) {
-                    SkipForwardGlyph(color = fg, modifier = Modifier.size(22.dp))
+                    SkipForwardGlyph(color = fg, modifier = Modifier.size(25.dp))
                 }
             }
         }
@@ -286,6 +305,7 @@ fun ImmersiveLyricsOverlay(
             fg = fg,
             fgDim = fgDim,
             fgUnsung = fgUnsung,
+            showTranslation = showTranslation,
             onSeekToMs = onSeekToMs,
             modifier = Modifier
                 .fillMaxSize()
@@ -299,11 +319,17 @@ fun ImmersiveLyricsOverlay(
 // 的"色彩云"做法，没有 blurred image 这第二层贴图，跟 Apple Music 的视觉一致。
 
 @Composable
-private fun ImmersiveIconButton(onClick: () -> Unit, content: @Composable () -> Unit) {
+private fun ImmersiveIconButton(
+    onClick: () -> Unit,
+    active: Boolean = false,
+    activeColor: Color = Color.Transparent,
+    content: @Composable () -> Unit,
+) {
     Box(
         modifier = Modifier
-            .size(38.dp)
+            .size(42.dp)
             .clip(RoundedCornerShape(50))
+            .background(if (active) activeColor.copy(alpha = 0.13f) else Color.Transparent)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -419,6 +445,7 @@ internal fun AppleMusicLyricColumn(
     fg: Color,
     fgDim: Color,
     fgUnsung: Color,
+    showTranslation: Boolean = false,
     onSeekToMs: (Long) -> Unit,
     modifier: Modifier = Modifier,
     horizontalPadding: Dp = 24.dp,
@@ -689,7 +716,9 @@ internal fun AppleMusicLyricColumn(
                             smoothedPositionMs
                         },
                         fg = fg,
+                        fgDim = fgDim,
                         fgUnsung = fgUnsung,
+                        showTranslation = showTranslation,
                         fontSize = lyricFontSize,
                         lineHeight = lyricLineHeight,
                         fontWeight = lyricFontWeight,
@@ -706,11 +735,12 @@ private fun lyricLineRenderKey(index: Int, line: PipoLyricLine): String {
 }
 
 private fun completedLinePositionMs(line: PipoLyricLine): Long {
-    val charEnd = (line.chars + line.companionLines.flatMap { it.chars })
+    val timedCompanions = line.timedCompanionLines()
+    val charEnd = (line.chars + timedCompanions.flatMap { it.chars })
         .maxOfOrNull { it.startMs + it.durationMs }
     val lineEnd = maxOf(
         line.startMs + line.durationMs,
-        line.companionLines.maxOfOrNull { it.startMs + it.durationMs } ?: line.startMs,
+        timedCompanions.maxOfOrNull { it.startMs + it.durationMs } ?: line.startMs,
     )
     return maxOf(charEnd ?: lineEnd, lineEnd, line.startMs + 1L)
 }
@@ -723,7 +753,9 @@ private fun AppleMusicLyricRow(
     distance: Int,
     positionMs: Long,
     fg: Color,
+    fgDim: Color,
     fgUnsung: Color,
+    showTranslation: Boolean,
     fontSize: TextUnit,
     lineHeight: TextUnit,
     fontWeight: FontWeight,
@@ -745,7 +777,9 @@ private fun AppleMusicLyricRow(
     val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
     val lineAudioStartMs = remember(line.startMs, line.chars) { LyricTiming.audioStartMs(line) }
     val shouldSnapActiveEffects = isActive && positionMs - lineAudioStartMs > LYRIC_ACTIVE_ENTRY_SNAP_MS
-    val hasCompanionCue = line.companionLines.any {
+    val timedCompanions = line.timedCompanionLines()
+    val translationLines = if (showTranslation) line.translationLines() else emptyList()
+    val hasCompanionCue = timedCompanions.any {
         shouldRenderCompanionLyric(it, positionMs) && !isCompanionLyricPast(it, positionMs)
     }
     // 行级焦点过渡：整行作为单一图层平滑进入焦点。
@@ -869,7 +903,7 @@ private fun AppleMusicLyricRow(
                 fontWeight = fontWeight,
                 liftEnvelope = liftEnvelope,
             )
-            line.companionLines.forEach { companion ->
+            timedCompanions.forEach { companion ->
                 if (shouldRenderCompanionLyric(companion, positionMs)) {
                     val companionActive = isCompanionLyricActive(companion, positionMs)
                     AppleMusicLyricText(
@@ -886,6 +920,20 @@ private fun AppleMusicLyricRow(
                     )
                 }
             }
+            translationLines.forEach { translation ->
+                AppleMusicTranslationText(
+                    line = translation,
+                    isActive = isActive,
+                    color = translationLyricColor(
+                        isActive = isActive,
+                        isPast = isPast,
+                        fg = fg,
+                        fgDim = fgDim,
+                    ),
+                    fontSize = fontSize * 0.64f,
+                    lineHeight = lineHeight * 0.66f,
+                )
+            }
         }
     }
 }
@@ -898,7 +946,7 @@ private fun shouldRenderCompanionLyric(
 }
 
 private fun hasVisibleCompanionLyric(line: PipoLyricLine, positionMs: Long): Boolean {
-    return line.companionLines.any { companion ->
+    return line.timedCompanionLines().any { companion ->
         shouldRenderCompanionLyric(companion, positionMs) && !isCompanionLyricPast(companion, positionMs)
     }
 }
@@ -914,6 +962,55 @@ private fun isCompanionLyricPast(line: PipoLyricLine, positionMs: Long): Boolean
 private fun companionLyricEndMs(line: PipoLyricLine): Long {
     val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs }
     return maxOf(charEnd ?: line.startMs, line.startMs + line.durationMs)
+}
+
+private fun PipoLyricLine.timedCompanionLines(): List<PipoLyricLine> {
+    return companionLines.filter { it.role != PipoLyricRole.Translation }
+}
+
+private fun PipoLyricLine.translationLines(): List<PipoLyricLine> {
+    return companionLines.filter { it.role == PipoLyricRole.Translation }
+}
+
+private fun translationLyricColor(
+    isActive: Boolean,
+    isPast: Boolean,
+    fg: Color,
+    fgDim: Color,
+): Color {
+    return when {
+        isActive -> lerp(fgDim, fg, 0.36f).copy(alpha = 0.78f)
+        isPast -> fgDim.copy(alpha = 0.70f)
+        else -> fgDim.copy(alpha = 0.74f)
+    }
+}
+
+@Composable
+private fun AppleMusicTranslationText(
+    line: PipoLyricLine,
+    isActive: Boolean,
+    color: Color,
+    fontSize: TextUnit,
+    lineHeight: TextUnit,
+) {
+    Text(
+        text = line.text,
+        color = color,
+        style = TextStyle(
+            fontSize = fontSize,
+            fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
+            lineHeight = lineHeight,
+            lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
+                alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
+                trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
+            ),
+            platformStyle = androidx.compose.ui.text.PlatformTextStyle(
+                includeFontPadding = false,
+            ),
+        ),
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+    )
 }
 
 @Composable

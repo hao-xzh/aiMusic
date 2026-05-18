@@ -119,6 +119,7 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
         val companions = attached[idx]
             .sortedBy { audioStartMs(it) }
             .take(MAX_COMPANION_LYRIC_LINES)
+            .map { it.copy(role = PipoLyricRole.Companion) }
         if (companions.isEmpty()) line else line.copy(companionLines = line.companionLines + companions)
     } + orphans).sortedBy { it.startMs }
 }

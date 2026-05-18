@@ -60,8 +60,11 @@ internal fun LandscapePlayerLyricsScreen(
     isPlaying: Boolean,
     isLoading: Boolean,
     controlsEnabled: Boolean,
+    showTranslation: Boolean,
+    hasTranslation: Boolean,
     onToggle: () -> Unit,
     onNext: () -> Unit,
+    onToggleTranslation: () -> Unit,
     onSeek: (Float) -> Unit,
     onSeekToMs: (Long) -> Unit,
 ) {
@@ -104,6 +107,9 @@ internal fun LandscapePlayerLyricsScreen(
                         album = album,
                         fg = fg,
                         fgDim = fgDim,
+                        showTranslation = showTranslation,
+                        hasTranslation = hasTranslation,
+                        onToggleTranslation = onToggleTranslation,
                     )
 
                     Spacer(modifier = Modifier.height(8.dp))
@@ -116,6 +122,7 @@ internal fun LandscapePlayerLyricsScreen(
                         fg = fg,
                         fgDim = fgDim,
                         fgUnsung = fgUnsung,
+                        showTranslation = showTranslation,
                         onSeekToMs = onSeekToMs,
                         horizontalPadding = 0.dp,
                         rowMinHeight = 52.dp,
@@ -269,34 +276,57 @@ private fun LandscapeTrackHeader(
     album: String,
     fg: Color,
     fgDim: Color,
+    showTranslation: Boolean,
+    hasTranslation: Boolean,
+    onToggleTranslation: () -> Unit,
 ) {
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 48.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = title.ifBlank { "—" },
-            color = fg,
-            style = TextStyle(
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = (-0.2).sp,
-            ),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = buildString {
-                append(artist)
-                if (album.isNotBlank()) append(" · $album")
-            }.ifBlank { " " },
-            color = fgDim,
-            style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 12.dp),
+        ) {
+            Text(
+                text = title.ifBlank { "—" },
+                color = fg,
+                style = TextStyle(
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = (-0.2).sp,
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = buildString {
+                    append(artist)
+                    if (album.isNotBlank()) append(" · $album")
+                }.ifBlank { " " },
+                color = fgDim,
+                style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (hasTranslation) {
+            LandscapeRoundButton(
+                enabled = true,
+                active = showTranslation,
+                activeColor = fg,
+                onClick = onToggleTranslation,
+            ) {
+                TranslateGlyph(
+                    color = if (showTranslation) fg else fgDim,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
     }
 }
 
@@ -355,6 +385,8 @@ private fun LandscapeBottomControls(
 @Composable
 private fun LandscapeRoundButton(
     enabled: Boolean,
+    active: Boolean = false,
+    activeColor: Color = Color.Transparent,
     onClick: () -> Unit,
     content: @Composable () -> Unit,
 ) {
@@ -362,6 +394,7 @@ private fun LandscapeRoundButton(
         modifier = Modifier
             .size(38.dp)
             .clip(CircleShape)
+            .background(if (active) activeColor.copy(alpha = 0.13f) else Color.Transparent)
             .clickable(
                 enabled = enabled,
                 interactionSource = remember { MutableInteractionSource() },

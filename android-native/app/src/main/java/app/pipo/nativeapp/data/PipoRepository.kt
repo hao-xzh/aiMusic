@@ -96,6 +96,12 @@ enum class PipoLyricTiming {
     Word,
 }
 
+enum class PipoLyricRole {
+    Primary,
+    Companion,
+    Translation,
+}
+
 data class PipoLyricLine(
     val startMs: Long,
     val durationMs: Long,
@@ -103,6 +109,7 @@ data class PipoLyricLine(
     val chars: List<PipoLyricChar> = emptyList(),
     val timing: PipoLyricTiming = if (chars.isEmpty()) PipoLyricTiming.Line else PipoLyricTiming.Word,
     val companionLines: List<PipoLyricLine> = emptyList(),
+    val role: PipoLyricRole = PipoLyricRole.Primary,
 )
 
 data class PipoLyricChar(
@@ -121,6 +128,7 @@ data class DistillState(
 data class NativeSettings(
     val hideDotPattern: Boolean = false,
     val hideAiPetOrb: Boolean = true,
+    val lyricTranslation: Boolean = false,
     val smartSessionPlanner: Boolean = true,
     val workdayAutoplay: Boolean = true,
     val lunchRelaxMode: Boolean = false,

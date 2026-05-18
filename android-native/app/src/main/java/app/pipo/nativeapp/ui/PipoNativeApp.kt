@@ -38,6 +38,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +64,7 @@ import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.NativeTrack
+import app.pipo.nativeapp.data.PipoLyricRole
 import app.pipo.nativeapp.data.PetAgent
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.Weather
@@ -70,6 +72,7 @@ import app.pipo.nativeapp.playback.PlayerUiState
 import app.pipo.nativeapp.playback.PlayerViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Calendar
 
 /**
@@ -103,10 +106,30 @@ fun PipoNativeApp() {
         var smartSessionTrigger by remember { mutableStateOf<String?>(null) }
         var smartSessionCanReplace by remember { mutableStateOf(false) }
         var smartSessionAutoPlay by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
+        val showLyricTranslation = settings.lyricTranslation
+        val toggleLyricTranslation: () -> Unit = {
+            val enabled = !settings.lyricTranslation
+            DiagnosticsLogStore.record(
+                area = "lyrics",
+                event = "translation_toggle",
+                fields = mapOf("enabled" to enabled),
+            )
+            scope.launch {
+                PipoGraph.repository.updateSettings(settings.copy(lyricTranslation = enabled))
+            }
+        }
         val coverAnchor = rememberCoverAnchorState()
         val configuration = LocalConfiguration.current
         val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
             configuration.screenWidthDp > configuration.screenHeightDp
+        val hasLyricTranslation by remember(playerState.lyrics) {
+            derivedStateOf {
+                playerState.lyrics.any { line ->
+                    line.companionLines.any { it.role == PipoLyricRole.Translation }
+                }
+            }
+        }
 
         // 600ms FlipEase 入 / 540ms CloseEase 出，驱动整个沉浸式过渡
         val coverProgress by animateFloatAsState(
@@ -261,6 +284,9 @@ fun PipoNativeApp() {
                     onOpenDistill = { route = Route.Distill },
                     onOpenSettings = { route = Route.Settings },
                     immersiveActive = coverInTransition,
+                    showTranslation = showLyricTranslation && hasLyricTranslation,
+                    hasTranslation = hasLyricTranslation,
+                    onToggleTranslation = toggleLyricTranslation,
                     viewModel = viewModel,
                 )
 
@@ -298,9 +324,12 @@ fun PipoNativeApp() {
                         activeLyricIndex = lyricClock.activeIndex,
                         positionMs = lyricClock.positionMs,
                         isPlaying = viewModel.state.isPlaying,
+                        showTranslation = showLyricTranslation && hasLyricTranslation,
+                        hasTranslation = hasLyricTranslation,
                         onClose = { immersive = false },
                         onToggle = viewModel::toggle,
                         onNext = viewModel::next,
+                        onToggleTranslation = toggleLyricTranslation,
                         onSeekToMs = { targetMs ->
                             viewModel.seekToMs(targetMs)
                         },

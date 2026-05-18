@@ -1,6 +1,8 @@
 package app.pipo.nativeapp.ui
 
 import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -476,6 +478,14 @@ fun LyricsIcon(
     modifier: Modifier = Modifier.size(20.dp),
 ) {
     Icon(imageVector = LyricsIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun TranslateGlyph(
+    color: Color = Color(0xD1F5F7FF),
+    modifier: Modifier = Modifier.size(20.dp),
+) {
+    Icon(imageVector = Icons.Rounded.Translate, contentDescription = null, tint = color, modifier = modifier)
 }
 
 @Composable

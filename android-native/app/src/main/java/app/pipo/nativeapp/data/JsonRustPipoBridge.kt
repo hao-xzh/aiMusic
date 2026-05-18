@@ -139,12 +139,15 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
 
     override suspend fun neteaseSongLyric(trackId: String): List<PipoLyricLine> {
         val raw = callObject("netease_song_lyric", jsonObject("id" to trackId.toLongOrNull()))
+        val translations = raw.optStringOrNull("translation")
+            ?.let { LrcParser.parse(it) }
+            .orEmpty()
         raw.optStringOrNull("yrc")?.let { yrc ->
             val parsed = YrcParser.parse(yrc)
-            if (parsed.isNotEmpty()) return parsed
+            if (parsed.isNotEmpty()) return attachTranslationLines(parsed, translations)
         }
         val lrc = raw.optStringOrNull("lyric") ?: return emptyList()
-        return LrcParser.parse(lrc)
+        return attachTranslationLines(LrcParser.parse(lrc), translations)
     }
 
     override suspend fun audioCacheClear() {
@@ -353,6 +356,76 @@ private object LrcParser {
         }
     }
 }
+
+private fun attachTranslationLines(
+    primaryLines: List<PipoLyricLine>,
+    translationLines: List<PipoLyricLine>,
+): List<PipoLyricLine> {
+    if (primaryLines.isEmpty() || translationLines.isEmpty()) return primaryLines
+    val attached = List(primaryLines.size) { mutableListOf<PipoLyricLine>() }
+    translationLines
+        .asSequence()
+        .filter { it.text.isNotBlank() }
+        .forEach { translation ->
+            val hostIndex = findTranslationHostIndex(translation, primaryLines)
+            if (hostIndex >= 0) {
+                val normalizedTranslation = translation.copy(
+                    text = translation.text.trim(),
+                    chars = emptyList(),
+                    timing = PipoLyricTiming.Line,
+                    companionLines = emptyList(),
+                    role = PipoLyricRole.Translation,
+                )
+                if (attached[hostIndex].none { it.text == normalizedTranslation.text }) {
+                    attached[hostIndex].add(normalizedTranslation)
+                }
+            }
+        }
+
+    return primaryLines.mapIndexed { index, line ->
+        val translations = attached[index].take(MAX_TRANSLATION_LINES_PER_PRIMARY)
+        if (translations.isEmpty()) line else line.copy(companionLines = line.companionLines + translations)
+    }
+}
+
+private fun findTranslationHostIndex(
+    translation: PipoLyricLine,
+    primaryLines: List<PipoLyricLine>,
+): Int {
+    val translationStart = translation.startMs
+    var bestIndex = -1
+    var bestScore = Long.MIN_VALUE
+    primaryLines.forEachIndexed { index, primary ->
+        val primaryStart = lyricAudioStartMs(primary)
+        val nextPrimaryStart = primaryLines.getOrNull(index + 1)?.let(::lyricAudioStartMs)
+        val primaryEnd = nextPrimaryStart ?: (primaryStart + primary.durationMs.coerceAtLeast(1_200L))
+        val inHostWindow = translationStart >= primaryStart - TRANSLATION_HOST_LEAD_MS &&
+            translationStart < primaryEnd + TRANSLATION_HOST_TAIL_MS
+        val startDistance = kotlin.math.abs(translationStart - primaryStart)
+        if (!inHostWindow && startDistance > TRANSLATION_MAX_START_DISTANCE_MS) return@forEachIndexed
+
+        val score = if (inHostWindow) {
+            TRANSLATION_HOST_WINDOW_SCORE - startDistance
+        } else {
+            -startDistance
+        }
+        if (score > bestScore) {
+            bestScore = score
+            bestIndex = index
+        }
+    }
+    return bestIndex
+}
+
+private fun lyricAudioStartMs(line: PipoLyricLine): Long {
+    return line.chars.firstOrNull()?.startMs ?: line.startMs
+}
+
+private const val MAX_TRANSLATION_LINES_PER_PRIMARY = 1
+private const val TRANSLATION_HOST_LEAD_MS = 700L
+private const val TRANSLATION_HOST_TAIL_MS = 350L
+private const val TRANSLATION_MAX_START_DISTANCE_MS = 1_650L
+private const val TRANSLATION_HOST_WINDOW_SCORE = 10_000L
 
 private fun jsonObject(vararg pairs: Pair<String, Any?>): JSONObject {
     val o = JSONObject()
