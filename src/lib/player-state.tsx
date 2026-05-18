@@ -753,7 +753,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         eqDuck: transition.eqDuck,
         reason: plan.reason,
       });
-
       sched.scheduleNext({
         trackId: nxt.neteaseId,
         buffer: decoded.buffer,

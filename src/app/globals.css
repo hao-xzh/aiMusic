@@ -88,6 +88,80 @@ button, a, [role="button"], [tabindex] {
   to   { opacity: 1; }
 }
 
+/* 封面上的 AI 短提示：只保留 logo + 一句话，自动出现 / 消失。
+   它是播放体验的一层轻微呼吸，不是聊天框。 */
+.claudio-cover-ai-caption {
+  position: absolute;
+  left: clamp(12px, 4vw, 18px);
+  right: clamp(12px, 4vw, 18px);
+  top: clamp(12px, 4vw, 18px);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 10px 7px 8px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(10, 12, 18, 0.58), rgba(10, 12, 18, 0.36));
+  border: 1px solid rgba(255,255,255,0.10);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  backdrop-filter: blur(22px) saturate(150%);
+  color: rgba(248, 250, 255, 0.94);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    0 18px 44px rgba(0,0,0,0.28);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-8px) scale(0.985);
+  filter: blur(3px);
+  transition:
+    opacity 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    filter 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.claudio-cover-ai-caption.is-visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+  animation: coverAiCaptionSettle 560ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.claudio-cover-ai-caption__logo {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  overflow: hidden;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.38),
+    0 2px 8px rgba(0,0,0,0.32);
+}
+
+.claudio-cover-ai-caption__logo img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.claudio-cover-ai-caption__text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: clamp(11px, 2.8vw, 13px);
+  line-height: 1.2;
+  letter-spacing: 0;
+  font-weight: 520;
+}
+
+@keyframes coverAiCaptionSettle {
+  0% { opacity: 0; transform: translateY(-9px) scale(0.975); filter: blur(4px); }
+  58% { opacity: 1; transform: translateY(1px) scale(1.005); filter: blur(0); }
+  100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+
 /* 正在播放指示器（三条 bar 跳动）—— alternate + ease-in-out 让弹性更"音乐"，
    不是机械的方波。每根 bar 加 stagger 延迟，错峰跳动而非整体上下。 */
 @keyframes playingBar {

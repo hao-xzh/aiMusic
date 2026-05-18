@@ -273,7 +273,7 @@ function pickAudioBase(): string {
 
 // ---------- 本地缓存 ----------
 //
-// 为什么要这个：
+// 本地缓存用途：
 //   用户歌单几十张、每张几百首，每次进 /distill 都重新拉 weapi = 又慢又浪费。
 //   Rust 侧用 SQLite（bundled）落盘。TS 侧走 SWR：先 `cache.*` 给界面灌显示，
 //   再异步 `netease.*` 拉最新，对比 `updateTime` 变了才 upsert + 重绘。

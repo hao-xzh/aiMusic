@@ -103,7 +103,7 @@ export const MusicIntentSchema = z.object({
    *   - chat：纯聊天，不要切歌
    *   - play：要听歌（可能是泛泛"放点东西"，也可能是点名某首）
    */
-  action: z.enum(["chat", "play", "recommend", "continue", "avoid", "adjust_queue", "explain"]),
+  action: z.enum(["chat", "play", "recommend", "continue", "avoid", "adjust_queue"]),
   queryText: z.string().default(""),
   textHints: TextHintsSchema.default({
     artists: [],
@@ -128,8 +128,8 @@ export const MusicIntentSchema = z.object({
   desiredCount: z.number().int().min(1).max(60).default(30),
   /**
    * Claudio 自己说的一句话 —— 永远要有，无论 action 是 chat 还是 play。
-   * 这句是用户在 UI 上看到的回复。要有人格、幽默抽象、贴当下的语境。
-   * 不要客服腔、不要鸡汤、不要解释"我为什么放这些"。
+   * 这段是用户在 UI 上看到的回复。要有人格、幽默抽象、贴当下的语境。
+   * 不要客服腔、不要鸡汤、不要解释选歌原因。
    * 例：「打工是吧。来点能把电量充满的。」「老天爷在哭。我换情绪。」「行，点火。」
    */
   reply: z.string().min(1).max(80).default("嗯。"),
@@ -217,8 +217,8 @@ function offlineFallbackIntent(
 ): MusicIntent {
   const reply =
     action === "play"
-      ? "AI 没回来，先按本地排了。" // play 还能继续，告诉一声
-      : "我这边断线了，再说一次？"; // chat 没 AI 就是哑的，承认就行
+      ? "先排了。"
+      : "断线了。";
   return MusicIntentSchema.parse({ action, queryText, reply });
 }
 
@@ -250,7 +250,7 @@ function looksLikeImperativePlay(text: string): boolean {
  * 这样每次调用 system 部分前缀完全相同 → DeepSeek 自动 prompt cache 命中，
  * 缓存命中后 input 价格降到 1/10，延迟也明显下降。
  *
- * USER 部分只放真正变化的：用户这句话 + 时段 + 在播曲目 + 最近对话。
+ * USER 部分只放真正变化的：用户输入 + 时段 + 在播曲目 + 最近对话。
  * 旧版把 1.5k 字示例都拼在 user 里，每次重新计费、缓存永远失效，又慢又贵。
  */
 const SYSTEM_PROMPT = `你是 Claudio —— 一只幽默抽象的音乐宠物。你既会接话，也会顺手放歌；这两件事不是互斥的。

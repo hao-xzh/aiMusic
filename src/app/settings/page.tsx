@@ -61,31 +61,31 @@ export default function SettingsPage() {
           width: "100%",
         }}
       >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "center",
-          marginTop: "clamp(12px, 3vh, 24px)",
-          marginBottom: 6,
-        }}
-      >
-        <DotText text="设置" fontSize={48} grid={4} dotRadius={1.6} />
-      </div>
-      <div style={subtitle}>
-        Pipo 把你的账号、播放规则、AI 口吻都攒在本地。
-      </div>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "center",
+            marginTop: "clamp(12px, 3vh, 24px)",
+            marginBottom: 6,
+          }}
+        >
+          <DotText text="设置" fontSize={48} grid={4} dotRadius={1.6} />
+        </div>
+        <div style={subtitle}>
+          Pipo 把你的账号、播放规则、AI 口吻都攒在本地。
+        </div>
 
-      <Section title="音乐来源" label="SOURCE">
-        <NeteaseRow me={me} err={err} />
-      </Section>
+        <Section title="音乐来源" label="SOURCE">
+          <NeteaseRow me={me} err={err} />
+        </Section>
 
-      <Section title="整库声学分析" subtitle="接歌丝滑度" label="ANALYSIS">
-        <AnalysisRow />
-      </Section>
+        <Section title="整库声学分析" subtitle="接歌丝滑度" label="ANALYSIS">
+          <AnalysisRow />
+        </Section>
 
-      <Section title="音频缓存" subtitle="原始字节" label="CACHE">
-        <AudioCacheRow />
-      </Section>
+        <Section title="音频缓存" subtitle="原始字节" label="CACHE">
+          <AudioCacheRow />
+        </Section>
 
       <Section title="外观" label="LOOK">
         <Toggle
@@ -94,13 +94,43 @@ export default function SettingsPage() {
           value={appSettings.hideDotPattern}
           onChange={(v) => updateAppSettings({ hideDotPattern: v })}
         />
+        <Toggle
+          label="隐藏 AI 圆球"
+          desc="不显示右下角圆球和绳子，只在封面上冒一句"
+          value={appSettings.hideAiPetOrb}
+          onChange={(v) => updateAppSettings({ hideAiPetOrb: v })}
+        />
       </Section>
 
       <Section title="播放规则" label="RULES">
-        <Toggle label="工作时段自动播放" desc="09:00 – 18:30（可自定义）" initial={true} />
-        <Toggle label="开会时自动暂停" desc="读取系统日历判断" initial={true} />
-        <Toggle label="午休换放松歌单" desc="12:00 – 13:30" initial={false} />
-        <Toggle label="深夜降低推荐节奏" desc="22:30 之后" initial={true} />
+        <Toggle
+          label="主动安排一段"
+          desc="启动后按时间、天气和近期听感自动排一小段"
+          value={appSettings.smartSessionPlanner}
+          onChange={(v) => updateAppSettings({ smartSessionPlanner: v })}
+        />
+        <Toggle
+          label="工作时段自动播放"
+          desc="09:00 – 18:30，偏专注、不吵"
+          value={appSettings.workdayAutoplay}
+          onChange={(v) => updateAppSettings({ workdayAutoplay: v })}
+        />
+        <Toggle
+          label="午休换放松歌单"
+          desc="12:00 – 13:30"
+          value={appSettings.lunchRelaxMode}
+          onChange={(v) => updateAppSettings({ lunchRelaxMode: v })}
+        />
+        <Toggle
+          label="深夜降低推荐节奏"
+          desc="22:30 之后"
+          value={appSettings.lateNightCalmMode}
+          onChange={(v) => updateAppSettings({ lateNightCalmMode: v })}
+        />
+        <PromptedRadioRule
+          value={appSettings.promptedRadioRule}
+          onChange={(value) => updateAppSettings({ promptedRadioRule: value })}
+        />
       </Section>
 
       <Section title="关于你" subtitle="自述事实" label="ABOUT YOU">
@@ -112,8 +142,12 @@ export default function SettingsPage() {
       </Section>
 
       <Section title="AI 解说" label="NARRATION">
-        <Toggle label="每首歌给一段解说" desc="类似 Pipo 的那种 DJ 口吻" initial={true} />
-        <Toggle label="中文解说" desc="关闭则使用英文" initial={true} />
+        <Toggle
+          label="封面短提示"
+          desc="只出现一句，自动消失"
+          value={appSettings.aiNarration}
+          onChange={(v) => updateAppSettings({ aiNarration: v })}
+        />
       </Section>
 
       <div style={footerNote}>
@@ -160,6 +194,45 @@ function SettingsTopBar() {
     </div>
   );
 }
+
+function PromptedRadioRule({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>Prompted Radio</div>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value.slice(0, 240))}
+        placeholder="例：每天上午 90 分钟不吵，熟歌 70%，新歌 30%，不要太多同一歌手。"
+        rows={3}
+        style={smallTextarea}
+      />
+      <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 6 }}>
+        {value.length} / 240
+      </div>
+    </div>
+  );
+}
+
+const smallTextarea: React.CSSProperties = {
+  width: "100%",
+  padding: "9px 11px",
+  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(255,255,255,0.08)",
+  borderRadius: 8,
+  color: "rgba(233,239,255,0.92)",
+  fontSize: 13,
+  lineHeight: 1.55,
+  fontFamily: "inherit",
+  resize: "vertical",
+  minHeight: 74,
+  boxSizing: "border-box",
+};
 
 // ---------- 多 provider AI 接入 ----------
 //

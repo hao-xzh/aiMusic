@@ -26,6 +26,8 @@ import {
 import {
   readBehaviorLog,
   summarize,
+  logBehavior,
+  type BehaviorEvent,
   type BehaviorStats,
 } from "@/lib/behavior-log";
 import { cdn } from "@/lib/cdn";
@@ -167,9 +169,11 @@ function ProfileView({ profile }: { profile: TasteProfile }) {
         </Section>
       )}
 
-      <DiscoverySection profile={profile} />
-
       <BehaviorSummary />
+
+      <LibraryOrganizer profile={profile} />
+
+      <DiscoverySection profile={profile} />
 
       <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
         <Link href="/distill" style={secondaryBtn}>
@@ -253,6 +257,188 @@ const behaviorBlock: React.CSSProperties = {
   background: "rgba(12,16,24,0.55)",
 };
 
+const libraryQueueRow: React.CSSProperties = {
+  display: "flex",
+  gap: 8,
+  flexWrap: "wrap",
+  marginTop: 8,
+};
+
+const microBtn: React.CSSProperties = {
+  height: 30,
+  padding: "0 12px",
+  borderRadius: 999,
+  border: "1px solid rgba(155,227,198,0.22)",
+  background: "rgba(155,227,198,0.08)",
+  color: "#9be3c6",
+  fontSize: 12,
+  cursor: "pointer",
+};
+
+type LibraryOrganizerState =
+  | { kind: "loading" }
+  | {
+      kind: "ready";
+      duplicateGroups: number;
+      staleCount: number;
+      topArtistShare: number;
+      queues: LibraryQueue[];
+    }
+  | { kind: "empty" };
+
+type LibraryQueue = {
+  key: string;
+  label: string;
+  tracks: TrackInfo[];
+};
+
+function LibraryOrganizer({ profile }: { profile: TasteProfile }) {
+  const { playNetease } = usePlayer();
+  const [state, setState] = useState<LibraryOrganizerState>({ kind: "loading" });
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const tracks: TrackInfo[] = [];
+      for (const pid of profile.sourcePlaylistIds) {
+        const detail = await cache.getPlaylistDetail(pid).catch(() => null);
+        if (detail) tracks.push(...detail.tracks);
+      }
+      if (!alive) return;
+      if (tracks.length === 0) {
+        setState({ kind: "empty" });
+        return;
+      }
+      const bySong = new Map<string, number>();
+      const byArtist = new Map<string, number>();
+      for (const t of tracks) {
+        const primaryArtist = t.artists[0]?.name ?? "Unknown";
+        const key = `${normalizeSong(t.name)}::${normalizeSong(primaryArtist)}`;
+        bySong.set(key, (bySong.get(key) ?? 0) + 1);
+        byArtist.set(primaryArtist, (byArtist.get(primaryArtist) ?? 0) + 1);
+      }
+      const duplicateGroups = [...bySong.values()].filter((count) => count > 1).length;
+      const topArtistShare = Math.max(...byArtist.values()) / tracks.length;
+      const events = await readBehaviorLog().catch(() => []);
+      const touched = new Set(events.map((ev) => ev.trackId));
+      const staleCount = tracks.filter((track) => !touched.has(track.id)).length;
+      const queues = buildLibraryQueues(tracks, profile, events);
+      if (alive) setState({ kind: "ready", duplicateGroups, staleCount, topArtistShare, queues });
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [profile.sourcePlaylistIds]);
+
+  if (state.kind === "empty") return null;
+  return (
+    <Section title="音乐图书管理员">
+      {state.kind === "loading" ? (
+        <Status text="正在看你的库..." />
+      ) : (
+        <div style={{ display: "grid", gap: 8 }}>
+          <LibraryTip label="重复版本" value={`${state.duplicateGroups} 组`} />
+          <LibraryTip label="旧歌复活" value={`${state.staleCount} 首`} />
+          <LibraryTip label="歌单集中度" value={`${Math.round(state.topArtistShare * 100)}%`} />
+          {state.queues.length > 0 && (
+            <div style={libraryQueueRow}>
+              {state.queues.map((queue) => (
+                <button
+                  key={queue.key}
+                  style={microBtn}
+                  onClick={() => {
+                    const [head, ...rest] = queue.tracks;
+                    if (head) void playNetease(head, [head, ...rest], { smoothMode: "library" });
+                  }}
+                >
+                  {queue.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </Section>
+  );
+}
+
+function LibraryTip({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", color: "#e9efff", fontSize: 13 }}>
+      <span style={{ color: "#8a93a8" }}>{label}</span>
+      <span>{value}</span>
+    </div>
+  );
+}
+
+function normalizeSong(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, "").replace(/[()（）\[\]【】"'’‘“”\-—_,，。.、]/g, "");
+}
+
+function buildLibraryQueues(
+  tracks: TrackInfo[],
+  profile: TasteProfile,
+  events: BehaviorEvent[],
+): LibraryQueue[] {
+  const touched = new Set(events.map((ev) => ev.trackId));
+  const stale = tracks.filter((track) => !touched.has(track.id));
+  const profileWords = [
+    ...profile.moods,
+    ...profile.genres.map((g) => g.tag),
+    ...profile.culturalContext,
+  ].map((v) => v.toLowerCase());
+  const stableByArtist = diverseByArtist(stale.length >= 8 ? stale : tracks);
+  const queues: LibraryQueue[] = [
+    { key: "revive", label: "旧歌", tracks: stableByArtist.slice(0, 18) },
+    { key: "work", label: "工作", tracks: scoreQueue(tracks, profileWords.concat(["ambient", "chill", "indie", "lofi", "民谣", "器乐", "轻"])) },
+    { key: "drive", label: "开车", tracks: scoreQueue(tracks, profileWords.concat(["rock", "pop", "city", "funk", "律动", "公路"])) },
+    { key: "night", label: "睡前", tracks: scoreQueue(tracks, ["night", "moon", "rain", "dream", "blue", "acoustic", "piano", "夜", "月", "雨", "梦"]) },
+  ];
+  return queues
+    .map((queue) => ({ ...queue, tracks: queue.tracks.slice(0, 20) }))
+    .filter((queue) => queue.tracks.length >= 4);
+}
+
+function scoreQueue(tracks: TrackInfo[], words: string[]): TrackInfo[] {
+  return tracks
+    .map((track) => {
+      const haystack = `${track.name} ${track.artists.map((a) => a.name).join(" ")} ${track.album?.name ?? ""}`.toLowerCase();
+      const score = words.reduce((sum, word) => sum + (word && haystack.includes(word) ? 1 : 0), 0);
+      return { track, score };
+    })
+    .sort((a, b) => b.score - a.score || stableTrackRank(a.track) - stableTrackRank(b.track))
+    .map((item) => item.track);
+}
+
+function diverseByArtist(tracks: TrackInfo[]): TrackInfo[] {
+  const seen = new Map<string, number>();
+  return tracks
+    .slice()
+    .sort((a, b) => stableTrackRank(a) - stableTrackRank(b))
+    .sort((a, b) => {
+      const aa = a.artists[0]?.name ?? "";
+      const bb = b.artists[0]?.name ?? "";
+      return (seen.get(aa) ?? 0) - (seen.get(bb) ?? 0);
+    })
+    .filter((track) => {
+      const artist = track.artists[0]?.name ?? "";
+      const count = seen.get(artist) ?? 0;
+      seen.set(artist, count + 1);
+      return count < 2;
+    });
+}
+
+function stableTrackRank(track: TrackInfo): number {
+  return (track.id * 2654435761) >>> 0;
+}
+
+function tasteRadarWeekKey(ids: Array<string | number>): string {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), 0, 1);
+  const week = Math.ceil((((now.getTime() - start.getTime()) / 86400000) + start.getDay() + 1) / 7);
+  return `claudio-taste-radar:${now.getFullYear()}-${week}:${ids.join(",")}`;
+}
+
 // ---------- 库外推荐区 ----------
 
 type DiscoveryState =
@@ -262,36 +448,77 @@ type DiscoveryState =
   | { kind: "ready"; picks: DiscoveryPick[] }
   | { kind: "error"; message: string };
 
+type RadarVote = "up" | "down";
+type RadarFeedback = Record<string, RadarVote>;
+
 function DiscoverySection({ profile }: { profile: TasteProfile }) {
   const { playNetease } = usePlayer();
   const [state, setState] = useState<DiscoveryState>({ kind: "idle" });
+  const [feedback, setFeedback] = useState<RadarFeedback>({});
 
-  const run = async () => {
+  useEffect(() => {
+    setFeedback(readRadarFeedback(profile));
+  }, [profile.sourceHash]);
+
+  const run = async (force = false) => {
     setState({ kind: "loading-library" });
     try {
       // 拿用户库里所有曲目 id（来自 profile.sourcePlaylistIds）作为"已有"集合
       const owned = new Set<number>();
+      const libraryTracks: TrackInfo[] = [];
       for (const pid of profile.sourcePlaylistIds) {
         const d = await cache.getPlaylistDetail(pid).catch(() => null);
-        if (d) for (const t of d.tracks) owned.add(t.id);
+        if (d) {
+          for (const t of d.tracks) {
+            owned.add(t.id);
+            libraryTracks.push(t);
+          }
+        }
       }
+      const behavior = await readBehaviorLog().catch(() => []);
 
       setState({ kind: "running", progress: { phase: "seeding" } });
-      const picks = await discoverBeyondLibrary(profile, owned, {
+      const outsidePicks = await discoverBeyondLibrary(profile, owned, {
+        finalCount: 9,
         onProgress: (p) => setState({ kind: "running", progress: p }),
       });
+      const revivalPicks = buildRevivalPicks(libraryTracks, behavior, 3);
+      const picks = mergeRadarPicks(outsidePicks, revivalPicks, 12);
+      writeRadarCache(profile, picks);
       setState({ kind: "ready", picks });
     } catch (e) {
       setState({
         kind: "error",
         message: e instanceof Error ? e.message : String(e),
       });
+      if (!force) {
+        const cached = readRadarCache(profile);
+        if (cached.length > 0) setState({ kind: "ready", picks: cached });
+      }
     }
   };
 
+  useEffect(() => {
+    if (state.kind !== "idle") return;
+    const cached = readRadarCache(profile);
+    if (cached.length > 0) {
+      setState({ kind: "ready", picks: cached });
+      return;
+    }
+    const weekKey = tasteRadarWeekKey(profile.sourcePlaylistIds);
+    if (window.localStorage.getItem(weekKey) === "1") return;
+    window.localStorage.setItem(weekKey, "1");
+    void run();
+    // 只在首次进入本周 radar 时自动跑一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile.sourcePlaylistIds, state.kind]);
+
   const playAll = async () => {
     if (state.kind !== "ready" || state.picks.length === 0) return;
-    const queue: TrackInfo[] = state.picks.map((p) => p.track);
+    const queue: TrackInfo[] = state.picks
+      .filter((p) => feedback[String(p.track.id)] !== "down")
+      .map((p) => p.track);
+    if (queue.length === 0) return;
     // 库外推荐 = 算法挑的"丰富感"歌单，走 discovery 排序
     await playNetease(queue[0], queue, { smoothMode: "discovery" });
   };
@@ -302,19 +529,32 @@ function DiscoverySection({ profile }: { profile: TasteProfile }) {
     await playNetease(pick.track, queue, { smoothMode: "discovery" });
   };
 
+  const vote = (pick: DiscoveryPick, nextVote: RadarVote) => {
+    const key = String(pick.track.id);
+    const next = { ...feedback, [key]: nextVote };
+    setFeedback(next);
+    writeRadarFeedback(profile, next);
+    void logBehavior({
+      trackId: pick.track.id,
+      title: pick.track.name,
+      artist: pick.track.artists.map((a) => a.name).join(" / ") || "未知",
+      kind: nextVote === "up" ? "liked" : "disliked",
+    }).catch(() => {});
+  };
+
   return (
     <div style={{ marginTop: 24, marginBottom: 24 }}>
       <div style={discoveryHeader}>
         <div>
           <div style={{ fontSize: 16, fontWeight: 700, color: "#f5f7ff" }}>
-            ✦ 库外推荐
+            Taste Radar
           </div>
           <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 4, lineHeight: 1.55 }}>
-            基于这份口味，AI 给你挖几首歌单里没有的。每首带"为什么推这首"。
+            每周自动刷新 12 首：库外发现、旧歌复活、相邻艺人。
           </div>
         </div>
         {state.kind === "idle" && (
-          <button onClick={run} style={primaryBtn}>
+          <button onClick={() => void run()} style={primaryBtn}>
             为我推荐 →
           </button>
         )}
@@ -323,7 +563,7 @@ function DiscoverySection({ profile }: { profile: TasteProfile }) {
             <button onClick={playAll} style={primaryBtn}>
               ▶ 全部进电台
             </button>
-            <button onClick={run} style={secondaryBtn}>
+            <button onClick={() => void run(true)} style={secondaryBtn}>
               换一批
             </button>
           </div>
@@ -340,10 +580,85 @@ function DiscoverySection({ profile }: { profile: TasteProfile }) {
         <div style={errorBlock}>推荐失败：{state.message}</div>
       )}
       {state.kind === "ready" && (
-        <PickList picks={state.picks} onPlay={playOne} />
+        <PickList picks={state.picks} feedback={feedback} onPlay={playOne} onVote={vote} />
       )}
     </div>
   );
+}
+
+function buildRevivalPicks(
+  tracks: TrackInfo[],
+  events: BehaviorEvent[],
+  count: number,
+): DiscoveryPick[] {
+  if (tracks.length === 0) return [];
+  const touched = new Set(events.map((ev) => ev.trackId));
+  return tracks
+    .filter((track) => !touched.has(track.id))
+    .sort((a, b) => stableTrackRank(a) - stableTrackRank(b))
+    .slice(0, count)
+    .map((track) => ({
+      track,
+      fromSeed: "library-revival",
+    }));
+}
+
+function mergeRadarPicks(
+  outside: DiscoveryPick[],
+  revivals: DiscoveryPick[],
+  limit: number,
+): DiscoveryPick[] {
+  const seen = new Set<number>();
+  const out: DiscoveryPick[] = [];
+  for (const pick of [...outside.slice(0, 6), ...revivals, ...outside.slice(6)]) {
+    if (seen.has(pick.track.id)) continue;
+    seen.add(pick.track.id);
+    out.push(pick);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function radarCacheKey(profile: TasteProfile): string {
+  return `${tasteRadarWeekKey(profile.sourcePlaylistIds)}:picks:v2:${profile.sourceHash}`;
+}
+
+function radarFeedbackKey(profile: TasteProfile): string {
+  return `claudio-taste-radar-feedback:v1:${profile.sourceHash}`;
+}
+
+function readRadarCache(profile: TasteProfile): DiscoveryPick[] {
+  try {
+    const raw = window.localStorage.getItem(radarCacheKey(profile));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((p) => p?.track?.id && p?.track?.name).slice(0, 12);
+  } catch {
+    return [];
+  }
+}
+
+function writeRadarCache(profile: TasteProfile, picks: DiscoveryPick[]) {
+  try {
+    window.localStorage.setItem(radarCacheKey(profile), JSON.stringify(picks.slice(0, 12)));
+  } catch {}
+}
+
+function readRadarFeedback(profile: TasteProfile): RadarFeedback {
+  try {
+    const raw = window.localStorage.getItem(radarFeedbackKey(profile));
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRadarFeedback(profile: TasteProfile, feedback: RadarFeedback) {
+  try {
+    window.localStorage.setItem(radarFeedbackKey(profile), JSON.stringify(feedback));
+  } catch {}
 }
 
 function progressText(p: DiscoveryProgress): string {
@@ -379,10 +694,14 @@ function Status({ text }: { text: string }) {
 
 function PickList({
   picks,
+  feedback,
   onPlay,
+  onVote,
 }: {
   picks: DiscoveryPick[];
+  feedback: RadarFeedback;
   onPlay: (p: DiscoveryPick) => void;
+  onVote: (p: DiscoveryPick, vote: RadarVote) => void;
 }) {
   if (picks.length === 0) {
     return <Status text="AI 没挑出来 —— 可能候选池没合适的，换一批试试" />;
@@ -390,7 +709,14 @@ function PickList({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {picks.map((p, i) => (
-        <PickRow key={p.track.id} pick={p} index={i + 1} onPlay={onPlay} />
+        <PickRow
+          key={p.track.id}
+          pick={p}
+          index={i + 1}
+          vote={feedback[String(p.track.id)]}
+          onPlay={onPlay}
+          onVote={onVote}
+        />
       ))}
     </div>
   );
@@ -399,17 +725,21 @@ function PickList({
 function PickRow({
   pick,
   index,
+  vote,
   onPlay,
+  onVote,
 }: {
   pick: DiscoveryPick;
   index: number;
+  vote?: RadarVote;
   onPlay: (p: DiscoveryPick) => void;
+  onVote: (p: DiscoveryPick, vote: RadarVote) => void;
 }) {
-  const { track, why } = pick;
+  const { track } = pick;
   const cover = track.album?.picUrl;
   const artist = track.artists.map((a) => a.name).join(" / ") || "未知";
   return (
-    <div style={pickRowStyle}>
+    <div style={{ ...pickRowStyle, opacity: vote === "down" ? 0.52 : 1 }}>
       <div style={{ width: 22, color: "rgba(233,239,255,0.42)", fontSize: 12, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", textAlign: "right" }}>
         {index}
       </div>
@@ -438,13 +768,6 @@ function PickRow({
         >
           {artist}
         </div>
-        {why && (
-          <div
-            style={{ color: "rgba(155,227,198,0.85)", fontSize: 11, marginTop: 4, fontStyle: "italic", lineHeight: 1.45 }}
-          >
-            「{why}」
-          </div>
-        )}
       </div>
       <button
         onClick={() => onPlay(pick)}
@@ -455,6 +778,20 @@ function PickRow({
           <path d="M8 5.5v13l11-6.5z" />
         </svg>
       </button>
+      <div style={voteGroup}>
+        <button
+          style={{ ...voteBtn, ...(vote === "up" ? voteBtnActive : null) }}
+          onClick={() => onVote(pick, "up")}
+        >
+          准
+        </button>
+        <button
+          style={{ ...voteBtn, ...(vote === "down" ? voteBtnActiveBad : null) }}
+          onClick={() => onVote(pick, "down")}
+        >
+          不准
+        </button>
+      </div>
     </div>
   );
 }
@@ -512,6 +849,35 @@ const playBtn: React.CSSProperties = {
   justifyContent: "center",
   cursor: "pointer",
   flexShrink: 0,
+};
+
+const voteGroup: React.CSSProperties = {
+  display: "flex",
+  gap: 5,
+  flexShrink: 0,
+};
+
+const voteBtn: React.CSSProperties = {
+  height: 28,
+  padding: "0 9px",
+  borderRadius: 999,
+  border: "1px solid rgba(233,239,255,0.10)",
+  background: "rgba(255,255,255,0.04)",
+  color: "rgba(233,239,255,0.62)",
+  fontSize: 11,
+  cursor: "pointer",
+};
+
+const voteBtnActive: React.CSSProperties = {
+  borderColor: "rgba(155,227,198,0.44)",
+  background: "rgba(155,227,198,0.14)",
+  color: "#9be3c6",
+};
+
+const voteBtnActiveBad: React.CSSProperties = {
+  borderColor: "rgba(255,180,180,0.34)",
+  background: "rgba(255,180,180,0.10)",
+  color: "rgba(255,180,180,0.88)",
 };
 
 function Meta({ profile }: { profile: TasteProfile }) {

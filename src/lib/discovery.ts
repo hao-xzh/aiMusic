@@ -4,9 +4,9 @@
  * 库外推荐流水线 —— 拿口味画像出"我可能喜欢但歌单里没有"的歌。
  *
  * 三步走：
- *   1) AI 出 "seeds"：搜索关键词组合（艺人/子流派/年代/情绪），每个带 rationale
+ *   1) AI 出 "seeds"：搜索关键词组合（艺人/子流派/年代/情绪）
  *   2) 用 netease.search 把每个 seed 搜回真实曲目；聚合 + 去重 + 排除用户已有
- *   3) 把候选池 + 画像再喂给 AI，让它从中挑 top N，每首带"为什么推这首"
+ *   3) 把候选池 + 画像再喂给 AI，让它从中挑 top N
  *
  * 这样 AI 只负责"语义/文化判断"，"什么真的存在/能播"交给 Netease ——
  * 把幻觉风险压到最低。
@@ -18,14 +18,10 @@ import type { TasteProfile } from "./taste-profile";
 export type DiscoverySeed = {
   /** 搜索关键词，比如 "Mitski Be the Cowboy" / "city pop 1985" */
   query: string;
-  /** 为什么这个 seed —— 给画像做注脚，也作为最终 picks 的"上下文" */
-  rationale: string;
 };
 
 export type DiscoveryPick = {
   track: TrackInfo;
-  /** AI 写的一句"为什么推这首" */
-  why: string;
   /** 来自哪个 seed */
   fromSeed?: string;
 };
@@ -63,7 +59,7 @@ export async function discoverBeyondLibrary(
 
   // ---- 2) 真实搜索聚合 ----
   // 简单串行（Netease 不喜欢瞬时并发太多） + 失败容错（单 seed 挂了不影响整体）
-  const candidates = new Map<number, DiscoveryPick>(); // id -> pick (no why yet)
+  const candidates = new Map<number, DiscoveryPick>(); // id -> pick
   for (let i = 0; i < seeds.length; i++) {
     const seed = seeds[i];
     onProgress({
@@ -79,7 +75,6 @@ export async function discoverBeyondLibrary(
         if (candidates.has(t.id)) continue; // 已被另一 seed 收录
         candidates.set(t.id, {
           track: t,
-          why: "", // 暂留空，下一步 AI 填
           fromSeed: seed.query,
         });
       }
@@ -95,7 +90,7 @@ export async function discoverBeyondLibrary(
     );
   }
 
-  // ---- 3) AI rerank + 写 why ----
+  // ---- 3) AI rerank ----
   onProgress({ phase: "ranking", candidateCount: candidateList.length });
   const ranked = await rankCandidates(profile, candidateList, finalCount);
 
@@ -136,8 +131,8 @@ async function generateSeeds(
         `seed 要尽量贴这份指纹（比如指纹偏慢就别推 EDM，偏暗就别推干净 pop）。\n`
       : "") +
     `4) query 字段就是要塞进搜索框的那串字符（中英都行，看哪个更精准）。\n` +
-    `5) rationale ≤30 字，说"为什么这个 seed 该推给 TA"。\n\n` +
-    `严格只输出一行 JSON：{"seeds":[{"query":"...","rationale":"..."}]}\n` +
+    `5) 不要解释。\n\n` +
+    `严格只输出一行 JSON：{"seeds":[{"query":"..."}]}\n` +
     `不要 markdown，不要解释，不要代码块包裹。`;
 
   const raw = await ai.chat({
@@ -194,20 +189,20 @@ async function rankCandidates(
       ? `   "匹配度"明确包含声学指纹：BPM/响度/音色亮度对得上才算匹配，不只是 genre 标签。\n`
       : "") +
     `2) 不要为了多样性刻意避开同一艺人；如果同一艺人的多首歌更贴口味，可以保留。\n` +
-    `3) why ≤25 字，说"为什么是这首"，可以提风格相似度、情绪契合、文化坐标。\n` +
+    `3) 不要解释。\n` +
     `4) trackIds 必须从上面候选列表的 neteaseId 里挑，不许编。\n\n` +
-    `严格只输出一行 JSON：{"picks":[{"trackId":1234,"why":"..."}]}\n` +
+    `严格只输出一行 JSON：{"picks":[{"trackId":1234}]}\n` +
     `不要 markdown，不要解释，不要代码块包裹。`;
 
   const raw = await ai.chat({
     system:
-      "你是 Claudio 的口味匹配器。从候选池里挑最贴气质的 ≤N 首，每首附一句「为什么」。只输出 JSON。",
+      "你是 Claudio 的口味匹配器。从候选池里挑最贴气质的 ≤N 首。只输出 JSON，不要解释。",
     user,
     temperature: 0.5,
     maxTokens: 1400,
   });
 
-  type RankedPick = { trackId: number; why: string };
+  type RankedPick = { trackId: number };
   const parsed = parseJsonObject(raw) as { picks?: RankedPick[] } | null;
   if (!parsed || !Array.isArray(parsed.picks)) {
     throw new Error("AI rerank 返回不合法");
@@ -219,7 +214,7 @@ async function rankCandidates(
     if (typeof p.trackId !== "number") continue;
     const c = byId.get(p.trackId);
     if (!c) continue; // AI 幻觉了一个不在候选池里的 id，丢
-    out.push({ track: c.track, why: p.why ?? "", fromSeed: c.fromSeed });
+    out.push({ track: c.track, fromSeed: c.fromSeed });
     if (out.length >= finalCount) break;
   }
   return out;

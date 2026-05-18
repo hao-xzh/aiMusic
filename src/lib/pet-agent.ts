@@ -66,7 +66,7 @@ export type ChatMessage = {
 
 export type PlayPlan = {
   trackIds: number[];
-  /** AI 写的"为什么这一组"短文 —— UI 上展示给用户看 */
+  /** 内部播放计划摘要；极简 UI 不展示。 */
   reason: string;
 };
 
@@ -91,8 +91,7 @@ export function markGreeted(): void {
  * 这一段没经过流水线 —— 不需要意图解析也不需要选歌。
  */
 // SYSTEM 模块级常量 —— 让招呼语的规则/示例进 DeepSeek 缓存。
-// 一天虽然只触发一次,但跟 commentOnTrack 没法共享(那个的 system 不一样),
-// 这里独立成一个缓存条目,反复几天命中,省一点是一点。
+// 一天最多触发一次；这里独立成一个缓存条目，反复几天命中，省一点是一点。
 const GREETING_SYSTEM = `你是 Claudio —— TA 熟到不用客气的音乐宠物。
 打开 app 时由你说一句**进门招呼**(不是问候,是熟人语气的一句话陈述)。
 
@@ -163,113 +162,30 @@ export async function generateDailyGreeting(): Promise<string> {
     : `${ctx.dayOfWeek}${ctx.timeSlotLabel}。`;
 }
 
-// ---------- 单曲点评：每首歌开始播时 Claudio 说一句 ----------
+// ---------- 兼容旧入口：播放链路保持沉默 ----------
 
 export type TrackCommentInput = {
   track: {
     id: number;
     title: string;
     artist: string;
-    /** 这首歌的语义 profile —— 让 AI 真的能"看懂"这首歌的特点 */
+    /** 旧版单曲点评参数；当前播放链路不再自动请求 AI。 */
     moods?: string[];
     scenes?: string[];
     genres?: string[];
     summary?: string;
   };
-  /** 用户最近一条文字（用来贴 TA 当下心情）。没有就当"开场无 context" */
+  /** 旧版单曲点评参数；保留给历史调用兼容。 */
   userContext?: string;
-  /** 队列第几首（1 起算）。1=开场，>1=接歌——语气区分 */
+  /** 旧版单曲点评参数；保留给历史调用兼容。 */
   positionInQueue?: number;
-  /** 上一首什么 —— 让"接歌"有上下文（"降一点速""换个味道"） */
+  /** 旧版单曲点评参数；保留给历史调用兼容。 */
   previousTrack?: { title: string; artist: string };
 };
 
-/**
- * 单曲点评：每首歌开始播时让 Claudio 说一句"为什么放这首"。
- * 上限 16 字左右，幽默抽象，绝不客服腔。
- *
- * 失败时返回空字符串 —— 上层只在非空时显示气泡，不要兜底打扰用户。
- * AI 调用很轻（≤60 tokens 输出），每首歌一次完全在预算内。
- */
-// SYSTEM 模块级常量 —— 含全部规则/示例,跨调用永远不变 → DeepSeek 自动缓存命中。
-// 旧版把这一坨塞 user 字段且顶在变量行后面,每次发一遍且永远不命中。
-const TRACK_COMMENT_SYSTEM = `你是 Claudio,一只幽默抽象的音乐宠物。
-每当一首歌开始播,你说一句**为什么放这首给 TA**。
-
-# 调性
-- 短。一句话。能短就短,5-8 字最佳,绝不超过 16 字。
-- 不是介绍歌,是说"为什么它适合这一刻"。
-- 抽象比喻 OK,但要跟 TA 的话 / 这首歌的特征 / 当下时刻接得上。
-- 把当下时段/天气/临近周末或假期当作锚点之一,但只挑最相关的一个,别一句话报全。
-- 不要客服词("为您""推荐"),不要感叹号,不要 emoji。
-
-# 输出格式
-直接输出这一句话本身——不要 JSON、不要前缀、不要引号、不要解释。
-
-# 示例(注意时间/天气/假期可以是锚点)
-TA："今天好累",播 Coldplay → "拿这个把电量充回去。"
-周五晚上,播 city pop → "周末已经在门口。"
-下雨,播 ambient → "雨配这个,正好。"
-再 3 天国庆,播 funk → "假期心情先到。"
-TA："我刚分手",播 The Killers → "猛的,开场。"
-深夜,播 lo-fi → "适合熬。"
-周一上午,播 indie folk → "周一不该这么吵。"
-接歌,前激情本慢 → "降一点速。"
-接歌,同艺人连排 → "再多听 TA 一首。"
-开场无 context,播 indie folk → "这首是入口。"`;
-
 export async function commentOnTrack(input: TrackCommentInput): Promise<string> {
-  const { track, userContext, positionInQueue, previousTrack } = input;
-  const tagsLine = [
-    track.summary,
-    track.moods?.length ? `情绪=${track.moods.slice(0, 3).join("/")}` : null,
-    track.scenes?.length ? `场景=${track.scenes.slice(0, 2).join("/")}` : null,
-    track.genres?.length ? `风格=${track.genres.slice(0, 2).join("/")}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-
-  const isOpener = !positionInQueue || positionInQueue <= 1;
-
-  // 时间/天气/节假日上下文 —— 让点评能说"周五晚上""明天就周末"
-  // "再 3 天就国庆" 这种期待感. weather 已经是 memo'd 调用,几乎无开销.
-  // 同时也读跨 session 记忆 —— 偏好/跳过率/上次说过什么。
-  const [ctxFresh, weather, memoryDigest] = await Promise.all([
-    Promise.resolve(getAppContext()),
-    getWeather().catch(() => null),
-    getMemoryDigest().catch(() => ""),
-  ]);
-  const ctxLine = describeContext({ ...ctxFresh, weather: weather ?? undefined });
-
-  // USER 只放变量。短,~80-150 tokens,每次都发新的(本来也不缓存)。
-  const userPrompt =
-    `当下：${ctxLine}\n` +
-    (memoryDigest ? `TA 的人:${memoryDigest}\n` : "") +
-    `现在播：${track.title} — ${track.artist}\n` +
-    (tagsLine ? `这首特征：${tagsLine}\n` : "") +
-    (userContext ? `TA 之前说：「${userContext}」\n` : "") +
-    (previousTrack
-      ? `刚刚那首：${previousTrack.title} — ${previousTrack.artist}\n`
-      : "") +
-    `${isOpener ? "这是开场。" : `这是接歌(队列第 ${positionInQueue} 首)。`}`;
-
-  try {
-    const raw = await ai.chat({
-      system: TRACK_COMMENT_SYSTEM,
-      user: userPrompt,
-      temperature: 0.95,
-      maxTokens: 60,
-    });
-    // 清掉常见的引号/书名号包裹和首尾空白
-    return raw
-      .trim()
-      .replace(/^["'「『""]+|["'」』""]+$/g, "")
-      .replace(/^\s*[-—]\s*/, "")
-      .slice(0, 30);
-  } catch (e) {
-    console.debug("[claudio] commentOnTrack 失败", e);
-    return "";
-  }
+  void input;
+  return "";
 }
 
 // ---------- 主聊天入口 ----------
@@ -277,6 +193,8 @@ export async function commentOnTrack(input: TrackCommentInput): Promise<string> 
 export type AgentInput = {
   history: ChatMessage[];
   userText: string;
+  /** 系统主动规划时不把内部 prompt 记成用户原话 */
+  skipMemory?: boolean;
   /**
    * 当前正在播的曲目（轻量 shape）。给 intent parser / recall 做语境锚点：
    *   - 让 AI 理解 "再来一首类似的" 这种代词
@@ -350,7 +268,9 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
 
   // 用户说话先写入跨 session 记忆(在 AI 调用前 fire-and-forget,
   // 这样如果用户连续发话,后面的 AI 调用看得到前面的话作为上下文)
-  void recordUserUtterance(input.userText);
+  if (!input.skipMemory) {
+    void recordUserUtterance(input.userText);
+  }
 
   // ---- 阶段 1：人格 + 意图（一次 LLM 调用）----
   const intent = await parseMusicIntent(input.userText, {

@@ -16,13 +16,34 @@ const CHANGE_EVENT = "claudio:app-settings-changed";
 export type AppSettings = {
   /** 隐藏全屏点阵纹理（封面模糊底层不受影响） */
   hideDotPattern: boolean;
+  /** 隐藏右下角 AI 宠物圆球 / 绳子，仅保留封面短提示 */
+  hideAiPetOrb: boolean;
+  /** 允许 Claudio 主动给短旁白 / 封面提示 */
+  aiNarration: boolean;
+  /** 启动后按当下时段主动规划一段播放 session */
+  smartSessionPlanner: boolean;
+  /** 工作时段无播放时主动安排低打扰电台 */
+  workdayAutoplay: boolean;
+  /** 午休时段自动压低能量 */
+  lunchRelaxMode: boolean;
+  /** 深夜自动降低推荐节奏 */
+  lateNightCalmMode: boolean;
+  /** 长期执行的自定义电台规则 */
+  promptedRadioRule: string;
 };
 
 const DEFAULTS: AppSettings = {
   hideDotPattern: false,
+  hideAiPetOrb: true,
+  aiNarration: false,
+  smartSessionPlanner: true,
+  workdayAutoplay: true,
+  lunchRelaxMode: false,
+  lateNightCalmMode: true,
+  promptedRadioRule: "",
 };
 
-function readFromStorage(): AppSettings {
+export function getAppSettingsSnapshot(): AppSettings {
   if (typeof window === "undefined") return DEFAULTS;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -48,8 +69,8 @@ export function useAppSettings(): [AppSettings, (patch: Partial<AppSettings>) =>
   const [settings, setSettings] = useState<AppSettings>(DEFAULTS);
 
   useEffect(() => {
-    setSettings(readFromStorage());
-    const sync = () => setSettings(readFromStorage());
+    setSettings(getAppSettingsSnapshot());
+    const sync = () => setSettings(getAppSettingsSnapshot());
     window.addEventListener(CHANGE_EVENT, sync);
     // 跨标签页（多窗口 Tauri 场景）也同步一下
     window.addEventListener("storage", sync);
@@ -60,7 +81,7 @@ export function useAppSettings(): [AppSettings, (patch: Partial<AppSettings>) =>
   }, []);
 
   const update = useCallback((patch: Partial<AppSettings>) => {
-    const next = { ...readFromStorage(), ...patch };
+    const next = { ...getAppSettingsSnapshot(), ...patch };
     writeToStorage(next);
     setSettings(next);
   }, []);

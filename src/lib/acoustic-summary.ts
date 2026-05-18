@@ -3,7 +3,7 @@
 /**
  * 把一组曲目的 AudioFeatures 压成一个**人话短摘要**，喂给 AI prompt。
  *
- * 为什么不直接给 AI 看 200 行 raw features：
+ * 不直接给 AI 看 200 行 raw features 的原因：
  *   - token 浪费
  *   - 模型读完 200 行 RMS 数字根本记不住
  *   - 我们要的是"用户口味的物理特征"，是 mean / 分布 / 主导段，不是单首

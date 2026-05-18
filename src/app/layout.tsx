@@ -6,6 +6,7 @@ import { PlatformTag } from "@/components/PlatformTag";
 import { AiPet } from "@/components/AiPet";
 import { WindowResizer } from "@/components/WindowResizer";
 import { AnalysisAutoResume } from "@/components/AnalysisAutoResume";
+import { SmartSessionPlanner } from "@/components/SmartSessionPlanner";
 
 export const metadata: Metadata = {
   title: "Pipo",
@@ -35,6 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <AiPet />
           <WindowResizer />
           <AnalysisAutoResume />
+          <SmartSessionPlanner />
           <main
             style={{
               position: "relative",

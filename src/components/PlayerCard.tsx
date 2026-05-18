@@ -16,6 +16,7 @@
  */
 
 import { Waveform } from "./Waveform";
+import { AiCoverCaption } from "./AiCoverCaption";
 import { usePlayer } from "@/lib/player-state";
 import { type LrcLine } from "@/lib/lrc";
 import { charProgress, type YrcLine } from "@/lib/yrc";
@@ -1129,6 +1130,7 @@ const CoverBox = React.forwardRef<
       }}
     >
       <CoverImageLayer key={coverUrl ?? "empty-cover"} url={coverUrl} />
+      <AiCoverCaption hidden={hidden} />
       <div
         style={{
           ...coverPlaceholder,

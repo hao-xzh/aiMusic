@@ -22,16 +22,16 @@ import {
 } from "react";
 import { usePlayer } from "@/lib/player-state";
 import { cdn } from "@/lib/cdn";
+import { announceAi } from "@/lib/ai-announcer";
+import { getAppSettingsSnapshot, useAppSettings } from "@/lib/app-settings";
 import "./AiPet.css";
 import {
   chat as petChat,
   generateDailyGreeting,
   shouldGreetToday,
   markGreeted,
-  commentOnTrack,
   type ChatMessage,
 } from "@/lib/pet-agent";
-import { getTrackSemanticProfile } from "@/lib/track-semantic-profile";
 
 // 空状态提示词池 —— 整体调性: 短、抽象、像真朋友一句话开场。
 // 每次开 panel 随机一句，避免每次看到一样的台词。**绝不**给"示例式提示"
@@ -55,6 +55,7 @@ const IDLE_SUBTITLES = [
 
 export function AiPet() {
   const player = usePlayer();
+  const [appSettings] = useAppSettings();
   const [open, setOpen] = useState(false);
   // closing：进出动画用 —— 点关闭后保留挂载 220ms 跑 exit 动画
   const [closing, setClosing] = useState(false);
@@ -85,6 +86,8 @@ export function AiPet() {
   const coverHook = anchorPos?.mode === "attached"
     ? { x: anchorPos.x, y: anchorPos.y }
     : null;
+  const hideOrb = appSettings.hideAiPetOrb;
+  const canNarrate = appSettings.aiNarration;
   // 跟封面取色出来的"水珠主色"（rgb 三元组），默认薄荷绿
   const [orbRgb, setOrbRgb] = useState<[number, number, number]>([
     155, 227, 198,
@@ -95,17 +98,12 @@ export function AiPet() {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const petBtnRef = useRef<HTMLButtonElement | null>(null);
   const closeTimerRef = useRef<number | null>(null);
-  // 单曲点评：避免对同一首歌重复评论 / 用户狂切歌时浪费 AI 调用
-  const lastCommentTrackIdRef = useRef<number | null>(null);
-  const lastTrackForCommentRef = useRef<{ title: string; artist: string } | null>(null);
-  const commentDebounceRef = useRef<number | null>(null);
   const hintHideRef = useRef<number | null>(null);
-  // 频次自适应: 用户狂切歌时(30s 内 3+ 次切换),进入冷却期不再触发 AI 点评
-  const recentTrackChangesRef = useRef<number[]>([]);
-  const skipCooldownUntilRef = useRef<number>(0);
 
   // 显示一次 hint 气泡，duration 后自动收。多次调用会清掉上一条 timer。
   const showHint = useCallback((text: string, durationMs: number) => {
+    announceAi(text, { kind: "pet", ttlMs: durationMs });
+    if (hideOrb) return;
     if (hintHideRef.current) {
       clearTimeout(hintHideRef.current);
       hintHideRef.current = null;
@@ -115,7 +113,7 @@ export function AiPet() {
       setHint(null);
       hintHideRef.current = null;
     }, durationMs);
-  }, []);
+  }, [hideOrb]);
 
   // 退出动画：先 closing=true 跑 220ms 动画，再真正 unmount
   const requestClose = useCallback(() => {
@@ -414,6 +412,7 @@ export function AiPet() {
   useEffect(() => {
     if (greetStartedRef.current) return;
     greetStartedRef.current = true;
+    if (!canNarrate || !getAppSettingsSnapshot().aiNarration) return;
     if (!shouldGreetToday()) return;
 
     (async () => {
@@ -427,95 +426,7 @@ export function AiPet() {
     })();
     // showHint 是稳定 callback —— 这里就是 once-on-mount，不订阅依赖
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ----- 单曲点评气泡 -----
-  // 每首新歌开始播 → 1.5s 后让 Claudio 说一句"为什么放这首给 TA"。
-  // 多重护栏避免浪费 AI 调用:
-  //   1. 同一首 id 不会重复评论
-  //   2. panel 打开时跳过(气泡看不见)
-  //   3. 窗口失焦/被遮 (document.hidden) 跳过
-  //   4. 用户狂切歌(30s 内 3+ 次)进入 60s 冷却期
-  //   5. 1.5s debounce —— 用户连刷时只评最后停留的那首
-  useEffect(() => {
-    const cur = player.current;
-    if (!cur?.neteaseId) return;
-    if (lastCommentTrackIdRef.current === cur.neteaseId) return;
-    if (open) return;
-
-    // 频次护栏: 记录这次切歌时间, 30s 内累计 3+ 次就进入冷却
-    const now = Date.now();
-    const recent = recentTrackChangesRef.current;
-    recent.push(now);
-    while (recent.length > 0 && now - recent[0] > 30_000) recent.shift();
-    if (recent.length >= 3) {
-      // 用户在 shopping 模式,suspend 60s
-      skipCooldownUntilRef.current = now + 60_000;
-      console.debug("[claudio] 切歌过密, 冷却 60s 不触发点评");
-    }
-    if (now < skipCooldownUntilRef.current) {
-      lastCommentTrackIdRef.current = cur.neteaseId; // 标记已"处理"防重入
-      return;
-    }
-
-    // 窗口不可见(浏览器 tab 背后 / app 失焦)时跳过 —— 看不见气泡浪费 AI
-    if (typeof document !== "undefined" && document.hidden) {
-      lastCommentTrackIdRef.current = cur.neteaseId;
-      return;
-    }
-
-    if (commentDebounceRef.current) {
-      clearTimeout(commentDebounceRef.current);
-      commentDebounceRef.current = null;
-    }
-
-    const trackId = cur.neteaseId;
-    const trackTitle = cur.title;
-    const trackArtist = cur.artist;
-
-    commentDebounceRef.current = window.setTimeout(async () => {
-      lastCommentTrackIdRef.current = trackId;
-      try {
-        const userContext = [...messages]
-          .reverse()
-          .find((m) => m.role === "user")?.text;
-        let semantic = null;
-        try {
-          semantic = await getTrackSemanticProfile(trackId);
-        } catch {
-          /* 没有 profile 就走 track 名 + artist 兜底 */
-        }
-        const previous = lastTrackForCommentRef.current ?? undefined;
-        const comment = await commentOnTrack({
-          track: {
-            id: trackId,
-            title: trackTitle,
-            artist: trackArtist,
-            moods: semantic?.vibe.moods,
-            scenes: semantic?.vibe.scenes,
-            genres: semantic?.style.genres,
-            summary: semantic?.summary,
-          },
-          userContext,
-          previousTrack: previous,
-        });
-        lastTrackForCommentRef.current = { title: trackTitle, artist: trackArtist };
-        if (comment && !open) {
-          showHint(comment, 6000);
-        }
-      } catch (e) {
-        console.debug("[claudio] track comment 失败", e);
-      }
-    }, 1500);
-
-    return () => {
-      if (commentDebounceRef.current) {
-        clearTimeout(commentDebounceRef.current);
-        commentDebounceRef.current = null;
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [player.current?.neteaseId, open]);
+  }, [canNarrate, showHint]);
 
   // 滚到底
   useEffect(() => {
@@ -554,6 +465,7 @@ export function AiPet() {
           play: res.play ?? undefined,
         };
         setMessages([...next, assistantMsg]);
+        announceAi(assistantMsg.text, { kind: "pet", ttlMs: 5600 });
 
         // 触发播放
         if (res.play && res.resolvedTracks.length > 0) {
@@ -587,7 +499,7 @@ export function AiPet() {
     <>
       {/* 招呼气泡 —— 玻璃 + 封面色辉。位置跟宠物当前位置走（attached 时贴封面挂点,
           否则回退到默认右下角）。气泡的"尾巴"（小圆角那一角）指向宠物。 */}
-      {hint && !open && (
+      {hint && !open && !hideOrb && (
         <div
           style={
             {
@@ -603,7 +515,7 @@ export function AiPet() {
       )}
 
       {/* chat 浮层 —— closing 时挂 exit 类跑动画再卸载 */}
-      {open && (
+      {open && !hideOrb && (
         <div
           ref={panelRef}
           className={`claudio-pet-panel${closing ? " is-closing" : ""}`}
@@ -683,6 +595,7 @@ export function AiPet() {
           - free 模式（无封面 / 歌词页）：anchor 在屏幕右下角附近
           两种模式共用 left/top inline + CSS transition，模式切换时跑平滑移动动画。
           钟摆围绕 anchor 自身（绳子顶端）做缓慢摆动。 */}
+      {!hideOrb && (
       <div
         className={`claudio-pet-anchor${coverHook ? " is-attached" : ""}`}
         style={
@@ -722,6 +635,7 @@ export function AiPet() {
           </span>
         </button>
       </div>
+      )}
     </>
   );
 }
