@@ -19,6 +19,7 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.PipoGraph
 
 /**
@@ -35,6 +36,7 @@ class PipoPlaybackService : MediaSessionService() {
     private var smartAutoMixer: SmartAutoMixer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastKeepAlivePrepareAtMs: Long = 0L
+    private var badSourceSkipToken: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -98,19 +100,51 @@ class PipoPlaybackService : MediaSessionService() {
                         mediaItem: androidx.media3.common.MediaItem?,
                         reason: Int,
                     ) {
+                        DiagnosticsLogStore.record(
+                            area = "playback_service",
+                            event = "media_transition",
+                            fields = mapOf(
+                                "reason" to mediaTransitionReason(reason),
+                                "mediaId" to mediaItem?.mediaId,
+                                "title" to mediaItem?.mediaMetadata?.title?.toString(),
+                            ),
+                        )
+                        badSourceSkipToken += 1L
                         smartAutoMixer?.onMediaItemTransition(mediaItem, reason)
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
-                        // 恢复策略统一放在 PlayerViewModel。Service 层只记录底层错误，
-                        // 避免这里 seek/prepare/play 和 ViewModel 的 URL 重签互相抢状态。
+                        // 控制层在线时仍优先由 PlayerViewModel 重签 URL；服务层只兜底坏源，
+                        // 防止后台播放卡在同一个失效地址并触发前台服务崩溃。
                         Log.w("PipoPlayer", "playback error code=${error.errorCodeName}", error)
+                        DiagnosticsLogStore.record(
+                            area = "playback_service",
+                            event = "player_error",
+                            fields = playerFields(this@apply) + mapOf(
+                                "code" to error.errorCodeName,
+                                "message" to error.message,
+                            ),
+                        )
                         smartAutoMixer?.onMainPlayerError()
                         notificationPlayer?.armRecoveryWindow()
-                        keepMediaNotificationAlive(this@apply, "error")
+                        if (isLikelyBadSource(error)) {
+                            scheduleBadSourceSkip(this@apply, error)
+                        } else {
+                            keepMediaNotificationAlive(this@apply, "error")
+                        }
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
+                        DiagnosticsLogStore.record(
+                            area = "playback_service",
+                            event = "state_changed",
+                            fields = mapOf(
+                                "state" to playbackStateName(playbackState),
+                                "playWhenReady" to this@apply.playWhenReady,
+                                "mediaItemCount" to this@apply.mediaItemCount,
+                                "mediaId" to this@apply.currentMediaItem?.mediaId,
+                            ),
+                        )
                         smartAutoMixer?.onMainPlayerEvent()
                         when (playbackState) {
                             Player.STATE_IDLE -> keepMediaNotificationAlive(this@apply, "idle")
@@ -119,7 +153,7 @@ class PipoPlaybackService : MediaSessionService() {
                                 if (playWhenReady && mediaItemCount > 0) {
                                     notificationPlayer?.armRecoveryWindow()
                                     mediaSession?.let { session ->
-                                        onUpdateNotification(session, true)
+                                        updateNotificationSafely(session, true, "state-$playbackState")
                                     }
                                 }
                             }
@@ -131,7 +165,7 @@ class PipoPlaybackService : MediaSessionService() {
                         if (isPlaying) {
                             notificationPlayer?.clearRecoveryWindow()
                             mediaSession?.let { session ->
-                                onUpdateNotification(session, true)
+                                updateNotificationSafely(session, true, "playing")
                             }
                         }
                     }
@@ -192,10 +226,106 @@ class PipoPlaybackService : MediaSessionService() {
                     player.mediaItemCount > 0 &&
                     sessionPlayer.playbackState != Player.STATE_IDLE
                 ) {
-                    onUpdateNotification(liveSession, true)
+                    updateNotificationSafely(liveSession, true, "keep-alive-$reason")
                 }
             }, KEEP_ALIVE_NOTIFICATION_DELAY_MS)
         }
+    }
+
+    private fun scheduleBadSourceSkip(player: Player, error: PlaybackException) {
+        if (!player.playWhenReady || player.mediaItemCount <= 1) return
+        val mediaId = player.currentMediaItem?.mediaId
+        val token = ++badSourceSkipToken
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "bad_source_wait",
+            fields = playerFields(player) + mapOf(
+                "code" to error.errorCodeName,
+                "graceMs" to BAD_SOURCE_CONTROLLER_GRACE_MS,
+            ),
+        )
+        mainHandler.postDelayed({
+            if (token != badSourceSkipToken) return@postDelayed
+            if (!player.playWhenReady || player.currentMediaItem?.mediaId != mediaId) return@postDelayed
+            if (player.playbackState != Player.STATE_IDLE) return@postDelayed
+            val nextIndex = player.nextMediaItemIndex
+            if (nextIndex == C.INDEX_UNSET || nextIndex == player.currentMediaItemIndex) return@postDelayed
+            runCatching {
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "bad_source_skip",
+                    fields = playerFields(player) + mapOf(
+                        "code" to error.errorCodeName,
+                        "nextIndex" to nextIndex,
+                    ),
+                )
+                player.seekToNextMediaItem()
+                player.prepare()
+                player.play()
+            }.onFailure { err ->
+                Log.w("PipoPlayer", "bad source skip failed", err)
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "bad_source_skip_failed",
+                    fields = playerFields(player) + mapOf(
+                        "errorType" to err::class.java.simpleName,
+                        "message" to err.message,
+                    ),
+                )
+            }
+        }, BAD_SOURCE_CONTROLLER_GRACE_MS)
+    }
+
+    private fun updateNotificationSafely(
+        session: MediaSession,
+        startInForegroundRequired: Boolean,
+        reason: String,
+    ) {
+        runCatching {
+            onUpdateNotification(session, startInForegroundRequired)
+        }.onFailure { err ->
+            val foregroundDenied = isForegroundStartDenied(err)
+            Log.w("PipoPlayer", "notification update failed ($reason)", err)
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = if (foregroundDenied) {
+                    "notification_foreground_denied"
+                } else {
+                    "notification_update_failed"
+                },
+                fields = playerFields(session.player) + mapOf(
+                    "reason" to reason,
+                    "startForeground" to startInForegroundRequired,
+                    "errorType" to err::class.java.simpleName,
+                    "message" to err.message,
+                ),
+            )
+            if (foregroundDenied && startInForegroundRequired) {
+                runCatching { onUpdateNotification(session, false) }
+                    .onFailure { fallback ->
+                        DiagnosticsLogStore.record(
+                            area = "playback_service",
+                            event = "notification_fallback_failed",
+                            fields = playerFields(session.player) + mapOf(
+                                "reason" to reason,
+                                "errorType" to fallback::class.java.simpleName,
+                                "message" to fallback.message,
+                            ),
+                        )
+                    }
+            }
+        }
+    }
+
+    private fun playerFields(player: Player): Map<String, Any?> {
+        return mapOf(
+            "mediaId" to player.currentMediaItem?.mediaId,
+            "title" to player.currentMediaItem?.mediaMetadata?.title?.toString(),
+            "state" to playbackStateName(player.playbackState),
+            "playWhenReady" to player.playWhenReady,
+            "mediaItemCount" to player.mediaItemCount,
+            "positionMs" to player.currentPosition.coerceAtLeast(0L),
+        )
     }
 
     /**
@@ -232,5 +362,36 @@ class PipoPlaybackService : MediaSessionService() {
     private companion object {
         private const val KEEP_ALIVE_PREPARE_COOLDOWN_MS = 1_500L
         private const val KEEP_ALIVE_NOTIFICATION_DELAY_MS = 80L
+        private const val BAD_SOURCE_CONTROLLER_GRACE_MS = 5_000L
     }
+}
+
+private fun isLikelyBadSource(error: PlaybackException): Boolean = when (error.errorCode) {
+    PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE -> true
+    else -> false
+}
+
+private fun isForegroundStartDenied(error: Throwable): Boolean {
+    val name = error::class.java.simpleName
+    val message = error.message.orEmpty()
+    return name == "ForegroundServiceStartNotAllowedException" ||
+        message.contains("startForegroundService() not allowed", ignoreCase = true)
+}
+
+private fun mediaTransitionReason(reason: Int): String = when (reason) {
+    Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> "auto"
+    Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> "playlist_changed"
+    Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT -> "repeat"
+    Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> "seek"
+    else -> reason.toString()
+}
+
+private fun playbackStateName(state: Int): String = when (state) {
+    Player.STATE_IDLE -> "idle"
+    Player.STATE_BUFFERING -> "buffering"
+    Player.STATE_READY -> "ready"
+    Player.STATE_ENDED -> "ended"
+    else -> state.toString()
 }

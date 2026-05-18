@@ -1,6 +1,11 @@
 package app.pipo.nativeapp.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -28,23 +33,29 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.AudioCacheStats
 import app.pipo.nativeapp.data.AiConfigView
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
+    val context = LocalContext.current
     val account by repository.account.collectAsState(initial = null)
     val cacheStats by repository.audioCacheStats.collectAsState(initial = AudioCacheStats(0, 0, 0))
     val aiConfig by repository.aiConfig.collectAsState(initial = AiConfigView(activeProvider = "", providers = emptyList()))
@@ -67,7 +78,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
 
     ScreenScaffold(title = "SETTINGS") {
         Text(
-            "Pipo 把你的账号状态、播放规则、AI 口吻都攒在本地。",
+            "账号、播放和 AI 都在本机。",
             color = PipoColors.TextDim,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(bottom = 20.dp),
@@ -86,6 +97,14 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                         if (start == null || start.qrContent.isBlank()) {
                             startResult.exceptionOrNull()?.let { err ->
                                 Log.w("PipoSettings", "start QR login failed", err)
+                                DiagnosticsLogStore.record(
+                                    area = "login",
+                                    event = "qr_start_failed",
+                                    fields = mapOf(
+                                        "errorType" to err::class.java.simpleName,
+                                        "errorMessage" to err.message.orEmpty().take(180),
+                                    ),
+                                )
                             }
                             loginStatus = "二维码加载失败，检查网络后刷新"
                             return@launch
@@ -96,6 +115,14 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                             val statusResult = runCatching { repository.checkQrLogin(start.key) }
                             val status = statusResult.getOrElse { err ->
                                 Log.w("PipoSettings", "check QR login failed", err)
+                                DiagnosticsLogStore.record(
+                                    area = "login",
+                                    event = "qr_check_failed",
+                                    fields = mapOf(
+                                        "errorType" to err::class.java.simpleName,
+                                        "errorMessage" to err.message.orEmpty().take(180),
+                                    ),
+                                )
                                 loginStatus = "登录状态获取失败，稍等后刷新"
                                 qrContent = null
                                 return@launch
@@ -108,6 +135,11 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                                 else -> status.message ?: "等待中"
                             }
                             if (status.code == 803) {
+                                DiagnosticsLogStore.record(
+                                    area = "login",
+                                    event = "qr_login_success",
+                                    fields = mapOf("hasNickname" to !status.nickname.isNullOrBlank()),
+                                )
                                 qrContent = null
                                 repository.refreshAccount()
                                 return@launch
@@ -133,6 +165,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                             repository.logout()
                             runCatching { PipoGraph.lastPlayback.clear() }
                             runCatching { PipoGraph.library.invalidate() }
+                            DiagnosticsLogStore.record("login", "logout")
                             loginStatus = "已退出"
                         }
                     }) { Text("退出", color = PipoColors.TextDim) }
@@ -167,9 +200,10 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
             val anyHasKey = aiConfig.providers.any { it.hasKey }
             LabelRow("服务商", activeProvider?.let { "${it.label} · ${it.model}" } ?: "DeepSeek / OpenAI / MiMo")
             if (!anyHasKey) {
-                LabelRow("未配置", "填入任一 provider 的 API key 才会有 AI 招呼 / 单曲点评 / Discovery")
+                LabelRow("未配置", "填入任一 key 后启用 AI")
             }
-            ToggleRow("DJ 旁白", settings.aiNarration) {
+            ToggleRow("封面短提示", settings.aiNarration) {
+                logSettingToggle("aiNarration", it)
                 scope.launch { repository.updateSettings(settings.copy(aiNarration = it)) }
             }
             aiConfig.providers.forEach { provider ->
@@ -196,30 +230,104 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
             )
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 TextButton(onClick = {
-                    scope.launch { repository.aiSetApiKey(aiConfig.activeProvider, apiKeyDraft) }
+                    scope.launch {
+                        DiagnosticsLogStore.record(
+                            area = "settings",
+                            event = "ai_key_save",
+                            fields = mapOf(
+                                "provider" to aiConfig.activeProvider,
+                                "keyLen" to apiKeyDraft.length,
+                            ),
+                        )
+                        repository.aiSetApiKey(aiConfig.activeProvider, apiKeyDraft)
+                    }
                 }) { Text("保存 key", color = PipoColors.Blue) }
                 TextButton(onClick = {
-                    scope.launch { aiReply = repository.aiPing() }
+                    scope.launch {
+                        val result = runCatching { repository.aiPing() }
+                        result.onSuccess {
+                            DiagnosticsLogStore.record(
+                                area = "settings",
+                                event = "ai_ping_success",
+                                fields = mapOf(
+                                    "provider" to aiConfig.activeProvider,
+                                    "replyLen" to it.length,
+                                ),
+                            )
+                        }.onFailure {
+                            DiagnosticsLogStore.record(
+                                area = "settings",
+                                event = "ai_ping_failed",
+                                fields = mapOf(
+                                    "provider" to aiConfig.activeProvider,
+                                    "errorType" to it::class.java.simpleName,
+                                    "errorMessage" to it.message.orEmpty().take(180),
+                                ),
+                            )
+                        }
+                        aiReply = result.getOrElse { "断线了。" }
+                    }
                 }) { Text("Ping", color = PipoColors.Gold) }
             }
             aiReply?.let { LabelRow("AI 回复", it) }
         }
 
         SettingsGroup("播放规则") {
+            ToggleRow("主动安排一段", settings.smartSessionPlanner) {
+                logSettingToggle("smartSessionPlanner", it)
+                scope.launch { repository.updateSettings(settings.copy(smartSessionPlanner = it)) }
+            }
             ToggleRow("工作时段自动播放", settings.workdayAutoplay) {
+                logSettingToggle("workdayAutoplay", it)
                 scope.launch { repository.updateSettings(settings.copy(workdayAutoplay = it)) }
             }
-            ToggleRow("会议时暂停", settings.pauseDuringMeetings) {
-                scope.launch { repository.updateSettings(settings.copy(pauseDuringMeetings = it)) }
-            }
             ToggleRow("午休换放松歌单", settings.lunchRelaxMode) {
+                logSettingToggle("lunchRelaxMode", it)
                 scope.launch { repository.updateSettings(settings.copy(lunchRelaxMode = it)) }
             }
+            ToggleRow("深夜低刺激", settings.lateNightCalmMode) {
+                logSettingToggle("lateNightCalmMode", it)
+                scope.launch { repository.updateSettings(settings.copy(lateNightCalmMode = it)) }
+            }
+            OutlinedTextField(
+                value = settings.promptedRadioRule,
+                onValueChange = { value ->
+                    scope.launch {
+                        repository.updateSettings(settings.copy(promptedRadioRule = value.take(240)))
+                    }
+                },
+                label = { Text("Prompted Radio") },
+                placeholder = { Text("上午不吵，熟歌 70%，新歌 30%") },
+                minLines = 2,
+                maxLines = 4,
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
 
         SettingsGroup("外观") {
             ToggleRow("隐藏点阵叠加", settings.hideDotPattern) {
+                logSettingToggle("hideDotPattern", it)
                 scope.launch { repository.updateSettings(settings.copy(hideDotPattern = it)) }
+            }
+            ToggleRow("隐藏 AI 圆球", settings.hideAiPetOrb) {
+                logSettingToggle("hideAiPetOrb", it)
+                scope.launch { repository.updateSettings(settings.copy(hideAiPetOrb = it)) }
+            }
+        }
+
+        SettingsGroup("诊断日志") {
+            LabelRow("范围", "记录播放、歌词、混音、AI 排歌、Taste Radar、网络错误和崩溃摘要；不会记录 cookie、API key、完整 URL 或完整歌词。")
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TextButton(onClick = {
+                    scope.launch { copyDiagnosticsToClipboard(context) }
+                }) {
+                    Text("复制日志", color = PipoColors.Mint)
+                }
+                TextButton(onClick = {
+                    scope.launch { shareDiagnosticsTxt(context) }
+                }) {
+                    Text("分享 txt", color = PipoColors.Blue)
+                }
             }
         }
 
@@ -239,6 +347,55 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
             LabelRow("已写", "${settings.userFacts.length} / 400")
         }
     }
+}
+
+private suspend fun copyDiagnosticsToClipboard(context: Context) {
+    val text = withContext(Dispatchers.IO) {
+        DiagnosticsLogStore.snapshotText(context, maxBytes = 360_000)
+    }
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText("PIPO diagnostic log", text))
+    DiagnosticsLogStore.record("diagnostics", "copied", mapOf("chars" to text.length))
+    Toast.makeText(context, "诊断日志已复制", Toast.LENGTH_SHORT).show()
+}
+
+private suspend fun shareDiagnosticsTxt(context: Context) {
+    val file = withContext(Dispatchers.IO) {
+        DiagnosticsLogStore.createShareFile(context)
+    }
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.diagnostics",
+        file,
+    )
+    DiagnosticsLogStore.record(
+        area = "diagnostics",
+        event = "share_txt",
+        fields = mapOf("bytes" to file.length()),
+    )
+    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "PIPO diagnostic log")
+        putExtra(Intent.EXTRA_TEXT, "PIPO 诊断日志")
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching {
+        context.startActivity(Intent.createChooser(sendIntent, "分享诊断日志"))
+    }.onFailure {
+        Toast.makeText(context, "没有可用的分享应用", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun logSettingToggle(name: String, value: Boolean) {
+    DiagnosticsLogStore.record(
+        area = "settings",
+        event = "toggle",
+        fields = mapOf(
+            "name" to name,
+            "value" to value,
+        ),
+    )
 }
 
 @Composable

@@ -11,6 +11,7 @@ import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -742,6 +743,8 @@ private fun AppleMusicLyricRow(
     }
 
     val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
+    val lineAudioStartMs = remember(line.startMs, line.chars) { LyricTiming.audioStartMs(line) }
+    val shouldSnapActiveEffects = isActive && positionMs - lineAudioStartMs > LYRIC_ACTIVE_ENTRY_SNAP_MS
     val hasCompanionCue = line.companionLines.any {
         shouldRenderCompanionLyric(it, positionMs) && !isCompanionLyricPast(it, positionMs)
     }
@@ -804,9 +807,13 @@ private fun AppleMusicLyricRow(
     val blurSpec: AnimationSpec<Float> = remember(cssEase) {
         tween(durationMillis = 200, easing = cssEase)    // AMLL: filter 0.2s
     }
+    val snapSpec: AnimationSpec<Float> = remember { snap() }
+    val rowAlphaSpec = if (shouldSnapActiveEffects) snapSpec else alphaSpec
+    val rowBlurSpec = if (shouldSnapActiveEffects) snapSpec else blurSpec
+    val liftSpec = if (shouldSnapActiveEffects) snapSpec else alphaSpec
     val rowAlpha by animateFloatAsState(
         targetValue = targetAlpha,
-        animationSpec = alphaSpec,
+        animationSpec = rowAlphaSpec,
         label = "lyricAlpha",
     )
     // 行级 translateY：归零，让 scale + alpha 承担"焦点层次"。
@@ -822,12 +829,12 @@ private fun AppleMusicLyricRow(
     // 跟 alpha 同节奏（250ms CSS ease），不带物理弹跳 —— Apple Music 的切句没有 bounce 感。
     val liftEnvelope by animateFloatAsState(
         targetValue = if (isActiveYrc) 1f else 0f,
-        animationSpec = alphaSpec,
+        animationSpec = liftSpec,
         label = "liftEnvelope",
     )
     val rowBlurDp by animateFloatAsState(
         targetValue = targetBlur,
-        animationSpec = blurSpec,
+        animationSpec = rowBlurSpec,
         label = "lyricBlur",
     )
 
@@ -968,6 +975,7 @@ private fun AppleMusicLyricText(
 }
 
 private const val COMPANION_LYRIC_LEAD_MS = 450L
+private const val LYRIC_ACTIVE_ENTRY_SNAP_MS = 450L
 
 /**
  * AGSL（Android Graphics Shading Language，API 33+）shader：lift + color 都在 GPU 里

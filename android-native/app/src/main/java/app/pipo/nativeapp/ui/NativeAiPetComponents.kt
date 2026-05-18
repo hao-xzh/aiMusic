@@ -8,6 +8,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -34,12 +35,15 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -51,12 +55,15 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.pipo.nativeapp.R
 
 internal data class PetPalette(
     val accent: Color,
@@ -212,6 +219,39 @@ internal fun HintBubble(text: String, palette: PetPalette) {
 }
 
 @Composable
+internal fun CoverAiCaption(text: String, palette: PetPalette) {
+    if (text.isBlank()) return
+    Row(
+        modifier = Modifier
+            .widthIn(max = 280.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(palette.panel.copy(alpha = 0.78f))
+            .padding(start = 7.dp, end = 11.dp, top = 7.dp, bottom = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Image(
+            painter = painterResource(id = R.mipmap.ic_launcher_round),
+            contentDescription = null,
+            modifier = Modifier
+                .size(20.dp)
+                .clip(CircleShape),
+        )
+        Text(
+            text = text,
+            color = palette.panelText,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = TextStyle(
+                fontSize = 12.sp,
+                lineHeight = 15.sp,
+                fontWeight = FontWeight.Medium,
+            ),
+        )
+    }
+}
+
+@Composable
 internal fun ReplyBubble(text: String?, palette: PetPalette) {
     if (text != null && text.isBlank()) return
     Box(
@@ -301,6 +341,13 @@ internal fun PetCommandBar(
     onSend: () -> Unit,
 ) {
     val canSend = input.isNotBlank() && !pending
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
 
     Row(
         modifier = Modifier
@@ -357,7 +404,9 @@ internal fun PetCommandBar(
                 keyboardActions = KeyboardActions(
                     onSend = { if (input.isNotBlank() && !pending) onSend() },
                 ),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusRequester),
                 decorationBox = { innerTextField ->
                     if (input.isEmpty()) {
                         Text(

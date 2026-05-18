@@ -82,7 +82,15 @@ object CrashLogStore {
             .putString(KEY_THREAD, thread.name)
             .putString(KEY_SUMMARY, summary)
             .putString(KEY_PATH, file.absolutePath)
-            .apply()
+            .commit()
+        DiagnosticsLogStore.record(
+            area = "crash",
+            event = "uncaught_exception",
+            fields = mapOf(
+                "thread" to thread.name,
+                "summary" to summary,
+            ),
+        )
     }
 
     private fun crashDir(context: Context): File = File(context.filesDir, "crashes")

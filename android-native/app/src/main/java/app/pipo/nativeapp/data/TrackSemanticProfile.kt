@@ -6,7 +6,7 @@ package app.pipo.nativeapp.data
  * 跟 React 端字段对齐，version=1，便于以后 LLM schema 升级时直接 invalidate 旧缓存。
  *
  * 用途：
- *   - PetAgent.commentOnTrack 让 Claudio 知道这首歌的 moods/scenes/genres，说人话点评
+ *   - 召回排序时按 moods/scenes/genres 做本地匹配
  *   - DistillEngine 蒸馏时把这些 tag 一起喂给口味画像，比纯 metadata 准
  *   - 将来召回排序时按 hardConstraints / softPreferences 对齐打分
  */
@@ -96,7 +96,7 @@ data class TrackSemanticProfile(
     val sourceLlm: Boolean = false,
     val updatedAtMs: Long = System.currentTimeMillis(),
 ) {
-    /** 给 PetAgent commentOnTrack 用的简短特征 line */
+    /** 给召回/调试用的简短特征 line */
     fun briefForComment(): String? {
         val parts = listOf(
             summary.takeIf { it.isNotBlank() },

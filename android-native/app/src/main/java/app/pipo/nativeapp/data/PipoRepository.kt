@@ -120,10 +120,14 @@ data class DistillState(
 
 data class NativeSettings(
     val hideDotPattern: Boolean = false,
+    val hideAiPetOrb: Boolean = true,
+    val smartSessionPlanner: Boolean = true,
     val workdayAutoplay: Boolean = true,
-    val pauseDuringMeetings: Boolean = true,
     val lunchRelaxMode: Boolean = false,
-    val aiNarration: Boolean = true,
+    val lateNightCalmMode: Boolean = true,
+    val promptedRadioRule: String = "",
+    val aiNarration: Boolean = false,
+    val playbackMode: String = "PlaylistLoop",
     val userFacts: String = "",
 )
 

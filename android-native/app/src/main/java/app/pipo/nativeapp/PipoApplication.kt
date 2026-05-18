@@ -13,6 +13,7 @@ import app.pipo.nativeapp.runtime.AppForeground
 class PipoApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        DiagnosticsLogStore.install(this)
         CrashLogStore.install(this)
         PipoGraph.installContext(this)
         registerForegroundTracker()
@@ -39,10 +40,13 @@ class PipoApplication : Application() {
                     appContext = applicationContext,
                 ),
             )
+            DiagnosticsLogStore.record("app", "repository_installed")
         } catch (_: UnsatisfiedLinkError) {
             // The native bridge is optional during UI migration and local desktop edits.
+            DiagnosticsLogStore.record("app", "repository_native_bridge_missing")
         } catch (_: SecurityException) {
             // Keep demo data if the runtime blocks native library loading.
+            DiagnosticsLogStore.record("app", "repository_install_blocked")
         }
     }
 

@@ -35,6 +35,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import app.pipo.nativeapp.data.AiCaptionBus
+import app.pipo.nativeapp.data.AiPetCommandBus
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.runtime.Amp
@@ -60,6 +63,7 @@ fun NativeAiPet(
     val context = LocalContext.current
     val repository = PipoGraph.repository
     val settings by repository.settings.collectAsState(initial = NativeSettings())
+    val coverCaption by AiCaptionBus.caption.collectAsState()
     val appInForeground by AppForeground.isForeground.collectAsState()
     val scope = rememberCoroutineScope()
     val messages = remember { mutableStateListOf<PetMessage>() }
@@ -76,6 +80,21 @@ fun NativeAiPet(
         if (latestReply != null) {
             delay(6000)
             latestReply = null
+        }
+    }
+    LaunchedEffect(Unit) {
+        AiPetCommandBus.commands.collect { command ->
+            when (command) {
+                AiPetCommandBus.Command.OpenChat -> {
+                    open = true
+                    hint = null
+                    DiagnosticsLogStore.record(
+                        area = "ai_pet",
+                        event = "open_from_shortcut",
+                        fields = mapOf("hideOrb" to settings.hideAiPetOrb),
+                    )
+                }
+            }
         }
     }
 
@@ -214,85 +233,11 @@ fun NativeAiPet(
                 ?.take(80)
             if (text != null) {
                 markGreeted(context)
+                AiCaptionBus.show(text)
                 hint = text
                 delay(5500)
                 hint = null
             }
-        }
-    }
-
-    // 单曲点评（一首歌一次 AI 调用，跨进出播放页持久 → 见 PetBubbleState 注释）
-    LaunchedEffect(currentTrackKey, open, settings.aiNarration, appInForeground, isPlaying) {
-        val key = currentTrackKey ?: return@LaunchedEffect
-        if (!settings.aiNarration || !appInForeground || !isPlaying) return@LaunchedEffect
-        if (open) return@LaunchedEffect
-        // 这首歌已经评过 → 直接返回，不再 burn AI
-        if (PetBubbleState.lastCommentedKey == key) return@LaunchedEffect
-
-        val now = System.currentTimeMillis()
-        PetBubbleState.recentChanges.add(now)
-        while (PetBubbleState.recentChanges.isNotEmpty() &&
-            now - PetBubbleState.recentChanges.first() > 30_000L
-        ) {
-            PetBubbleState.recentChanges.removeAt(0)
-        }
-        if (PetBubbleState.recentChanges.size >= 3) {
-            PetBubbleState.cooldownUntil = now + 60_000L
-        }
-        if (now < PetBubbleState.cooldownUntil) {
-            PetBubbleState.lastCommentedKey = key
-            return@LaunchedEffect
-        }
-
-        delay(1500)
-        if (open) return@LaunchedEffect
-        if (!AppForeground.isForeground.value || !isPlaying) return@LaunchedEffect
-        // delay 完再 check 一次：可能 1.5s 内用户连切歌，被新一轮处理掉了
-        if (PetBubbleState.lastCommentedKey == key) return@LaunchedEffect
-
-        val prev = PetBubbleState.previousTrack
-        val nextPositionInQueue = PetBubbleState.positionInQueue + 1
-
-        // USER 部分对齐 React commentOnTrack：当下 + 天气 + 记忆 + 这首特征 + TA 之前说 + 上一首 + 是否开场
-        val weather = runCatching { app.pipo.nativeapp.data.Weather.get() }.getOrNull()
-        val ctxLine = app.pipo.nativeapp.data.AppContext.describe(weather)
-        val digest = app.pipo.nativeapp.data.AppContext.memoryDigest(settings.userFacts)
-        val semantic = currentTrack?.id?.let { PipoGraph.trackSemanticStore.get(it) }
-        val tagsLine = semantic?.briefForComment()
-        val isOpener = nextPositionInQueue <= 1
-        val userPrompt = buildString {
-            append("当下：$ctxLine\n")
-            digest?.let { append("TA 的人:$it\n") }
-            append("现在播：$currentTitle — $currentArtist\n")
-            tagsLine?.let { append("这首特征：$it\n") }
-            PetBubbleState.lastUserContext?.let { append("TA 之前说：「$it」\n") }
-            prev?.let { append("刚刚那首：${it.first} — ${it.second}\n") }
-            append(if (isOpener) "这是开场。" else "这是接歌(队列第 $nextPositionInQueue 首)。")
-        }
-
-        if (!AppForeground.isForeground.value || !isPlaying) return@LaunchedEffect
-        PetBubbleState.previousTrack = currentTitle to currentArtist
-        PetBubbleState.positionInQueue = nextPositionInQueue
-        PetBubbleState.lastCommentedKey = key
-        val text = try {
-            repository.aiChat(
-                system = TRACK_COMMENT_SYSTEM,
-                user = userPrompt,
-                temperature = 0.95f,
-                maxTokens = 60,
-            )
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            null
-        }?.takeIf { it.isNotBlank() }
-            ?.trim()
-            ?.trim('「', '」', '『', '』', '"', '\'', '“', '”', '-', '—', ' ')
-            ?.take(30)
-        if (text != null && !open && AppForeground.isForeground.value) {
-            hint = text
-            delay(6000)
-            hint = null
         }
     }
 
@@ -345,6 +290,45 @@ fun NativeAiPet(
                         },
                     ),
             )
+        }
+
+        // 隐藏圆球时：AI 的话只贴在封面上方，logo + 一句话，自动消散。
+        val coverCaptionText = if (settings.hideAiPetOrb && !open) {
+            (coverCaption?.text ?: AiCaptionBus.compact(hint ?: latestReply))
+                .takeIf { it.isNotBlank() }
+        } else null
+        AnimatedVisibility(
+            visible = coverCaptionText != null,
+            enter = fadeIn(tween(220)) + slideInVertically(
+                animationSpec = tween(260, easing = PipoMotion.FlipEase),
+                initialOffsetY = { -it / 3 },
+            ),
+            exit = fadeOut(tween(180)) + slideOutVertically(
+                animationSpec = tween(180),
+                targetOffsetY = { -it / 3 },
+            ),
+            modifier = Modifier.layout { measurable, _ ->
+                val placeable = measurable.measure(androidx.compose.ui.unit.Constraints())
+                layout(placeable.width, placeable.height) {
+                    val rect = coverRect
+                    if (rect != null) {
+                        val topInset = with(density) { 12.dp.toPx() }.toInt()
+                        val left = (rect.left + topInset).toInt()
+                        val top = (rect.top + topInset).toInt()
+                        placeable.placeRelative(
+                            x = left.coerceAtLeast(0),
+                            y = top.coerceAtLeast(0),
+                        )
+                    } else {
+                        placeable.placeRelative(
+                            x = ((screenW - placeable.width) / 2).toInt().coerceAtLeast(0),
+                            y = with(density) { 72.dp.toPx() }.toInt(),
+                        )
+                    }
+                }
+            },
+        ) {
+            CoverAiCaption(coverCaptionText.orEmpty(), palette = petPalette)
         }
 
         // ---- 助手回复浮气泡 ----
@@ -420,6 +404,7 @@ fun NativeAiPet(
                             )
                             messages += PetMessage(fromUser = false, text = response.reply)
                             latestReply = response.reply
+                            AiCaptionBus.show(response.reply)
                             when {
                                 response.action == app.pipo.nativeapp.data.PetAgent.Action.Insert &&
                                     response.initialBatch.isNotEmpty() -> {
@@ -436,6 +421,7 @@ fun NativeAiPet(
                             val reply = "我这边刚刚断了一下，再说一次。"
                             messages += PetMessage(fromUser = false, text = reply)
                             latestReply = reply
+                            AiCaptionBus.show(reply)
                         } finally {
                             pending = false
                         }
@@ -446,7 +432,7 @@ fun NativeAiPet(
 
         // ---- Hint 气泡：仍贴 orb（panel 关闭状态下才显示）----
         AnimatedVisibility(
-            visible = hint != null && !open,
+            visible = hint != null && !open && !settings.hideAiPetOrb,
             enter = fadeIn(tween(200)) + scaleIn(tween(220), initialScale = 0.92f),
             exit = fadeOut(tween(180)) + scaleOut(tween(180), targetScale = 0.92f),
             modifier = Modifier.layout { measurable, _ ->
@@ -466,30 +452,32 @@ fun NativeAiPet(
         }
 
         // ---- Orb：常驻挂在封面右下，是命令条的开关 ----
-        Box(
-            modifier = Modifier
-                .layout { measurable, _ ->
-                    val placeable = measurable.measure(
-                        androidx.compose.ui.unit.Constraints(),
-                    )
-                    layout(placeable.width, placeable.height) {
-                        val anchorRight = (animatedOffset.x + petSizePx).toInt()
-                        val anchorBottom = (animatedOffset.y + petSizePx).toInt()
-                        placeable.placeRelative(
-                            x = anchorRight - placeable.width,
-                            y = anchorBottom - placeable.height,
+        if (!settings.hideAiPetOrb) {
+            Box(
+                modifier = Modifier
+                    .layout { measurable, _ ->
+                        val placeable = measurable.measure(
+                            androidx.compose.ui.unit.Constraints(),
                         )
-                    }
-                },
-        ) {
-            PetOrb(
-                haloPulse = haloPhaseValue,
-                sway = swayDeg,
-                pulseScale = orbScale,
-                attached = (coverRect != null),
-                palette = petPalette,
-                onClick = { open = !open; if (open) hint = null },
-            )
+                        layout(placeable.width, placeable.height) {
+                            val anchorRight = (animatedOffset.x + petSizePx).toInt()
+                            val anchorBottom = (animatedOffset.y + petSizePx).toInt()
+                            placeable.placeRelative(
+                                x = anchorRight - placeable.width,
+                                y = anchorBottom - placeable.height,
+                            )
+                        }
+                    },
+            ) {
+                PetOrb(
+                    haloPulse = haloPhaseValue,
+                    sway = swayDeg,
+                    pulseScale = orbScale,
+                    attached = (coverRect != null),
+                    palette = petPalette,
+                    onClick = { open = !open; if (open) hint = null },
+                )
+            }
         }
     }
 }

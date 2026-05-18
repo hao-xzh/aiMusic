@@ -59,7 +59,7 @@ object AppContext {
 
     /**
      * 跨 session 记忆 digest —— 镜像 React getMemoryDigest。
-     * 喂给 GREETING_SYSTEM / TRACK_COMMENT_SYSTEM / 主聊天 USER。
+     * 喂给 GREETING_SYSTEM / 主聊天 USER。
      *
      * 包含：陪伴痕迹（总播放数 + 上次说过的话）+ 用户自述事实 + 口味画像摘要。
      * 故意**不**包含 loveArtists / skipHotArtists —— 见 PetMemory 模块顶部注释。

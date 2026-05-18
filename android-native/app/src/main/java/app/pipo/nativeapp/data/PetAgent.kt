@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.data
 
+import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
@@ -50,24 +51,60 @@ class PetAgent(
         currentTrack: NativeTrack?,
         userFacts: String,
     ): AgentResponse {
-        val raw = runCatching {
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "chat_start",
+            fields = mapOf(
+                "inputLen" to userText.length,
+                "historyCount" to history.size,
+                "hasCurrentTrack" to (currentTrack != null),
+                "userFactsLen" to userFacts.length,
+            ),
+        )
+        val aiResult = runCatching {
             repository.aiChat(
                 system = SYSTEM_PROMPT,
                 user = buildUserMessage(userText, history, currentTrack, userFacts),
                 temperature = 0.75f,
                 maxTokens = 4000,
             )
-        }.getOrNull().orEmpty()
+        }
+        aiResult.onFailure { error ->
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "ai_chat_failed",
+                fields = errorFields(error) + mapOf("inputLen" to userText.length),
+            )
+        }
+        val raw = aiResult.getOrNull().orEmpty()
 
         val parsed = parseIntent(raw)
-            ?: return AgentResponse(
-                reply = if (raw.isBlank()) "我这边断线了，再说一次？" else raw.take(60),
-                action = Action.Chat,
-                initialBatch = emptyList(),
-                continuous = null,
-            )
+            ?: run {
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = if (raw.isBlank()) "intent_empty" else "intent_parse_failed",
+                    fields = mapOf(
+                        "rawChars" to raw.length,
+                        "inputLen" to userText.length,
+                    ),
+                )
+                return AgentResponse(
+                    reply = if (raw.isBlank()) "断线了。" else raw.take(60),
+                    action = Action.Chat,
+                    initialBatch = emptyList(),
+                    continuous = null,
+                )
+            }
 
         if (parsed.action != Action.Play) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "intent_chat",
+                fields = mapOf(
+                    "replyLen" to parsed.reply.length,
+                    "rawAction" to parsed.action.name,
+                ),
+            )
             return AgentResponse(
                 reply = parsed.reply,
                 action = Action.Chat,
@@ -81,6 +118,17 @@ class PetAgent(
 
         // 1) 本地库 → 多路召回 → 排序
         val localTracks = runCatching { library.library() }.getOrDefault(emptyList())
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "intent_play",
+            fields = mapOf(
+                "desired" to desired,
+                "queueAction" to parsed.queueAction,
+                "libraryCount" to localTracks.size,
+                "hardTrackCount" to intent.hardTracks.size,
+                "hardArtistCount" to intent.hardArtists.size,
+            ),
+        )
 
         // 1a) 命名歌曲 PIN —— 用户在话里明确点过的歌（"放七百年后"、"陈奕迅 浮夸"），
         //     直接钉到队首；recall 只是"补差"，不是"覆盖用户明示意图"。
@@ -95,6 +143,14 @@ class PetAgent(
             val pinnedOnlineOnly = resolvePinnedFromOnline(intent, pinnedNamed)
             val toInsert = mergeUnique(pinnedNamed, pinnedOnlineOnly).take(1)
             if (toInsert.isEmpty()) {
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "insert_not_found",
+                    fields = mapOf(
+                        "localPinned" to pinnedNamed.size,
+                        "trackHintCount" to (intent.hardTracks.size + intent.textTracks.size),
+                    ),
+                )
                 return AgentResponse(
                     reply = "${parsed.reply}（这首我没找到，换个名字？）",
                     action = Action.Chat,
@@ -105,6 +161,14 @@ class PetAgent(
             runCatching {
                 recommendationLog.log(toInsert.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
             }
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "insert_ready",
+                fields = mapOf(
+                    "trackCount" to toInsert.size,
+                    "neteaseId" to toInsert.firstOrNull()?.neteaseId,
+                ),
+            )
             return AgentResponse(
                 reply = parsed.reply,
                 action = Action.Insert,
@@ -145,6 +209,16 @@ class PetAgent(
                     recentRecommendation = recentRec,
                 ),
             )
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "local_ranked",
+                fields = mapOf(
+                    "libraryCount" to localTracks.size,
+                    "candidateCount" to candidates.size,
+                    "rankedCount" to ranked.size,
+                    "queryVector" to (queryVector != null),
+                ),
+            )
             // smooth-queue 平滑接歌
             val asTracks = ranked.map { it.candidate.track }
             SmoothQueue.smooth(
@@ -164,6 +238,15 @@ class PetAgent(
         } else {
             val queries = intent.toSearchQueries(userText)
             val online = neteaseSearch(queries)
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "online_backfill",
+                fields = mapOf(
+                    "queryCount" to queries.size,
+                    "localRankedCount" to localRanked.size,
+                    "onlineCount" to online.size,
+                ),
+            )
             // 合并：本地优先 + 在线兜底
             val seenKeys = HashSet<String>()
             val merged = ArrayList<NativeTrack>(localRanked.size + online.size)
@@ -186,6 +269,14 @@ class PetAgent(
         }
 
         if (final.isEmpty()) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "queue_empty",
+                fields = mapOf(
+                    "localRankedCount" to localRanked.size,
+                    "pinnedCount" to pinnedAll.size,
+                ),
+            )
             return AgentResponse(
                 reply = "${parsed.reply}（这次库里真没贴的，换个说法？）",
                 action = Action.Chat,
@@ -202,6 +293,16 @@ class PetAgent(
             recommendationLog.log(initialBatch.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
         }
         val reservoir = final.drop(12)
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "queue_ready",
+            fields = mapOf(
+                "initialCount" to initialBatch.size,
+                "reservoirCount" to reservoir.size,
+                "pinnedCount" to pinnedAll.size,
+                "desired" to desired,
+            ),
+        )
 
         return AgentResponse(
             reply = parsed.reply,
@@ -404,6 +505,14 @@ class PetAgent(
             }
             if (drained.isNotEmpty()) {
                 runCatching { recommendationLog.log(drained.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet) }
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "continuous_drain",
+                    fields = mapOf(
+                        "count" to drained.size,
+                        "poolLeft" to pool.size,
+                    ),
+                )
                 return@ContinuousQueueSource drained
             }
 
@@ -426,11 +535,34 @@ class PetAgent(
                 }
                 val refill = collected.take(8)
                 runCatching { recommendationLog.log(refill.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet) }
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "continuous_refill",
+                    fields = mapOf(
+                        "queryCount" to seedQueries.size,
+                        "collected" to collected.size,
+                        "returned" to refill.size,
+                    ),
+                )
                 return@ContinuousQueueSource refill
             }
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "continuous_empty",
+                fields = mapOf(
+                    "seedQueryCount" to seedQueries.size,
+                    "excludeCount" to excludeIds.size,
+                ),
+            )
             emptyList()
         }
     }
+
+    private fun errorFields(error: Throwable): Map<String, Any?> =
+        mapOf(
+            "errorType" to error::class.java.simpleName,
+            "errorMessage" to error.message.orEmpty().take(180),
+        )
 
     // ---------- USER message ----------
 

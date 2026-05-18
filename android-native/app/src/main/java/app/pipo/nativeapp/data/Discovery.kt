@@ -3,11 +3,10 @@ package app.pipo.nativeapp.data
 /**
  * 续杯式 Discovery —— 镜像 src/lib/discovery.ts 的三步走流水线。
  *
- *   1) AI 出 seeds（搜索关键词，每个带 rationale）—— 没 AI key 时退化成
+ *   1) AI 出 seeds（搜索关键词）—— 没 AI key 时退化成
  *      "当前 artist + tasteProfile.tags 前 3 个" 的本地启发式
  *   2) netease.search 把每个 seed 搜回真实曲目；聚合 + 去重 + 排除用户已有
- *   3) AI rerank（可选）—— 这一版直接按 seed 顺序 + tag overlap 排序，
- *      AI 接入后可以扩展为 commentOnTrack 风格
+ *   3) 本地 rerank —— 这一版直接按 seed 顺序 + tag overlap 排序
  */
 class Discovery(
     private val repository: PipoRepository,
