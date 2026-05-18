@@ -11,39 +11,32 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.AudioFeatures
 import app.pipo.nativeapp.data.AudioFeaturesStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.TransitionScore
 import app.pipo.nativeapp.runtime.Amp
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.roundToLong
-import kotlin.math.sin
 
 /**
- * Service-side dual-deck AutoMix.
+ * Service-side main-deck AutoMix.
  *
- * The MediaSession player remains the only authoritative player. During an AutoMix transition the
- * main player advances into the full next track immediately, while a short-lived secondary deck only
- * carries the outgoing tail. The next song is therefore never played once by the shadow deck and then
- * replayed by the main deck.
+ * The MediaSession player is the only audio source during transitions. AutoMix only decides an early,
+ * high-confidence cut point and lets the main player enter the full next track from 0ms. No extra copy
+ * of the outgoing tail or incoming intro is played by a secondary deck, so neither side can repeat.
  */
 @UnstableApi
 internal class SmartAutoMixer(
-    context: Context,
+    @Suppress("UNUSED_PARAMETER") context: Context,
     private val mainPlayer: ExoPlayer,
-    private val dataSourceFactory: CacheDataSource.Factory,
-    private val audioAttributes: AudioAttributes,
+    @Suppress("UNUSED_PARAMETER") dataSourceFactory: CacheDataSource.Factory,
+    @Suppress("UNUSED_PARAMETER") audioAttributes: AudioAttributes,
     private val featuresStore: AudioFeaturesStore,
 ) {
-    private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private var tickPosted = false
     private var armed: ArmedMix? = null
@@ -143,11 +136,7 @@ internal class SmartAutoMixer(
             SystemClock.elapsedRealtime() - lastCompletedAtMs < COMPLETED_PAIR_COOLDOWN_MS
         ) return
 
-        val shadow = buildShadowPlayer()
-        shadow.setMediaItem(plan.currentItem, plan.currentTailStartPositionMs)
-        shadow.volume = 0f
-        shadow.prepare()
-        armed = ArmedMix(plan = plan, shadow = shadow)
+        armed = ArmedMix(plan = plan)
         Log.d(TAG, "armed ${plan.currentTitle} -> ${plan.nextTitle}, mix=${plan.mixMs}ms, ${plan.reason}")
         logMixEvent(
             "armed",
@@ -157,8 +146,7 @@ internal class SmartAutoMixer(
                 "reason" to plan.reason,
                 "remainingMs" to remainingMs,
                 "prepareLeadMs" to prepareLeadMs,
-                "transitionMode" to "main-next-shadow-tail",
-                "currentTailStartPositionMs" to plan.currentTailStartPositionMs,
+                "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
             ),
         )
     }
@@ -175,59 +163,23 @@ internal class SmartAutoMixer(
             cancel("armed-no-duration", keepMainVolume = true)
             return
         }
-        val shadowState = waiting.shadow.playbackState
-        if (shadowState == Player.STATE_READY && !waiting.shadowReadyLogged) {
-            waiting.shadowReadyLogged = true
-            waiting.shadowReadyRemainingMs = remainingMs
-            logMixEvent(
-                "shadow_ready",
-                plan,
-                mapOf(
-                    "remainingMs" to remainingMs,
-                    "mixMs" to plan.mixMs,
-                    "readyAheadMs" to (remainingMs - plan.mixMs),
-                ),
-            )
-        }
         if (remainingMs > plan.mixMs) return
         if (remainingMs < MIN_REMAINING_TO_START_MS) {
-            cancel("shadow-too-late", keepMainVolume = true)
-            return
-        }
-        if (shadowState != Player.STATE_READY) return
-        val readyRemainingMs = waiting.shadowReadyRemainingMs ?: remainingMs
-        val lateByMs = plan.mixMs - readyRemainingMs
-        if (lateByMs > LATE_SHADOW_READY_TOLERANCE_MS) {
-            logMixEvent(
-                "shadow_ready_too_late",
-                plan,
-                mapOf(
-                    "remainingMs" to remainingMs,
-                    "readyRemainingMs" to readyRemainingMs,
-                    "mixMs" to plan.mixMs,
-                    "lateByMs" to lateByMs,
-                    "shadowState" to playbackStateName(shadowState),
-                ),
-            )
-            cancel("shadow-ready-too-late", keepMainVolume = true)
+            cancel("mix-too-late", keepMainVolume = true)
             return
         }
         if (!tailSignalAllowsMix(waiting, remainingMs)) return
 
-        startMainNextMix(waiting, remainingMs)
+        startMainOnlyNext(waiting, remainingMs)
     }
 
-    private fun startMainNextMix(waiting: ArmedMix, remainingMs: Long) {
+    private fun startMainOnlyNext(waiting: ArmedMix, remainingMs: Long) {
         val plan = waiting.plan
         val outgoingPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
         val startedAtMs = SystemClock.elapsedRealtime()
-        waiting.shadow.seekTo(outgoingPositionMs)
-        waiting.shadow.volume = 1f
-        waiting.shadow.play()
 
         active = ActiveMix(
             plan = plan,
-            shadow = waiting.shadow,
             startedAtMs = startedAtMs,
         )
         armed = null
@@ -248,7 +200,7 @@ internal class SmartAutoMixer(
             "started",
             plan,
             mapOf(
-                "transitionMode" to "main-next-shadow-tail",
+                "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
                 "remainingMs" to remainingMs,
                 "tailDipTicks" to waiting.tailDipTicks,
                 "outgoingPositionMs" to outgoingPositionMs,
@@ -256,8 +208,6 @@ internal class SmartAutoMixer(
                 "mainTargetPositionMs" to plan.nextStartPositionMs,
                 "mainState" to playbackStateName(mainPlayer.playbackState),
                 "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
-                "shadowPositionMs" to waiting.shadow.currentPosition.coerceAtLeast(0L),
-                "shadowState" to playbackStateName(waiting.shadow.playbackState),
             ),
         )
     }
@@ -267,7 +217,6 @@ internal class SmartAutoMixer(
         val currentId = mainPlayer.currentMediaItem?.mediaId
         if (currentId != plan.nextId) {
             mainPlayer.volume = 0f
-            running.shadow.volume = 1f
             if (!running.mainNextWaitLogged &&
                 SystemClock.elapsedRealtime() - running.startedAtMs >= MAIN_NEXT_WAIT_LOG_MS
             ) {
@@ -276,10 +225,9 @@ internal class SmartAutoMixer(
                     "main_next_waiting",
                     plan,
                     mapOf(
-                        "transitionMode" to "main-next-shadow-tail",
+                        "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
                         "mainMediaId" to currentId,
                         "mainState" to playbackStateName(mainPlayer.playbackState),
-                        "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
                         "elapsedMs" to (SystemClock.elapsedRealtime() - running.startedAtMs),
                     ),
                 )
@@ -291,17 +239,15 @@ internal class SmartAutoMixer(
         val mainReady = mainPlayer.playbackState == Player.STATE_READY && mainPlayer.playWhenReady
         if (!mainReady) {
             mainPlayer.volume = 0f
-            running.shadow.volume = 1f
             if (!running.mainNextWaitLogged && now - running.startedAtMs >= MAIN_NEXT_WAIT_LOG_MS) {
                 running.mainNextWaitLogged = true
                 logMixEvent(
                     "main_next_waiting",
                     plan,
                     mapOf(
-                        "transitionMode" to "main-next-shadow-tail",
+                        "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
                         "mainState" to playbackStateName(mainPlayer.playbackState),
                         "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
-                        "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
                         "elapsedMs" to (now - running.startedAtMs),
                     ),
                 )
@@ -317,11 +263,9 @@ internal class SmartAutoMixer(
                     "main_next_ready",
                     plan,
                     mapOf(
-                        "transitionMode" to "main-next-shadow-tail",
+                        "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
                         "elapsedToReadyMs" to (now - running.startedAtMs),
                         "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
-                        "shadowPositionMs" to running.shadow.currentPosition.coerceAtLeast(0L),
-                        "shadowState" to playbackStateName(running.shadow.playbackState),
                     ),
                 )
             }
@@ -329,23 +273,19 @@ internal class SmartAutoMixer(
 
         val fadeStartedAtMs = running.fadeStartedAtMs ?: now
         val fadeElapsed = now - fadeStartedAtMs
-        val p = (fadeElapsed.toFloat() / plan.mixMs.toFloat()).coerceIn(0f, 1f)
-        val gains = equalPowerGains(p)
-        running.shadow.volume = gains.current
-        mainPlayer.volume = gains.next
+        val p = (fadeElapsed.toFloat() / MAIN_ONLY_FADE_IN_MS.toFloat()).coerceIn(0f, 1f)
+        mainPlayer.volume = p
 
-        if (p >= 1f || running.shadow.playbackState == Player.STATE_ENDED) {
+        if (p >= 1f) {
             completeMainNextMix(running, now, fadeElapsed)
         }
     }
 
     private fun completeMainNextMix(running: ActiveMix, now: Long, fadeElapsedMs: Long) {
         val plan = running.plan
-        val shadowPositionMs = running.shadow.currentPosition.coerceAtLeast(0L)
         val mainPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
         lastCompletedKey = plan.key
         lastCompletedAtMs = now
-        cleanupShadow(running.shadow)
         active = null
         mainPlayer.volume = 1f
         Log.d(TAG, "completed ${plan.currentTitle} -> ${plan.nextTitle}")
@@ -353,12 +293,11 @@ internal class SmartAutoMixer(
             "completed",
             plan,
             mapOf(
-                "transitionMode" to "main-next-shadow-tail",
+                "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
                 "mainPositionMs" to mainPositionMs,
-                "shadowPositionMs" to shadowPositionMs,
                 "elapsedToReadyMs" to ((running.fadeStartedAtMs ?: now) - running.startedAtMs),
                 "fadeElapsedMs" to fadeElapsedMs,
-                "continuityMode" to "main-next-continuous",
+                "continuityMode" to "main-only-next",
                 "offsetOutsideTolerance" to false,
             ),
         )
@@ -385,11 +324,8 @@ internal class SmartAutoMixer(
             key = "${currentTrack.id}->${nextTrack.id}",
             currentId = currentTrack.id,
             nextId = nextTrack.id,
-            currentItem = currentItem,
             nextIndex = nextIndex,
             nextStartPositionMs = 0L,
-            currentTailStartPositionMs = (currentDurationMs - mix.mixMs - CURRENT_TAIL_PREROLL_MS)
-                .coerceAtLeast(0L),
             currentTitle = currentTrack.title,
             nextTitle = nextTrack.title,
             mixMs = mix.mixMs,
@@ -598,27 +534,6 @@ internal class SmartAutoMixer(
         return maxOf(styleLeadMs, tailLeadMs).coerceAtMost(MAX_PREPARE_LEAD_MS)
     }
 
-    private fun buildShadowPlayer(): ExoPlayer {
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                /* minBufferMs = */ 8_000,
-                /* maxBufferMs = */ 18_000,
-                /* bufferForPlaybackMs = */ 250,
-                /* bufferForPlaybackAfterRebufferMs = */ 600,
-            )
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build()
-        return ExoPlayer.Builder(appContext)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
-            .setLoadControl(loadControl)
-            .build()
-            .apply {
-                setAudioAttributes(audioAttributes, /* handleAudioFocus = */ false)
-                repeatMode = Player.REPEAT_MODE_OFF
-                setWakeMode(C.WAKE_MODE_NETWORK)
-            }
-    }
-
     private fun cancel(reason: String, keepMainVolume: Boolean) {
         val plan = active?.plan ?: armed?.plan
         val phase = when {
@@ -626,8 +541,6 @@ internal class SmartAutoMixer(
             armed != null -> "armed"
             else -> "idle"
         }
-        armed?.let { cleanupShadow(it.shadow) }
-        active?.let { cleanupShadow(it.shadow) }
         armed = null
         active = null
         if (keepMainVolume) mainPlayer.volume = 1f
@@ -666,12 +579,6 @@ internal class SmartAutoMixer(
         )
     }
 
-    private fun cleanupShadow(player: ExoPlayer) {
-        runCatching { player.stop() }
-        runCatching { player.clearMediaItems() }
-        runCatching { player.release() }
-    }
-
     private fun MediaItem.toNativeTrack(): NativeTrack? {
         val mediaId = mediaId.takeIf { it.isNotBlank() } ?: return null
         return NativeTrack(
@@ -684,13 +591,6 @@ internal class SmartAutoMixer(
         )
     }
 
-    private fun equalPowerGains(progress: Float): Gains {
-        val p = progress.coerceIn(0f, 1f)
-        val current = cos(p * PI.toFloat() / 2f).coerceIn(0f, 1f)
-        val next = sin(p * PI.toFloat() / 2f).coerceIn(0f, 1f)
-        return Gains(current = current, next = next)
-    }
-
     private fun playbackStateName(state: Int): String = when (state) {
         Player.STATE_IDLE -> "idle"
         Player.STATE_BUFFERING -> "buffering"
@@ -698,8 +598,6 @@ internal class SmartAutoMixer(
         Player.STATE_ENDED -> "ended"
         else -> state.toString()
     }
-
-    private data class Gains(val current: Float, val next: Float)
 
     private data class MixWindow(
         val mixMs: Long,
@@ -714,10 +612,8 @@ internal class SmartAutoMixer(
         val key: String,
         val currentId: String,
         val nextId: String,
-        val currentItem: MediaItem,
         val nextIndex: Int,
         val nextStartPositionMs: Long,
-        val currentTailStartPositionMs: Long,
         val currentTitle: String,
         val nextTitle: String,
         val mixMs: Long,
@@ -730,15 +626,11 @@ internal class SmartAutoMixer(
 
     private data class ArmedMix(
         val plan: AutoMixPlan,
-        val shadow: ExoPlayer,
         var tailDipTicks: Int = 0,
-        var shadowReadyLogged: Boolean = false,
-        var shadowReadyRemainingMs: Long? = null,
     )
 
     private data class ActiveMix(
         val plan: AutoMixPlan,
-        val shadow: ExoPlayer,
         val startedAtMs: Long,
         var fadeStartedAtMs: Long? = null,
         var mainNextReadyLogged: Boolean = false,
@@ -750,8 +642,8 @@ internal class SmartAutoMixer(
         private const val TICK_MS = 180L
         private const val SHORT_MIX_PREPARE_THRESHOLD_MS = 1_500L
         private const val TIGHT_MIX_PREPARE_THRESHOLD_MS = 2_300L
-        private const val CURRENT_TAIL_PREROLL_MS = 600L
         private const val MAIN_NEXT_WAIT_LOG_MS = 700L
+        private const val MAIN_ONLY_FADE_IN_MS = 520L
         private const val SHORT_MIX_PREPARE_LEAD_MS = 7_200L
         private const val TIGHT_MIX_PREPARE_LEAD_MS = 6_200L
         private const val SOFT_MIX_PREPARE_LEAD_MS = 5_200L
@@ -759,7 +651,7 @@ internal class SmartAutoMixer(
         private const val MAX_PREPARE_LEAD_MS = 8_500L
         private const val MIN_REMAINING_TO_ARM_MS = 1_200L
         private const val MIN_REMAINING_TO_START_MS = 750L
-        private const val LATE_SHADOW_READY_TOLERANCE_MS = 260L
+        private const val MAIN_ONLY_TRANSITION_MODE = "main-only-next"
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
         private const val MIN_TRACK_DURATION_S = 35.0
