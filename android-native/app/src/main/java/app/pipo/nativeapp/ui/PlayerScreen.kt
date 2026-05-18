@@ -147,6 +147,7 @@ fun PlayerScreen(
                 title = state.title,
                 artist = state.artist,
                 album = state.album,
+                trackId = state.currentTrackId,
                 lyrics = state.lyrics,
                 activeLyricIndex = lyricClock.activeIndex,
                 positionMs = lyricClock.positionMs,

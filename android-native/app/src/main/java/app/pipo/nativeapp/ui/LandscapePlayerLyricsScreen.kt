@@ -52,6 +52,7 @@ internal fun LandscapePlayerLyricsScreen(
     title: String,
     artist: String,
     album: String,
+    trackId: String?,
     lyrics: List<PipoLyricLine>,
     activeLyricIndex: Int,
     positionMs: Long,
@@ -116,6 +117,7 @@ internal fun LandscapePlayerLyricsScreen(
 
                     AppleMusicLyricColumn(
                         lines = lyrics,
+                        sessionId = trackId,
                         activeLyricIndex = activeLyricIndex,
                         positionMs = positionMs,
                         isPlaying = isPlaying,

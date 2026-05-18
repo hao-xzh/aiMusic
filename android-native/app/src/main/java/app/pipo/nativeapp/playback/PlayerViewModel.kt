@@ -45,6 +45,7 @@ data class PlayerUiState(
     val title: String = "",
     val artist: String = "",
     val album: String = "",
+    val currentTrackId: String? = null,
     val artworkUrl: String? = null,
     val isPlaying: Boolean = false,
     val positionMs: Long = 0L,
@@ -1213,6 +1214,17 @@ class PlayerViewModel(
                             "lineCount" to lines.size,
                             "wordLineCount" to lines.count { it.chars.isNotEmpty() },
                             "tokenCount" to lines.sumOf { it.chars.size + it.companionLines.sumOf { companion -> companion.chars.size } },
+                            "timingPartCount" to lines.sumOf {
+                                it.chars.sumOf { char -> char.timingParts.size.coerceAtLeast(1) } +
+                                    it.companionLines.sumOf { companion ->
+                                        companion.chars.sumOf { char -> char.timingParts.size.coerceAtLeast(1) }
+                                    }
+                            },
+                            "firstLineStartMs" to lines.firstOrNull()?.startMs,
+                            "firstAudioStartMs" to lines.firstOrNull()?.let { LyricTiming.audioStartMs(it) },
+                            "lastLineStartMs" to lines.lastOrNull()?.startMs,
+                            "lastLineDurationMs" to lines.lastOrNull()?.durationMs,
+                            "focusLeadMs" to LyricTiming.focusLeadMs(lines),
                             "companionLineCount" to lines.sumOf { it.companionLines.size },
                         ),
                     )
@@ -1227,6 +1239,7 @@ class PlayerViewModel(
             title = player.mediaMetadata.title?.toString() ?: track?.title.orEmpty(),
             artist = player.mediaMetadata.artist?.toString() ?: track?.artist.orEmpty(),
             album = player.mediaMetadata.albumTitle?.toString() ?: track?.album.orEmpty(),
+            currentTrackId = authoritativeTrackId,
             artworkUrl = player.mediaMetadata.artworkUri?.toString() ?: track?.artworkUrl,
             isPlaying = player.isPlaying,
             positionMs = player.currentPosition.coerceAtLeast(0L),

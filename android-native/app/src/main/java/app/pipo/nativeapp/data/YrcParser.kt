@@ -46,18 +46,24 @@ object YrcParser {
                             startMs = tokenStart + idx * perDur,
                             durationMs = if (idx == groups.size - 1) tokenDur - perDur * idx else perDur,
                             text = charText,
+                            timingParts = listOf(
+                                PipoLyricTimingPart(
+                                    startMs = tokenStart + idx * perDur,
+                                    durationMs = if (idx == groups.size - 1) tokenDur - perDur * idx else perDur,
+                                    text = charText,
+                                ),
+                            ),
                         )
                     )
                 }
             }
 
             val rawMergedChars = mergeAdjacentAsciiLyricChars(chars)
-            val rawText = if (rawMergedChars.isNotEmpty()) rawMergedChars.joinToString("") { it.text } else ""
             val mergedChars = normalizeYrcLineTimings(
                 chars = rawMergedChars,
                 lineStartMs = lineStart,
                 lineDurationMs = lineDur,
-                tightenInternalDurations = isParentheticalLine(rawText),
+                tightenInternalDurations = true,
             )
             val text = if (mergedChars.isNotEmpty()) mergedChars.joinToString("") { it.text } else ""
             if (mergedChars.isEmpty() && text.isEmpty()) continue
@@ -194,7 +200,17 @@ private fun normalizeYrcLineTimings(
 
     if (!looksLikeLineTailPackedIntoLast) return normalizedChars
 
-    val cappedLast = last.copy(durationMs = maxVisualLastMs.coerceAtLeast(1L))
+    val cappedDuration = maxVisualLastMs.coerceAtLeast(1L)
+    val cappedLast = last.copy(
+        durationMs = cappedDuration,
+        timingParts = listOf(
+            PipoLyricTimingPart(
+                startMs = last.startMs,
+                durationMs = cappedDuration,
+                text = last.text,
+            ),
+        ),
+    )
     return normalizedChars.dropLast(1) + cappedLast
 }
 
@@ -249,19 +265,38 @@ private fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoL
     val merged = ArrayList<PipoLyricChar>(chars.size)
     for (char in chars) {
         val prev = merged.lastOrNull()
-        if (prev != null && shouldMergeAsciiFragments(prev.text, char.text)) {
+        if (prev != null && shouldAttachTrailingPunctuation(prev.text, char.text)) {
+            merged[merged.lastIndex] = prev.copy(
+                text = prev.text + char.text,
+            )
+        } else if (prev != null && shouldMergeAsciiFragments(prev.text, char.text)) {
             val start = minOf(prev.startMs, char.startMs)
             val end = maxOf(prev.startMs + prev.durationMs, char.startMs + char.durationMs)
+            val mergedText = prev.text + char.text
+            val mergedDurationMs = (end - start).coerceAtLeast(1L)
             merged[merged.lastIndex] = PipoLyricChar(
                 startMs = start,
-                durationMs = (end - start).coerceAtLeast(1L),
-                text = prev.text + char.text,
+                durationMs = mergedDurationMs,
+                text = mergedText,
+                timingParts = listOf(
+                    PipoLyricTimingPart(
+                        startMs = start,
+                        durationMs = mergedDurationMs,
+                        text = mergedText,
+                    ),
+                ),
             )
         } else {
             merged.add(char)
         }
     }
     return merged
+}
+
+private fun shouldAttachTrailingPunctuation(left: String, right: String): Boolean {
+    if (left.isBlank() || right.isEmpty()) return false
+    if (right.any { isWordLikeChar(it) }) return false
+    return true
 }
 
 private fun shouldMergeAsciiFragments(left: String, right: String): Boolean {
@@ -276,11 +311,23 @@ private fun shouldMergeAsciiFragments(left: String, right: String): Boolean {
 private fun isAsciiWordFragment(value: String): Boolean {
     var hasAsciiWord = false
     for (c in value) {
-        val asciiWord = c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
+        val asciiWord = isAsciiWordChar(c)
         if (asciiWord) hasAsciiWord = true
-        if (c in '一'..'鿿' || c in '぀'..'ヿ' || c in '가'..'힣') return false
+        if (isCjkWordChar(c)) return false
     }
     return hasAsciiWord
+}
+
+private fun isWordLikeChar(c: Char): Boolean {
+    return isAsciiWordChar(c) || isCjkWordChar(c)
+}
+
+private fun isAsciiWordChar(c: Char): Boolean {
+    return c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
+}
+
+private fun isCjkWordChar(c: Char): Boolean {
+    return c in '一'..'鿿' || c in '぀'..'ヿ' || c in '가'..'힣'
 }
 
 private fun isAsciiWordJoiner(c: Char): Boolean {
@@ -307,8 +354,8 @@ fun splitIntoVisualChars(text: String): List<String> {
     }
     var lastWasAsciiWord = false
     for (c in text) {
-        val isCjk = c in '一'..'鿿' || c in '぀'..'ヿ' || c in '가'..'힣'
-        val isAsciiWord = (c in 'a'..'z') || (c in 'A'..'Z') || (c in '0'..'9')
+        val isCjk = isCjkWordChar(c)
+        val isAsciiWord = isAsciiWordChar(c)
         when {
             isCjk -> {
                 startNew(c)
@@ -320,13 +367,19 @@ fun splitIntoVisualChars(text: String): List<String> {
                 lastWasAsciiWord = true
             }
             else -> {
-                // 空白 / 标点：附在前一个字符上，不单独成字
+                // 空白 / 标点：附在前一个字符上，不单独成字。
+                // 撇号 / 连字符仍保持 ASCII word 状态，让 can't / you're / uh-oh
+                // 在单个 YRC token 内直接成为一个视觉单词，避免后续碎片抢走扫色速度。
                 appendToLast(c)
-                lastWasAsciiWord = false
+                lastWasAsciiWord = lastWasAsciiWord && isAsciiInlineWordJoiner(c)
             }
         }
     }
     return out.map { it.toString() }
+}
+
+private fun isAsciiInlineWordJoiner(c: Char): Boolean {
+    return c == '\'' || c == '’' || c == '-'
 }
 
 /**
@@ -336,10 +389,62 @@ fun splitIntoVisualChars(text: String): List<String> {
  *   - 正在唱 → 0..1
  */
 fun PipoLyricChar.progress(positionMs: Long): Float {
-    if (positionMs <= startMs) return 0f
-    if (positionMs >= startMs + durationMs) return 1f
-    if (durationMs <= 0L) return 1f
-    return ((positionMs - startMs).toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    val parts = timingPartsForProgress()
+    if (parts.size <= 1) {
+        if (positionMs <= startMs) return 0f
+        if (positionMs >= startMs + durationMs) return 1f
+        if (durationMs <= 0L) return 1f
+        return ((positionMs - startMs).toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    }
+
+    val totalTextLength = parts.sumOf { it.text.length }.coerceAtLeast(1)
+    var consumed = 0
+    var progress = 0f
+    parts.forEachIndexed { idx, part ->
+        val partLength = part.text.length.coerceAtLeast(1)
+        val partStartProgress = consumed.toFloat() / totalTextLength.toFloat()
+        val partEndProgress = (consumed + partLength).toFloat() / totalTextLength.toFloat()
+        val nextStartMs = parts.getOrNull(idx + 1)?.startMs
+        val effectiveDurationMs = nextStartMs
+            ?.let { (it - part.startMs).coerceAtLeast(1L).coerceAtMost(part.durationMs.coerceAtLeast(1L)) }
+            ?: part.durationMs.coerceAtLeast(1L)
+        val partEndMs = part.startMs + effectiveDurationMs
+        progress = when {
+            positionMs < part.startMs -> return partStartProgress
+            positionMs >= partEndMs -> partEndProgress
+            else -> {
+                val t = ((positionMs - part.startMs).toFloat() / effectiveDurationMs.toFloat()).coerceIn(0f, 1f)
+                partStartProgress + (partEndProgress - partStartProgress) * t
+            }
+        }
+        consumed += partLength
+    }
+    return progress.coerceIn(0f, 1f)
+}
+
+fun PipoLyricChar.timingPartsForProgress(): List<PipoLyricTimingPart> {
+    if (timingParts.isEmpty()) return timingPartsOrSelf()
+    val tokenEndMs = startMs + durationMs.coerceAtLeast(1L)
+    return timingParts
+        .filter { part ->
+            part.text.isNotEmpty() &&
+                part.startMs < tokenEndMs &&
+                part.startMs + part.durationMs.coerceAtLeast(1L) > startMs
+        }
+        .sortedBy { it.startMs }
+        .ifEmpty { timingPartsOrSelf() }
+}
+
+fun PipoLyricChar.timingPartsOrSelf(): List<PipoLyricTimingPart> {
+    return timingParts.ifEmpty {
+        listOf(
+            PipoLyricTimingPart(
+                startMs = startMs,
+                durationMs = durationMs,
+                text = text,
+            ),
+        )
+    }
 }
 
 private const val NEAR_SIMULTANEOUS_LINE_MS = 80L

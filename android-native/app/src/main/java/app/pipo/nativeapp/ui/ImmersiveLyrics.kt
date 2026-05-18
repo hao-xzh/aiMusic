@@ -78,11 +78,13 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.PipoLyricRole
 import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.progress
+import app.pipo.nativeapp.data.timingPartsForProgress
 import kotlinx.coroutines.delay
 
 /**
@@ -174,6 +176,7 @@ fun ImmersiveLyricsOverlay(
     coverUrl: String?,
     title: String,
     artist: String,
+    trackId: String?,
     lyrics: List<PipoLyricLine>,
     activeLyricIndex: Int,
     positionMs: Long,
@@ -299,6 +302,7 @@ fun ImmersiveLyricsOverlay(
         val lyricsTopPadding = (coverAreaHeight - 28.dp).coerceAtLeast(80.dp)
         AppleMusicLyricColumn(
             lines = lyrics,
+            sessionId = trackId,
             activeLyricIndex = activeLyricIndex,
             positionMs = positionMs,
             isPlaying = isPlaying,
@@ -363,12 +367,13 @@ private data class SmoothPositionAnchor(
     val positionMs: Long,
     val capturedAtNanos: Long,
     val resetToken: Long,
+    val canExtrapolate: Boolean,
 )
 
-private fun lyricColumnSessionKey(lines: List<PipoLyricLine>): String {
+private fun lyricColumnSessionKey(sessionId: String?, lines: List<PipoLyricLine>): String {
     val first = lines.firstOrNull()
     val last = lines.lastOrNull()
-    return "${lines.size}:${first?.startMs}:${first?.text.hashCode()}:${last?.startMs}:${last?.text.hashCode()}"
+    return "${sessionId.orEmpty()}:${lines.size}:${first?.startMs}:${first?.text.hashCode()}:${last?.startMs}:${last?.text.hashCode()}"
 }
 
 @Composable
@@ -385,19 +390,85 @@ private fun rememberSmoothPositionMs(
                 positionMs = rawPositionMs,
                 capturedAtNanos = System.nanoTime(),
                 resetToken = 0L,
+                canExtrapolate = rawPositionMs > SMOOTH_POSITION_START_GUARD_MS,
             )
+        )
+    }
+    LaunchedEffect(sessionKey) {
+        DiagnosticsLogStore.record(
+            area = "lyrics_speed",
+            event = "smooth_session",
+            fields = mapOf(
+                "sessionKeyHash" to sessionKey.hashCode(),
+                "rawPositionMs" to rawPositionMs,
+                "isPlaying" to isPlaying,
+                "canExtrapolate" to rawAnchor.value.canExtrapolate,
+            ),
         )
     }
     LaunchedEffect(rawPositionMs, isPlaying, sessionKey) {
         val previous = rawAnchor.value
         val jumpedBackward = rawPositionMs + SMOOTH_POSITION_BACKWARD_RESET_MS < previous.positionMs
-        val jumpedFar = kotlin.math.abs(rawPositionMs - output.value) > SMOOTH_POSITION_HARD_RESET_MS
-        val shouldReset = jumpedBackward || jumpedFar
+        val jumpedForward = rawPositionMs > previous.positionMs + SMOOTH_POSITION_SEEK_RESET_MS
+        val shouldReset = jumpedBackward || jumpedForward
+        val advanced = rawPositionMs > previous.positionMs
+        val canExtrapolate = if (shouldReset) {
+            rawPositionMs > SMOOTH_POSITION_START_GUARD_MS
+        } else {
+            previous.canExtrapolate || advanced || rawPositionMs > SMOOTH_POSITION_START_GUARD_MS
+        }
         rawAnchor.value = SmoothPositionAnchor(
             positionMs = rawPositionMs,
             capturedAtNanos = System.nanoTime(),
             resetToken = if (shouldReset) previous.resetToken + 1L else previous.resetToken,
+            canExtrapolate = canExtrapolate,
         )
+        if (shouldReset) {
+            DiagnosticsLogStore.record(
+                area = "lyrics_speed",
+                event = "smooth_anchor_reset",
+                fields = mapOf(
+                    "sessionKeyHash" to sessionKey.hashCode(),
+                    "reason" to when {
+                        jumpedBackward -> "backward"
+                        jumpedForward -> "forward_seek"
+                        else -> "unknown"
+                    },
+                    "previousRawMs" to previous.positionMs,
+                    "newRawMs" to rawPositionMs,
+                    "currentOutputMs" to output.value,
+                    "isPlaying" to isPlaying,
+                    "canExtrapolate" to canExtrapolate,
+                    "resetToken" to rawAnchor.value.resetToken,
+                ),
+            )
+        } else if (!previous.canExtrapolate && canExtrapolate) {
+            DiagnosticsLogStore.record(
+                area = "lyrics_speed",
+                event = "smooth_extrapolate_enabled",
+                fields = mapOf(
+                    "sessionKeyHash" to sessionKey.hashCode(),
+                    "rawPositionMs" to rawPositionMs,
+                    "previousRawMs" to previous.positionMs,
+                    "isPlaying" to isPlaying,
+                ),
+            )
+        }
+        val outputLagMs = rawPositionMs - output.value
+        if (isPlaying && !shouldReset && outputLagMs > SMOOTH_POSITION_OUTPUT_STALE_MS) {
+            DiagnosticsLogStore.record(
+                area = "lyrics_speed",
+                event = "smooth_output_catchup",
+                fields = mapOf(
+                    "sessionKeyHash" to sessionKey.hashCode(),
+                    "rawPositionMs" to rawPositionMs,
+                    "previousOutputMs" to output.value,
+                    "outputLagMs" to outputLagMs,
+                    "canExtrapolate" to canExtrapolate,
+                ),
+            )
+            output.value = rawPositionMs
+        }
         if (!isPlaying || shouldReset) {
             output.value = rawPositionMs
         }
@@ -417,13 +488,18 @@ private fun rememberSmoothPositionMs(
                     seenResetToken = anchor.resetToken
                     smoothed = anchor.positionMs.toFloat()
                 }
+                if (!anchor.canExtrapolate) {
+                    smoothed = anchor.positionMs.toFloat()
+                    output.value = anchor.positionMs
+                    return@withFrameNanos
+                }
                 val target = anchor.positionMs.toFloat() +
                     (frameNanos - anchor.capturedAtNanos).toFloat() / 1_000_000f
                 val diff = target - smoothed
                 when {
-                    kotlin.math.abs(diff) > SMOOTH_POSITION_HARD_RESET_MS.toFloat() -> smoothed = target
+                    kotlin.math.abs(diff) > SMOOTH_POSITION_FRAME_RESET_MS.toFloat() -> smoothed = target
                     diff < -SMOOTH_POSITION_BACKWARD_RESET_MS.toFloat() -> smoothed = target
-                    diff > 0f -> smoothed += diff * 0.4f                        // 前进追赶
+                    diff > 0f -> smoothed += diff * SMOOTH_POSITION_FOLLOW_ALPHA // 前进追赶
                     // diff <= 0：target 比 smoothed 落后（线程抖动 / 短暂停拍），原地等。
                 }
                 output.value = smoothed.toLong()
@@ -433,12 +509,20 @@ private fun rememberSmoothPositionMs(
     return output
 }
 
-private const val SMOOTH_POSITION_HARD_RESET_MS = 500L
-private const val SMOOTH_POSITION_BACKWARD_RESET_MS = 120L
+private const val SMOOTH_POSITION_SEEK_RESET_MS = 1_500L
+private const val SMOOTH_POSITION_FRAME_RESET_MS = 1_500L
+private const val SMOOTH_POSITION_BACKWARD_RESET_MS = 300L
+private const val SMOOTH_POSITION_OUTPUT_STALE_MS = 360L
+private const val SMOOTH_POSITION_START_GUARD_MS = 900L
+private const val SMOOTH_POSITION_FOLLOW_ALPHA = 0.68f
+private const val LYRIC_SWEEP_VISUAL_LEAD_MS = 45L
+private const val LYRIC_WORD_LINE_FOCUS_LEAD_MS = 95L
+private const val LYRIC_WORD_SCROLL_LOOKAHEAD_MS = 170L
 
 @Composable
 internal fun AppleMusicLyricColumn(
     lines: List<PipoLyricLine>,
+    sessionId: String? = null,
     activeLyricIndex: Int,
     positionMs: Long,
     isPlaying: Boolean,
@@ -457,9 +541,10 @@ internal fun AppleMusicLyricColumn(
     bottomFadeStart: Float = 0.80f,
     bottomFadeSoftEnd: Float = 0.94f,
 ) {
-    val lyricSessionKey = remember(lines) { lyricColumnSessionKey(lines) }
+    val lyricSessionKey = remember(sessionId, lines) { lyricColumnSessionKey(sessionId, lines) }
     // 把 player 的 30Hz tick 平滑成按帧位置（120Hz 屏丝滑度提升关键）
     val smoothedPositionMs by rememberSmoothPositionMs(positionMs, isPlaying, lyricSessionKey)
+    val renderPositionMs = (smoothedPositionMs + LYRIC_SWEEP_VISUAL_LEAD_MS).coerceAtLeast(0L)
     val haptics = LocalHapticFeedback.current
     if (lines.isEmpty()) {
         Box(
@@ -508,15 +593,26 @@ internal fun AppleMusicLyricColumn(
     // 之前是 500ms：滚动比 alpha/blur 早 500ms 触发。Spring 滚动 ~360ms 内就稳了，
     // 但 alpha/blur 要等到 sing boundary 才开始（再 250ms），中间有 ~140ms 的"空窗"——
     // 用户看到的现象就是"滚上去 → 顿一下 → 突然加模糊"。
-    // 行级歌词没有逐字时间轴，高亮本身有 250ms alpha 过渡；焦点需要稍微提前启动，
-    // 让唱到时间戳时视觉基本落位。YRC 仍走真实逐字 timing，只保留 100ms 的滚动准备。
+    // 行级歌词没有逐字时间轴，高亮本身有 250ms alpha 过渡；焦点需要稍微提前启动。
+    // YRC 的"行焦点"可提前，逐字 sweep 仍走真实 token timing。
     val focusLeadMs = remember(lines) { LyricTiming.focusLeadMs(lines) }
-    val scrollLookaheadMs = maxOf(100L, focusLeadMs)
-    val scrollTargetIdx = remember(positionMs, lines, scrollLookaheadMs) {
+    val hasWordTiming = remember(lines) { lines.any { it.chars.isNotEmpty() } }
+    val lineFocusLeadMs = if (hasWordTiming) LYRIC_WORD_LINE_FOCUS_LEAD_MS else focusLeadMs
+    val scrollLookaheadMs = if (hasWordTiming) LYRIC_WORD_SCROLL_LOOKAHEAD_MS else maxOf(100L, focusLeadMs)
+    val lineClockPositionMs = if (hasWordTiming) renderPositionMs else positionMs
+    val scrollClockPositionMs = if (hasWordTiming) renderPositionMs else positionMs
+    val scrollTargetIdx = remember(scrollClockPositionMs, lines, scrollLookaheadMs) {
         if (lines.isEmpty()) 0
-        else lines.indexOfLast { line -> positionMs + scrollLookaheadMs >= LyricTiming.audioStartMs(line) }
+        else lines.indexOfLast { line -> scrollClockPositionMs + scrollLookaheadMs >= LyricTiming.audioStartMs(line) }
             .coerceAtLeast(0)
     }
+    // 活动行也用按帧平滑后的时钟直接判定，避免 ViewModel 的 position tick 让快歌切句慢半拍。
+    // 这里只提前行焦点；逐词/逐字扫色仍由 token timing 控制。
+    val playbackActiveIdx = if (lineClockPositionMs + lineFocusLeadMs >= LyricTiming.audioStartMs(lines.first())) {
+        lines.indexOfLast { line -> lineClockPositionMs + lineFocusLeadMs >= LyricTiming.audioStartMs(line) }
+            .coerceAtLeast(0)
+    } else -1
+    val effectiveActiveIdx = manualFocusIndex ?: playbackActiveIdx
     LaunchedEffect(scrollTargetIdx, clickSeekFocusIndex, clickSeekHoldUntilMs) {
         val heldIndex = clickSeekFocusIndex ?: return@LaunchedEffect
         if (scrollTargetIdx >= heldIndex && clickSeekHoldUntilMs > 0L) {
@@ -543,10 +639,6 @@ internal fun AppleMusicLyricColumn(
         val waitMs = manualScrollHoldUntilMs - now
         val returningFromManualScroll = waitMs > 0L
         if (waitMs > 0L) delay(waitMs)
-        if (listState.isScrollInProgress) {
-            manualScrollHoldUntilMs = SystemClock.elapsedRealtime() + 250L
-            return@LaunchedEffect
-        }
         // 焦点位置：容器顶 11%，正好让活动行上方只露出 1 句历史歌词
         val info = listState.layoutInfo
         val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == targetIdx }
@@ -577,7 +669,7 @@ internal fun AppleMusicLyricColumn(
             // Apple Music 行级滚动：从 AMLL 的 posY spring（mass=0.9 damping=15 stiffness=90）
             // 翻译过来 → ζ≈0.83, k≈100。spring 比 tween 的 cubic-bezier 更"有重量"——
             // 起步沉、收尾微弹，是 Apple Music 切句时那种"被拽过去"的物理感的核心。
-            animationSpec = spring(dampingRatio = 0.83f, stiffness = 100f),
+            animationSpec = spring(dampingRatio = 0.92f, stiffness = 190f),
         ) { value, _ ->
             val step = value - prev
             prev = value
@@ -594,6 +686,127 @@ internal fun AppleMusicLyricColumn(
     val bottomPadDp = with(density) { (containerHeightPx * 0.89f).toDp() }
     val bottomSolidStop = bottomFadeStart.coerceIn(0.60f, 0.96f)
     val bottomSoftStop = bottomFadeSoftEnd.coerceIn(bottomSolidStop, 0.99f)
+    val activeLineSource = if (manualFocusIndex != null) "manual" else "playback"
+    val lineEntryCounts = remember(lyricSessionKey) { mutableMapOf<Int, Int>() }
+    val tokenEntryCounts = remember(lyricSessionKey) { mutableMapOf<String, Int>() }
+    val activeTokenLog = lines.getOrNull(playbackActiveIdx)
+        ?.let { line -> activeLyricTimingForLog(playbackActiveIdx, line, renderPositionMs) }
+    val activeTokenLogKey = activeTokenLog
+        ?.let { "${it.lineIndex}:${it.tokenIndex}:${it.partIndex}" }
+
+    LaunchedEffect(lyricSessionKey) {
+        val firstLine = lines.firstOrNull()
+        val secondLine = lines.getOrNull(1)
+        DiagnosticsLogStore.record(
+            area = "lyrics_speed",
+            event = "session_lines",
+            fields = mapOf(
+                "sessionId" to sessionId,
+                "sessionKeyHash" to lyricSessionKey.hashCode(),
+                "lineCount" to lines.size,
+                "wordLineCount" to lines.count { it.chars.isNotEmpty() },
+                "tokenCount" to lines.sumOf { it.chars.size },
+                "timingPartCount" to lines.sumOf { line ->
+                    line.chars.sumOf { it.timingParts.size.coerceAtLeast(1) }
+                },
+                "focusLeadMs" to focusLeadMs,
+                "lineFocusLeadMs" to lineFocusLeadMs,
+                "scrollLookaheadMs" to scrollLookaheadMs,
+                "hasWordTiming" to hasWordTiming,
+                "firstLineStartMs" to firstLine?.startMs,
+                "firstAudioStartMs" to firstLine?.let { LyricTiming.audioStartMs(it) },
+                "firstLineDurationMs" to firstLine?.durationMs,
+                "firstLineText" to firstLine?.text?.let(::lyricLogPreview),
+                "secondLineStartMs" to secondLine?.startMs,
+                "secondAudioStartMs" to secondLine?.let { LyricTiming.audioStartMs(it) },
+                "secondLineText" to secondLine?.text?.let(::lyricLogPreview),
+            ),
+        )
+    }
+
+    LaunchedEffect(lyricSessionKey, effectiveActiveIdx, activeLineSource) {
+        if (effectiveActiveIdx !in lines.indices) return@LaunchedEffect
+        val line = lines[effectiveActiveIdx]
+        val entryCount = (lineEntryCounts[effectiveActiveIdx] ?: 0) + 1
+        lineEntryCounts[effectiveActiveIdx] = entryCount
+        val fields = mapOf(
+            "sessionId" to sessionId,
+            "sessionKeyHash" to lyricSessionKey.hashCode(),
+            "lineIndex" to effectiveActiveIdx,
+            "entryCount" to entryCount,
+            "source" to activeLineSource,
+            "rawPositionMs" to positionMs,
+            "smoothedPositionMs" to smoothedPositionMs,
+            "renderPositionMs" to renderPositionMs,
+            "activeLyricIndex" to activeLyricIndex,
+            "playbackActiveIdx" to playbackActiveIdx,
+            "scrollTargetIdx" to scrollTargetIdx,
+            "scrollLookaheadMs" to scrollLookaheadMs,
+            "focusLeadMs" to focusLeadMs,
+            "lineFocusLeadMs" to lineFocusLeadMs,
+            "lineClockPositionMs" to lineClockPositionMs,
+            "lineStartMs" to line.startMs,
+            "lineDurationMs" to line.durationMs,
+            "audioStartMs" to LyricTiming.audioStartMs(line),
+            "audioEndMs" to lyricLineAudioEndMsForLog(line),
+            "tokenCount" to line.chars.size,
+            "timingPartCount" to line.chars.sumOf { it.timingParts.size.coerceAtLeast(1) },
+            "firstTokenStartMs" to line.chars.firstOrNull()?.startMs,
+            "lastTokenEndMs" to line.chars.maxOfOrNull { it.startMs + it.durationMs },
+            "text" to lyricLogPreview(line.text),
+        )
+        DiagnosticsLogStore.record(
+            area = "lyrics_speed",
+            event = "active_line",
+            fields = fields,
+        )
+        if (entryCount > 1) {
+            DiagnosticsLogStore.record(
+                area = "lyrics_speed",
+                event = "active_line_reentered",
+                fields = fields,
+            )
+        }
+    }
+
+    LaunchedEffect(lyricSessionKey, activeTokenLogKey) {
+        val tokenLog = activeTokenLog ?: return@LaunchedEffect
+        val tokenKey = activeTokenLogKey ?: return@LaunchedEffect
+        val entryCount = (tokenEntryCounts[tokenKey] ?: 0) + 1
+        tokenEntryCounts[tokenKey] = entryCount
+        val fields = mapOf(
+            "sessionId" to sessionId,
+            "sessionKeyHash" to lyricSessionKey.hashCode(),
+            "lineIndex" to tokenLog.lineIndex,
+            "tokenIndex" to tokenLog.tokenIndex,
+            "partIndex" to tokenLog.partIndex,
+            "entryCount" to entryCount,
+            "rawPositionMs" to positionMs,
+            "smoothedPositionMs" to smoothedPositionMs,
+            "renderPositionMs" to renderPositionMs,
+            "tokenStartMs" to tokenLog.tokenStartMs,
+            "tokenDurationMs" to tokenLog.tokenDurationMs,
+            "tokenProgress" to tokenLog.tokenProgress,
+            "partStartMs" to tokenLog.partStartMs,
+            "partDurationMs" to tokenLog.partDurationMs,
+            "effectivePartDurationMs" to tokenLog.effectivePartDurationMs,
+            "partProgress" to tokenLog.partProgress,
+            "tokenText" to lyricLogPreview(tokenLog.tokenText, max = 40),
+            "partText" to lyricLogPreview(tokenLog.partText, max = 40),
+        )
+        DiagnosticsLogStore.record(
+            area = "lyrics_speed",
+            event = "active_token",
+            fields = fields,
+        )
+        if (entryCount > 1) {
+            DiagnosticsLogStore.record(
+                area = "lyrics_speed",
+                event = "active_token_reentered",
+                fields = fields,
+            )
+        }
+    }
 
     Box(
         modifier = modifier
@@ -667,12 +880,6 @@ internal fun AppleMusicLyricColumn(
             ),
             userScrollEnabled = true,
         ) {
-            // LyricTiming 会在第一句真正到达前返回 -1；这里仍保留 100ms 的滚动 lookahead，
-            // 只让列表提前进入位置，不提前触发逐字 sweep。
-            val playbackActiveIdx = if (smoothedPositionMs + scrollLookaheadMs >= LyricTiming.audioStartMs(lines.first())) {
-                activeLyricIndex
-            } else -1
-            val effectiveActiveIdx = manualFocusIndex ?: playbackActiveIdx
             itemsIndexed(
                 items = lines,
                 key = { idx, line -> lyricLineRenderKey(idx, line) },
@@ -713,7 +920,7 @@ internal fun AppleMusicLyricColumn(
                         positionMs = if ((isManualFocusLine || idx < effectiveActiveIdx) && !hasCompanionCue) {
                             completedLinePositionMs(line)
                         } else {
-                            smoothedPositionMs
+                            renderPositionMs
                         },
                         fg = fg,
                         fgDim = fgDim,
@@ -743,6 +950,81 @@ private fun completedLinePositionMs(line: PipoLyricLine): Long {
         timedCompanions.maxOfOrNull { it.startMs + it.durationMs } ?: line.startMs,
     )
     return maxOf(charEnd ?: lineEnd, lineEnd, line.startMs + 1L)
+}
+
+private data class LyricSpeedTokenLog(
+    val lineIndex: Int,
+    val tokenIndex: Int,
+    val partIndex: Int,
+    val tokenText: String,
+    val partText: String,
+    val tokenStartMs: Long,
+    val tokenDurationMs: Long,
+    val tokenProgress: Float,
+    val partStartMs: Long,
+    val partDurationMs: Long,
+    val effectivePartDurationMs: Long,
+    val partProgress: Float,
+)
+
+private fun activeLyricTimingForLog(
+    lineIndex: Int,
+    line: PipoLyricLine,
+    positionMs: Long,
+): LyricSpeedTokenLog? {
+    line.chars.forEachIndexed { tokenIndex, token ->
+        val parts = token.timingPartsForProgress()
+        parts.forEachIndexed { partIndex, part ->
+            val effectiveDurationMs = effectiveTimingPartDurationMs(parts, partIndex)
+            val partEndMs = part.startMs + effectiveDurationMs
+            if (positionMs >= part.startMs && positionMs < partEndMs) {
+                val partProgress = ((positionMs - part.startMs).toFloat() / effectiveDurationMs.toFloat())
+                    .coerceIn(0f, 1f)
+                return LyricSpeedTokenLog(
+                    lineIndex = lineIndex,
+                    tokenIndex = tokenIndex,
+                    partIndex = partIndex,
+                    tokenText = token.text,
+                    partText = part.text,
+                    tokenStartMs = token.startMs,
+                    tokenDurationMs = token.durationMs,
+                    tokenProgress = token.progress(positionMs),
+                    partStartMs = part.startMs,
+                    partDurationMs = part.durationMs,
+                    effectivePartDurationMs = effectiveDurationMs,
+                    partProgress = partProgress,
+                )
+            }
+        }
+    }
+    return null
+}
+
+private fun effectiveTimingPartDurationMs(
+    parts: List<app.pipo.nativeapp.data.PipoLyricTimingPart>,
+    index: Int,
+): Long {
+    val part = parts[index]
+    val durationMs = part.durationMs.coerceAtLeast(1L)
+    val nextStartMs = parts.getOrNull(index + 1)?.startMs
+    return nextStartMs
+        ?.let { (it - part.startMs).coerceAtLeast(1L).coerceAtMost(durationMs) }
+        ?: durationMs
+}
+
+private fun lyricLineAudioEndMsForLog(line: PipoLyricLine): Long {
+    val charEnd = (line.chars + line.companionLines.flatMap { it.chars })
+        .maxOfOrNull { it.startMs + it.durationMs }
+    val lineEnd = maxOf(
+        line.startMs + line.durationMs,
+        line.companionLines.maxOfOrNull { it.startMs + it.durationMs } ?: line.startMs,
+    )
+    return maxOf(charEnd ?: lineEnd, lineEnd)
+}
+
+private fun lyricLogPreview(text: String, max: Int = 64): String {
+    val compact = text.replace(Regex("\\s+"), " ").trim()
+    return if (compact.length <= max) compact else compact.take(max) + "..."
 }
 
 @Composable
@@ -811,9 +1093,9 @@ private fun AppleMusicLyricRow(
         val enteredAt = becamePastAtRealtime
         if (isPast && distance == 1 && enteredAt != null) {
             val elapsed = (SystemClock.elapsedRealtime() - enteredAt).coerceAtLeast(0L)
-            val t = (elapsed.toFloat() / 820f).coerceIn(0f, 1f)
+            val t = (elapsed.toFloat() / 380f).coerceIn(0f, 1f)
             val eased = cssEase.transform(t)
-            val exitStartAlpha = 0.82f
+            val exitStartAlpha = 0.74f
             baseTargetAlpha + (exitStartAlpha - baseTargetAlpha) * (1f - eased)
         } else {
             baseTargetAlpha
@@ -836,10 +1118,10 @@ private fun AppleMusicLyricRow(
     // spring 物理感只用在滚动 posY 上（行间相对位移），切句的 alpha/blur/lift 都是 tween。
     // 之前误把 spring 全套给 alpha → 视觉上有 bouncy 感，不是 Apple Music。
     val alphaSpec: AnimationSpec<Float> = remember(cssEase) {
-        tween(durationMillis = 250, easing = cssEase)    // AMLL: opacity 0.25s
+        tween(durationMillis = 170, easing = cssEase)
     }
     val blurSpec: AnimationSpec<Float> = remember(cssEase) {
-        tween(durationMillis = 200, easing = cssEase)    // AMLL: filter 0.2s
+        tween(durationMillis = 140, easing = cssEase)
     }
     val snapSpec: AnimationSpec<Float> = remember { snap() }
     val rowAlphaSpec = if (shouldSnapActiveEffects) snapSpec else alphaSpec
@@ -887,7 +1169,7 @@ private fun AppleMusicLyricRow(
             modifier = Modifier
                 .fillMaxWidth()
                 .animateContentSize(
-                    animationSpec = tween(durationMillis = 260, easing = cssEase),
+                    animationSpec = tween(durationMillis = 180, easing = cssEase),
                 ),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
@@ -1362,7 +1644,7 @@ private fun lyricWordPalette(fg: Color, fgUnsung: Color): LyricWordPalette {
 /**
  * 视觉单元级 "颜色 + 上浮"：
  *   仍按原来的横向 sweep 动画变色，只把未唱 / 已唱色阶收敛到行级对比。
- *   单词只保留轻微上浮，不再做发光或硬分界扫色。
+ *   不做阴影 / 外发光 / 额外效果，只按真实 timing 做黑白扫色。
  */
 private fun DrawScope.drawPerCharLiftedSweep(
     layout: TextLayoutResult,
@@ -1374,7 +1656,6 @@ private fun DrawScope.drawPerCharLiftedSweep(
 ) {
     val units = lyricDrawUnits(layout, chars)
     val wordPalette = lyricWordPalette(fg, fgUnsung)
-    // 保留单词上浮手感；不再叠加发光，避免模糊/描边破坏歌词质感。
     val liftPeakPx = (-0.95f).dp.toPx() * envelope
 
     val fadeWidthPx = 6.dp.toPx()
@@ -1406,28 +1687,30 @@ private fun DrawScope.drawPerCharLiftedSweep(
             next.inkLeft > unit.right -> minOf(next.inkLeft, unit.right + glyphEdgeOverdrawPx)
             else -> unit.right
         }
+        val lineTop = layout.getLineTop(unit.line)
+        val lineBottom = layout.getLineBottom(unit.line)
+        val sweepX = unit.left + (unit.right - unit.left) * segmentProgress
+        val sungRight = when {
+            segmentProgress <= 0f -> clipLeft
+            segmentProgress >= 1f -> clipRight
+            else -> sweepX.coerceIn(clipLeft, clipRight)
+        }
         clipRect(
             left = clipLeft,
-            top = layout.getLineTop(unit.line),
+            top = lineTop,
             right = clipRight,
-            bottom = layout.getLineBottom(unit.line),
+            bottom = lineBottom,
             clipOp = ClipOp.Intersect,
         ) {
             drawText(layout, color = wordPalette.unsung, topLeft = Offset(0f, ty))
         }
         if (segmentProgress > 0f) {
-            val sweepX = unit.left + (unit.right - unit.left) * segmentProgress
-            val sungRight = if (segmentProgress >= 1f) {
-                clipRight
-            } else {
-                sweepX.coerceIn(clipLeft, clipRight)
-            }
             if (sungRight > clipLeft) {
                 clipRect(
                     left = clipLeft,
-                    top = layout.getLineTop(unit.line),
+                    top = lineTop,
                     right = sungRight,
-                    bottom = layout.getLineBottom(unit.line),
+                    bottom = lineBottom,
                     clipOp = ClipOp.Intersect,
                 ) {
                     drawText(layout, color = wordPalette.sung, topLeft = Offset(0f, ty))
@@ -1438,9 +1721,9 @@ private fun DrawScope.drawPerCharLiftedSweep(
                 if (fadeRight > sweepX) {
                     clipRect(
                         left = sweepX.coerceAtLeast(clipLeft),
-                        top = layout.getLineTop(unit.line),
+                        top = lineTop,
                         right = fadeRight,
-                        bottom = layout.getLineBottom(unit.line),
+                        bottom = lineBottom,
                         clipOp = ClipOp.Intersect,
                     ) {
                         drawText(

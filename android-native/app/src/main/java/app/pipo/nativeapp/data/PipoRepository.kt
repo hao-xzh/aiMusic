@@ -116,6 +116,13 @@ data class PipoLyricChar(
     val startMs: Long,
     val durationMs: Long,
     val text: String,
+    val timingParts: List<PipoLyricTimingPart> = emptyList(),
+)
+
+data class PipoLyricTimingPart(
+    val startMs: Long,
+    val durationMs: Long,
+    val text: String,
 )
 
 data class DistillState(

@@ -320,6 +320,7 @@ fun PipoNativeApp() {
                         coverUrl = viewModel.state.artworkUrl,
                         title = viewModel.state.title,
                         artist = viewModel.state.artist,
+                        trackId = viewModel.state.currentTrackId,
                         lyrics = viewModel.state.lyrics,
                         activeLyricIndex = lyricClock.activeIndex,
                         positionMs = lyricClock.positionMs,
