@@ -11,23 +11,13 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -42,14 +32,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -101,11 +88,9 @@ fun PipoNativeApp() {
         val viewModel: PlayerViewModel = viewModel()
         val playerState = viewModel.state
         val settings by PipoGraph.repository.settings.collectAsState(initial = NativeSettings())
-        var smartSessionProposal by remember { mutableStateOf<SmartSessionProposal?>(null) }
         var smartSessionRefreshNonce by remember { mutableStateOf(0) }
         var smartSessionTrigger by remember { mutableStateOf<String?>(null) }
         var smartSessionCanReplace by remember { mutableStateOf(false) }
-        var smartSessionAutoPlay by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
         val showLyricTranslation = settings.lyricTranslation
         val toggleLyricTranslation: () -> Unit = {
@@ -220,31 +205,28 @@ fun PipoNativeApp() {
             refreshNonce = smartSessionRefreshNonce,
             extraIntent = smartSessionTrigger,
             canReplaceNow = smartSessionCanReplace,
-            onProposal = { proposal ->
-                if (proposal != null && smartSessionAutoPlay) {
+            onReady = { tracks, continuous, canReplaceNow ->
+                if ((playerState.isPlaying || playerState.queue.isNotEmpty()) && !canReplaceNow) {
+                    DiagnosticsLogStore.record(
+                        area = "smart_session",
+                        event = "auto_play_skipped_stale",
+                        fields = mapOf(
+                            "trackCount" to tracks.size,
+                            "queueSize" to playerState.queue.size,
+                        ),
+                    )
+                } else {
                     DiagnosticsLogStore.record(
                         area = "smart_session",
                         event = "auto_play",
                         fields = mapOf(
-                            "trackCount" to proposal.tracks.size,
-                            "canReplace" to proposal.canReplaceNow,
+                            "trackCount" to tracks.size,
+                            "canReplace" to canReplaceNow,
                         ),
                     )
-                    smartSessionAutoPlay = false
-                    smartSessionProposal = null
-                    viewModel.playFromAgent(proposal.tracks, proposal.continuous)
-                } else {
-                    if (proposal != null) {
-                        DiagnosticsLogStore.record(
-                            area = "smart_session",
-                            event = "proposal_visible",
-                            fields = mapOf(
-                                "trackCount" to proposal.tracks.size,
-                                "canReplace" to proposal.canReplaceNow,
-                            ),
-                        )
-                    }
-                    smartSessionProposal = proposal
+                    smartSessionTrigger = null
+                    smartSessionCanReplace = false
+                    viewModel.playFromAgent(tracks, continuous)
                 }
             },
         )
@@ -267,8 +249,6 @@ fun PipoNativeApp() {
                 )
                 smartSessionTrigger = intent
                 smartSessionCanReplace = canReplace
-                smartSessionAutoPlay = autoPlay
-                smartSessionProposal = null
                 smartSessionRefreshNonce += 1
             },
         )
@@ -412,52 +392,6 @@ fun PipoNativeApp() {
                             },
                     )
                 }
-
-                AnimatedVisibility(
-                    visible = route == Route.Player &&
-                        !immersive &&
-                        !isLandscape &&
-                        smartSessionProposal != null &&
-                        (
-                            (!playerState.isPlaying && playerState.queue.isEmpty()) ||
-                                smartSessionProposal?.canReplaceNow == true
-                            ),
-                    enter = fadeIn(tween(180)) + slideInVertically(tween(220)) { it / 4 },
-                    exit = fadeOut(tween(140)) + slideOutVertically(tween(180)) { it / 4 },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(start = 16.dp, end = 16.dp, bottom = 96.dp)
-                        .navigationBarsPadding(),
-                ) {
-                    smartSessionProposal?.let { proposal ->
-                        SmartSessionProposalCard(
-                            onPlay = {
-                                DiagnosticsLogStore.record(
-                                    area = "smart_session",
-                                    event = "proposal_play_tap",
-                                    fields = mapOf(
-                                        "trackCount" to proposal.tracks.size,
-                                        "canReplace" to proposal.canReplaceNow,
-                                    ),
-                                )
-                                smartSessionProposal = null
-                                viewModel.playFromAgent(proposal.tracks, proposal.continuous)
-                            },
-                            onRefresh = {
-                                DiagnosticsLogStore.record(
-                                    area = "smart_session",
-                                    event = "proposal_refresh_tap",
-                                    fields = mapOf("trackCount" to proposal.tracks.size),
-                                )
-                                smartSessionTrigger = "换一版，和上一版避开同一批歌。"
-                                smartSessionCanReplace = proposal.canReplaceNow
-                                smartSessionAutoPlay = false
-                                smartSessionProposal = null
-                                smartSessionRefreshNonce += 1
-                            },
-                        )
-                    }
-                }
             }
 
             BackHandler(enabled = immersive || route != Route.Player) {
@@ -482,7 +416,7 @@ private fun SmartSessionPlannerEffect(
     refreshNonce: Int,
     extraIntent: String?,
     canReplaceNow: Boolean,
-    onProposal: (SmartSessionProposal?) -> Unit,
+    onReady: (List<NativeTrack>, ContinuousQueueSource?, Boolean) -> Unit,
 ) {
     var requestedNonce by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(
@@ -503,7 +437,6 @@ private fun SmartSessionPlannerEffect(
         if (requestedNonce == refreshNonce || !settings.smartSessionPlanner) return@LaunchedEffect
         if (route != Route.Player || immersive || isLandscape) return@LaunchedEffect
         if ((playerState.isPlaying || playerState.queue.isNotEmpty()) && !canReplaceNow) {
-            onProposal(null)
             return@LaunchedEffect
         }
 
@@ -559,14 +492,7 @@ private fun SmartSessionPlannerEffect(
                         "hasContinuous" to (response.continuous != null),
                     ),
                 )
-                onProposal(
-                    SmartSessionProposal(
-                        reply = response.reply.ifBlank { "这段可以直接开始。" },
-                        tracks = response.initialBatch,
-                        continuous = response.continuous,
-                        canReplaceNow = canReplaceNow,
-                    ),
-                )
+                onReady(response.initialBatch, response.continuous, canReplaceNow)
             } else {
                 DiagnosticsLogStore.record(
                     area = "smart_session",
@@ -594,13 +520,6 @@ private fun SmartSessionPlannerEffect(
         }
     }
 }
-
-private data class SmartSessionProposal(
-    val reply: String,
-    val tracks: List<NativeTrack>,
-    val continuous: ContinuousQueueSource?,
-    val canReplaceNow: Boolean = false,
-)
 
 @Composable
 private fun SmartPlaybackRuleEffect(
@@ -802,33 +721,5 @@ private fun smartSessionPrompt(
         append(brief.behaviorLine)
         append('\n')
         append("队列 10 到 15 首即可，能续杯，接歌要顺。回复只要一句很短的话；不要解释。")
-    }
-}
-
-@Composable
-private fun SmartSessionProposalCard(
-    onPlay: () -> Unit,
-    onRefresh: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .widthIn(max = 260.dp)
-            .clip(RoundedCornerShape(18.dp))
-            .background(PipoColors.GlassFill)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TextButton(onClick = onPlay) {
-                Text("播放", color = PipoColors.Mint, style = TextStyle(fontSize = 13.sp))
-            }
-            TextButton(onClick = onRefresh) {
-                Text("换一版", color = PipoColors.Ink, style = TextStyle(fontSize = 13.sp))
-            }
-        }
     }
 }

@@ -62,7 +62,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Shadow
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asComposeRenderEffect
@@ -1865,28 +1864,27 @@ private fun lyricLiftEnvelope(durationMs: Long, elapsedMs: Long): Float {
     return EaseOutCss.transform((elapsedMs.toFloat() / riseMs.toFloat()).coerceIn(0f, 1f))
 }
 
-// ---- Apple Music 慢词 emphasis（逐字母辉光 + 呼吸，随音频位置左→右流动）----
+// ---- Apple Music 慢词 emphasis（连续左→右扫过的辉光 + 色带 + 呼吸 + 起伏）----
 //
-// 设计要点（实测自 Apple Music 网页版逐帧采样 + 用户反馈"发光不要一闪一闪"）：
-//   · 触发：词 duration ≥ EMP_MIN_DURATION_MS（短词不强调）。
-//   · 辉光不改字色 —— 字色自始至终只有 fgUnsung→fg 两色（行级 / 词级一致）。
-//     发光是叠加的一层白色光晕（Shadow，offset 0 + 模糊半径）。
-//   · 辉光强度 = 同一条 x 方向扫描光带和当前 glyph bbox 的重叠比例。
-//     光斑随音频连续地左→右流动，不再按字母中心逐个触发。
-//   · 呼吸缩放与辉光同源（同一 e 驱动），字母被扫到时同步轻微放大。
-//   · amp 按 duration 在 EMP_MIN..EMP_FULL 间插值：刚过阈值的词几乎不动，长音更强。
+// 关键：辉光是「一束连续的光」从左到右扫过整词，不是逐字母点亮 ——
+//   · 颜色 sweep：整词共用一条横向渐变（fg→fgUnsung），柔边连续滑过、跨字母不分段。
+//   · 辉光：只在同一次字形绘制里加 Shadow，强度仍按连续"彗星"曲线计算。
+//     不再额外画一层模糊整词，避免双字 / 灰色背景块 / 相邻非慢词被带亮。
+//   · 呼吸 / 起伏：逐字母（缩放 / 位移步进极小，肉眼连续），跟扫描位置走。
+//   · 触发：词 duration ≥ EMP_MIN_DURATION_MS；amp 按时长在 MIN..FULL 间插值。
 private const val EMP_MIN_DURATION_MS = 800L
 private const val EMP_FULL_DURATION_MS = 2000L
-private const val EMP_AMP_FLOOR = 0.7f            // 刚过阈值的慢词也保底 70% 强度（确保发光+起伏都明显）
+private const val EMP_AMP_FLOOR = 0.7f            // 刚过阈值的慢词也保底 70% 强度
 private const val EMP_PEAK_SCALE = 0.05f          // 呼吸缩放峰值（1.0 → 1.05）
 private const val EMP_FLOAT_PEAK_DP = 3.2f        // 字母上浮量峰值
-private const val EMP_FLOAT_RAMP = 1.3f           // 上浮过渡半宽（单位：字母）—— 越大波浪越平缓连贯
+private const val EMP_FLOAT_RAMP = 1.3f           // 上浮过渡半宽（字母）—— 越大波浪越平缓
 private const val EMP_GLOW_OPACITY = 0.40f        // 辉光峰值不透明度（白色光晕）
-private const val EMP_GLOW_BLUR_REST_DP = 4f      // 辉光最小模糊半径
-private const val EMP_GLOW_BLUR_PEAK_DP = 11f     // 辉光峰值模糊半径（同时用作裁切框的横向外扩量）
-private const val EMP_GLOW_SPREAD = 1.7f          // 辉光光斑半宽（单位：字母）
-private const val EMP_GLOW_BIAS = 0.15f           // 光斑峰值相对扫描位置的滞后（字母）
-private const val EMP_FILL_EDGE_FRAC = 0.5f       // 单字母内填充柔边宽度（占字母宽比例）
+private const val EMP_GLOW_BLUR_DP = 8f           // 单层字形 Shadow 模糊半径
+private const val EMP_GLOW_TRAIL_DP = 34f         // 辉光在扫描位置之后（已唱侧）的拖尾长度
+private const val EMP_GLOW_LEAD_DP = 8f           // 辉光略微探到扫描位置之前
+private const val EMP_GLOW_PEAK_DP = 6f           // 辉光最亮点落在扫描位置之后多少
+private const val EMP_FILL_EDGE_DP = 13f          // 颜色 sweep 柔边总宽度
+private const val EMP_GLOW_MIN_MS_PER_GLYPH = 180L // 平均每个可见字母足够慢，才给辉光
 
 /**
  * 起伏斜坡：dist = 当前音频扫描位置 − 字母中心（单位：字母）。
@@ -1907,16 +1905,18 @@ private fun emphasisAmp(durationMs: Long): Float {
     return EMP_AMP_FLOOR + (1f - EMP_AMP_FLOOR) * ramp
 }
 
+private fun emphasisGlowAmp(durationMs: Long, visibleGlyphCount: Int): Float {
+    val glyphMs = durationMs / visibleGlyphCount.coerceAtLeast(1)
+    if (glyphMs < EMP_GLOW_MIN_MS_PER_GLYPH) return 0f
+    return emphasisAmp(durationMs)
+}
+
 /**
- * 慢词逐字母渲染：每个字母单独 measure 成独立 TextLayoutResult，单独绘制一次
- *（不裁切、不叠第二份字形）。镜像 Apple Music 把每个字母拆成独立 span 的做法 ——
- * 字母各自完整绘制，辉光（Shadow）自然外溢、字母间无裁切裂缝。
- *
- * 每个字母叠加：
- *   · 填充扫色：fgUnsung→fg 横向渐变（含柔边），随音频扫过；
- *   · 辉光：白色 Shadow 光晕，强度 = 连续扫描光带覆盖率，随音频左→右流动；
- *   · 呼吸：被扫到时绕字母中心轻微放大；
- *   · 起伏：唱过后上浮并保持。
+ * 慢词 emphasis 渲染：
+ *  · 逐字母清晰文字只绘制一次 —— 整词共用连续色带渐变（连续扫色，不分字母），
+ *    叠加逐字母呼吸缩放与上浮起伏。
+ *  · 辉光不再走额外 saveLayer；它作为当前字母同一次 drawText 的 Shadow 出现，
+ *    强度按连续彗星曲线随 sweepX 流动，避免双重文字和矩形背景。
  */
 private fun DrawScope.drawEmphasizedToken(
     layout: TextLayoutResult,
@@ -1933,62 +1933,44 @@ private fun DrawScope.drawEmphasizedToken(
     val text = layout.layoutInput.text.text
     val token = unit.timing
     val letterCount = unit.tokenCharCount.coerceAtLeast(1)
+    val visibleGlyphCount = (unit.glyphStart until unit.glyphEnd)
+        .count { it in text.indices && !text[it].isWhitespace() }
+        .coerceAtLeast(1)
     val durationF = token.durationMs.coerceAtLeast(1L).toFloat()
-    // token.progress 已经是 timingParts 感知的「文本分数」：含子音节真实节奏，
-    // 不是均匀线性。填充、发光、起伏全部以它为准 → 三者与人声同一套时间轴。
+    // token.progress 是 timingParts 感知的「文本分数」；词外用线性外插（衔接处天然连续）。
     val tokenProgress = token.progress(positionMs).coerceIn(0f, 1f)
-    // 辉光 / 起伏扫描位置：
-    //   · 词内（0..1）跟 token.progress 走 —— 贴合 timingParts 的子音节真实节奏，与填充同步；
-    //   · 词外用线性外插（rawLinear <0 词前、>1 词后）—— 光斑能平滑滑入 / 滑出词，不赖着发光。
-    //   rawLinear 与 progress 在 0 / 1 处天然一致，衔接连续无跳变。
     val rawLinear = (positionMs - token.startMs).toFloat() / durationF
     val sweepProgress = if (rawLinear in 0f..1f) tokenProgress else rawLinear
     val tokenStarted = rawLinear >= 0f
-    val glowActive = rawLinear in 0f..1f
     val glowSweep = sweepProgress * letterCount
-    // 辉光 / 呼吸 / 起伏统一用 empGain 作总增益 —— 三者永远同时出现、同时消失。
-    val empGain = emphasisAmp(token.durationMs) * envelope.coerceIn(0f, 1f)
+    val empGain = (emphasisAmp(token.durationMs) * envelope.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+    val glowGain = (emphasisGlowAmp(token.durationMs, visibleGlyphCount) *
+        envelope.coerceIn(0f, 1f)).coerceIn(0f, 1f)
 
     val lineTopY = layout.getLineTop(unit.line)
     val lineBottomY = layout.getLineBottom(unit.line)
     val floatPeakPx = EMP_FLOAT_PEAK_DP.dp.toPx()
-    val glowRestPx = EMP_GLOW_BLUR_REST_DP.dp.toPx()
-    val glowPeakPx = EMP_GLOW_BLUR_PEAK_DP.dp.toPx()
+    val glowBlurPx = EMP_GLOW_BLUR_DP.dp.toPx()
+    val fillEdgeHalfPx = EMP_FILL_EDGE_DP.dp.toPx() * 0.5f
 
-    // ---- 辉光裁切框：把这个慢词的辉光严格关在它自己的"格子"里 ----
-    //   · 纵向：只在本可视行的行高带 [lineTopY, lineBottomY] 内。折行歌词的不同可视行、
-    //     以及上下相邻的歌词行，都不会被这个词的辉光晕染到。
-    //   · 横向：可探入相邻空白处绽放（外扩 glowPeakPx），但绝不越过相邻 token 的真实
-    //     字形 inkLeft/inkRight —— 不会影响同一行里的其它单词 / 字母。
-    //   词内各字母的辉光仍在框内自由叠加（它们本就是同一个词）。
+    // 辉光裁切框：纵向锁在本可视行行高带内（不渗到折行的其它可视行 / 上下相邻歌词行），
+    // 横向可探入相邻空白，但不越过相邻 token 的真实字形 —— 不影响其它单词。
     val clipLeft = when {
-        prev == null -> layout.getLineLeft(unit.line) - glowPeakPx
-        unit.left > prev.inkRight -> maxOf(prev.inkRight, unit.left - glowPeakPx)
+        prev == null -> layout.getLineLeft(unit.line) - glowBlurPx
+        unit.left > prev.inkRight -> maxOf(prev.inkRight, unit.left - glowBlurPx)
         else -> unit.left
     }
     val clipRight = when {
-        next == null -> layout.getLineRight(unit.line) + glowPeakPx
-        next.inkLeft > unit.right -> minOf(next.inkLeft, unit.right + glowPeakPx)
+        next == null -> layout.getLineRight(unit.line) + glowBlurPx
+        next.inkLeft > unit.right -> minOf(next.inkLeft, unit.right + glowBlurPx)
         else -> unit.right
     }
-    // 填充颜色复用辉光 / 起伏同一条 sweepProgress 时间轴，只是映射到当前视觉段的 x 坐标。
-    // 这样颜色、辉光、上浮同步推进，同时保持一个连续扫过的色带，不再每个字母独立跳色。
-    val fillSegmentProgress = if (tokenStarted) {
-        ((sweepProgress - unit.segmentStartProgress) /
-            (unit.segmentEndProgress - unit.segmentStartProgress).coerceAtLeast(0.001f))
-            .coerceIn(0f, 1f)
-    } else {
-        0f
-    }
-    val fillSweepX = unit.left + (unit.right - unit.left) * fillSegmentProgress
-    val fillFadeWidthPx = maxOf(
-        2.dp.toPx(),
-        ((unit.right - unit.left) / letterCount.toFloat()) * EMP_FILL_EDGE_FRAC,
-    )
-    val unitWidthPx = (unit.right - unit.left).coerceAtLeast(1f)
-    val glyphUnitWidthPx = unitWidthPx / letterCount.toFloat()
-    val glowCenterX = unit.left + unitWidthPx * ((glowSweep - EMP_GLOW_BIAS) / letterCount.toFloat())
-    val glowBandHalfPx = maxOf(glyphUnitWidthPx * EMP_GLOW_SPREAD, fillFadeWidthPx)
+
+    // 颜色 / 辉光共用的连续扫描 x —— 行程两端各多走半个柔边，保证 progress 0/1 时
+    // 柔边完全移出词外（词首全未唱 / 词尾全已唱）。
+    val segProgress = lyricUnitSegmentProgress(unit, positionMs)
+    val sweepX = (unit.left - fillEdgeHalfPx) +
+        (unit.right - unit.left + 2f * fillEdgeHalfPx) * segProgress
 
     AmllLyricLogger.maybeRecord(
         event = "emphasis_token",
@@ -1996,23 +1978,25 @@ private fun DrawScope.drawEmphasizedToken(
         fields = {
             mapOf(
                 "tokenText" to lyricLogPreview(token.text, max = 24),
-                "tokenStartMs" to token.startMs,
                 "tokenDurationMs" to token.durationMs,
                 "tokenProgress" to tokenProgress,
-                "fillSegmentProgress" to fillSegmentProgress,
-                "glowSweep" to glowSweep,
-                "amp" to emphasisAmp(token.durationMs),
-                "envelope" to envelope,
+                "segProgress" to segProgress,
+                "sweepX" to sweepX,
+                "empGain" to empGain,
+                "glowGain" to glowGain,
                 "letterCount" to letterCount,
+                "visibleGlyphCount" to visibleGlyphCount,
             )
         },
     )
 
+    val glowTrailPx = EMP_GLOW_TRAIL_DP.dp.toPx()
+    val glowLeadPx = EMP_GLOW_LEAD_DP.dp.toPx()
+    val glowPeakLagPx = EMP_GLOW_PEAK_DP.dp.toPx()
+
+    val scaleBandHalfPx = ((unit.right - unit.left) / letterCount).coerceAtLeast(1f)
     clipRect(
-        left = clipLeft,
-        top = lineTopY,
-        right = clipRight,
-        bottom = lineBottomY,
+        left = clipLeft, top = lineTopY, right = clipRight, bottom = lineBottomY,
         clipOp = ClipOp.Intersect,
     ) {
         for (gi in unit.glyphStart until unit.glyphEnd) {
@@ -2022,60 +2006,51 @@ private fun DrawScope.drawEmphasizedToken(
             if (box.width <= 0f) continue
 
             val letterIdx = gi - unit.tokenStartChar
-            // 该字母相对当前音频扫描位置的距离（字母为单位）—— 辉光与起伏共用同一位置。
             val letterDist = glowSweep - (letterIdx + 0.5f)
-            // emphasis 强度：用同一条连续 x 方向光带和当前 glyph bbox 的重叠比例。
-            // 不再等字母中心命中才整字发光，视觉上是同一束光从左到右扫过字形。
-            val e = if (glowActive) {
-                (appleBandCoverage(box.left, box.right, glowCenterX, glowBandHalfPx) * empGain)
-                    .coerceIn(0f, 1f)
-            } else {
-                0f
-            }
-
-            val scaleAmt = 1f + EMP_PEAK_SCALE * e
-            // 起伏：宽过渡的平滑斜坡（约 2·EMP_FLOAT_RAMP 字母宽），与辉光同位置、同增益 ——
-            // 多字母连成一道平滑上浮波浪，不再一个个独立跳起；发光与位移必定同时发生。
-            val ty = if (tokenStarted) -floatPeakPx * floatRamp(letterDist) * empGain else 0f
-            val glowAlpha = EMP_GLOW_OPACITY * e
-            val glowBlurPx = glowRestPx + (glowPeakPx - glowRestPx) * e
-
-            val letterLayout = glyphMeasurer.measure(text[gi].toString(), glyphStyle)
-            val topLeft = Offset(box.left, lineTopY + ty)
-
-            // 辉光：独立叠加的白色光晕，不改字色；强度随音频扫描位置流动。
-            val glow = if (glowAlpha > 0.01f) {
-                Shadow(Color.White.copy(alpha = glowAlpha), Offset.Zero, glowBlurPx)
+            // 呼吸缩放：该字母被连续扫描带覆盖的比例（逐字母步进极小、肉眼连续）。
+            val scaleE = appleBandCoverage(box.left, box.right, sweepX, scaleBandHalfPx) * empGain
+            val scaleAmt = 1f + EMP_PEAK_SCALE * scaleE
+            val glowE = appleCometCoverage(
+                left = box.left,
+                right = box.right,
+                sweepX = sweepX,
+                trailPx = glowTrailPx,
+                leadPx = glowLeadPx,
+                peakLagPx = glowPeakLagPx,
+            ) * glowGain
+            val glow = if (glowE > 0.01f) {
+                Shadow(
+                    color = Color.White.copy(alpha = (EMP_GLOW_OPACITY * glowE).coerceIn(0f, 1f)),
+                    offset = Offset.Zero,
+                    blurRadius = glowBlurPx,
+                )
             } else {
                 null
             }
+            // 起伏：宽过渡平滑斜坡 → 多字母连成一道上浮波浪。
+            val ty = if (tokenStarted) -floatPeakPx * floatRamp(letterDist) * empGain else 0f
 
-            // 单字母只绘制一次，避免双层文字造成重影。
-            // 回到整字母渐变基线：不再做局部扫线和额外辉光联动，方便继续从稳定版本接手。
-            val fillFadeStartX = fillSweepX - fillFadeWidthPx
-            val fillBrush: Brush = when {
-                fillSegmentProgress <= 0f -> SolidColor(fgUnsung)
-                fillSegmentProgress >= 1f -> SolidColor(fg)
-                box.right <= fillFadeStartX -> SolidColor(fg)
-                box.left >= fillSweepX -> SolidColor(fgUnsung)
-                else -> Brush.horizontalGradient(
-                    colorStops = arrayOf(
-                        0f to fg,
-                        1f to fgUnsung,
-                    ),
-                    startX = fillFadeStartX,
-                    endX = fillSweepX.coerceAtLeast(fillFadeStartX + 1f),
-                    tileMode = TileMode.Clamp,
-                )
-            }
-
-            if (e > 0.001f) {
+            val letterLayout = glyphMeasurer.measure(text[gi].toString(), glyphStyle)
+            val topLeft = Offset(box.left, lineTopY + ty)
+            // drawText(letterLayout, topLeft=box.left) 会在字母自己的局部坐标里采样 Brush。
+            // sweepX 仍然是整词的全局扫描位置，但传给单字母 Brush 前必须减去 box.left，
+            // 否则每个字母都会直接吃到同一种 clamp 色，看起来像整词瞬间变色。
+            val localSweepStartX = sweepX - fillEdgeHalfPx - box.left
+            val localSweepEndX = (sweepX + fillEdgeHalfPx - box.left)
+                .coerceAtLeast(localSweepStartX + 1f)
+            val letterFillBrush = Brush.horizontalGradient(
+                colorStops = arrayOf(0f to fg, 1f to fgUnsung),
+                startX = localSweepStartX,
+                endX = localSweepEndX,
+                tileMode = TileMode.Clamp,
+            )
+            if (scaleE > 0.001f) {
                 val pivot = Offset(box.left + box.width / 2f, box.center.y + ty)
                 withTransform({ scale(scaleX = scaleAmt, scaleY = scaleAmt, pivot = pivot) }) {
-                    drawText(letterLayout, brush = fillBrush, topLeft = topLeft, shadow = glow)
+                    drawText(letterLayout, brush = letterFillBrush, topLeft = topLeft, shadow = glow)
                 }
             } else {
-                drawText(letterLayout, brush = fillBrush, topLeft = topLeft, shadow = glow)
+                drawText(letterLayout, brush = letterFillBrush, topLeft = topLeft, shadow = glow)
             }
         }
     }
@@ -2092,6 +2067,38 @@ private fun appleBandCoverage(
     val bandRight = centerX + halfWidth
     val overlap = (minOf(right, bandRight) - maxOf(left, bandLeft)).coerceAtLeast(0f)
     return (overlap / (right - left).coerceAtLeast(1f)).coerceIn(0f, 1f)
+}
+
+private fun appleCometCoverage(
+    left: Float,
+    right: Float,
+    sweepX: Float,
+    trailPx: Float,
+    leadPx: Float,
+    peakLagPx: Float,
+): Float {
+    if (right <= left) return 0f
+    val startX = sweepX - trailPx
+    val peakX = sweepX - peakLagPx
+    val endX = sweepX + leadPx
+
+    fun smooth(value: Float): Float {
+        val t = value.coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+
+    fun sample(x: Float): Float {
+        return when {
+            x <= startX || x >= endX -> 0f
+            x <= peakX -> smooth((x - startX) / (peakX - startX).coerceAtLeast(1f))
+            else -> smooth((endX - x) / (endX - peakX).coerceAtLeast(1f))
+        }
+    }
+
+    val q1 = left + (right - left) * 0.25f
+    val mid = (left + right) * 0.5f
+    val q3 = left + (right - left) * 0.75f
+    return ((sample(q1) + sample(mid) + sample(q3)) / 3f).coerceIn(0f, 1f)
 }
 
 private fun snapTextOffset(value: Float): Float {
