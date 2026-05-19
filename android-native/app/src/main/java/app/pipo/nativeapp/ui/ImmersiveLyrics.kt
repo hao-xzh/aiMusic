@@ -1870,8 +1870,10 @@ private fun lyricLiftEnvelope(durationMs: Long, elapsedMs: Long): Float {
 //   · amp 按 duration 在 EMP_MIN..EMP_FULL 间插值：刚过阈值的词几乎不动，长音更强。
 private const val EMP_MIN_DURATION_MS = 800L
 private const val EMP_FULL_DURATION_MS = 2000L
+private const val EMP_AMP_FLOOR = 0.7f            // 刚过阈值的慢词也保底 70% 强度（确保发光+起伏都明显）
 private const val EMP_PEAK_SCALE = 0.05f          // 呼吸缩放峰值（1.0 → 1.05）
-private const val EMP_FLOAT_PEAK_DP = 2.6f        // 字母唱过后的上浮量（≈ -0.09em @28sp）
+private const val EMP_FLOAT_PEAK_DP = 3.2f        // 字母上浮量峰值
+private const val EMP_FLOAT_RAMP = 1.3f           // 上浮过渡半宽（单位：字母）—— 越大波浪越平缓连贯
 private const val EMP_GLOW_OPACITY = 0.40f        // 辉光峰值不透明度（白色光晕）
 private const val EMP_GLOW_BLUR_REST_DP = 4f      // 辉光最小模糊半径
 private const val EMP_GLOW_BLUR_PEAK_DP = 13f     // 辉光峰值模糊半径
@@ -1890,11 +1892,23 @@ private fun empBell(dist: Float): Float {
     return 0.5f * (1f + kotlin.math.cos(3.1415927f * x))
 }
 
-/** 强调幅度：词越长越夸张，刚过阈值（EMP_MIN）几乎不动，到 EMP_FULL 拉满。 */
+/**
+ * 起伏斜坡：dist = 当前音频扫描位置 − 字母中心（单位：字母）。
+ * dist ≤ -EMP_FLOAT_RAMP 时 0（未上浮），≥ +EMP_FLOAT_RAMP 时 1（已上浮并保持），
+ * 中间约 2·EMP_FLOAT_RAMP 字母宽的 smoothstep 过渡 —— 相邻字母平滑错开 → 连成上浮波浪，
+ * 不再各自在 1 字母窗口里独立跳起。
+ */
+private fun floatRamp(dist: Float): Float {
+    val t = ((dist + EMP_FLOAT_RAMP) / (2f * EMP_FLOAT_RAMP)).coerceIn(0f, 1f)
+    return t * t * (3f - 2f * t)
+}
+
+/** 强调幅度：所有慢词都有保底 EMP_AMP_FLOOR；词越长越夸张，到 EMP_FULL 拉满。 */
 private fun emphasisAmp(durationMs: Long): Float {
     if (durationMs < EMP_MIN_DURATION_MS) return 0f
-    return ((durationMs - EMP_MIN_DURATION_MS).toFloat() /
+    val ramp = ((durationMs - EMP_MIN_DURATION_MS).toFloat() /
         (EMP_FULL_DURATION_MS - EMP_MIN_DURATION_MS).toFloat()).coerceIn(0f, 1f)
+    return EMP_AMP_FLOOR + (1f - EMP_AMP_FLOOR) * ramp
 }
 
 /**
@@ -1927,8 +1941,8 @@ private fun DrawScope.drawEmphasizedToken(
     val fillSweep = tokenProgress * letterCount
     // 辉光扫描位置（不夹取：唱完后光斑继续右移、滑出词尾 → 全字母辉光归零，不会赖着发光）。
     val glowSweep = ((positionMs - token.startMs).toFloat() / durationF) * letterCount
+    // 辉光 / 呼吸 / 起伏统一用 empGain 作总增益 —— 三者永远同时出现、同时消失。
     val empGain = emphasisAmp(token.durationMs) * envelope.coerceIn(0f, 1f)
-    val envClamped = envelope.coerceIn(0f, 1f)
 
     val lineTopY = layout.getLineTop(unit.line)
     val floatPeakPx = EMP_FLOAT_PEAK_DP.dp.toPx()
@@ -1959,13 +1973,17 @@ private fun DrawScope.drawEmphasizedToken(
         if (box.width <= 0f) continue
 
         val letterIdx = gi - unit.tokenStartChar
+        // 该字母相对当前音频扫描位置的距离（字母为单位）—— 辉光与起伏共用同一位置。
+        val letterDist = glowSweep - (letterIdx + 0.5f)
         // 该字母填充进度：扫描位置跨过 [k, k+1] 时 0→1，连续。
         val fp = (fillSweep - letterIdx).coerceIn(0f, 1f)
         // emphasis 强度：以音频扫描位置为中心的平滑钟形 → 光斑随音频左→右流动，连续不闪。
-        val e = (empBell(glowSweep - (letterIdx + 0.5f)) * empGain).coerceIn(0f, 1f)
+        val e = (empBell(letterDist) * empGain).coerceIn(0f, 1f)
 
         val scaleAmt = 1f + EMP_PEAK_SCALE * e
-        val ty = -floatPeakPx * EaseOutCss.transform(fp) * envClamped
+        // 起伏：宽过渡的平滑斜坡（约 2·EMP_FLOAT_RAMP 字母宽），与辉光同位置、同增益 empGain ——
+        // 多字母连成一道平滑上浮波浪，不再一个个独立跳起；发光与位移必定同时发生。
+        val ty = -floatPeakPx * floatRamp(letterDist) * empGain
         val glowAlpha = EMP_GLOW_OPACITY * e
         val glowBlurPx = glowRestPx + (glowPeakPx - glowRestPx) * e
 
