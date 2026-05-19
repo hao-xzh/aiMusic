@@ -41,5 +41,10 @@
 -keep class app.pipo.nativeapp.data.** { *; }
 -keep class app.pipo.nativeapp.runtime.** { *; }
 
+# 诊断日志（B 阶段 AMLL 调试需要从设置导出，禁止 R8 删除写日志路径）
+-keep class app.pipo.nativeapp.DiagnosticsLogStore { *; }
+-keep class app.pipo.nativeapp.DiagnosticsLogStore$* { *; }
+-keep class app.pipo.nativeapp.CrashLogStore { *; }
+
 # 保留泛型 / 注解 / 内部类签名
 -keepattributes Signature, *Annotation*, InnerClasses, EnclosingMethod, SourceFile, LineNumberTable

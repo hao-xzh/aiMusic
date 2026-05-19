@@ -56,6 +56,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -86,6 +87,9 @@ import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.progress
 import app.pipo.nativeapp.data.timingPartsForProgress
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 沉浸式歌词层 —— 镜像 src/components/PlayerCard.tsx ImmersiveLyrics 的非封面部分。
@@ -1154,6 +1158,75 @@ private fun AppleMusicLyricRow(
         label = "lyricBlur",
     )
 
+    // ---- AMLL 调试日志：active YRC 行每 ~120ms dump 一次动画快照 ----
+    // 通过 withFrameNanos 在 Choreographer 节拍上采样，读取动画 state 的当前值，
+    // 不阻塞渲染。导出走「设置 → 诊断日志 → 分享 txt」。
+    val rowLogKey = remember(line.startMs, line.text) { line.text.hashCode() }
+    LaunchedEffect(rowLogKey, isActive, isYrcLine) {
+        if (!isActive || !isYrcLine) return@LaunchedEffect
+        var lastDumpNanos = 0L
+        AmllLyricLogger.forceRecord(
+            event = "row_active_enter",
+            fields = mapOf(
+                "lineHash" to rowLogKey,
+                "lineStartMs" to line.startMs,
+                "lineDurationMs" to line.durationMs,
+                "audioStartMs" to LyricTiming.audioStartMs(line),
+                "tokenCount" to line.chars.size,
+                "lineText" to lyricLogPreview(line.text),
+                "distance" to distance,
+            ),
+        )
+        try {
+            while (true) {
+                withFrameNanos { nowNanos ->
+                    if (nowNanos - lastDumpNanos < 120_000_000L) return@withFrameNanos
+                    lastDumpNanos = nowNanos
+                    val curPos = positionMs
+                    val activeToken = line.chars.firstOrNull { ch ->
+                        val p = ch.progress(curPos)
+                        p > 0f && p < 1f
+                    }
+                    val activeTokenDur = activeToken?.durationMs ?: -1L
+                    val activeTokenProgress = activeToken?.progress(curPos) ?: -1f
+                    AmllLyricLogger.maybeRecord(
+                        event = "row_frame",
+                        key = rowLogKey.toString(),
+                        fields = {
+                            mapOf(
+                                "lineHash" to rowLogKey,
+                                "positionMs" to curPos,
+                                "lineStartMs" to line.startMs,
+                                "lineDurationMs" to line.durationMs,
+                                "lineElapsedMs" to (curPos - line.startMs),
+                                "targetAlpha" to targetAlpha,
+                                "rowAlpha" to rowAlpha,
+                                "rowBlurDp" to rowBlurDp,
+                                "liftEnvelope" to liftEnvelope,
+                                "shouldSnap" to shouldSnapActiveEffects,
+                                "activeTokenIdx" to (activeToken?.let { line.chars.indexOf(it) } ?: -1),
+                                "activeTokenText" to (activeToken?.text?.let { lyricLogPreview(it, max = 24) } ?: ""),
+                                "activeTokenStartMs" to (activeToken?.startMs ?: -1L),
+                                "activeTokenDurMs" to activeTokenDur,
+                                "activeTokenProgress" to activeTokenProgress,
+                            )
+                        },
+                    )
+                }
+            }
+        } finally {
+            AmllLyricLogger.forceRecord(
+                event = "row_active_exit",
+                fields = mapOf(
+                    "lineHash" to rowLogKey,
+                    "lineStartMs" to line.startMs,
+                    "rowAlphaAtExit" to rowAlpha,
+                    "liftEnvelopeAtExit" to liftEnvelope,
+                ),
+            )
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -1668,6 +1741,42 @@ private fun DrawScope.drawPerCharLiftedSweep(
         val liftT = lyricLiftEnvelope(durationMs, elapsedMs)
         val ty = snapTextOffset(liftPeakPx * liftT)
         val segmentProgress = lyricUnitSegmentProgress(unit, positionMs)
+        // Emphasis envelope —— 慢词呼吸 + 自体发光的强度因子（0..1）。
+        // envelope 是行级 lift 总开关；离开 active 行（envelope<1）时 emphasis 也按比例淡出。
+        val empT = lyricEmphasisEnvelope(durationMs, elapsedMs) * envelope
+        val empScale = 1f + EMP_PEAK_SCALE * empT
+        val sungColor = if (empT > 0f) {
+            lerp(wordPalette.sung, Color.White, empT * EMP_PEAK_BRIGHTNESS)
+        } else {
+            wordPalette.sung
+        }
+
+        if (segmentProgress in 0.001f..0.999f) {
+            val unitText = unit.timing.text
+            AmllLyricLogger.maybeRecord(
+                event = "sweep_active_unit",
+                key = unitText.hashCode().toString(),
+                fields = {
+                    mapOf(
+                        "tokenText" to lyricLogPreview(unitText, max = 24),
+                        "tokenStartMs" to unit.timing.startMs,
+                        "tokenDurationMs" to durationMs,
+                        "elapsedMs" to elapsedMs,
+                        "segmentProgress" to segmentProgress,
+                        "liftT" to liftT,
+                        "tyPx" to ty,
+                        "liftPeakPx" to liftPeakPx,
+                        "envelope" to envelope,
+                        "empT" to empT,
+                        "empScale" to empScale,
+                        "unitLeft" to unit.left,
+                        "unitRight" to unit.right,
+                        "fadeWidthPx" to fadeWidthPx,
+                        "lineNo" to unit.line,
+                    )
+                },
+            )
+        }
 
         // 按视觉单元 clip，而不是按单个字母 clip：
         // 英文单词会作为一个整体上浮和重绘，避免字母之间因 clip 边缘抗锯齿出现裂缝。
@@ -1695,49 +1804,69 @@ private fun DrawScope.drawPerCharLiftedSweep(
             segmentProgress >= 1f -> clipRight
             else -> sweepX.coerceIn(clipLeft, clipRight)
         }
-        clipRect(
-            left = clipLeft,
-            top = lineTop,
-            right = clipRight,
-            bottom = lineBottom,
-            clipOp = ClipOp.Intersect,
-        ) {
-            drawText(layout, color = wordPalette.unsung, topLeft = Offset(0f, ty))
-        }
-        if (segmentProgress > 0f) {
-            if (sungRight > clipLeft) {
-                clipRect(
-                    left = clipLeft,
-                    top = lineTop,
-                    right = sungRight,
-                    bottom = lineBottom,
-                    clipOp = ClipOp.Intersect,
-                ) {
-                    drawText(layout, color = wordPalette.sung, topLeft = Offset(0f, ty))
-                }
+        // ---- 单层呼吸：用 withTransform { scale } 包住所有 drawText ----
+        // pivot 选 unit 水平中点 + 行垂直中点，原字形向**自身中心**膨胀。
+        // 不增加任何 drawText 调用次数，绝不在原字之上叠加第二份字形。
+        // empT == 0 时这就是恒等变换，性能也无额外开销（scale=1）。
+        val drawUnit: DrawScope.() -> Unit = {
+            clipRect(
+                left = clipLeft,
+                top = lineTop,
+                right = clipRight,
+                bottom = lineBottom,
+                clipOp = ClipOp.Intersect,
+            ) {
+                drawText(layout, color = wordPalette.unsung, topLeft = Offset(0f, ty))
             }
-            if (segmentProgress < 1f) {
-                val fadeRight = (sweepX + fadeWidthPx).coerceAtMost(clipRight)
-                if (fadeRight > sweepX) {
+            if (segmentProgress > 0f) {
+                if (sungRight > clipLeft) {
                     clipRect(
-                        left = sweepX.coerceAtLeast(clipLeft),
+                        left = clipLeft,
                         top = lineTop,
-                        right = fadeRight,
+                        right = sungRight,
                         bottom = lineBottom,
                         clipOp = ClipOp.Intersect,
                     ) {
-                        drawText(
-                            layout,
-                            brush = Brush.horizontalGradient(
-                                colors = listOf(wordPalette.sung, Color.Transparent),
-                                startX = sweepX,
-                                endX = sweepX + fadeWidthPx,
-                            ),
-                            topLeft = Offset(0f, ty),
-                        )
+                        drawText(layout, color = sungColor, topLeft = Offset(0f, ty))
+                    }
+                }
+                if (segmentProgress < 1f) {
+                    val fadeRight = (sweepX + fadeWidthPx).coerceAtMost(clipRight)
+                    if (fadeRight > sweepX) {
+                        clipRect(
+                            left = sweepX.coerceAtLeast(clipLeft),
+                            top = lineTop,
+                            right = fadeRight,
+                            bottom = lineBottom,
+                            clipOp = ClipOp.Intersect,
+                        ) {
+                            drawText(
+                                layout,
+                                brush = Brush.horizontalGradient(
+                                    colors = listOf(sungColor, Color.Transparent),
+                                    startX = sweepX,
+                                    endX = sweepX + fadeWidthPx,
+                                ),
+                                topLeft = Offset(0f, ty),
+                            )
+                        }
                     }
                 }
             }
+        }
+
+        if (empT > 0f) {
+            val pivotX = (clipLeft + clipRight) * 0.5f
+            val pivotY = (lineTop + lineBottom) * 0.5f
+            withTransform(
+                {
+                    scale(scaleX = empScale, scaleY = empScale, pivot = Offset(pivotX, pivotY))
+                },
+            ) {
+                drawUnit()
+            }
+        } else {
+            drawUnit()
         }
     }
 }
@@ -1757,6 +1886,71 @@ private fun lyricLiftEnvelope(durationMs: Long, elapsedMs: Long): Float {
     return EaseOutCss.transform((elapsedMs.toFloat() / riseMs.toFloat()).coerceIn(0f, 1f))
 }
 
+// ---- Emphasis envelope（呼吸 + 自体发光，单层，不画第二份字形） ----
+//
+// 触发条件：单词 token duration ≥ 800ms（短词不触发，避免每个字都呼吸）。
+// 曲线：正弦半波 sin(πt)，t ∈ [0, 1]，0 → 1（峰值在 token 中点） → 0；
+// 离开 token 时严格回到 0，不污染下一词。
+// Amplitude：在 800ms-2000ms 之间线性插值，慢的更夸张、刚刚过阈值的几乎不动。
+//
+// 这只是一个标量，呼吸大小（scale）和发光色亮度都用这个值做线性插值。
+// **绝对不画第二份字形** —— 只对原本要画的 unsung/sung/fade 三次 drawText 套上
+// withTransform { scale(...) }，让原字形自己缩放。颜色亮度也直接改 drawText 的 color。
+private const val EMP_MIN_DURATION_MS = 800L
+private const val EMP_FULL_DURATION_MS = 2000L
+private const val EMP_PEAK_SCALE = 0.045f       // 1.0 → 1.045 → 1.0
+private const val EMP_PEAK_BRIGHTNESS = 0.40f   // 已唱色向白色 lerp 的最大比例
+
+private fun lyricEmphasisEnvelope(durationMs: Long, elapsedMs: Long): Float {
+    if (durationMs < EMP_MIN_DURATION_MS) return 0f
+    if (elapsedMs <= 0L) return 0f
+    if (elapsedMs >= durationMs) return 0f
+    val t = (elapsedMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    val amp = ((durationMs - EMP_MIN_DURATION_MS).toFloat() /
+        (EMP_FULL_DURATION_MS - EMP_MIN_DURATION_MS).toFloat()).coerceIn(0f, 1f)
+    return (kotlin.math.sin(t * kotlin.math.PI.toFloat()) * amp).coerceIn(0f, 1f)
+}
+
 private fun snapTextOffset(value: Float): Float {
     return kotlin.math.round(value * 2f) / 2f
+}
+
+/**
+ * AMLL 调试日志节流器。每个 (event, key) 通道独立 throttle，避免逐帧爆掉诊断 ndjson。
+ * 默认 120ms 一帧；用户在「设置 → 诊断日志 → 分享 txt」导出即可拿到。
+ */
+private object AmllLyricLogger {
+    private const val DEFAULT_INTERVAL_NANOS = 120_000_000L // 120ms
+    private val channelNanos = ConcurrentHashMap<String, AtomicLong>()
+    private val droppedCounts = ConcurrentHashMap<String, AtomicLong>()
+
+    fun maybeRecord(
+        event: String,
+        key: String = "",
+        intervalNanos: Long = DEFAULT_INTERVAL_NANOS,
+        fields: () -> Map<String, Any?>,
+    ) {
+        val channel = if (key.isEmpty()) event else "$event|$key"
+        val now = System.nanoTime()
+        val ref = channelNanos.getOrPut(channel) { AtomicLong(0L) }
+        val last = ref.get()
+        if (now - last < intervalNanos) {
+            droppedCounts.getOrPut(channel) { AtomicLong(0L) }.incrementAndGet()
+            return
+        }
+        if (!ref.compareAndSet(last, now)) {
+            droppedCounts.getOrPut(channel) { AtomicLong(0L) }.incrementAndGet()
+            return
+        }
+        val dropped = droppedCounts[channel]?.getAndSet(0L) ?: 0L
+        val computed = runCatching { fields() }.getOrElse { return }
+        val payload = if (dropped > 0L) computed + ("droppedFramesSinceLast" to dropped) else computed
+        DiagnosticsLogStore.record(area = "amll_lyric", event = event, fields = payload)
+    }
+
+    fun forceRecord(event: String, fields: Map<String, Any?>) {
+        val channel = event
+        channelNanos.getOrPut(channel) { AtomicLong(0L) }.set(System.nanoTime())
+        DiagnosticsLogStore.record(area = "amll_lyric", event = event, fields = fields)
+    }
 }
