@@ -105,6 +105,10 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
                 kotlin.math.abs(line.startMs - previousPrimary.startMs) >= NEAR_SIMULTANEOUS_LINE_MS
             ) {
                 primaryLines.add(line)
+            } else if (!sameLyricText(line.text, previousPrimary.text)) {
+                // 同一时间戳附近出现第二条不同文本，网易 YRC 通常是在标副唱 / ad-lib。
+                // 之前这里直接跳过，导致非括号副词丢失；重复同文本仍按去重处理。
+                companionCandidates.add(line)
             }
         }
     }
@@ -258,6 +262,11 @@ private fun isParentheticalLine(text: String): Boolean {
         (first == '（' && last == '）') ||
         (first == '[' && last == ']') ||
         (first == '【' && last == '】')
+}
+
+private fun sameLyricText(left: String, right: String): Boolean {
+    return left.replace(Regex("\\s+"), " ").trim()
+        .equals(right.replace(Regex("\\s+"), " ").trim(), ignoreCase = true)
 }
 
 private fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoLyricChar> {

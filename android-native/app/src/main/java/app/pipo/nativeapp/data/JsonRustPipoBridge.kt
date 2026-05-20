@@ -363,11 +363,12 @@ private fun attachTranslationLines(
 ): List<PipoLyricLine> {
     if (primaryLines.isEmpty() || translationLines.isEmpty()) return primaryLines
     val attached = List(primaryLines.size) { mutableListOf<PipoLyricLine>() }
+    var minHostIndex = 0
     translationLines
         .asSequence()
         .filter { it.text.isNotBlank() }
         .forEach { translation ->
-            val hostIndex = findTranslationHostIndex(translation, primaryLines)
+            val hostIndex = findTranslationHostIndex(translation, primaryLines, minHostIndex)
             if (hostIndex >= 0) {
                 val normalizedTranslation = translation.copy(
                     text = translation.text.trim(),
@@ -378,6 +379,7 @@ private fun attachTranslationLines(
                 )
                 if (attached[hostIndex].none { it.text == normalizedTranslation.text }) {
                     attached[hostIndex].add(normalizedTranslation)
+                    minHostIndex = (hostIndex + 1).coerceAtMost(primaryLines.lastIndex)
                 }
             }
         }
@@ -391,13 +393,15 @@ private fun attachTranslationLines(
 private fun findTranslationHostIndex(
     translation: PipoLyricLine,
     primaryLines: List<PipoLyricLine>,
+    minIndex: Int,
 ): Int {
     val translationStart = translation.startMs
     var bestIndex = -1
     var bestScore = Long.MIN_VALUE
     primaryLines.forEachIndexed { index, primary ->
-        val primaryStart = lyricAudioStartMs(primary)
-        val nextPrimaryStart = primaryLines.getOrNull(index + 1)?.let(::lyricAudioStartMs)
+        if (index < minIndex) return@forEachIndexed
+        val primaryStart = primary.startMs
+        val nextPrimaryStart = primaryLines.getOrNull(index + 1)?.startMs
         val primaryEnd = nextPrimaryStart ?: (primaryStart + primary.durationMs.coerceAtLeast(1_200L))
         val inHostWindow = translationStart >= primaryStart - TRANSLATION_HOST_LEAD_MS &&
             translationStart < primaryEnd + TRANSLATION_HOST_TAIL_MS
@@ -415,10 +419,6 @@ private fun findTranslationHostIndex(
         }
     }
     return bestIndex
-}
-
-private fun lyricAudioStartMs(line: PipoLyricLine): Long {
-    return line.chars.firstOrNull()?.startMs ?: line.startMs
 }
 
 private const val MAX_TRANSLATION_LINES_PER_PRIMARY = 1

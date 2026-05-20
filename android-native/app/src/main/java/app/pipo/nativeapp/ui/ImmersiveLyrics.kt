@@ -76,6 +76,8 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.Hyphens
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.unit.Dp
@@ -1262,7 +1264,7 @@ private fun AppleMusicLyricRow(
                 liftEnvelope = liftEnvelope,
             )
             timedCompanions.forEach { companion ->
-                if (shouldRenderCompanionLyric(companion, positionMs)) {
+                if (shouldRenderCompanionLyric(companion, positionMs) && !isCompanionLyricPast(companion, positionMs)) {
                     val companionActive = isCompanionLyricActive(companion, positionMs)
                     AppleMusicLyricText(
                         line = companion,
@@ -1358,6 +1360,8 @@ private fun AppleMusicTranslationText(
             fontSize = fontSize,
             fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
             lineHeight = lineHeight,
+            lineBreak = LineBreak.Paragraph,
+            hyphens = Hyphens.None,
             lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
                 alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
                 trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
@@ -1391,6 +1395,8 @@ private fun AppleMusicLyricText(
         fontSize = fontSize,
         fontWeight = fontWeight,
         lineHeight = lineHeight,
+        lineBreak = LineBreak.Paragraph,
+        hyphens = Hyphens.None,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
             alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
             trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.None,
@@ -1734,7 +1740,7 @@ private fun lyricWordPalette(fg: Color, fgUnsung: Color): LyricWordPalette {
 /**
  * 逐视觉单元 "颜色扫描 + 上浮"。
  *   · 普通词：原有的逐单元横向 sweep（fgUnsung → fg 扫色）。
- *   · 慢词（duration ≥ EMP_MIN_DURATION_MS）：交给 drawEmphasizedToken 逐字母渲染，
+ *   · 慢词（duration 与平均字母时长都足够慢）：交给 drawEmphasizedToken 逐字母渲染，
  *     叠加随音频位置左→右流动的白色辉光 + 呼吸缩放（见 EMP_* 注释）。
  * 文字颜色自始至终只有 fgUnsung / fg 两色 —— 行级（整行）与词级（逐字）一致。
  * 辉光是独立叠加的白色光晕（Shadow），不改变字色本身。
@@ -1759,7 +1765,8 @@ private fun DrawScope.drawPerCharLiftedSweep(
     for (idx in units.indices) {
         val unit = units[idx]
         // 慢词：交给逐字母 emphasis 通道（辉光随音频左→右流动 + 呼吸 + 起伏）。
-        if (unit.timing.durationMs >= EMP_MIN_DURATION_MS) {
+        // 位移 / 呼吸 / 辉光必须共用同一个 eligibility，避免出现“按慢词动但没发光”的半状态。
+        if (shouldUseSlowEmphasis(unit.timing)) {
             // 传入同一可视行的左右邻 token —— drawEmphasizedToken 用它把辉光裁切框
             // 收在本词自己的格子里，不溢到相邻单词 / 相邻行。
             val prevUnit = units.getOrNull(idx - 1)?.takeIf { it.line == unit.line }
@@ -1884,7 +1891,7 @@ private const val EMP_GLOW_TRAIL_DP = 34f         // 辉光在扫描位置之后
 private const val EMP_GLOW_LEAD_DP = 8f           // 辉光略微探到扫描位置之前
 private const val EMP_GLOW_PEAK_DP = 6f           // 辉光最亮点落在扫描位置之后多少
 private const val EMP_FILL_EDGE_DP = 13f          // 颜色 sweep 柔边总宽度
-private const val EMP_GLOW_MIN_MS_PER_GLYPH = 180L // 平均每个可见字母足够慢，才给辉光
+private const val EMP_MIN_MS_PER_GLYPH = 180L     // 平均每个可见字母足够慢，才进入慢词通道
 
 /**
  * 起伏斜坡：dist = 当前音频扫描位置 − 字母中心（单位：字母）。
@@ -1905,10 +1912,14 @@ private fun emphasisAmp(durationMs: Long): Float {
     return EMP_AMP_FLOOR + (1f - EMP_AMP_FLOOR) * ramp
 }
 
-private fun emphasisGlowAmp(durationMs: Long, visibleGlyphCount: Int): Float {
-    val glyphMs = durationMs / visibleGlyphCount.coerceAtLeast(1)
-    if (glyphMs < EMP_GLOW_MIN_MS_PER_GLYPH) return 0f
-    return emphasisAmp(durationMs)
+private fun shouldUseSlowEmphasis(token: PipoLyricChar): Boolean {
+    if (token.durationMs < EMP_MIN_DURATION_MS) return false
+    val glyphMs = token.durationMs / visibleLyricGlyphCount(token.text)
+    return glyphMs >= EMP_MIN_MS_PER_GLYPH
+}
+
+private fun visibleLyricGlyphCount(text: String): Int {
+    return text.count { !it.isWhitespace() }.coerceAtLeast(1)
 }
 
 /**
@@ -1933,9 +1944,6 @@ private fun DrawScope.drawEmphasizedToken(
     val text = layout.layoutInput.text.text
     val token = unit.timing
     val letterCount = unit.tokenCharCount.coerceAtLeast(1)
-    val visibleGlyphCount = (unit.glyphStart until unit.glyphEnd)
-        .count { it in text.indices && !text[it].isWhitespace() }
-        .coerceAtLeast(1)
     val durationF = token.durationMs.coerceAtLeast(1L).toFloat()
     // token.progress 是 timingParts 感知的「文本分数」；词外用线性外插（衔接处天然连续）。
     val tokenProgress = token.progress(positionMs).coerceIn(0f, 1f)
@@ -1944,8 +1952,7 @@ private fun DrawScope.drawEmphasizedToken(
     val tokenStarted = rawLinear >= 0f
     val glowSweep = sweepProgress * letterCount
     val empGain = (emphasisAmp(token.durationMs) * envelope.coerceIn(0f, 1f)).coerceIn(0f, 1f)
-    val glowGain = (emphasisGlowAmp(token.durationMs, visibleGlyphCount) *
-        envelope.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+    val glowGain = empGain
 
     val lineTopY = layout.getLineTop(unit.line)
     val lineBottomY = layout.getLineBottom(unit.line)
@@ -1985,7 +1992,7 @@ private fun DrawScope.drawEmphasizedToken(
                 "empGain" to empGain,
                 "glowGain" to glowGain,
                 "letterCount" to letterCount,
-                "visibleGlyphCount" to visibleGlyphCount,
+                "visibleGlyphCount" to visibleLyricGlyphCount(token.text),
             )
         },
     )

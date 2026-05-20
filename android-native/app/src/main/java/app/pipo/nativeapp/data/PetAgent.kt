@@ -115,6 +115,8 @@ class PetAgent(
 
         val intent = parsed.intent
         val desired = intent.desiredCount.coerceIn(8, 60)
+        val requestedArtistKeys = requestedArtistKeys(intent)
+        val artistSearchQueries = artistFirstSearchQueries(intent, userText)
 
         // 1) 本地库 → 多路召回 → 排序
         val localTracks = runCatching { library.library() }.getOrDefault(emptyList())
@@ -127,6 +129,7 @@ class PetAgent(
                 "libraryCount" to localTracks.size,
                 "hardTrackCount" to intent.hardTracks.size,
                 "hardArtistCount" to intent.hardArtists.size,
+                "promptArtistCount" to requestedArtistKeys.size,
             ),
         )
 
@@ -221,8 +224,13 @@ class PetAgent(
             )
             // smooth-queue 平滑接歌
             val asTracks = ranked.map { it.candidate.track }
-            SmoothQueue.smooth(
+            val promptScopedTracks = prioritizeRequestedArtists(
                 tracks = asTracks,
+                artistKeys = requestedArtistKeys,
+                desired = desired * 3,
+            )
+            SmoothQueue.smooth(
+                tracks = promptScopedTracks,
                 featuresStore = featuresStore,
                 mode = SmoothQueue.Mode.Discovery,
             ).take(desired)
@@ -233,18 +241,30 @@ class PetAgent(
         val pinnedAll = mergeUnique(pinnedNamed, pinnedOnline)
 
         // 3) 本地不够 → netease 搜索补
-        val recallMerged = if (localRanked.size >= 6) {
+        val localArtistCount = localRanked.count { matchesRequestedArtist(it, requestedArtistKeys) }
+        val needsArtistBackfill = requestedArtistKeys.isNotEmpty() && localArtistCount < desired
+        val recallMerged = if (localRanked.size >= 6 && !needsArtistBackfill) {
             localRanked
         } else {
-            val queries = intent.toSearchQueries(userText)
-            val online = neteaseSearch(queries)
+            val queries = artistSearchQueries
+            val onlineRaw = neteaseSearch(
+                queries = queries,
+                limitPerQuery = if (requestedArtistKeys.isNotEmpty()) 12 else 4,
+            )
+            val online = prioritizeRequestedArtists(
+                tracks = onlineRaw,
+                artistKeys = requestedArtistKeys,
+                desired = desired,
+            )
             DiagnosticsLogStore.record(
                 area = "ai_agent",
                 event = "online_backfill",
                 fields = mapOf(
                     "queryCount" to queries.size,
                     "localRankedCount" to localRanked.size,
+                    "localArtistCount" to localArtistCount,
                     "onlineCount" to online.size,
+                    "promptArtistCount" to requestedArtistKeys.size,
                 ),
             )
             // 合并：本地优先 + 在线兜底
@@ -258,13 +278,18 @@ class PetAgent(
             }
             merged
         }
+        val promptScoped = prioritizeRequestedArtists(
+            tracks = recallMerged,
+            artistKeys = requestedArtistKeys,
+            desired = desired,
+        )
 
         // 4) 把 pinned 钉到队首，然后是 recall 结果（去重）
         val final = if (pinnedAll.isEmpty()) {
-            recallMerged.take(desired)
+            promptScoped.take(desired)
         } else {
             val pinnedKeys = pinnedAll.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-            val rest = recallMerged.filter { TrackDedupe.songKey(it) !in pinnedKeys }
+            val rest = promptScoped.filter { TrackDedupe.songKey(it) !in pinnedKeys }
             (pinnedAll + rest).take(desired)
         }
 
@@ -300,6 +325,8 @@ class PetAgent(
                 "initialCount" to initialBatch.size,
                 "reservoirCount" to reservoir.size,
                 "pinnedCount" to pinnedAll.size,
+                "promptArtistCount" to requestedArtistKeys.size,
+                "finalArtistCount" to final.count { matchesRequestedArtist(it, requestedArtistKeys) },
                 "desired" to desired,
             ),
         )
@@ -308,7 +335,7 @@ class PetAgent(
             reply = parsed.reply,
             action = Action.Play,
             initialBatch = initialBatch,
-            continuous = makeContinuousSource(reservoir, intent.toSearchQueries(userText)),
+            continuous = makeContinuousSource(reservoir, artistSearchQueries, requestedArtistKeys),
         )
     }
 
@@ -456,11 +483,11 @@ class PetAgent(
     }
 
     /** 用一组查询词跑并行 netease 搜索，去重后返回 */
-    private suspend fun neteaseSearch(queries: List<String>): List<NativeTrack> {
+    private suspend fun neteaseSearch(queries: List<String>, limitPerQuery: Int = 4): List<NativeTrack> {
         if (queries.isEmpty()) return emptyList()
         return coroutineScope {
             val deferred = queries.map { q ->
-                async { runCatching { repository.searchTracks(q, limit = 4) }.getOrDefault(emptyList()) }
+                async { runCatching { repository.searchTracks(q, limit = limitPerQuery) }.getOrDefault(emptyList()) }
             }
             val seen = LinkedHashMap<Long, NativeTrack>()
             deferred.forEach { d ->
@@ -479,27 +506,29 @@ class PetAgent(
     private fun makeContinuousSource(
         reservoir: List<NativeTrack>,
         seedQueries: List<String>,
+        requestedArtistKeys: Set<String>,
     ): ContinuousQueueSource {
         val pool = reservoir.toMutableList()
-        val consumed = mutableSetOf<Long>().apply {
-            reservoir.forEach { it.neteaseId?.let(::add) }
-        }
+        val consumed = mutableSetOf<Long>()
         // 同一首歌的 Live/Karaoke/Acoustic 多版本归一到同 songKey —— 续杯不能再灌进重复版本
-        val consumedSongKeys = HashSet<String>().apply {
-            reservoir.forEach { add(TrackDedupe.songKey(it)) }
-        }
+        val consumedSongKeys = HashSet<String>()
         var refillTried = false
 
         return ContinuousQueueSource { excludeIds ->
             val drained = mutableListOf<NativeTrack>()
-            val iter = pool.iterator()
-            while (iter.hasNext() && drained.size < 8) {
-                val t = iter.next()
+            var index = 0
+            while (index < pool.size && drained.size < 8) {
+                val t = pool[index]
+                if (requestedArtistKeys.isNotEmpty() && !matchesRequestedArtist(t, requestedArtistKeys)) {
+                    index += 1
+                    continue
+                }
                 val id = t.neteaseId
-                iter.remove()
-                if (id == null || id in excludeIds) continue
+                pool.removeAt(index)
+                if (id == null || id in excludeIds || id in consumed) continue
                 val k = TrackDedupe.songKey(t)
                 if (k in consumedSongKeys) continue
+                consumed.add(id)
                 consumedSongKeys.add(k)
                 drained.add(t)
             }
@@ -511,17 +540,21 @@ class PetAgent(
                     fields = mapOf(
                         "count" to drained.size,
                         "poolLeft" to pool.size,
+                        "promptArtistCount" to requestedArtistKeys.size,
                     ),
                 )
                 return@ContinuousQueueSource drained
             }
 
-            if (!refillTried && seedQueries.isNotEmpty()) {
+            if ((requestedArtistKeys.isNotEmpty() || !refillTried) && seedQueries.isNotEmpty()) {
                 refillTried = true
                 val collected = mutableListOf<NativeTrack>()
                 for (q in seedQueries) {
-                    val hits = runCatching { repository.searchTracks(q, limit = 8) }.getOrDefault(emptyList())
+                    val hits = runCatching {
+                        repository.searchTracks(q, limit = if (requestedArtistKeys.isNotEmpty()) 16 else 8)
+                    }.getOrDefault(emptyList())
                     for (t in hits) {
+                        if (requestedArtistKeys.isNotEmpty() && !matchesRequestedArtist(t, requestedArtistKeys)) continue
                         val id = t.neteaseId ?: continue
                         if (id in excludeIds || id in consumed) continue
                         val k = TrackDedupe.songKey(t)
@@ -542,6 +575,7 @@ class PetAgent(
                         "queryCount" to seedQueries.size,
                         "collected" to collected.size,
                         "returned" to refill.size,
+                        "promptArtistCount" to requestedArtistKeys.size,
                     ),
                 )
                 return@ContinuousQueueSource refill
@@ -552,10 +586,89 @@ class PetAgent(
                 fields = mapOf(
                     "seedQueryCount" to seedQueries.size,
                     "excludeCount" to excludeIds.size,
+                    "promptArtistCount" to requestedArtistKeys.size,
                 ),
             )
             emptyList()
         }
+    }
+
+    private fun requestedArtistKeys(intent: PetIntent): Set<String> =
+        requestedArtistNames(intent).map(::normalizeForMatch).filter { it.isNotEmpty() }.toSet()
+
+    private fun requestedArtistNames(intent: PetIntent): List<String> {
+        val out = LinkedHashMap<String, String>()
+        for (raw in intent.hardArtists + intent.textArtists) {
+            val name = raw.trim()
+            val key = normalizeForMatch(name)
+            if (name.isNotEmpty() && key.isNotEmpty() && key !in out) out[key] = name
+        }
+        return out.values.toList()
+    }
+
+    private fun artistFirstSearchQueries(intent: PetIntent, rawText: String): List<String> {
+        val artistNames = requestedArtistNames(intent)
+        if (artistNames.isEmpty()) return intent.toSearchQueries(rawText)
+        val queries = LinkedHashSet<String>()
+        artistNames.take(3).forEach { artist ->
+            queries.add(artist)
+            (intent.hardTracks + intent.textTracks).take(2).forEach { track ->
+                if (track.isNotBlank()) queries.add("$artist ${track.trim()}")
+            }
+            (intent.musicHintsGenres + intent.hardGenres).take(2).forEach { genre ->
+                if (genre.isNotBlank()) queries.add("$artist ${genre.trim()}")
+            }
+            (intent.softMoods + intent.musicHintsMoods).take(2).forEach { mood ->
+                if (mood.isNotBlank()) queries.add("$artist ${mood.trim()}")
+            }
+        }
+        intent.toSearchQueries(rawText).forEach { query ->
+            if (query.isBlank()) return@forEach
+            queries.add(query.trim())
+            artistNames.take(2).forEach { artist ->
+                if (!query.contains(artist, ignoreCase = true)) queries.add("$artist ${query.trim()}")
+            }
+        }
+        return queries.toList().take(10)
+    }
+
+    private fun prioritizeRequestedArtists(
+        tracks: List<NativeTrack>,
+        artistKeys: Set<String>,
+        desired: Int,
+    ): List<NativeTrack> {
+        if (artistKeys.isEmpty() || tracks.isEmpty()) return tracks
+        val matching = ArrayList<NativeTrack>(tracks.size)
+        val fallback = ArrayList<NativeTrack>(tracks.size)
+        for (track in tracks) {
+            if (matchesRequestedArtist(track, artistKeys)) matching.add(track) else fallback.add(track)
+        }
+        if (matching.isEmpty()) return tracks
+        val enoughForQueue = matching.size >= minOf(6, desired)
+        return if (enoughForQueue) {
+            matching.take(desired)
+        } else {
+            (matching + fallback).take(desired)
+        }
+    }
+
+    private fun matchesRequestedArtist(track: NativeTrack, artistKeys: Set<String>): Boolean {
+        if (artistKeys.isEmpty()) return false
+        val artistParts = track.artist
+            .split("/", "&", ",", "、", " feat.", " feat ", "feat.", "feat ", " featuring ", " ft.", " ft ")
+            .map(::normalizeForMatch)
+            .filter { it.isNotEmpty() }
+        val wholeArtist = normalizeForMatch(track.artist)
+        return artistKeys.any { key ->
+            artistParts.any { part -> artistKeyMatches(part, key) } ||
+                (key.length >= 3 && wholeArtist.contains(key))
+        }
+    }
+
+    private fun artistKeyMatches(part: String, requested: String): Boolean {
+        if (part == requested) return true
+        if (requested.length < 3 || part.length < 3) return false
+        return requested in part || part in requested
     }
 
     private fun errorFields(error: Throwable): Map<String, Any?> =
