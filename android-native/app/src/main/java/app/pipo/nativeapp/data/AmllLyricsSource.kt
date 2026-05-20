@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.data
 
 import android.content.Context
+import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
@@ -35,30 +36,44 @@ class AmllLyricsSource(private val context: Context) {
      *   · 返回 null = 没命中（404 / 非数字 ID / 网络失败 / 解析失败），调用方应回落到原源
      */
     suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine>? {
-        if (trackId.isBlank() || trackId.any { !it.isDigit() }) return null
+        if (trackId.isBlank() || trackId.any { !it.isDigit() }) {
+            log(trackId, "skip_non_numeric", lineCount = null)
+            return null
+        }
         return withContext(Dispatchers.IO) {
             val cacheFile = File(cacheDir, "$trackId$TTML_SUFFIX")
             val missFile = File(cacheDir, "$trackId$MISS_SUFFIX")
 
             // 1. 之前已经确认 404 过 → 直接放弃
-            if (missFile.exists()) return@withContext null
+            if (missFile.exists()) {
+                log(trackId, "miss_cached_404", lineCount = null)
+                return@withContext null
+            }
 
             // 2. 本地缓存命中
             if (cacheFile.exists() && cacheFile.length() > 0L) {
                 val cached = runCatching { cacheFile.readText(Charsets.UTF_8) }.getOrNull()
                 if (!cached.isNullOrBlank()) {
                     val parsed = runCatching { AmllTtmlParser.parse(cached) }.getOrNull()
-                    if (!parsed.isNullOrEmpty()) return@withContext parsed
+                    if (!parsed.isNullOrEmpty()) {
+                        log(trackId, "hit_cache", lineCount = parsed.size)
+                        return@withContext parsed
+                    }
                     // 文件存在但解析空 → 当作脏缓存删了，下次重拉
                     cacheFile.delete()
                 }
             }
 
             // 3. 走网拉
-            val result = fetchOnce(trackId) ?: return@withContext null
+            val result = fetchOnce(trackId)
+            if (result == null) {
+                log(trackId, "miss_network_error", lineCount = null)
+                return@withContext null
+            }
             when (result) {
                 FetchResult.NotFound -> {
                     runCatching { missFile.writeBytes(ByteArray(0)) }
+                    log(trackId, "miss_404", lineCount = null)
                     null
                 }
                 is FetchResult.Ok -> {
@@ -67,14 +82,33 @@ class AmllLyricsSource(private val context: Context) {
                         // 拿到了但解析失败 —— 不写 404 哨兵（数据有效，是我们的 parser 有问题，
                         // 留着 .ttml 给开发可见，但本次返回 null）
                         runCatching { cacheFile.writeText(result.body, Charsets.UTF_8) }
+                        log(trackId, "parse_failed", lineCount = null)
                         null
                     } else {
                         runCatching { cacheFile.writeText(result.body, Charsets.UTF_8) }
+                        log(trackId, "hit_network", lineCount = parsed.size)
                         parsed
                     }
                 }
             }
         }
+    }
+
+    private fun log(trackId: String, result: String, lineCount: Int?) {
+        // 走 area="lyrics" / event="amll_resolve" —— 用户从设置里分享诊断日志时，
+        // 一眼能看出每首歌走的是 AMLL（字级）还是 yrc/lrc（回落）。
+        // result 取值：hit_cache / hit_network / miss_cached_404 / miss_404 /
+        //             miss_network_error / parse_failed / skip_non_numeric
+        val fields = mutableMapOf<String, Any?>(
+            "trackId" to trackId,
+            "result" to result,
+        )
+        if (lineCount != null) fields["lineCount"] = lineCount
+        DiagnosticsLogStore.record(
+            area = "lyrics",
+            event = "amll_resolve",
+            fields = fields,
+        )
     }
 
     private suspend fun fetchOnce(trackId: String): FetchResult? = withContext(Dispatchers.IO) {

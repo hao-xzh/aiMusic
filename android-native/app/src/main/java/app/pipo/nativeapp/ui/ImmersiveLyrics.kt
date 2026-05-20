@@ -338,11 +338,17 @@ private fun ImmersiveIconButton(
     activeColor: Color = Color.Transparent,
     content: @Composable () -> Unit,
 ) {
+    val activeEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
+    val activeProgress by animateFloatAsState(
+        targetValue = if (active) 1f else 0f,
+        animationSpec = tween(durationMillis = 260, easing = activeEase),
+        label = "immersiveIconActive",
+    )
     Box(
         modifier = Modifier
             .size(42.dp)
             .clip(RoundedCornerShape(50))
-            .background(if (active) activeColor.copy(alpha = 0.13f) else Color.Transparent)
+            .background(activeColor.copy(alpha = 0.13f * activeProgress))
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -595,7 +601,25 @@ internal fun AppleMusicLyricColumn(
     val density = LocalDensity.current
     var containerHeightPx by remember { mutableStateOf(0) }
 
-    val listState = remember(lyricSessionKey) { LazyListState() }
+    // listState 创建时就用当前 active 行作为初始位置 —— 避免「LazyColumn 先渲染 index=0 顶部，
+    // 再异步 LaunchedEffect 滚到 active」中间那一帧；用户在 immersive 打开 / 切歌瞬间能立刻
+    // 看到正在唱的那行歌词，不会出现「行 N 唱完切到 N+1 时 N 才出来」的滞后现象。
+    val listState = remember(lyricSessionKey) {
+        val initialIdx = if (lines.isEmpty()) {
+            0
+        } else {
+            val hasWordTimingLocal = lines.any { it.chars.isNotEmpty() }
+            val leadMs = if (hasWordTimingLocal) {
+                LYRIC_WORD_LINE_FOCUS_LEAD_MS
+            } else {
+                LyricTiming.focusLeadMs(lines)
+            }
+            val ledMs = positionMs + leadMs
+            lines.indexOfLast { line -> ledMs >= LyricTiming.audioStartMs(line) }
+                .coerceAtLeast(0)
+        }
+        LazyListState(firstVisibleItemIndex = initialIdx)
+    }
     var manualScrollHoldUntilMs by remember(lyricSessionKey) { mutableStateOf(0L) }
     var clickSeekHoldUntilMs by remember(lyricSessionKey) { mutableStateOf(0L) }
     var clickSeekFocusIndex by remember(lyricSessionKey) { mutableStateOf<Int?>(null) }
@@ -1080,10 +1104,31 @@ private fun AppleMusicLyricRow(
     }
 
     val cssEase = remember { CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f) }
+    val companionEase = cssEase
+    val density = LocalDensity.current
     val lineAudioStartMs = remember(line.startMs, line.chars) { LyricTiming.audioStartMs(line) }
     val shouldSnapActiveEffects = isActive && positionMs - lineAudioStartMs > LYRIC_ACTIVE_ENTRY_SNAP_MS
     val timedCompanions = line.timedCompanionLines()
-    val translationLines = if (showTranslation) line.translationLines() else emptyList()
+    val translationLines = line.translationLines()
+    var keepTranslationVisible by remember(line.startMs, line.text) { mutableStateOf(showTranslation) }
+    LaunchedEffect(showTranslation, translationLines.isNotEmpty()) {
+        if (showTranslation && translationLines.isNotEmpty()) {
+            keepTranslationVisible = true
+        }
+    }
+    val translationVisibility by animateFloatAsState(
+        targetValue = if (showTranslation) 1f else 0f,
+        animationSpec = tween(
+            durationMillis = if (showTranslation) TRANSLATION_TOGGLE_SHOW_MS else TRANSLATION_TOGGLE_HIDE_MS,
+            easing = companionEase,
+        ),
+        label = "translationVisibility",
+        finishedListener = { value ->
+            if (!showTranslation && value <= 0.001f) {
+                keepTranslationVisible = false
+            }
+        },
+    )
     val hasCompanionCue = timedCompanions.any {
         shouldRenderCompanionLyric(it, positionMs) && !isCompanionLyricPast(it, positionMs)
     }
@@ -1261,7 +1306,7 @@ private fun AppleMusicLyricRow(
             modifier = Modifier
                 .fillMaxWidth()
                 .animateContentSize(
-                    animationSpec = tween(durationMillis = 180, easing = cssEase),
+                    animationSpec = tween(durationMillis = 280, easing = companionEase),
                 ),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
@@ -1278,35 +1323,66 @@ private fun AppleMusicLyricRow(
                 liftEnvelope = liftEnvelope,
             )
             timedCompanions.forEach { companion ->
-                if (shouldRenderCompanionLyric(companion, positionMs) && !isCompanionLyricPast(companion, positionMs)) {
+                // 副词不再随结束时间消失：渲染条件保留「已经到了起播时间」，
+                // 但删除「past 即移除」—— 让副词唱完后跟主行同步停留（isPast=true，
+                // 颜色切到 fg 已唱色），整体亮度跟着 rowAlpha 走，看起来和主行历史副歌的
+                // 排版一致，不会出现"上一段副歌唱完一句话突然抽掉一半"的视觉断层。
+                if (shouldRenderCompanionLyric(companion, positionMs)) {
                     val companionActive = isCompanionLyricActive(companion, positionMs)
-                    AppleMusicLyricText(
-                        line = companion,
-                        isActive = companionActive,
-                        isPast = isCompanionLyricPast(companion, positionMs),
-                        positionMs = positionMs,
-                        fg = fg,
-                        fgUnsung = fgUnsung,
-                        fontSize = fontSize * 0.76f,
-                        lineHeight = lineHeight * 0.76f,
-                        fontWeight = FontWeight.SemiBold,
-                        liftEnvelope = if (companionActive) 1f else liftEnvelope,
-                    )
+                    val appear = companionEase.transform(companionLyricAppearProgress(companion, positionMs))
+                    val risePx = with(density) { COMPANION_LYRIC_APPEAR_RISE_DP.dp.toPx() }
+                    Box(
+                        modifier = Modifier.graphicsLayer {
+                            alpha = appear
+                            translationY = risePx * (1f - appear)
+                            val scale = COMPANION_LYRIC_APPEAR_SCALE_FROM +
+                                (1f - COMPANION_LYRIC_APPEAR_SCALE_FROM) * appear
+                            scaleX = scale
+                            scaleY = scale
+                        }
+                    ) {
+                        AppleMusicLyricText(
+                            line = companion,
+                            isActive = companionActive,
+                            isPast = isCompanionLyricPast(companion, positionMs),
+                            positionMs = positionMs,
+                            fg = fg,
+                            fgUnsung = fgUnsung,
+                            fontSize = fontSize * 0.76f,
+                            lineHeight = lineHeight * 0.76f,
+                            fontWeight = FontWeight.SemiBold,
+                            liftEnvelope = if (companionActive) 1f else liftEnvelope,
+                        )
+                    }
                 }
             }
-            translationLines.forEach { translation ->
-                AppleMusicTranslationText(
-                    line = translation,
-                    isActive = isActive,
-                    color = translationLyricColor(
-                        isActive = isActive,
-                        isPast = isPast,
-                        fg = fg,
-                        fgDim = fgDim,
-                    ),
-                    fontSize = fontSize * 0.64f,
-                    lineHeight = lineHeight * 0.66f,
-                )
+            if (showTranslation || keepTranslationVisible) {
+                val translationRisePx = with(density) { TRANSLATION_TOGGLE_RISE_DP.dp.toPx() }
+                translationLines.forEach { translation ->
+                    Box(
+                        modifier = Modifier.graphicsLayer {
+                            alpha = translationVisibility
+                            translationY = translationRisePx * (1f - translationVisibility)
+                            val scale = TRANSLATION_TOGGLE_SCALE_FROM +
+                                (1f - TRANSLATION_TOGGLE_SCALE_FROM) * translationVisibility
+                            scaleX = scale
+                            scaleY = scale
+                        }
+                    ) {
+                        AppleMusicTranslationText(
+                            line = translation,
+                            isActive = isActive,
+                            color = translationLyricColor(
+                                isActive = isActive,
+                                isPast = isPast,
+                                fg = fg,
+                                fgDim = fgDim,
+                            ),
+                            fontSize = fontSize * 0.64f,
+                            lineHeight = lineHeight * 0.66f,
+                        )
+                    }
+                }
             }
         }
     }
@@ -1317,6 +1393,15 @@ private fun shouldRenderCompanionLyric(
     positionMs: Long,
 ): Boolean {
     return positionMs >= LyricTiming.audioStartMs(line) - COMPANION_LYRIC_LEAD_MS
+}
+
+private fun companionLyricAppearProgress(
+    line: PipoLyricLine,
+    positionMs: Long,
+): Float {
+    val appearStartMs = LyricTiming.audioStartMs(line) - COMPANION_LYRIC_LEAD_MS
+    return ((positionMs - appearStartMs).toFloat() / COMPANION_LYRIC_APPEAR_MS)
+        .coerceIn(0f, 1f)
 }
 
 private fun hasVisibleCompanionLyric(line: PipoLyricLine, positionMs: Long): Boolean {
@@ -1455,7 +1540,14 @@ private fun AppleMusicLyricText(
     )
 }
 
-private const val COMPANION_LYRIC_LEAD_MS = 450L
+private const val COMPANION_LYRIC_LEAD_MS = 320L
+private const val COMPANION_LYRIC_APPEAR_MS = 260L
+private const val COMPANION_LYRIC_APPEAR_RISE_DP = 4f
+private const val COMPANION_LYRIC_APPEAR_SCALE_FROM = 0.995f
+private const val TRANSLATION_TOGGLE_SHOW_MS = 260
+private const val TRANSLATION_TOGGLE_HIDE_MS = 220
+private const val TRANSLATION_TOGGLE_RISE_DP = 2.5f
+private const val TRANSLATION_TOGGLE_SCALE_FROM = 0.996f
 private const val LYRIC_ACTIVE_ENTRY_SNAP_MS = 450L
 
 /**
