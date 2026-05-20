@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.playback
 
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoRepository
 import kotlinx.coroutines.withTimeoutOrNull
@@ -10,7 +11,9 @@ internal class PlaybackUrlResolver(
     private val streamUrlTimeoutMs: Long,
 ) {
     suspend fun fetchPlayableUrl(id: Long): String? {
+        var attemptedLevels = 0
         for (level in streamLevelFallbacks) {
+            attemptedLevels += 1
             val url = withTimeoutOrNull(streamUrlTimeoutMs) {
                 runCatching { repository.songUrls(listOf(id), level) }
                     .getOrNull()
@@ -20,6 +23,15 @@ internal class PlaybackUrlResolver(
             }
             if (!url.isNullOrBlank()) return url
         }
+        DiagnosticsLogStore.record(
+            area = "playback",
+            event = "playable_url_empty",
+            fields = mapOf(
+                "neteaseId" to id,
+                "attemptedLevels" to attemptedLevels,
+                "timeoutMs" to streamUrlTimeoutMs,
+            ),
+        )
         return null
     }
 
@@ -58,6 +70,19 @@ internal class PlaybackUrlResolver(
             }
             unresolved = unresolved.filter { it !in urls }
             if (unresolved.isEmpty()) break
+        }
+        if (unresolved.isNotEmpty()) {
+            DiagnosticsLogStore.record(
+                area = "playback",
+                event = "playable_queue_partial",
+                fields = mapOf(
+                    "missingCount" to missingIds.size,
+                    "resolvedCount" to urls.size,
+                    "unresolvedCount" to unresolved.size,
+                    "attemptedLevels" to streamLevelFallbacks.size,
+                    "timeoutMs" to streamUrlTimeoutMs,
+                ),
+            )
         }
 
         return queue.map { track ->

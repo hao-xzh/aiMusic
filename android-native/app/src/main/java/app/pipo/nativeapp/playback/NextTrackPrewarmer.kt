@@ -2,10 +2,10 @@ package app.pipo.nativeapp.playback
 
 import android.content.Context
 import android.net.Uri
-import android.util.Log
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.CacheWriter
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
@@ -33,13 +33,23 @@ class NextTrackPrewarmer(
         activeWriter.getAndSet(writer)?.cancel()
         try {
             writer.cache()
-            Log.d("PipoPrewarm", "prewarmed ${track.title}")
             true
         } catch (e: CancellationException) {
             writer.cancel()
             throw e
         } catch (e: Exception) {
-            Log.w("PipoPrewarm", "prewarm failed for ${track.title}", e)
+            DiagnosticsLogStore.record(
+                area = "playback",
+                event = "prewarm_failed",
+                fields = mapOf(
+                    "trackId" to track.id,
+                    "neteaseId" to track.neteaseId,
+                    "title" to track.title,
+                    "artist" to track.artist,
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
             false
         } finally {
             activeWriter.compareAndSet(writer, null)

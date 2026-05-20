@@ -15,6 +15,7 @@ object DiagnosticsLogStore {
     private const val MAX_FILE_BYTES = 1_200_000L
     private const val MAX_ARCHIVE_FILES = 6
     private const val DEFAULT_SNAPSHOT_BYTES = 420_000
+    private val MUTED_AREAS = setOf("lyrics_speed", "amll_lyric")
     private val lock = Any()
 
     @Volatile
@@ -40,6 +41,7 @@ object DiagnosticsLogStore {
     }
 
     fun record(area: String, event: String, fields: Map<String, Any?> = emptyMap()) {
+        if (area in MUTED_AREAS) return
         val context = appContext ?: return
         synchronized(lock) {
             val dir = diagnosticsDir(context).apply { mkdirs() }

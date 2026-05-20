@@ -4,7 +4,6 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -49,7 +48,14 @@ internal class SmartAutoMixer(
             tickPosted = false
             runCatching { tick() }
                 .onFailure {
-                    Log.w(TAG, "AutoMix tick failed", it)
+                    DiagnosticsLogStore.record(
+                        area = "automix",
+                        event = "tick_failed",
+                        fields = mapOf(
+                            "errorType" to it::class.java.simpleName,
+                            "message" to it.message,
+                        ),
+                    )
                     cancel("tick-error", keepMainVolume = true)
                 }
             if (shouldKeepTicking()) scheduleTick()
@@ -137,7 +143,6 @@ internal class SmartAutoMixer(
         ) return
 
         armed = ArmedMix(plan = plan)
-        Log.d(TAG, "armed ${plan.currentTitle} -> ${plan.nextTitle}, mix=${plan.mixMs}ms, ${plan.reason}")
         logMixEvent(
             "armed",
             plan,
@@ -195,7 +200,6 @@ internal class SmartAutoMixer(
         }
         mainPlayer.play()
 
-        Log.d(TAG, "started ${plan.currentTitle} -> ${plan.nextTitle}")
         logMixEvent(
             "started",
             plan,
@@ -288,7 +292,6 @@ internal class SmartAutoMixer(
         lastCompletedAtMs = now
         active = null
         mainPlayer.volume = 1f
-        Log.d(TAG, "completed ${plan.currentTitle} -> ${plan.nextTitle}")
         logMixEvent(
             "completed",
             plan,
@@ -544,7 +547,6 @@ internal class SmartAutoMixer(
         armed = null
         active = null
         if (keepMainVolume) mainPlayer.volume = 1f
-        if (reason != "main-not-playing") Log.d(TAG, "cancel $reason")
         if (reason != "main-not-playing" || plan != null) {
             val fields = mapOf(
                 "reason" to reason,
@@ -638,7 +640,6 @@ internal class SmartAutoMixer(
     )
 
     private companion object {
-        private const val TAG = "SmartAutoMix"
         private const val TICK_MS = 180L
         private const val SHORT_MIX_PREPARE_THRESHOLD_MS = 1_500L
         private const val TIGHT_MIX_PREPARE_THRESHOLD_MS = 2_300L

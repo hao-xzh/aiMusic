@@ -106,7 +106,6 @@ class RustBridgeRepository(
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Throwable) {
-            android.util.Log.w("PipoLogin", "startQrLogin failed", e)
             throw e
         }
     }
@@ -117,7 +116,6 @@ class RustBridgeRepository(
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Throwable) {
-            android.util.Log.w("PipoLogin", "checkQrLogin failed", e)
             // checkQrLogin 在轮询里被频繁调,这里返回带异常文案的 status,而不是 throw,
             // 让轮询循环能优雅退出 + 显示信息
             return QrLoginStatus(code = -1, message = "${e.javaClass.simpleName}: ${e.message ?: "bridge error"}")

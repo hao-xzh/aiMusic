@@ -15,6 +15,7 @@ class PipoApplication : Application() {
         super.onCreate()
         DiagnosticsLogStore.install(this)
         CrashLogStore.install(this)
+        StabilityDiagnostics.install(this)
         PipoGraph.installContext(this)
         registerForegroundTracker()
         installRustBridgeWhenPackaged()
@@ -53,11 +54,11 @@ class PipoApplication : Application() {
     private fun registerForegroundTracker() {
         registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: Activity) {
-                AppForeground.onActivityResumed()
+                AppForeground.onActivityResumed(activity.applicationContext)
             }
 
             override fun onActivityPaused(activity: Activity) {
-                AppForeground.onActivityPaused()
+                AppForeground.onActivityPaused(activity.applicationContext)
             }
 
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit

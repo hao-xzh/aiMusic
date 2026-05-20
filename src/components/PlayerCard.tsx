@@ -19,7 +19,7 @@ import { Waveform } from "./Waveform";
 import { AiCoverCaption } from "./AiCoverCaption";
 import { usePlayer } from "@/lib/player-state";
 import { type LrcLine } from "@/lib/lrc";
-import { charProgress, type YrcLine } from "@/lib/yrc";
+import { charProgress, type YrcChar, type YrcLine } from "@/lib/yrc";
 import { cdn } from "@/lib/cdn";
 import { useIsDesktop } from "@/lib/use-is-desktop";
 import { useCoverEdgeColors, computeTone } from "@/lib/cover-color";
@@ -87,6 +87,35 @@ const FLIP_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
 //     再衔接长尾减速（第三、四控制点保持平滑），整体像 iOS modal dismiss
 const CLOSE_DURATION_MS = 540;
 const CLOSE_EASE = "cubic-bezier(0.6, 0.04, 0.22, 1)";
+
+// Android-native ImmersiveLyrics 的时钟 / 行焦点参数，桌面端保持同一套节奏。
+const LYRIC_SWEEP_VISUAL_LEAD_SEC = 0.045;
+const LYRIC_WORD_LINE_FOCUS_LEAD_SEC = 0.095;
+const LYRIC_WORD_SCROLL_LOOKAHEAD_SEC = 0.17;
+const LYRIC_LINE_FOCUS_LEAD_SEC = 0.22;
+
+const SMOOTH_POSITION_SEEK_RESET_SEC = 1.5;
+const SMOOTH_POSITION_FRAME_RESET_SEC = 1.5;
+const SMOOTH_POSITION_BACKWARD_RESET_SEC = 0.3;
+const SMOOTH_POSITION_OUTPUT_STALE_SEC = 0.36;
+const SMOOTH_POSITION_START_GUARD_SEC = 0.9;
+const SMOOTH_POSITION_FOLLOW_ALPHA = 0.68;
+
+const COMPANION_LYRIC_LEAD_SEC = 0.45;
+
+// Android slow-emphasis 通道的桌面复刻：慢词才启用轻 glow / scale / float。
+const EMP_MIN_DURATION_SEC = 0.8;
+const EMP_FULL_DURATION_SEC = 2.0;
+const EMP_AMP_FLOOR = 0.7;
+const EMP_PEAK_SCALE = 0.05;
+const EMP_FLOAT_PEAK_PX = 3.2;
+const EMP_FLOAT_RAMP = 1.3;
+const EMP_GLOW_OPACITY = 0.4;
+const EMP_GLOW_BLUR_PX = 8;
+const EMP_GLOW_TRAIL_PX = 34;
+const EMP_GLOW_LEAD_PX = 8;
+const EMP_GLOW_PEAK_PX = 6;
+const EMP_MIN_SEC_PER_GLYPH = 0.18;
 
 
 // ============== 主组件 ==============
@@ -796,10 +825,13 @@ function ImmersiveLyrics({
           lines={lyric?.lines ?? []}
           yrcLines={lyric?.yrcLines ?? []}
           positionSec={positionSec}
+          isPlaying={isPlaying}
+          sessionId={current?.id}
           meta={lyric}
           fgColor={layout.fgColor}
           fgDimColor={layout.fgDimColor}
           fgUnsungColor={fgUnsungColor}
+          onSeekToSec={player.seek}
         />
       </div>
     </div>,
@@ -1238,6 +1270,7 @@ function LyricStrip({
     lines,
     yrcLines,
     positionSec,
+    isPlaying: false,
     visibleRows: LYRIC_ROWS_COMPACT,
     rowH: LYRIC_ROW_H,
     activeFs: LYRIC_ACTIVE_FS,
@@ -1282,25 +1315,33 @@ function LyricColumn({
   lines,
   yrcLines,
   positionSec,
+  isPlaying,
+  sessionId,
   meta,
   fgColor,
   fgDimColor,
   fgUnsungColor,
+  onSeekToSec,
 }: {
   lines: LrcLine[];
   yrcLines: YrcLine[];
   positionSec: number;
+  isPlaying: boolean;
+  sessionId?: string;
   meta:
     | { lines: LrcLine[]; yrcLines: YrcLine[]; instrumental: boolean; uncollected: boolean }
     | null;
   fgColor: string;
   fgDimColor: string;
   fgUnsungColor: string;
+  onSeekToSec: (sec: number) => void;
 }) {
   const view = useLyricView({
     lines,
     yrcLines,
     positionSec,
+    isPlaying,
+    sessionId,
     visibleRows: IMMERSIVE_ROWS,
     rowH: IMMERSIVE_LYRIC_ROW_H,
     activeFs: IMMERSIVE_ACTIVE_FS,
@@ -1309,6 +1350,7 @@ function LyricColumn({
     fgColor,
     fgDimColor,
     fgUnsungColor,
+    onSeekToSec,
   });
 
   if (!meta) return <PlaceholderLyric text="歌词加载中…" mode="immersive" />;
@@ -1326,16 +1368,14 @@ function LyricColumn({
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
       scrollIdx={view.scrollIdx}
-      // PC/桌面歌词模式：当前行焦点落在容器顶 40%，按实际听感再往下压。
-      focusFraction={0.4}
+      // 跟 Android-native 一致：焦点行落在容器顶约 11%，上方只露一行历史歌词。
+      focusFraction={0.11}
       outerStyle={{
         ...immersiveLyricFrame,
-        // 顶部 fade 加狠：0..26% 渐进透明 → 全亮，老句子退场时几乎看不见。
-        // 底部保留 18% 渐隐（不像顶部那么狠，因为下面是"还没唱到"的预览，需要可读）。
         WebkitMaskImage:
-          "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.10) 10%, rgba(0,0,0,0.55) 18%, #000 26%, #000 82%, transparent 100%)",
+          "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.10) 5%, rgba(0,0,0,0.50) 10%, #000 14%, #000 80%, rgba(0,0,0,0.40) 94%, transparent 100%)",
         maskImage:
-          "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.10) 10%, rgba(0,0,0,0.55) 18%, #000 26%, #000 82%, transparent 100%)",
+          "linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.10) 5%, rgba(0,0,0,0.50) 10%, #000 14%, #000 80%, rgba(0,0,0,0.40) 94%, transparent 100%)",
       }}
       innerExtraStyle={{
         // 横向 padding 跟移动端 titlePadX 同步加大 1/3：28-48；
@@ -1355,6 +1395,50 @@ function LyricColumn({
 // 不再用"每行 = rowH"做硬编码 translate —— 实际行高随歌词字数 / 换行变化，
 // 用 ref 直接测量 active 行的 offsetTop + offsetHeight，确保激活行垂直居中
 // 在容器里。长歌词换行也不会跟下一行重叠。
+
+function useSpringNumber(target: number, enabled = true): number {
+  const [value, setValue] = useState(target);
+  const valueRef = useRef(target);
+  const velocityRef = useRef(0);
+
+  useEffect(() => {
+    if (!enabled) {
+      valueRef.current = target;
+      velocityRef.current = 0;
+      setValue(target);
+      return;
+    }
+    let raf = 0;
+    let last = performanceNow();
+    const stiffness = 190;
+    const dampingRatio = 0.92;
+    const damping = 2 * dampingRatio * Math.sqrt(stiffness);
+    const tick = () => {
+      const now = performanceNow();
+      const dt = Math.min(0.034, Math.max(0.001, (now - last) / 1000));
+      last = now;
+      const x = valueRef.current;
+      const v = velocityRef.current;
+      const accel = -stiffness * (x - target) - damping * v;
+      const nextV = v + accel * dt;
+      const nextX = x + nextV * dt;
+      if (Math.abs(nextX - target) < 0.35 && Math.abs(nextV) < 0.35) {
+        valueRef.current = target;
+        velocityRef.current = 0;
+        setValue(target);
+        return;
+      }
+      valueRef.current = nextX;
+      velocityRef.current = nextV;
+      setValue(nextX);
+      raf = window.requestAnimationFrame(tick);
+    };
+    raf = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(raf);
+  }, [target, enabled]);
+
+  return value;
+}
 
 function MeasuredLyricColumn({
   activeIdx,
@@ -1377,6 +1461,7 @@ function MeasuredLyricColumn({
   const outerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const [translateY, setTranslateY] = useState(0);
+  const animatedTranslateY = useSpringNumber(translateY, transitionMs >= 700);
   const measureAndPlace = useCallback(() => {
     const outer = outerRef.current;
     const inner = innerRef.current;
@@ -1423,10 +1508,11 @@ function MeasuredLyricColumn({
           left: 0,
           right: 0,
           top: 0,
-          transform: `translate3d(0, ${translateY}px, 0)`,
-          // FastOutSlowIn / Material standard ≈ cubic-bezier(0.4, 0, 0.2, 1)
-          // 比之前 (0.22, 1, 0.36, 1) 更接近 Apple Music"沉沉落到位"的体感
-          transition: `transform ${transitionMs}ms cubic-bezier(0.4, 0, 0.2, 1)`,
+          transform: `translate3d(0, ${animatedTranslateY}px, 0)`,
+          transition:
+            transitionMs >= 700
+              ? "none"
+              : `transform ${transitionMs}ms cubic-bezier(0.4, 0, 0.2, 1)`,
           willChange: "transform",
           ...innerExtraStyle,
         }}
@@ -1443,6 +1529,8 @@ type LyricViewParams = {
   lines: LrcLine[];
   yrcLines: YrcLine[];
   positionSec: number;
+  isPlaying: boolean;
+  sessionId?: string;
   visibleRows: number;
   rowH: string;
   activeFs: string;
@@ -1455,7 +1543,124 @@ type LyricViewParams = {
   // active 行内 "未唱" 字符颜色（介于 fg 和 fgDim 之间的中亮度）。
   // 不传则 fallback 到 fgDimColor。
   fgUnsungColor?: string;
+  onSeekToSec?: (sec: number) => void;
 };
+
+type SmoothPositionAnchor = {
+  positionSec: number;
+  capturedAtMs: number;
+  resetToken: number;
+  canExtrapolate: boolean;
+};
+
+function lyricViewSessionKey(
+  sessionId: string | undefined,
+  lines: readonly (LrcLine | YrcLine)[],
+): string {
+  const first = lines[0];
+  const last = lines[lines.length - 1];
+  const firstTime = first ? ("time" in first ? first.time : 0) : 0;
+  const lastTime = last ? ("time" in last ? last.time : 0) : 0;
+  const firstText = first?.text ?? "";
+  const lastText = last?.text ?? "";
+  return `${sessionId ?? ""}:${lines.length}:${firstTime}:${hashLyricText(firstText)}:${lastTime}:${hashLyricText(lastText)}`;
+}
+
+function hashLyricText(text: string): number {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = (hash * 31 + text.charCodeAt(i)) | 0;
+  }
+  return hash;
+}
+
+function useSmoothLyricPositionSec(
+  rawPositionSec: number,
+  isPlaying: boolean,
+  sessionKey: string,
+): number {
+  const [output, setOutput] = useState(rawPositionSec);
+  const anchorRef = useRef<SmoothPositionAnchor>({
+    positionSec: rawPositionSec,
+    capturedAtMs: performanceNow(),
+    resetToken: 0,
+    canExtrapolate: rawPositionSec > SMOOTH_POSITION_START_GUARD_SEC,
+  });
+
+  useEffect(() => {
+    anchorRef.current = {
+      positionSec: rawPositionSec,
+      capturedAtMs: performanceNow(),
+      resetToken: anchorRef.current.resetToken + 1,
+      canExtrapolate: rawPositionSec > SMOOTH_POSITION_START_GUARD_SEC,
+    };
+    setOutput(rawPositionSec);
+  }, [sessionKey]);
+
+  useEffect(() => {
+    const previous = anchorRef.current;
+    const jumpedBackward = rawPositionSec + SMOOTH_POSITION_BACKWARD_RESET_SEC < previous.positionSec;
+    const jumpedForward = rawPositionSec > previous.positionSec + SMOOTH_POSITION_SEEK_RESET_SEC;
+    const shouldReset = jumpedBackward || jumpedForward;
+    const advanced = rawPositionSec > previous.positionSec;
+    const canExtrapolate = shouldReset
+      ? rawPositionSec > SMOOTH_POSITION_START_GUARD_SEC
+      : previous.canExtrapolate || advanced || rawPositionSec > SMOOTH_POSITION_START_GUARD_SEC;
+    anchorRef.current = {
+      positionSec: rawPositionSec,
+      capturedAtMs: performanceNow(),
+      resetToken: shouldReset ? previous.resetToken + 1 : previous.resetToken,
+      canExtrapolate,
+    };
+
+    setOutput((prev) => {
+      const outputLagSec = rawPositionSec - prev;
+      if (isPlaying && !shouldReset && outputLagSec > SMOOTH_POSITION_OUTPUT_STALE_SEC) {
+        return rawPositionSec;
+      }
+      if (!isPlaying || shouldReset) {
+        return rawPositionSec;
+      }
+      return prev;
+    });
+  }, [rawPositionSec, isPlaying]);
+
+  useEffect(() => {
+    if (!isPlaying) {
+      setOutput(anchorRef.current.positionSec);
+      return;
+    }
+    let raf = 0;
+    let smoothed = anchorRef.current.positionSec;
+    let seenResetToken = anchorRef.current.resetToken;
+    const tick = () => {
+      const anchor = anchorRef.current;
+      if (anchor.resetToken !== seenResetToken) {
+        seenResetToken = anchor.resetToken;
+        smoothed = anchor.positionSec;
+      }
+      if (!anchor.canExtrapolate) {
+        smoothed = anchor.positionSec;
+      } else {
+        const target = anchor.positionSec + (performanceNow() - anchor.capturedAtMs) / 1000;
+        const diff = target - smoothed;
+        if (Math.abs(diff) > SMOOTH_POSITION_FRAME_RESET_SEC) smoothed = target;
+        else if (diff < -SMOOTH_POSITION_BACKWARD_RESET_SEC) smoothed = target;
+        else if (diff > 0) smoothed += diff * SMOOTH_POSITION_FOLLOW_ALPHA;
+      }
+      setOutput((prev) => (Math.abs(prev - smoothed) < 0.001 ? prev : smoothed));
+      raf = window.requestAnimationFrame(tick);
+    };
+    raf = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(raf);
+  }, [isPlaying, sessionKey]);
+
+  return output;
+}
+
+function performanceNow(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
 
 function useLyricView(p: LyricViewParams): {
   empty: boolean;
@@ -1470,6 +1675,12 @@ function useLyricView(p: LyricViewParams): {
     () => (useYrc ? p.yrcLines : p.lines),
     [useYrc, p.lines, p.yrcLines],
   );
+  const sessionKey = useMemo(
+    () => lyricViewSessionKey(p.sessionId, lyricLines),
+    [p.sessionId, lyricLines],
+  );
+  const smoothedPositionSec = useSmoothLyricPositionSec(p.positionSec, p.isPlaying, sessionKey);
+  const renderPositionSec = Math.max(0, smoothedPositionSec + LYRIC_SWEEP_VISUAL_LEAD_SEC);
   const audioStarts = useMemo(
     () =>
       lyricLines.map((line) =>
@@ -1477,29 +1688,19 @@ function useLyricView(p: LyricViewParams): {
       ),
     [lyricLines, useYrc],
   );
-  const audioEnds = useMemo(
-    () =>
-      lyricLines.map((line, i) =>
-        useYrc
-          ? yrcAudioEnd(line as YrcLine)
-          : i + 1 < lyricLines.length
-            ? (lyricLines[i + 1] as LrcLine).time
-            : (line as LrcLine).time + 5,
-      ),
-    [lyricLines, useYrc],
-  );
-
-  // 二分定位当前行（actually active = 已经在唱的那行）
+  const lineFocusLeadSec = useYrc ? LYRIC_WORD_LINE_FOCUS_LEAD_SEC : LYRIC_LINE_FOCUS_LEAD_SEC;
+  const scrollLookaheadSec = useYrc ? LYRIC_WORD_SCROLL_LOOKAHEAD_SEC : LYRIC_LINE_FOCUS_LEAD_SEC;
+  const lineClockPositionSec = useYrc ? renderPositionSec : p.positionSec;
+  const scrollClockPositionSec = useYrc ? renderPositionSec : p.positionSec;
   const idx = useMemo(() => {
-    return activeLineIndexAt(p.positionSec, audioStarts, audioEnds);
-  }, [audioStarts, audioEnds, p.positionSec]);
-
-  // 预滚动只提前 100ms：跟 Android 端一致，滚动和 active alpha 几乎同时发生。
-  // 之前 600ms 太早，会出现"下一句已经上来，但上一句颜色还没扫完"的割裂。
-  const scrollLookaheadSec = 0.1;
+    if (audioStarts.length === 0) return -1;
+    if (lineClockPositionSec + lineFocusLeadSec < audioStarts[0]!) return -1;
+    return lastLineIndexAt(lineClockPositionSec + lineFocusLeadSec, audioStarts);
+  }, [audioStarts, lineClockPositionSec, lineFocusLeadSec]);
   const scrollIdx = useMemo(() => {
-    return activeLineIndexAt(p.positionSec + scrollLookaheadSec, audioStarts, audioEnds);
-  }, [audioStarts, audioEnds, p.positionSec]);
+    if (audioStarts.length === 0) return -1;
+    return Math.max(0, lastLineIndexAt(scrollClockPositionSec + scrollLookaheadSec, audioStarts));
+  }, [audioStarts, scrollClockPositionSec, scrollLookaheadSec]);
 
   if (audioStarts.length === 0) {
     return { empty: true, rows: null, translateExpr: "0px", activeIdx: -1, scrollIdx: -1 };
@@ -1507,7 +1708,7 @@ function useLyricView(p: LyricViewParams): {
 
   const hasActiveLine = idx >= 0;
   const safeIdx = hasActiveLine ? idx : 0;
-  const safeScrollIdx = Math.max(scrollIdx, safeIdx);
+  const safeScrollIdx = Math.max(0, scrollIdx);
   const total = useYrc ? p.yrcLines.length : p.lines.length;
 
   // 渲染所有行（不再做 sliding window 切片）。配合 column 整体 translateY，
@@ -1530,6 +1731,7 @@ function useLyricView(p: LyricViewParams): {
     const isActive = hasActiveLine && i === safeIdx;
     const isScrollTarget = i === safeScrollIdx;
     const distance = hasActiveLine ? Math.abs(i - safeIdx) : i + 1;
+    const seekSec = audioStarts[i] ?? 0;
     if (useYrc) {
       const line = p.yrcLines[i]!;
       rowEls.push(
@@ -1539,7 +1741,7 @@ function useLyricView(p: LyricViewParams): {
           isActive={isActive}
           isScrollTarget={isScrollTarget}
           distance={distance}
-          positionSec={isActive ? p.positionSec : undefined}
+          positionSec={isActive ? renderPositionSec : undefined}
           rowH={p.rowH}
           activeFs={p.activeFs}
           dimFs={p.dimFs}
@@ -1547,6 +1749,8 @@ function useLyricView(p: LyricViewParams): {
           fgColor={fg}
           fgDimColor={fgDim}
           fgUnsungColor={fgUnsung}
+          seekSec={seekSec}
+          onSeekToSec={p.onSeekToSec}
         />,
       );
     } else {
@@ -1575,6 +1779,8 @@ function useLyricView(p: LyricViewParams): {
           fgColor={fg}
           fgDimColor={fgDim}
           fgUnsungColor={fgUnsung}
+          seekSec={seekSec}
+          onSeekToSec={p.onSeekToSec}
         />,
       );
     }
@@ -1595,11 +1801,7 @@ function useLyricView(p: LyricViewParams): {
   };
 }
 
-function activeLineIndexAt(
-  positionSec: number,
-  audioStarts: readonly number[],
-  audioEnds: readonly number[],
-): number {
+function lastLineIndexAt(positionSec: number, audioStarts: readonly number[]): number {
   if (audioStarts.length === 0) return -1;
   let lo = 0;
   let hi = audioStarts.length - 1;
@@ -1612,9 +1814,6 @@ function activeLineIndexAt(
     } else {
       hi = mid - 1;
     }
-  }
-  if (ans > 0 && positionSec < audioEnds[ans - 1]! - 0.02) {
-    return ans - 1;
   }
   return ans;
 }
@@ -1650,6 +1849,8 @@ type RowCommon = {
   fgColor: string;
   fgDimColor: string;
   fgUnsungColor: string;
+  seekSec?: number;
+  onSeekToSec?: (sec: number) => void;
 };
 
 const YrcRow = React.memo(function YrcRow({
@@ -1665,6 +1866,8 @@ const YrcRow = React.memo(function YrcRow({
   fgColor,
   fgDimColor,
   fgUnsungColor,
+  seekSec,
+  onSeekToSec,
 }: RowCommon & { line: YrcLine; positionSec?: number }) {
   // immersive 下非 active 行用 fgColor + 容器 opacity 压暗（统一颜色 + 透明度），
   // compact 仍用 fgDimColor（旧行为，保留视觉熟悉感）。
@@ -1673,16 +1876,35 @@ const YrcRow = React.memo(function YrcRow({
     <div
       data-active={isActive ? "1" : "0"}
       data-scroll-target={isScrollTarget ? "1" : "0"}
+      onClick={onSeekToSec && seekSec != null ? () => onSeekToSec(seekSec) : undefined}
       style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance)}
     >
-      <div style={lineInner()}>
+      <div style={lineInner(immersive)}>
         {isActive ? (
-          <YrcActiveLine
-            line={line}
-            positionSec={positionSec ?? 0}
-            fgColor={fgColor}
-            fgUnsungColor={fgUnsungColor}
-          />
+          <div style={activeLyricStack}>
+            <YrcActiveLine
+              line={line}
+              positionSec={positionSec ?? 0}
+              fgColor={fgColor}
+              fgUnsungColor={fgUnsungColor}
+            />
+            {immersive &&
+              (line.companionLines ?? []).map((companion, idx) =>
+                shouldRenderCompanionLyric(companion, positionSec ?? 0) &&
+                !isCompanionLyricPast(companion, positionSec ?? 0) ? (
+                  <span
+                    key={`${companion.time}-${idx}`}
+                    style={companionLyricStyle(
+                      isCompanionLyricActive(companion, positionSec ?? 0),
+                      fgColor,
+                      fgUnsungColor,
+                    )}
+                  >
+                    {companion.text}
+                  </span>
+                ) : null,
+              )}
+          </div>
         ) : (
           <span
             style={{
@@ -1711,22 +1933,23 @@ const LrcRow = React.memo(function LrcRow({
   fgColor,
   fgDimColor,
   fgUnsungColor,
+  seekSec,
+  onSeekToSec,
 }: RowCommon & { text: string; progress: number }) {
+  void progress;
   const inactiveColor = immersive ? fgColor : fgDimColor;
   return (
     <div
       data-active={isActive ? "1" : "0"}
       data-scroll-target={isScrollTarget ? "1" : "0"}
+      onClick={onSeekToSec && seekSec != null ? () => onSeekToSec(seekSec) : undefined}
       style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance)}
     >
-      <div style={lineInner()}>
+      <div style={lineInner(immersive)}>
         {isActive ? (
           <span
             style={{
-              backgroundImage: `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${progress * 100}%, ${fgUnsungColor} ${progress * 100 + 1}%, ${fgUnsungColor} 100%)`,
-              WebkitBackgroundClip: "text",
-              backgroundClip: "text",
-              WebkitTextFillColor: "transparent",
+              color: fgColor,
             }}
           >
             {text}
@@ -1744,6 +1967,39 @@ const LrcRow = React.memo(function LrcRow({
     </div>
   );
 });
+
+const activeLyricStack: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 2,
+};
+
+function companionLyricStyle(
+  active: boolean,
+  fgColor: string,
+  fgUnsungColor: string,
+): React.CSSProperties {
+  return {
+    display: "block",
+    color: active ? mixCssColor(fgUnsungColor, fgColor, 0.62) : fgUnsungColor,
+    fontSize: "0.76em",
+    lineHeight: 1.28,
+    fontWeight: 650,
+    whiteSpace: "break-spaces",
+  };
+}
+
+function shouldRenderCompanionLyric(line: YrcLine, positionSec: number): boolean {
+  return positionSec >= yrcAudioStart(line) - COMPANION_LYRIC_LEAD_SEC;
+}
+
+function isCompanionLyricActive(line: YrcLine, positionSec: number): boolean {
+  return positionSec >= yrcAudioStart(line) && positionSec < yrcAudioEnd(line);
+}
+
+function isCompanionLyricPast(line: YrcLine, positionSec: number): boolean {
+  return positionSec >= yrcAudioEnd(line);
+}
 
 function YrcActiveLine({
   line,
@@ -1771,6 +2027,17 @@ function YrcActiveLine({
   return (
     <>
       {chars.map((char, idx) => {
+        if (shouldUseSlowEmphasis(char)) {
+          return (
+            <YrcSlowEmphasisToken
+              key={`${idx}-${char.startSec}-${char.text}`}
+              char={char}
+              positionSec={positionSec}
+              fgColor={fgColor}
+              fgUnsungColor={fgUnsungColor}
+            />
+          );
+        }
         const progress = charProgress(char, positionSec);
         const beingSung = progress > 0 && progress < 1;
         const sung = progress >= 1;
@@ -1779,6 +2046,8 @@ function YrcActiveLine({
         const liftT = easeOutCss(Math.min(1, elapsed / riseSec));
         const liftPx = -0.95 * liftT;
         const stop = Math.min(100, Math.max(0, progress * 100));
+        const fadeStart = Math.max(0, stop - 0.5);
+        const fadeEnd = Math.min(100, stop + 5);
         return (
           <span
             key={`${idx}-${char.startSec}-${char.text}`}
@@ -1789,7 +2058,7 @@ function YrcActiveLine({
               color: sung ? fgColor : fgUnsungColor,
               transform: `translate3d(0, ${liftPx.toFixed(2)}px, 0)`,
               backgroundImage: beingSung
-                ? `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${stop}%, ${fgUnsungColor} ${Math.min(100, stop + 1)}%, ${fgUnsungColor} 100%)`
+                ? `linear-gradient(90deg, ${fgColor} 0%, ${fgColor} ${fadeStart}%, ${fgUnsungColor} ${fadeEnd}%, ${fgUnsungColor} 100%)`
                 : "none",
               WebkitBackgroundClip: beingSung ? "text" : "border-box",
               backgroundClip: beingSung ? "text" : "border-box",
@@ -1804,8 +2073,133 @@ function YrcActiveLine({
   );
 }
 
+function YrcSlowEmphasisToken({
+  char,
+  positionSec,
+  fgColor,
+  fgUnsungColor,
+}: {
+  char: YrcChar;
+  positionSec: number;
+  fgColor: string;
+  fgUnsungColor: string;
+}) {
+  const glyphs = Array.from(char.text);
+  const visibleGlyphCountValue = visibleLyricGlyphCount(char.text);
+  const progress = charProgress(char, positionSec);
+  const rawLinear = (positionSec - char.startSec) / Math.max(0.001, char.durSec);
+  const sweepProgress = rawLinear >= 0 && rawLinear <= 1 ? progress : rawLinear;
+  const glowSweep = sweepProgress * visibleGlyphCountValue;
+  const empGain = Math.max(0, Math.min(1, emphasisAmp(char.durSec)));
+  let visibleIndex = 0;
+
+  return (
+    <span style={{ display: "inline-block", whiteSpace: "break-spaces" }}>
+      {glyphs.map((glyph, idx) => {
+        if (/\s/.test(glyph)) {
+          return <span key={`${idx}-${glyph}`}>{glyph}</span>;
+        }
+        const letterIdx = visibleIndex++;
+        const letterCenter = letterIdx + 0.5;
+        const letterDist = glowSweep - letterCenter;
+        const floatT = rawLinear >= 0 ? floatRamp(letterDist) : 0;
+        const bandT = appleBandCoverage01(letterDist);
+        const glowT = appleCometCoverage01(letterDist) * empGain;
+        const colorT = smootherStep(Math.max(0, Math.min(1, (letterDist + 0.85) / 1.7)));
+        const scaleAmt = 1 + EMP_PEAK_SCALE * bandT * empGain;
+        const ty = -EMP_FLOAT_PEAK_PX * floatT * empGain;
+        return (
+          <span
+            key={`${idx}-${glyph}`}
+            style={{
+              display: "inline-block",
+              color: mixCssColor(fgUnsungColor, fgColor, colorT),
+              transform: `translate3d(0, ${ty.toFixed(2)}px, 0) scale(${scaleAmt.toFixed(3)})`,
+              transformOrigin: "center",
+              textShadow:
+                glowT > 0.01
+                  ? `0 0 ${EMP_GLOW_BLUR_PX}px rgba(255,255,255,${(EMP_GLOW_OPACITY * glowT).toFixed(3)})`
+                  : "none",
+            }}
+          >
+            {glyph}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
 function easeOutCss(t: number): number {
   return 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
+}
+
+function shouldUseSlowEmphasis(char: YrcChar): boolean {
+  if (char.durSec < EMP_MIN_DURATION_SEC) return false;
+  return char.durSec / visibleLyricGlyphCount(char.text) >= EMP_MIN_SEC_PER_GLYPH;
+}
+
+function visibleLyricGlyphCount(text: string): number {
+  return Math.max(1, Array.from(text).filter((c) => !/\s/.test(c)).length);
+}
+
+function emphasisAmp(durationSec: number): number {
+  if (durationSec < EMP_MIN_DURATION_SEC) return 0;
+  const ramp = Math.max(
+    0,
+    Math.min(1, (durationSec - EMP_MIN_DURATION_SEC) / (EMP_FULL_DURATION_SEC - EMP_MIN_DURATION_SEC)),
+  );
+  return EMP_AMP_FLOOR + (1 - EMP_AMP_FLOOR) * ramp;
+}
+
+function floatRamp(dist: number): number {
+  return smootherStep(Math.max(0, Math.min(1, (dist + EMP_FLOAT_RAMP) / (2 * EMP_FLOAT_RAMP))));
+}
+
+function appleBandCoverage01(dist: number): number {
+  return Math.max(0, 1 - Math.abs(dist) / 1.15);
+}
+
+function appleCometCoverage01(dist: number): number {
+  const start = -EMP_GLOW_LEAD_PX / 16;
+  const peak = EMP_GLOW_PEAK_PX / 16;
+  const end = EMP_GLOW_TRAIL_PX / 16;
+  if (dist <= start || dist >= end) return 0;
+  if (dist <= peak) return smootherStep((dist - start) / Math.max(0.001, peak - start));
+  return smootherStep((end - dist) / Math.max(0.001, end - peak));
+}
+
+function smootherStep(t: number): number {
+  const x = Math.max(0, Math.min(1, t));
+  return x * x * x * (x * (x * 6 - 15) + 10);
+}
+
+function mixCssColor(from: string, to: string, t: number): string {
+  const a = parseCssRgba(from);
+  const b = parseCssRgba(to);
+  if (!a || !b) return t >= 0.5 ? to : from;
+  const x = Math.max(0, Math.min(1, t));
+  const r = Math.round(a.r + (b.r - a.r) * x);
+  const g = Math.round(a.g + (b.g - a.g) * x);
+  const bl = Math.round(a.b + (b.b - a.b) * x);
+  const alpha = a.a + (b.a - a.a) * x;
+  return `rgba(${r},${g},${bl},${alpha.toFixed(3)})`;
+}
+
+function parseCssRgba(value: string): { r: number; g: number; b: number; a: number } | null {
+  const match = /rgba?\(([^)]+)\)/i.exec(value);
+  if (!match) return null;
+  const parts = match[1]!
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length < 3) return null;
+  const r = Number(parts[0]);
+  const g = Number(parts[1]);
+  const b = Number(parts[2]);
+  const a = parts[3] == null ? 1 : Number(parts[3]);
+  if (![r, g, b, a].every(Number.isFinite)) return null;
+  return { r, g, b, a };
 }
 
 function lineFrame(
@@ -1820,15 +2214,19 @@ function lineFrame(
   // immersive 不再变 fontSize（active/inactive 同号），但仍保留 transition
   // 兼容 compact 模式以及未来重新启用尺寸切换的可能。
   const transition = isActive
-    ? "font-size 280ms cubic-bezier(0.22, 1, 0.36, 1) 80ms, opacity 250ms ease, filter 200ms ease, color 320ms cubic-bezier(0.22, 1, 0.36, 1)"
-    : "font-size 200ms cubic-bezier(0.4, 0, 0.6, 1), opacity 250ms ease, filter 200ms ease, color 280ms cubic-bezier(0.4, 0, 0.6, 1)";
+    ? "font-size 170ms cubic-bezier(0.25, 0.1, 0.25, 1), opacity 170ms cubic-bezier(0.25, 0.1, 0.25, 1), filter 140ms cubic-bezier(0.25, 0.1, 0.25, 1), color 170ms cubic-bezier(0.25, 0.1, 0.25, 1)"
+    : "font-size 170ms cubic-bezier(0.25, 0.1, 0.25, 1), opacity 170ms cubic-bezier(0.25, 0.1, 0.25, 1), filter 140ms cubic-bezier(0.25, 0.1, 0.25, 1), color 170ms cubic-bezier(0.25, 0.1, 0.25, 1)";
   const immersiveOpacity = isActive
     ? 1
     : distance === 1
-      ? 0.38
+      ? 0.36
       : distance === 2
-        ? 0.28
-        : 0.18;
+        ? 0.27
+        : distance === 3
+          ? 0.2
+          : distance === 4
+            ? 0.15
+            : 0.11;
   const immersiveBlur = !immersive || isActive || distance <= 1
     ? "none"
     : `blur(${distance === 2 ? 1.2 : 2}px)`;
@@ -1846,9 +2244,9 @@ function lineFrame(
     // immersive: 所有行同字重（Heavy）—— 跟 Apple Music 一致，激活态全靠
     //   "色彩对比 + 逐字 wipe" 凸显，不靠字重切换。
     // compact: 仍保持 active 加粗 / inactive 细体，节省竖向空间。
-    fontWeight: immersive ? 700 : isActive ? 600 : 400,
+    fontWeight: immersive ? 800 : isActive ? 600 : 400,
     letterSpacing: 0,
-    lineHeight: immersive ? 1.32 : undefined,
+    lineHeight: immersive ? 1.56 : undefined,
     transformOrigin: "left center",
     filter: immersiveBlur,
     // 非 active 行：immersive 显著压暗（0.32）形成强对比；compact 保留较亮
@@ -1857,17 +2255,18 @@ function lineFrame(
     overflow: "visible",
     padding: immersive ? "10px 4px" : "2px 12px",
     textAlign: immersive ? "left" : "center",
+    cursor: "pointer",
     transition,
   };
 }
 
-function lineInner(): React.CSSProperties {
+function lineInner(immersive = false): React.CSSProperties {
   return {
     whiteSpace: "normal",
     overflow: "visible",
     textOverflow: "clip",
     maxWidth: "100%",
-    lineHeight: 1.35,
+    lineHeight: immersive ? 1.56 : 1.35,
     overflowWrap: "anywhere",
     wordBreak: "break-word",
   };

@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.runtime
 
+import android.content.Context
+import app.pipo.nativeapp.StabilityDiagnostics
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -11,17 +13,22 @@ object AppForeground {
 
     val isForeground: StateFlow<Boolean> = foregroundState.asStateFlow()
 
-    fun onActivityResumed() {
-        if (resumedCount.incrementAndGet() > 0) {
+    fun onActivityResumed(context: Context) {
+        val count = resumedCount.incrementAndGet()
+        if (count > 0 && !foregroundState.value) {
             foregroundState.value = true
+            StabilityDiagnostics.recordAppForeground(context, foreground = true, resumedCount = count)
         }
     }
 
-    fun onActivityPaused() {
+    fun onActivityPaused(context: Context) {
         val count = resumedCount.decrementAndGet().coerceAtLeast(0)
         if (count == 0) {
             resumedCount.set(0)
-            foregroundState.value = false
+            if (foregroundState.value) {
+                foregroundState.value = false
+                StabilityDiagnostics.recordAppForeground(context, foreground = false, resumedCount = 0)
+            }
         }
     }
 }

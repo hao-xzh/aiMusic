@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.util.Log
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -96,7 +95,6 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                         val start = startResult.getOrNull()
                         if (start == null || start.qrContent.isBlank()) {
                             startResult.exceptionOrNull()?.let { err ->
-                                Log.w("PipoSettings", "start QR login failed", err)
                                 DiagnosticsLogStore.record(
                                     area = "login",
                                     event = "qr_start_failed",
@@ -114,7 +112,6 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                         repeat(30) {
                             val statusResult = runCatching { repository.checkQrLogin(start.key) }
                             val status = statusResult.getOrElse { err ->
-                                Log.w("PipoSettings", "check QR login failed", err)
                                 DiagnosticsLogStore.record(
                                     area = "login",
                                     event = "qr_check_failed",

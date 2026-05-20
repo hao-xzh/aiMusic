@@ -9,7 +9,6 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import android.util.Log
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
@@ -184,6 +183,10 @@ class PlayerViewModel(
     private var userPausedPlayback = false
     private var resolvingPlayback = false
     private var preferredPlaybackMode: PlaybackQueueMode = PlaybackQueueMode.PlaylistLoop
+    private var stallWatchTrackId: String? = null
+    private var stallWatchPositionMs: Long = 0L
+    private var stallWatchSinceMs: Long = 0L
+    private var stallRecoveryLastAtMs: Long = 0L
 
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
@@ -257,7 +260,6 @@ class PlayerViewModel(
     }
 
     private fun handlePlaybackError(error: PlaybackException) {
-        Log.w("PlayerVM", "playback error code=${error.errorCodeName}")
         DiagnosticsLogStore.record(
             area = "playback",
             event = "player_error",
@@ -285,7 +287,6 @@ class PlayerViewModel(
             transientRetryCount = 1
         }
         if (transientRetryCount > MAX_TRANSIENT_RETRIES) {
-            Log.w("PlayerVM", "network retry exhausted for ${track.title}, refreshing url")
             DiagnosticsLogStore.record(
                 area = "playback",
                 event = "network_retry_exhausted",
@@ -311,7 +312,6 @@ class PlayerViewModel(
                 livePlayer.seekTo(targetIdx, resumePosMs)
                 livePlayer.prepare()
                 livePlayer.play()
-                Log.w("PlayerVM", "network retry #$attempt for ${track.title}: ${error.errorCodeName}")
                 DiagnosticsLogStore.record(
                     area = "playback",
                     event = "network_retry",
@@ -339,6 +339,7 @@ class PlayerViewModel(
         reason: String,
         force: Boolean = false,
         resumePositionMs: Long? = null,
+        resumeAsCurrent: Boolean = false,
     ) {
         val player = controller ?: initialPlayer
         if (refreshingUrlForTrack == track.id) return
@@ -346,7 +347,6 @@ class PlayerViewModel(
         // 已经在这首上重签过一次还失败 —— 这首确实坏了（区域受限 / 真下架 / 重签 URL 也是死的）。
         // 死链一次就能确认，不需要"先重试 N 次再放弃"。
         if (!force && track.id in urlRefreshTried) {
-            Log.w("PlayerVM", "${track.title} died after refresh, skipping")
             DiagnosticsLogStore.record(
                 area = "playback",
                 event = "url_refresh_failed_skip",
@@ -384,7 +384,6 @@ class PlayerViewModel(
             try {
                 val fresh = fetchPlayableUrl(ne)
                 if (fresh == null) {
-                    Log.w("PlayerVM", "songUrls returned no url for ${track.title}, skipping ($reason)")
                     DiagnosticsLogStore.record(
                         area = "playback",
                         event = "url_refresh_empty",
@@ -431,7 +430,7 @@ class PlayerViewModel(
                 // 只有 player 还停在被重签的这首上(没自动跳走)才接续播放;
                 // 已经在播下一首时不去打断 —— replaceMediaItem 已把 URL 更新,
                 // 下次 wraparound / 用户手动回来时直接是新 URL。
-                if (livePlayer.currentMediaItemIndex == updatedIdx) {
+                if (resumeAsCurrent || livePlayer.currentMediaItemIndex == updatedIdx) {
                     if (resumePosMs > 1000L) {
                         livePlayer.seekTo(updatedIdx, resumePosMs)
                     } else {
@@ -452,7 +451,6 @@ class PlayerViewModel(
         val player = controller ?: return
         if (state.queue.isEmpty() || userPausedPlayback) return
         if (state.playbackMode == PlaybackQueueMode.OrderOnce) return
-        Log.w("PlayerVM", "player reached STATE_ENDED, forcing repeat recovery")
         DiagnosticsLogStore.record(
             area = "playback",
             event = "ended_recovery",
@@ -492,6 +490,19 @@ class PlayerViewModel(
             ?: state.queue.getOrNull(player.currentMediaItemIndex.coerceAtLeast(0))
     }
 
+    private fun manualResumeTrackFor(player: Player): NativeTrack? {
+        val stateTrack = state.currentTrackId
+            ?.let { id -> state.queue.firstOrNull { it.id == id } }
+            ?: state.queue.getOrNull(state.currentIndex)
+        val playerTrack = currentTrackFor(player)
+        val playerMediaId = player.currentMediaItem?.mediaId
+        return if (stateTrack != null && stateTrack.id != playerMediaId) {
+            stateTrack
+        } else {
+            playerTrack ?: stateTrack
+        }
+    }
+
     private fun currentQueueIndexFor(player: Player, queue: List<NativeTrack> = state.queue): Int {
         val mediaId = player.currentMediaItem?.mediaId
         val mapped = mediaId?.let { id -> queue.indexOfFirst { it.id == id } } ?: -1
@@ -506,7 +517,6 @@ class PlayerViewModel(
 
     private fun skipToNextOrStop(p: Player) {
         if (recoverySkipCount >= MAX_RECOVERY_SKIPS) {
-            Log.w("PlayerVM", "too many recovery skips in a row, staying paused")
             DiagnosticsLogStore.record(
                 area = "playback",
                 event = "recovery_skips_exhausted",
@@ -667,28 +677,55 @@ class PlayerViewModel(
     }
 
     private fun recoverForManualPlay(player: Player): Boolean {
-        val track = currentTrackFor(player) ?: return false
-        val needsFreshUrl = player.playbackState == Player.STATE_IDLE ||
+        val track = manualResumeTrackFor(player) ?: return false
+        val playerMediaId = player.currentMediaItem?.mediaId
+        val targetMismatch = playerMediaId != null && playerMediaId != track.id
+        val needsFreshUrl = targetMismatch ||
+            player.playbackState == Player.STATE_IDLE ||
             player.playbackState == Player.STATE_ENDED ||
             player.playerError != null ||
             track.streamUrl.isBlank()
         if (!needsFreshUrl) return false
         val ne = track.neteaseId ?: return false
+        if (targetMismatch) {
+            DiagnosticsLogStore.record(
+                area = "playback",
+                event = "manual_resume_realign",
+                fields = trackFields(track) + mapOf(
+                    "playerMediaId" to playerMediaId,
+                    "stateTrackId" to state.currentTrackId,
+                    "queueIndex" to state.currentIndex,
+                ),
+            )
+        }
         transientRetryJob?.cancel()
         transientRetryForTrack = null
         transientRetryCount = 0
         recoverySkipCount = 0
         urlRefreshTried.remove(track.id)
         val resumeTrack = track.copy(neteaseId = ne)
-        val durationMs = player.duration.takeIf { it > 0 } ?: state.durationMs
-        val positionMs = maxOf(player.currentPosition, state.positionMs)
+        val durationMs = if (targetMismatch) {
+            track.durationMs.takeIf { it > 0 } ?: state.durationMs
+        } else {
+            player.duration.takeIf { it > 0 } ?: state.durationMs
+        }
+        val positionMs = if (targetMismatch) {
+            state.positionMs.coerceAtLeast(0L)
+        } else {
+            maxOf(player.currentPosition, state.positionMs)
+        }
         val atEnd = durationMs > 0L && positionMs >= durationMs - END_POSITION_TOLERANCE_MS
         refreshTrackUrlAndResume(
             initialPlayer = player,
             track = resumeTrack,
             reason = "manual-play",
             force = true,
-            resumePositionMs = if (atEnd || player.playbackState == Player.STATE_ENDED) 0L else null,
+            resumePositionMs = when {
+                atEnd || player.playbackState == Player.STATE_ENDED -> 0L
+                targetMismatch -> positionMs
+                else -> null
+            },
+            resumeAsCurrent = targetMismatch,
         )
         return true
     }
@@ -1143,7 +1180,10 @@ class PlayerViewModel(
     }
 
     fun refreshPosition() {
-        controller?.let(::syncFrom)
+        controller?.let { player ->
+            syncFrom(player)
+            monitorPlaybackProgress(player)
+        }
     }
 
     override fun onCleared() {
@@ -1258,6 +1298,74 @@ class PlayerViewModel(
         if (queue.isNotEmpty()) {
             lastPlaybackStore.saveThrottled(queue, index, state.positionMs)
         }
+    }
+
+    private fun monitorPlaybackProgress(player: Player) {
+        val track = currentTrackFor(player)
+        val trackId = player.currentMediaItem?.mediaId ?: track?.id ?: return
+        val positionMs = player.currentPosition.coerceAtLeast(0L)
+        val durationMs = player.duration.takeIf { it > 0 } ?: state.durationMs
+        val shouldAdvance = player.playWhenReady &&
+            player.mediaItemCount > 0 &&
+            player.playbackState == Player.STATE_READY &&
+            !userPausedPlayback
+        val nearEnd = durationMs > 0L && positionMs >= durationMs - END_POSITION_TOLERANCE_MS
+        if (!shouldAdvance || nearEnd) {
+            resetStallWatch(trackId, positionMs)
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (stallWatchTrackId != trackId ||
+            positionMs > stallWatchPositionMs + STALL_POSITION_TOLERANCE_MS
+        ) {
+            resetStallWatch(trackId, positionMs, now)
+            return
+        }
+
+        if (now - stallWatchSinceMs < PLAYBACK_STALL_MS ||
+            now - stallRecoveryLastAtMs < PLAYBACK_STALL_RECOVERY_COOLDOWN_MS
+        ) {
+            return
+        }
+
+        stallRecoveryLastAtMs = now
+        DiagnosticsLogStore.record(
+            area = "playback",
+            event = "stalled_recover",
+            fields = trackFields(track) + mapOf(
+                "positionMs" to positionMs,
+                "durationMs" to durationMs,
+                "state" to playbackStateName(player.playbackState),
+                "playWhenReady" to player.playWhenReady,
+            ),
+        )
+        runCatching {
+            player.seekTo(positionMs)
+            player.prepare()
+            userPausedPlayback = false
+            player.play()
+        }.onFailure { err ->
+            DiagnosticsLogStore.record(
+                area = "playback",
+                event = "stalled_recover_failed",
+                fields = trackFields(track) + mapOf(
+                    "errorType" to err::class.java.simpleName,
+                    "message" to err.message,
+                ),
+            )
+        }
+        resetStallWatch(trackId, positionMs, now)
+    }
+
+    private fun resetStallWatch(
+        trackId: String?,
+        positionMs: Long,
+        now: Long = SystemClock.elapsedRealtime(),
+    ) {
+        stallWatchTrackId = trackId
+        stallWatchPositionMs = positionMs
+        stallWatchSinceMs = now
     }
 
     private fun maybePrewarmNextTrack(player: Player) {
@@ -1561,6 +1669,14 @@ class PlayerViewModel(
         else -> reason.toString()
     }
 
+    private fun playbackStateName(state: Int): String = when (state) {
+        Player.STATE_IDLE -> "idle"
+        Player.STATE_BUFFERING -> "buffering"
+        Player.STATE_READY -> "ready"
+        Player.STATE_ENDED -> "ended"
+        else -> state.toString()
+    }
+
     private fun playbackModeFromSettings(raw: String): PlaybackQueueMode {
         return when (raw) {
             PlaybackQueueMode.OrderOnce.name -> PlaybackQueueMode.OrderOnce
@@ -1608,5 +1724,8 @@ class PlayerViewModel(
         private const val STABLE_PLAYBACK_RESET_MS = 12_000L
         private const val END_POSITION_TOLERANCE_MS = 1_500L
         private const val RECOVERY_SCAN_LIMIT = 8
+        private const val STALL_POSITION_TOLERANCE_MS = 750L
+        private const val PLAYBACK_STALL_MS = 20_000L
+        private const val PLAYBACK_STALL_RECOVERY_COOLDOWN_MS = 60_000L
     }
 }

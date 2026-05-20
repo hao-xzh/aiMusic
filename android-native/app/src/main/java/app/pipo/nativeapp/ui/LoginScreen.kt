@@ -1,6 +1,5 @@
 package app.pipo.nativeapp.ui
 
-import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -150,15 +149,11 @@ private suspend fun runQrFlow(
     val start = startResult.getOrNull()
     if (start == null) {
         onContent(null)
-        startResult.exceptionOrNull()?.let { err ->
-            Log.w("PipoLogin", "start QR login failed", err)
-        }
         onStatus("二维码加载失败，检查网络后刷新")
         return
     }
     if (start.qrContent.isBlank()) {
         onContent(null)
-        Log.w("PipoLogin", "start QR login returned blank content")
         onStatus("二维码暂时不可用，请刷新重试")
         return
     }
@@ -169,9 +164,6 @@ private suspend fun runQrFlow(
         val checkResult = runCatching { repository.checkQrLogin(start.key) }
         val s = checkResult.getOrNull()
         if (s == null) {
-            checkResult.exceptionOrNull()?.let { err ->
-                Log.w("PipoLogin", "check QR login failed", err)
-            }
             onStatus("登录状态获取失败，稍等后刷新")
             onContent(null)
             return
