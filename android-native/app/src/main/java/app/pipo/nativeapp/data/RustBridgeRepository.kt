@@ -30,6 +30,7 @@ class RustBridgeRepository(
 ) : PipoRepository {
     private val settingsStore = appContext?.let(::LocalSettingsStore)
     private val playlistCache = appContext?.let(::PlaylistCacheStore)
+    private val amllSource = appContext?.let(::AmllLyricsSource)
     private val accountState = MutableStateFlow<PipoAccount?>(null)
     private val playlistState = MutableStateFlow<List<PipoPlaylist>>(emptyList())
     private val audioCacheStatsState = MutableStateFlow(AudioCacheStats(0, 0, 0))
@@ -215,6 +216,10 @@ class RustBridgeRepository(
     }
 
     override suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine> {
+        // 优先走 AMLL TTML 数据库（字级时间戳，质量明显高于 netease yrc）；
+        // 命中失败（404 / 网络错误 / 非数字 trackId / 解析空）才回落到 Rust bridge。
+        // AmllLyricsSource 内部已经做了本地永久缓存 + 404 哨兵，重复播同一首不会反复打网络。
+        amllSource?.lyricsForTrack(trackId)?.takeIf { it.isNotEmpty() }?.let { return it }
         return safe({ bridge.neteaseSongLyric(trackId) }, { fallback.lyricsForTrack(trackId) })
     }
 
