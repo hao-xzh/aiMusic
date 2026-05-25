@@ -144,7 +144,10 @@ fn silence_boundaries(samples: &[f32], sr: u32) -> (f32, f32) {
             break; // 整曲静默 —— 不可能但防御
         }
     }
-    (head_frames as f32 * frame_dur, tail_frames as f32 * frame_dur)
+    (
+        head_frames as f32 * frame_dur,
+        tail_frames as f32 * frame_dur,
+    )
 }
 
 // ---------- 解码 ----------
@@ -230,7 +233,9 @@ fn append_mono(buf: AudioBufferRef<'_>, out: &mut Vec<f32>) {
         AudioBufferRef::U8(b) => mix_with_conv(&b, out, |s| (s as f32 - 128.0) / 128.0),
         AudioBufferRef::U16(b) => mix_with_conv(&b, out, |s| (s as f32 - 32768.0) / 32768.0),
         AudioBufferRef::U24(b) => mix_with_conv(&b, out, |s| (s.0 as f32 - 8388608.0) / 8388608.0),
-        AudioBufferRef::U32(b) => mix_with_conv(&b, out, |s| (s as f32 - 2147483648.0) / 2147483648.0),
+        AudioBufferRef::U32(b) => {
+            mix_with_conv(&b, out, |s| (s as f32 - 2147483648.0) / 2147483648.0)
+        }
     }
 }
 
@@ -264,7 +269,11 @@ fn resample_linear(input: &[f32], src_sr: u32, dst_sr: u32) -> Vec<f32> {
         let idx = pos.floor() as usize;
         let frac = (pos - idx as f64) as f32;
         let a = input[idx];
-        let b = if idx + 1 < input.len() { input[idx + 1] } else { a };
+        let b = if idx + 1 < input.len() {
+            input[idx + 1]
+        } else {
+            a
+        };
         out.push(a + (b - a) * frac);
     }
     out
@@ -449,4 +458,3 @@ fn fft_mag_dft(input: &[f32]) -> Vec<f32> {
     }
     out
 }
-

@@ -102,6 +102,16 @@ enum class PipoLyricRole {
     Translation,
 }
 
+/**
+ * 行级横向对齐 —— 主要用于 AMLL 对唱：ttm:agent="v1" 行靠左（Start），
+ * 其它演唱者（v2/v3...）整行靠右（End），呈现 Apple Music / AMLL 官方播放器的对唱排版。
+ * 默认 Start，YRC / LRC / 主唱内容均按原来左对齐展示。
+ */
+enum class PipoLyricAlignment {
+    Start,
+    End,
+}
+
 data class PipoLyricLine(
     val startMs: Long,
     val durationMs: Long,
@@ -110,6 +120,7 @@ data class PipoLyricLine(
     val timing: PipoLyricTiming = if (chars.isEmpty()) PipoLyricTiming.Line else PipoLyricTiming.Word,
     val companionLines: List<PipoLyricLine> = emptyList(),
     val role: PipoLyricRole = PipoLyricRole.Primary,
+    val alignment: PipoLyricAlignment = PipoLyricAlignment.Start,
 )
 
 data class PipoLyricChar(

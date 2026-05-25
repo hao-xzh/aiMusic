@@ -97,6 +97,7 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
     val companionCandidates = mutableListOf<PipoLyricLine>()
     for (line in lines) {
         if (isParentheticalLine(line.text)) {
+            // 括号 ad-lib（"(yeah)" "(oh)"）= 和声，alignment 跟主行（默认 Start）。
             companionCandidates.add(line)
         } else {
             val previousPrimary = primaryLines.lastOrNull()
@@ -106,9 +107,12 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
             ) {
                 primaryLines.add(line)
             } else if (!sameLyricText(line.text, previousPrimary.text)) {
-                // 同一时间戳附近出现第二条不同文本，网易 YRC 通常是在标副唱 / ad-lib。
+                // 同一时间戳附近出现第二条不同文本，网易 YRC 通常是在标副唱 / 对唱。
                 // 之前这里直接跳过，导致非括号副词丢失；重复同文本仍按去重处理。
-                companionCandidates.add(line)
+                // 标记 alignment=End 让对唱 companion 在 ImmersiveLyrics 里靠右展示，
+                // 视觉上跟 AMLL 的 ttm:agent="v2" 对唱行一致（右对齐），避免"同样的合唱
+                // 在 AMLL 数据下右对齐、YRC 数据下又挤在左边"的不一致体验。
+                companionCandidates.add(line.copy(alignment = PipoLyricAlignment.End))
             }
         }
     }

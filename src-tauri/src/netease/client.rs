@@ -143,11 +143,7 @@ impl NeteaseClient {
     }
 
     /// 内部用：发一个 weapi POST。`endpoint` 不带前导 `/`，例如 `"login/qrcode/unikey"`。
-    pub async fn weapi<T: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        mut params: Value,
-    ) -> Result<T> {
+    pub async fn weapi<T: DeserializeOwned>(&self, endpoint: &str, mut params: Value) -> Result<T> {
         // 注入两个"身份"参数：
         //   - csrf_token: 未登录时空串，登录后从 cookie 里拿
         //   - realIP:     告诉风控这是大陆来源，否则 -462
@@ -243,10 +239,8 @@ mod tests {
     /// MUSIC_U / __csrf 这类 session cookie 就会丢，这个测试会挂。
     #[test]
     fn session_cookies_survive_restart() {
-        let tmp = std::env::temp_dir().join(format!(
-            "claudio-cookies-test-{}.json",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("claudio-cookies-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         // round 1: 塞 cookie，落盘
@@ -258,9 +252,7 @@ mod tests {
                 store
                     .parse("MUSIC_U=fake_music_u_value; Path=/", &url)
                     .unwrap();
-                store
-                    .parse("__csrf=fake_csrf_value; Path=/", &url)
-                    .unwrap();
+                store.parse("__csrf=fake_csrf_value; Path=/", &url).unwrap();
             }
             c.persist().expect("persist");
         }
@@ -288,10 +280,8 @@ mod tests {
     /// 文件不存在 = 第一次启动 = 未登录。不应该 panic。
     #[test]
     fn fresh_start_no_cookie_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "claudio-cookies-none-{}.json",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("claudio-cookies-none-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let c = NeteaseClient::new_with_persist(Some(tmp)).unwrap();
         assert!(c.cookie_value("MUSIC_U").is_none());

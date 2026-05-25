@@ -9,6 +9,8 @@
 //!        802 = 已扫码，等手机上点"确认登录"
 //!        803 = 确认完成，此时 reqwest 的 cookie jar 里已经自动装上 MUSIC_U + __csrf 等
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
@@ -23,7 +25,8 @@ impl NeteaseClient {
         if resp.code != 200 {
             return Err(anyhow!("qr_unikey code={}", resp.code));
         }
-        resp.unikey.ok_or_else(|| anyhow!("qr_unikey missing unikey"))
+        resp.unikey
+            .ok_or_else(|| anyhow!("qr_unikey missing unikey"))
     }
 
     pub async fn qr_check(&self, key: &str) -> Result<QrCheckResp> {
@@ -114,7 +117,10 @@ impl NeteaseClient {
         self.hydrate_playlist_tracks(resp.playlist).await
     }
 
-    async fn hydrate_playlist_tracks(&self, mut playlist: PlaylistDetail) -> Result<PlaylistDetail> {
+    async fn hydrate_playlist_tracks(
+        &self,
+        mut playlist: PlaylistDetail,
+    ) -> Result<PlaylistDetail> {
         if playlist.track_ids.is_empty() || playlist.tracks.len() >= playlist.track_ids.len() {
             return Ok(playlist);
         }
@@ -127,10 +133,8 @@ impl NeteaseClient {
             .filter(|id| !by_id.contains_key(id))
             .collect::<Vec<_>>();
 
-        for chunk in missing_ids.chunks(200) {
-            for track in self.song_detail(chunk).await? {
-                by_id.insert(track.id, track);
-            }
+        for track in self.song_detail_best_effort(&missing_ids).await {
+            by_id.insert(track.id, track);
         }
 
         let ordered = playlist
@@ -144,14 +148,46 @@ impl NeteaseClient {
         Ok(playlist)
     }
 
+    async fn song_detail_best_effort(&self, ids: &[i64]) -> Vec<TrackInfo> {
+        let mut out = Vec::new();
+        let mut pending = ids.to_vec();
+        for chunk_size in [200usize, 50, 10, 1] {
+            if pending.is_empty() {
+                break;
+            }
+            let mut still_missing = Vec::new();
+            for chunk in pending.chunks(chunk_size) {
+                match self.song_detail(chunk).await {
+                    Ok(tracks) => {
+                        let returned_ids =
+                            tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
+                        out.extend(tracks);
+                        for id in chunk {
+                            if !returned_ids.contains(id) {
+                                still_missing.push(*id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[netease] song_detail chunk failed: size={} first_id={:?}: {e:#}",
+                            chunk.len(),
+                            chunk.first(),
+                        );
+                        still_missing.extend_from_slice(chunk);
+                    }
+                }
+            }
+            pending = still_missing;
+        }
+        out
+    }
+
     pub async fn song_detail(&self, ids: &[i64]) -> Result<Vec<TrackInfo>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let c = ids
-            .iter()
-            .map(|id| json!({ "id": id }))
-            .collect::<Vec<_>>();
+        let c = ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>();
         let resp: SongDetailResp = self
             .weapi(
                 "v3/song/detail",

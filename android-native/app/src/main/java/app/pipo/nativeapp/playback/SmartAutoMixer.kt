@@ -163,6 +163,7 @@ internal class SmartAutoMixer(
             cancel("armed-current-changed", keepMainVolume = true)
             return
         }
+        if (mainPlayer.playbackState != Player.STATE_READY) return
 
         val remainingMs = remainingMs() ?: run {
             cancel("armed-no-duration", keepMainVolume = true)
@@ -651,7 +652,7 @@ internal class SmartAutoMixer(
         private const val TAIL_DIP_PREPARE_LEAD_MS = 7_000L
         private const val MAX_PREPARE_LEAD_MS = 8_500L
         private const val MIN_REMAINING_TO_ARM_MS = 1_200L
-        private const val MIN_REMAINING_TO_START_MS = 750L
+        private const val MIN_REMAINING_TO_START_MS = 500L
         private const val MAIN_ONLY_TRANSITION_MODE = "main-only-next"
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L

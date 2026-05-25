@@ -18,12 +18,22 @@ internal class PlayerMediaFactory(
         preserveHeadBoundary: Boolean = false,
         preserveTailBoundary: Boolean = false,
     ): MediaItem {
+        val artworkUri = track.artworkUrl?.let { url ->
+            val secureUrl = if (url.startsWith("http://")) {
+                url.replaceFirst("http://", "https://")
+            } else {
+                url
+            }
+            Uri.parse(secureUrl)
+        }
+
         val metadata = MediaMetadata.Builder()
             .setTitle(track.title)
             .setArtist(track.artist)
             .setAlbumTitle(track.album)
-            .setArtworkUri(track.artworkUrl?.let(Uri::parse))
+            .setArtworkUri(artworkUri)
             .build()
+
 
         val builder = MediaItem.Builder()
             .setMediaId(track.id)

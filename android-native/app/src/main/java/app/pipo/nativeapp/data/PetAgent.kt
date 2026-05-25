@@ -61,10 +61,11 @@ class PetAgent(
                 "userFactsLen" to userFacts.length,
             ),
         )
+        val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
         val aiResult = runCatching {
             repository.aiChat(
                 system = SYSTEM_PROMPT,
-                user = buildUserMessage(userText, history, currentTrack, userFacts),
+                user = buildUserMessage(userText, history, currentTrack, userFacts, behaviorEvents),
                 temperature = 0.75f,
                 maxTokens = 4000,
             )
@@ -179,7 +180,6 @@ class PetAgent(
                 continuous = null,
             )
         }
-        val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
         val recentPlay = runCatching { behaviorLog.recentPlay() }.getOrDefault(BehaviorLog.RecentPlay(emptySet(), emptySet()))
         val recentRec = runCatching { recommendationLog.recentContext() }.getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
         val tasteProfile = tasteProfileStore.flow.value
@@ -684,18 +684,55 @@ class PetAgent(
         history: List<Pair<Boolean, String>>,
         currentTrack: NativeTrack?,
         userFacts: String,
+        behaviorEvents: List<BehaviorEvent>,
     ): String {
         val ctxLines = mutableListOf<String>()
         val weather = runCatching { Weather.get() }.getOrNull()
         ctxLines.add("时段：${AppContext.describe(weather)}")
         AppContext.memoryDigest(userFacts)?.let { ctxLines.add("TA 的人:$it") }
-        currentTrack?.let { ctxLines.add("在播：${it.title} — ${it.artist}") }
+        
+        currentTrack?.let { track ->
+            val feat = featuresStore.get(track.id)
+            val featText = if (feat != null) {
+                val bpmText = if (feat.bpm != null && feat.bpmConfidence > 0.3) "BPM ${feat.bpm.toInt()}" else null
+                val energyText = when {
+                    feat.introEnergy > 0.7 -> "高能量/动感"
+                    feat.introEnergy < 0.3 -> "低能量/安静"
+                    else -> "中能量"
+                }
+                val dynamicText = when {
+                    feat.dynamicRangeDb < 6.0 -> "主流商业压缩"
+                    feat.dynamicRangeDb > 12.0 -> "高动态/原声/古典"
+                    else -> "中等动态"
+                }
+                val toneText = when {
+                    feat.spectralCentroidHz > 3000.0 -> "明亮高亢"
+                    feat.spectralCentroidHz < 1500.0 -> "温和/低沉暗淡"
+                    else -> "中性音色"
+                }
+                val list = listOfNotNull(bpmText, energyText, dynamicText, toneText)
+                if (list.isNotEmpty()) " (声学特征: ${list.joinToString(", ")})" else ""
+            } else ""
+            ctxLines.add("在播：${track.title} — ${track.artist}$featText")
+        }
+
+        val recentSkips = behaviorEvents
+            .filter { it.type == BehaviorType.Skipped || (it.type == BehaviorType.ManualCut && it.completionPct < 0.6f) }
+            .sortedByDescending { it.tsMs }
+            .take(3)
+        if (recentSkips.isNotEmpty()) {
+            val skipBlock = recentSkips.joinToString("\n") { e ->
+                "- ${e.title} — ${e.artist} (已听 ${(e.completionPct * 100).toInt()}%)"
+            }
+            ctxLines.add("最近被切的歌(负反馈)：\n$skipBlock")
+        }
+
         val tail = history.takeLast(4)
         if (tail.isNotEmpty()) {
             val block = tail.joinToString("\n") { (fromUser, text) ->
                 "${if (fromUser) "U" else "C"}：$text"
             }
-            ctxLines.add("最近：\n$block")
+            ctxLines.add("最近对话：\n$block")
         }
         val prefix = if (ctxLines.isNotEmpty()) ctxLines.joinToString("\n") + "\n\n" else ""
         return prefix + "用户：$userText"

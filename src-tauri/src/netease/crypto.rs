@@ -55,8 +55,7 @@ fn rsa_encrypt_secret_key(secret_key: &[u8; 16]) -> String {
     rev.reverse();
     let msg_hex = hex::encode(&rev); // 32 chars
     let padded = format!("{:0>256}", msg_hex); // 左填充到 256 chars（也即 1024 bit）
-    let m = BigUint::parse_bytes(padded.as_bytes(), 16)
-        .expect("msg hex is valid");
+    let m = BigUint::parse_bytes(padded.as_bytes(), 16).expect("msg hex is valid");
     let n = BigUint::parse_bytes(PUB_MOD_HEX.as_bytes(), 16)
         .expect("PUB_MOD_HEX is a valid hex literal");
     let e = BigUint::from(PUB_EXP);

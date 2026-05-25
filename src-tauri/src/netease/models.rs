@@ -149,7 +149,11 @@ pub struct TrackInfo {
 
 impl TrackInfo {
     pub fn by_id(tracks: &[TrackInfo]) -> HashMap<i64, TrackInfo> {
-        tracks.iter().cloned().map(|track| (track.id, track)).collect()
+        tracks
+            .iter()
+            .cloned()
+            .map(|track| (track.id, track))
+            .collect()
     }
 }
 
@@ -172,7 +176,11 @@ pub struct PlaylistDetail {
     #[serde(default, deserialize_with = "deserialize_tracks_lenient")]
     pub tracks: Vec<TrackInfo>,
     // 大歌单的 tracks 可能被接口按 n 截断，完整顺序在 trackIds 里。
-    #[serde(default, rename = "trackIds", deserialize_with = "deserialize_track_ids_lenient")]
+    #[serde(
+        default,
+        rename = "trackIds",
+        deserialize_with = "deserialize_track_ids_lenient"
+    )]
     pub track_ids: Vec<i64>,
 }
 

@@ -67,10 +67,7 @@ pub async fn chat(
         return Err(anyhow!("还没填 API key，请在设置里填上"));
     }
 
-    let url = format!(
-        "{}/chat/completions",
-        base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
@@ -109,9 +106,8 @@ pub async fn chat(
         return Err(anyhow!("{status}：{text}"));
     }
 
-    let parsed: ChatResp = serde_json::from_str(&text).map_err(|e| {
-        anyhow!("响应解析失败：{e} / body={text}")
-    })?;
+    let parsed: ChatResp =
+        serde_json::from_str(&text).map_err(|e| anyhow!("响应解析失败：{e} / body={text}"))?;
 
     parsed
         .choices
@@ -171,7 +167,10 @@ pub async fn embeddings(
         .build()
         .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
 
-    let body = EmbedReq { model, input: inputs };
+    let body = EmbedReq {
+        model,
+        input: inputs,
+    };
     let resp = client
         .post(&url)
         .bearer_auth(key)
@@ -181,13 +180,16 @@ pub async fn embeddings(
         .map_err(|e| anyhow!("请求失败：{e}"))?;
 
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| anyhow!("读取响应体失败：{e}"))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("读取响应体失败：{e}"))?;
     if !status.is_success() {
         return Err(anyhow!("{status}：{text}"));
     }
 
-    let parsed: EmbedResp = serde_json::from_str(&text)
-        .map_err(|e| anyhow!("响应解析失败：{e} / body={text}"))?;
+    let parsed: EmbedResp =
+        serde_json::from_str(&text).map_err(|e| anyhow!("响应解析失败：{e} / body={text}"))?;
 
     // 按 index 排回原顺序——OpenAI 实际返回是按 input 顺序，但保险起见显式排
     let mut indexed: Vec<(usize, Vec<f32>)> = parsed

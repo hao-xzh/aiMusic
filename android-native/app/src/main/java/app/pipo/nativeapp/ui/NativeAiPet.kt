@@ -184,13 +184,22 @@ fun NativeAiPet(
                 if (angle > 18f) { angle = 18f; if (velocity > 0f) velocity = 0f }
                 else if (angle < -18f) { angle = -18f; if (velocity < 0f) velocity = 0f }
 
-                sway.floatValue = angle
-                // 节拍 punch：拍中瞬间主球微胀
-                pulseScale.floatValue = 1f + ampSmooth * 0.06f + beatLevel * 0.10f
+                if (pending) {
+                    val thinkingSway = sin(tSec * 2f * PI.toFloat() * 1.8f) * 8f
+                    angle += (thinkingSway - angle) * (1f - kotlin.math.exp(-dt / 0.15f))
+                    sway.floatValue = angle
+                    pulseScale.floatValue = 1f + 0.08f * sin(tSec * 2f * PI.toFloat() * 1.5f)
+                    haloPhase += dt * 2.0f
+                    haloPulse.floatValue = 0.5f + 0.5f * sin(haloPhase * 2f * PI.toFloat())
+                } else {
+                    sway.floatValue = angle
+                    // 节拍 punch：拍中瞬间主球微胀
+                    pulseScale.floatValue = 1f + ampSmooth * 0.06f + beatLevel * 0.10f
 
-                // 呼吸光晕：1.0 Hz
-                haloPhase += dt * (1f + ampSmooth * 0.4f)
-                haloPulse.floatValue = 0.5f + 0.5f * sin(haloPhase * 2f * PI.toFloat())
+                    // 呼吸光晕：1.0 Hz
+                    haloPhase += dt * (1f + ampSmooth * 0.4f)
+                    haloPulse.floatValue = 0.5f + 0.5f * sin(haloPhase * 2f * PI.toFloat())
+                }
             }
         }
     }
@@ -331,12 +340,9 @@ fun NativeAiPet(
             CoverAiCaption(coverCaptionText.orEmpty(), palette = petPalette)
         }
 
-        // ---- 助手回复浮气泡 ----
-        // pending=true → 渲染思考态三点动效（让用户知道 AI 在努力）
-        // 回复回来 → 切到正文，6s 自动消散
-        // 不遮播放器，跟系统通知一样飘在角上
+        // ---- 历史对话面板 ----
         AnimatedVisibility(
-            visible = open && (pending || latestReply != null),
+            visible = open && (messages.isNotEmpty() || pending),
             enter = fadeIn(tween(220)) + slideInVertically(
                 animationSpec = tween(220, easing = PipoMotion.FlipEase),
                 initialOffsetY = { it / 3 },
@@ -348,14 +354,14 @@ fun NativeAiPet(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(horizontal = 14.dp)
-                // 输入条高 ~52dp + nav bar inset + 输入条与气泡间距 8dp
+                // 输入条高 ~52dp + nav bar inset + 间距 8dp
                 .padding(bottom = 70.dp)
                 .imePadding()
                 .navigationBarsPadding(),
         ) {
-            // pending 时显式 null —— 哪怕上一条 latestReply 还在 6s 窗口里，也要先盖成思考态
-            ReplyBubble(
-                text = if (pending) null else latestReply,
+            ChatHistoryPanel(
+                messages = messages,
+                pending = pending,
                 palette = petPalette,
             )
         }
@@ -475,6 +481,7 @@ fun NativeAiPet(
                     pulseScale = orbScale,
                     attached = (coverRect != null),
                     palette = petPalette,
+                    pending = pending,
                     onClick = { open = !open; if (open) hint = null },
                 )
             }

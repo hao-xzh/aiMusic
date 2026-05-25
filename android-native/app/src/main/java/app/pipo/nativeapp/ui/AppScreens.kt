@@ -176,6 +176,8 @@ private fun DistillLibrary(
     val focused = libraryPages.getOrNull(pagerState.currentPage)
     var tracks by remember { mutableStateOf<List<NativeTrack>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
+    var trackLoadError by remember { mutableStateOf<String?>(null) }
+    var trackLoadRetry by remember { mutableStateOf(0) }
     val trackListState = rememberLazyListState()
     var pendingLocateCurrent by remember { mutableStateOf(false) }
     val focusedListKey = when (val page = focused) {
@@ -193,19 +195,26 @@ private fun DistillLibrary(
         trackListTransitionAlpha.snapTo(0.88f)
         trackListTransitionAlpha.animateTo(1f, tween(durationMillis = 160))
     }
-    LaunchedEffect(focusedListKey, focusedQueue, focusedPlaylist) {
+    LaunchedEffect(focusedListKey, focusedQueue, focusedPlaylist, trackLoadRetry) {
         when (val page = focused) {
             is LibraryPage.CurrentQueue -> {
                 loading = false
+                trackLoadError = null
                 tracks = page.queue
             }
             is LibraryPage.PlaylistItem -> {
                 loading = true
-                tracks = runCatching { repository.tracksForPlaylist(page.playlist.id) }.getOrDefault(emptyList())
+                trackLoadError = null
+                val result = runCatching { repository.tracksForPlaylist(page.playlist.id) }
+                tracks = result.getOrElse {
+                    trackLoadError = "这张歌单刚才没拉下来"
+                    emptyList()
+                }
                 loading = false
             }
             null -> {
                 loading = false
+                trackLoadError = null
                 tracks = emptyList()
             }
         }
@@ -546,6 +555,20 @@ private fun DistillLibrary(
                                     style = TextStyle(fontSize = 13.sp),
                                     modifier = Modifier.padding(start = 24.dp),
                                 )
+                            }
+                            trackLoadError != null -> item {
+                                Column(
+                                    modifier = Modifier.padding(start = 24.dp, end = 24.dp),
+                                ) {
+                                    Text(
+                                        trackLoadError.orEmpty(),
+                                        color = PipoColors.TextDim,
+                                        style = TextStyle(fontSize = 13.sp),
+                                    )
+                                    TextButton(onClick = { trackLoadRetry += 1 }) {
+                                        Text("重试", color = PipoColors.Ink)
+                                    }
+                                }
                             }
                             tracks.isEmpty() -> item {
                                 Text(

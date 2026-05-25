@@ -159,10 +159,7 @@ impl AiConfigStore {
         let mut cfg = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(txt) => parse_with_legacy_fallback(&txt).unwrap_or_else(|e| {
-                    eprintln!(
-                        "[ai] {} 解析失败，回落到 default：{e}",
-                        path.display()
-                    );
+                    eprintln!("[ai] {} 解析失败，回落到 default：{e}", path.display());
                     AiConfig::default()
                 }),
                 Err(e) => {
@@ -217,10 +214,8 @@ impl AiConfigStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let txt = serde_json::to_string_pretty(&cfg)
-            .context("serialize ai config")?;
-        std::fs::write(&tmp, &txt)
-            .with_context(|| format!("write tmp {}", tmp.display()))?;
+        let txt = serde_json::to_string_pretty(&cfg).context("serialize ai config")?;
+        std::fs::write(&tmp, &txt).with_context(|| format!("write tmp {}", tmp.display()))?;
 
         // unix：把文件权限收到 0600，避免别的进程读到 key
         #[cfg(unix)]
@@ -232,9 +227,8 @@ impl AiConfigStore {
             }
         }
 
-        std::fs::rename(&tmp, &self.path).with_context(|| {
-            format!("rename {} -> {}", tmp.display(), self.path.display())
-        })?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), self.path.display()))?;
         Ok(())
     }
 }
@@ -267,8 +261,8 @@ fn parse_with_legacy_fallback(txt: &str) -> Result<AiConfig> {
         return Ok(c);
     }
     // 回落老 schema 迁移
-    let legacy: LegacyConfig = serde_json::from_str(txt)
-        .context("ai_config.json 既不是新 schema 也不是老 schema")?;
+    let legacy: LegacyConfig =
+        serde_json::from_str(txt).context("ai_config.json 既不是新 schema 也不是老 schema")?;
     let mut cfg = AiConfig::default();
     if let Some(k) = legacy.deepseek_api_key.filter(|s| !s.trim().is_empty()) {
         cfg.deepseek.api_key = Some(k);

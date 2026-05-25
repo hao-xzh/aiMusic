@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
-mod netease;
 mod ai;
 mod audio;
+mod netease;
 
 static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -102,7 +102,11 @@ fn dispatch(command: &str, args: Value) -> String {
             })
         }
         "netease_search" => {
-            let query = args.get("query").and_then(Value::as_str).unwrap_or_default().to_string();
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(30);
             run_json(async move {
                 let tracks = netease_client().search_tracks(&query, limit).await?;
@@ -117,7 +121,11 @@ fn dispatch(command: &str, args: Value) -> String {
             }))
         }),
         "netease_qr_check" => {
-            let key = args.get("key").and_then(Value::as_str).unwrap_or_default().to_string();
+            let key = args
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             run_json(async move {
                 let r = netease_client().qr_check(&key).await?;
                 Ok(json!({
@@ -128,7 +136,11 @@ fn dispatch(command: &str, args: Value) -> String {
             })
         }
         "netease_captcha_sent" => {
-            let phone = args.get("phone").and_then(Value::as_str).unwrap_or_default().to_string();
+            let phone = args
+                .get("phone")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let ctcode = args.get("ctcode").and_then(Value::as_i64).unwrap_or(86) as i32;
             run_json(async move {
                 let r = netease_client().captcha_sent(&phone, ctcode).await?;
@@ -139,11 +151,21 @@ fn dispatch(command: &str, args: Value) -> String {
             })
         }
         "netease_phone_login" => {
-            let phone = args.get("phone").and_then(Value::as_str).unwrap_or_default().to_string();
-            let captcha = args.get("captcha").and_then(Value::as_str).unwrap_or_default().to_string();
+            let phone = args
+                .get("phone")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let captcha = args
+                .get("captcha")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let ctcode = args.get("ctcode").and_then(Value::as_i64).unwrap_or(86) as i32;
             run_json(async move {
-                let r = netease_client().login_cellphone(&phone, &captcha, ctcode).await?;
+                let r = netease_client()
+                    .login_cellphone(&phone, &captcha, ctcode)
+                    .await?;
                 Ok(json!({
                     "code": r.code,
                     "message": r.message,
@@ -157,7 +179,11 @@ fn dispatch(command: &str, args: Value) -> String {
                 .and_then(Value::as_array)
                 .map(|arr| arr.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let level = args.get("level").and_then(Value::as_str).unwrap_or("lossless").to_string();
+            let level = args
+                .get("level")
+                .and_then(Value::as_str)
+                .unwrap_or("lossless")
+                .to_string();
             run_json(async move {
                 let urls = netease_client().song_urls(&ids, &level).await?;
                 Ok(serde_json::to_value(urls)?)
@@ -182,23 +208,42 @@ fn dispatch(command: &str, args: Value) -> String {
             Err(e) => error_json(e.to_string()),
         },
         "audio_cache_stats" => match audio_store().stats() {
-            Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|e| error_json(e.to_string())),
+            Ok(stats) => {
+                serde_json::to_string(&stats).unwrap_or_else(|e| error_json(e.to_string()))
+            }
             Err(e) => error_json(e.to_string()),
         },
         "audio_get_features" => {
             let track_id = args.get("trackId").and_then(Value::as_i64).unwrap_or(0);
-            let url = args.get("url").and_then(Value::as_str).unwrap_or_default().to_string();
-            let cache_bytes = args.get("cacheBytes").and_then(Value::as_bool).unwrap_or(true);
+            let url = args
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let cache_bytes = args
+                .get("cacheBytes")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             run_json(async move {
-                match audio_store().features_json(track_id, url, cache_bytes).await {
+                match audio_store()
+                    .features_json(track_id, url, cache_bytes)
+                    .await
+                {
                     Ok(v) => Ok(v),
                     Err(_) => Ok(audio::zero_features(track_id)),
                 }
             })
         }
         "ai_set_provider" => {
-            let provider = args.get("provider").and_then(Value::as_str).unwrap_or_default();
-            match parse_provider(provider).and_then(|p| ai_store().update(|c| c.provider = p).map_err(|e| e.to_string())) {
+            let provider = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match parse_provider(provider).and_then(|p| {
+                ai_store()
+                    .update(|c| c.provider = p)
+                    .map_err(|e| e.to_string())
+            }) {
                 Ok(()) => "null".to_string(),
                 Err(e) => error_json(e),
             }
@@ -217,11 +262,24 @@ fn dispatch(command: &str, args: Value) -> String {
             .to_string()
         }
         "ai_set_api_key" => {
-            let provider = args.get("provider").and_then(Value::as_str).unwrap_or_default();
-            let key = args.get("key").and_then(Value::as_str).unwrap_or_default().to_string();
+            let provider = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let key = args
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             match parse_provider(provider).and_then(|p| {
                 ai_store()
-                    .update(|c| slot_mut(c, p).api_key = if key.trim().is_empty() { None } else { Some(key.trim().to_string()) })
+                    .update(|c| {
+                        slot_mut(c, p).api_key = if key.trim().is_empty() {
+                            None
+                        } else {
+                            Some(key.trim().to_string())
+                        }
+                    })
                     .map_err(|e| e.to_string())
             }) {
                 Ok(()) => "null".to_string(),
@@ -229,7 +287,10 @@ fn dispatch(command: &str, args: Value) -> String {
             }
         }
         "ai_clear_api_key" => {
-            let provider = args.get("provider").and_then(Value::as_str).unwrap_or_default();
+            let provider = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             match parse_provider(provider).and_then(|p| {
                 ai_store()
                     .update(|c| slot_mut(c, p).api_key = None)
@@ -240,8 +301,15 @@ fn dispatch(command: &str, args: Value) -> String {
             }
         }
         "ai_set_model" => {
-            let provider = args.get("provider").and_then(Value::as_str).unwrap_or_default();
-            let model = args.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+            let provider = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let model = args
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             match parse_provider(provider).and_then(|p| {
                 ai_store()
                     .update(|c| slot_mut(c, p).model = model)
@@ -252,14 +320,16 @@ fn dispatch(command: &str, args: Value) -> String {
             }
         }
         "ai_list_models" => {
-            let provider = args.get("provider").and_then(Value::as_str).unwrap_or_default();
+            let provider = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             match parse_provider(provider) {
-                Ok(p) => json!(
-                    ai::config::known_models(p)
-                        .iter()
-                        .map(|(id, label)| json!({ "id": id, "label": label }))
-                        .collect::<Vec<_>>()
-                ).to_string(),
+                Ok(p) => json!(ai::config::known_models(p)
+                    .iter()
+                    .map(|(id, label)| json!({ "id": id, "label": label }))
+                    .collect::<Vec<_>>())
+                .to_string(),
                 Err(e) => error_json(e),
             }
         }
@@ -281,19 +351,43 @@ fn dispatch(command: &str, args: Value) -> String {
             Ok(json!(reply))
         }),
         "ai_chat" => {
-            let system = args.get("system").and_then(Value::as_str).map(str::to_string);
-            let user = args.get("user").and_then(Value::as_str).unwrap_or_default().to_string();
-            let temperature = args.get("temperature").and_then(Value::as_f64).unwrap_or(0.8) as f32;
+            let system = args
+                .get("system")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let user = args
+                .get("user")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let temperature = args
+                .get("temperature")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.8) as f32;
             let max_tokens = args.get("maxTokens").and_then(Value::as_u64).unwrap_or(400) as u32;
             run_json(async move {
                 let (key, base_url, model) = ai_store().active();
                 let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
                 let mut messages = Vec::new();
                 if let Some(system) = system {
-                    messages.push(ai::openai_compat::ChatMessage { role: "system".to_string(), content: system });
+                    messages.push(ai::openai_compat::ChatMessage {
+                        role: "system".to_string(),
+                        content: system,
+                    });
                 }
-                messages.push(ai::openai_compat::ChatMessage { role: "user".to_string(), content: user });
-                let reply = ai::openai_compat::chat(&key, base_url, &model, &messages, temperature, max_tokens).await?;
+                messages.push(ai::openai_compat::ChatMessage {
+                    role: "user".to_string(),
+                    content: user,
+                });
+                let reply = ai::openai_compat::chat(
+                    &key,
+                    base_url,
+                    &model,
+                    &messages,
+                    temperature,
+                    max_tokens,
+                )
+                .await?;
                 Ok(json!(reply))
             })
         }
@@ -312,17 +406,17 @@ fn dispatch(command: &str, args: Value) -> String {
             run_json(async move {
                 let cfg = ai_store().snapshot();
                 let provider = cfg.provider;
-                let embed_model = ai::config::default_embedding_model(provider).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "当前 provider 不支持 embedding，请切到 OpenAI 后再试"
-                    )
-                })?;
+                let embed_model =
+                    ai::config::default_embedding_model(provider).ok_or_else(|| {
+                        anyhow::anyhow!("当前 provider 不支持 embedding，请切到 OpenAI 后再试")
+                    })?;
                 let (key, base_url, _chat_model) = ai_store().active();
                 let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
                 if inputs.is_empty() {
                     return Ok(json!([]));
                 }
-                let vectors = ai::openai_compat::embeddings(&key, base_url, embed_model, &inputs).await?;
+                let vectors =
+                    ai::openai_compat::embeddings(&key, base_url, embed_model, &inputs).await?;
                 Ok(serde_json::to_value(vectors)?)
             })
         }
@@ -339,7 +433,10 @@ fn parse_provider(id: &str) -> Result<ai::config::Provider, String> {
     }
 }
 
-fn slot_mut(c: &mut ai::config::AiConfig, p: ai::config::Provider) -> &mut ai::config::ProviderSlot {
+fn slot_mut(
+    c: &mut ai::config::AiConfig,
+    p: ai::config::Provider,
+) -> &mut ai::config::ProviderSlot {
     match p {
         ai::config::Provider::Deepseek => &mut c.deepseek,
         ai::config::Provider::Openai => &mut c.openai,

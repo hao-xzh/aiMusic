@@ -78,6 +78,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.Hyphens
 import androidx.compose.ui.text.style.LineBreak
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.unit.Dp
@@ -85,6 +86,7 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.data.PipoLyricAlignment
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.PipoLyricRole
@@ -689,6 +691,14 @@ internal fun AppleMusicLyricColumn(
         // 焦点位置：容器顶 11%，正好让活动行上方只露出 1 句历史歌词
         val info = listState.layoutInfo
         val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == targetIdx }
+        // 用户点击歌词行触发的 seek —— 立即把目标行 snap 到焦点位（11% from top），
+        // 不走 720ms spring，避免 "点了一下还要等 1/3 秒被拽过去" 的迟滞感。
+        // 自然播放切句仍走下方的 spring，保留 Apple Music "被拽过去" 的物理感。
+        val isClickSeekScroll = heldClickIndex != null && heldClickIndex == targetIdx
+        if (isClickSeekScroll) {
+            listState.scrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
+            return@LaunchedEffect
+        }
         if (visibleHit == null) {
             if (returningFromManualScroll) {
                 listState.animateScrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
@@ -1310,18 +1320,34 @@ private fun AppleMusicLyricRow(
                 ),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
-            AppleMusicLyricText(
-                line = line,
-                isActive = isActive,
-                isPast = isPast,
-                positionMs = positionMs,
-                fg = fg,
-                fgUnsung = fgUnsung,
-                fontSize = fontSize,
-                lineHeight = lineHeight,
-                fontWeight = fontWeight,
-                liftEnvelope = liftEnvelope,
-            )
+            // AMLL 对唱排版：ttm:agent="v1" 的主唱行靠左，agent="v2/v3..." 的第二位
+            // 演唱者整行靠右，参考 AMLL 官方播放器的对唱效果。Column 默认 horizontalAlignment
+            // 是 Start，这里在每个子项上显式 .align(itemAlignment)，避免影响 Column 其他子项。
+            val itemAlignment = if (line.alignment == PipoLyricAlignment.End) {
+                Alignment.End
+            } else {
+                Alignment.Start
+            }
+            val itemTextAlign = if (line.alignment == PipoLyricAlignment.End) {
+                TextAlign.End
+            } else {
+                TextAlign.Start
+            }
+            Box(modifier = Modifier.align(itemAlignment)) {
+                AppleMusicLyricText(
+                    line = line,
+                    isActive = isActive,
+                    isPast = isPast,
+                    positionMs = positionMs,
+                    fg = fg,
+                    fgUnsung = fgUnsung,
+                    fontSize = fontSize,
+                    lineHeight = lineHeight,
+                    fontWeight = fontWeight,
+                    liftEnvelope = liftEnvelope,
+                    textAlign = itemTextAlign,
+                )
+            }
             timedCompanions.forEach { companion ->
                 // 副词不再随结束时间消失：渲染条件保留「已经到了起播时间」，
                 // 但删除「past 即移除」—— 让副词唱完后跟主行同步停留（isPast=true，
@@ -1331,15 +1357,28 @@ private fun AppleMusicLyricRow(
                     val companionActive = isCompanionLyricActive(companion, positionMs)
                     val appear = companionEase.transform(companionLyricAppearProgress(companion, positionMs))
                     val risePx = with(density) { COMPANION_LYRIC_APPEAR_RISE_DP.dp.toPx() }
+                    // 副词跟随主行对齐方向：v1 主唱里的 x-bg 靠左，v2 副唱里的 x-bg 靠右。
+                    val companionAlignment = if (companion.alignment == PipoLyricAlignment.End) {
+                        Alignment.End
+                    } else {
+                        itemAlignment
+                    }
+                    val companionTextAlign = if (companionAlignment == Alignment.End) {
+                        TextAlign.End
+                    } else {
+                        TextAlign.Start
+                    }
                     Box(
-                        modifier = Modifier.graphicsLayer {
-                            alpha = appear
-                            translationY = risePx * (1f - appear)
-                            val scale = COMPANION_LYRIC_APPEAR_SCALE_FROM +
-                                (1f - COMPANION_LYRIC_APPEAR_SCALE_FROM) * appear
-                            scaleX = scale
-                            scaleY = scale
-                        }
+                        modifier = Modifier
+                            .align(companionAlignment)
+                            .graphicsLayer {
+                                alpha = appear
+                                translationY = risePx * (1f - appear)
+                                val scale = COMPANION_LYRIC_APPEAR_SCALE_FROM +
+                                    (1f - COMPANION_LYRIC_APPEAR_SCALE_FROM) * appear
+                                scaleX = scale
+                                scaleY = scale
+                            }
                     ) {
                         AppleMusicLyricText(
                             line = companion,
@@ -1352,6 +1391,7 @@ private fun AppleMusicLyricRow(
                             lineHeight = lineHeight * 0.76f,
                             fontWeight = FontWeight.SemiBold,
                             liftEnvelope = if (companionActive) 1f else liftEnvelope,
+                            textAlign = companionTextAlign,
                         )
                     }
                 }
@@ -1360,14 +1400,16 @@ private fun AppleMusicLyricRow(
                 val translationRisePx = with(density) { TRANSLATION_TOGGLE_RISE_DP.dp.toPx() }
                 translationLines.forEach { translation ->
                     Box(
-                        modifier = Modifier.graphicsLayer {
-                            alpha = translationVisibility
-                            translationY = translationRisePx * (1f - translationVisibility)
-                            val scale = TRANSLATION_TOGGLE_SCALE_FROM +
-                                (1f - TRANSLATION_TOGGLE_SCALE_FROM) * translationVisibility
-                            scaleX = scale
-                            scaleY = scale
-                        }
+                        modifier = Modifier
+                            .align(itemAlignment)
+                            .graphicsLayer {
+                                alpha = translationVisibility
+                                translationY = translationRisePx * (1f - translationVisibility)
+                                val scale = TRANSLATION_TOGGLE_SCALE_FROM +
+                                    (1f - TRANSLATION_TOGGLE_SCALE_FROM) * translationVisibility
+                                scaleX = scale
+                                scaleY = scale
+                            }
                     ) {
                         AppleMusicTranslationText(
                             line = translation,
@@ -1380,6 +1422,7 @@ private fun AppleMusicLyricRow(
                             ),
                             fontSize = fontSize * 0.64f,
                             lineHeight = lineHeight * 0.66f,
+                            textAlign = itemTextAlign,
                         )
                     }
                 }
@@ -1451,6 +1494,7 @@ private fun AppleMusicTranslationText(
     color: Color,
     fontSize: TextUnit,
     lineHeight: TextUnit,
+    textAlign: TextAlign = TextAlign.Start,
 ) {
     Text(
         text = line.text,
@@ -1459,6 +1503,7 @@ private fun AppleMusicTranslationText(
             fontSize = fontSize,
             fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
             lineHeight = lineHeight,
+            textAlign = textAlign,
             // 强制按词组边界换行：英文单词到行尾若放不下，整词推到下一行，不再从字母中间断。
             // WordBreak.Phrase 同时优化 CJK 的标点 / 词组贴边。
             lineBreak = LineBreak.Paragraph.copy(wordBreak = LineBreak.WordBreak.Phrase),
@@ -1488,6 +1533,7 @@ private fun AppleMusicLyricText(
     lineHeight: TextUnit,
     fontWeight: FontWeight,
     liftEnvelope: Float,
+    textAlign: TextAlign = TextAlign.Start,
 ) {
     val isYrcLine = line.chars.isNotEmpty()
     val isActiveYrc = isActive && isYrcLine
@@ -1496,6 +1542,11 @@ private fun AppleMusicLyricText(
         fontSize = fontSize,
         fontWeight = fontWeight,
         lineHeight = lineHeight,
+        // 对唱行（v2 / v3）传 TextAlign.End：长英文折行时 Text 会自动撑到 parent.maxWidth，
+        // 仅靠外层 Box .align(End) 没用（Box 也跟着撑满），必须让 Text 内部 textAlign=End
+        // 才能让每一折行视觉上贴右。逐字 sweep 由 layout 计算字符位置，textAlign 改变后
+        // layout 自然反映出新的位置，sweep 无需额外处理。
+        textAlign = textAlign,
         lineBreak = LineBreak.Paragraph,
         hyphens = Hyphens.None,
         lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(

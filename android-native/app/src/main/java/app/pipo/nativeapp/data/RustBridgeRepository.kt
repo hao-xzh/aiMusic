@@ -2,6 +2,7 @@ package app.pipo.nativeapp.data
 
 import android.content.Context
 import androidx.media3.common.util.UnstableApi
+import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.playback.PipoMediaCache
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -186,12 +187,58 @@ class RustBridgeRepository(
     override suspend fun tracksForPlaylist(playlistId: Long): List<NativeTrack> {
         synchronized(tracksCacheLock) {
             tracksMemoryCache[playlistId]
-        }?.let { return it }
-        val fresh = safe(
-            { bridge.neteasePlaylistTracks(playlistId) },
-            { fallback.tracksForPlaylist(playlistId) },
-        )
+        }?.let {
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "playlist_tracks_cache_hit",
+                fields = mapOf("playlistId" to playlistId, "count" to it.size),
+            )
+            return it
+        }
+        val expectedCount = playlistState.value.firstOrNull { it.id == playlistId }?.trackCount
+        val fresh = try {
+            bridge.neteasePlaylistTracks(playlistId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val fallbackTracks = runCatching { fallback.tracksForPlaylist(playlistId) }.getOrDefault(emptyList())
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "playlist_tracks_fetch_failed",
+                fields = mapOf(
+                    "playlistId" to playlistId,
+                    "expectedCount" to expectedCount,
+                    "fallbackCount" to fallbackTracks.size,
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
+            if (fallbackTracks.isNotEmpty()) fallbackTracks else throw e
+        }
+        if (fresh.isEmpty()) {
+            val suspiciousEmpty = expectedCount != null && expectedCount > 0
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = if (suspiciousEmpty) "playlist_tracks_fetch_empty_suspect" else "playlist_tracks_fetch_empty",
+                fields = mapOf(
+                    "playlistId" to playlistId,
+                    "expectedCount" to expectedCount,
+                ),
+            )
+            if (suspiciousEmpty) {
+                throw IllegalStateException("Playlist $playlistId expected $expectedCount tracks but detail returned empty")
+            }
+        }
         if (fresh.isNotEmpty()) {
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "playlist_tracks_fetch_ok",
+                fields = mapOf(
+                    "playlistId" to playlistId,
+                    "expectedCount" to expectedCount,
+                    "count" to fresh.size,
+                ),
+            )
             val tracksSnapshot = synchronized(tracksCacheLock) {
                 tracksMemoryCache[playlistId] = fresh
                 HashMap(tracksMemoryCache)

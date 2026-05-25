@@ -89,7 +89,12 @@ impl NativeAudioStore {
         Ok(())
     }
 
-    pub async fn features_json(&self, track_id: i64, url: String, cache_bytes: bool) -> Result<Value> {
+    pub async fn features_json(
+        &self,
+        track_id: i64,
+        url: String,
+        cache_bytes: bool,
+    ) -> Result<Value> {
         if let Some(features) = self.read_features(track_id)? {
             return Ok(serde_json::to_value(features)?);
         }
@@ -118,7 +123,12 @@ impl NativeAudioStore {
         Ok(())
     }
 
-    async fn ensure_audio_file(&self, track_id: i64, url: &str, cache_bytes: bool) -> Result<PathBuf> {
+    async fn ensure_audio_file(
+        &self,
+        track_id: i64,
+        url: &str,
+        cache_bytes: bool,
+    ) -> Result<PathBuf> {
         if let Some(path) = self.cached_audio_path(track_id)? {
             return Ok(path);
         }
@@ -142,7 +152,10 @@ impl NativeAudioStore {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await.context("read audio response bytes")?;
+        let bytes = response
+            .bytes()
+            .await
+            .context("read audio response bytes")?;
         let ext = infer_ext_from_url(url)
             .or_else(|| content_type.as_deref().and_then(ext_from_content_type))
             .unwrap_or_else(|| "bin".to_string());
@@ -157,7 +170,9 @@ impl NativeAudioStore {
             self.evict_to_fit()?;
             Ok(path)
         } else {
-            let tmp = self.audio_dir.join(format!("{track_id}.analysis.{ext}.tmp"));
+            let tmp = self
+                .audio_dir
+                .join(format!("{track_id}.analysis.{ext}.tmp"));
             std::fs::write(&tmp, &bytes)
                 .with_context(|| format!("write temp analysis audio {}", tmp.display()))?;
             Ok(tmp)
@@ -253,7 +268,12 @@ fn infer_ext_from_url(url: &str) -> Option<String> {
 }
 
 fn ext_from_content_type(ct: &str) -> Option<String> {
-    let main = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+    let main = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
     match main.as_str() {
         "audio/mpeg" => Some("mp3".into()),
         "audio/flac" | "audio/x-flac" => Some("flac".into()),

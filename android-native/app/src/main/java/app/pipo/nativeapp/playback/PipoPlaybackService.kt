@@ -36,6 +36,8 @@ class PipoPlaybackService : MediaSessionService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastKeepAlivePrepareAtMs: Long = 0L
     private var badSourceSkipToken: Long = 0L
+    private var badSourceRecoveryMediaId: String? = null
+    private var badSourceRecoveryUntilMs: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -117,6 +119,7 @@ class PipoPlaybackService : MediaSessionService() {
                             ),
                         )
                         badSourceSkipToken += 1L
+                        clearBadSourceRecovery()
                         smartAutoMixer?.onMediaItemTransition(mediaItem, reason)
                     }
 
@@ -241,6 +244,14 @@ class PipoPlaybackService : MediaSessionService() {
         val now = SystemClock.elapsedRealtime()
         val sessionPlayer = notificationPlayer ?: return
         if (!sessionPlayer.isRecovering()) return
+        if (isWaitingForBadSourceController(player, now)) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "keep_alive_prepare_suppressed",
+                fields = playerFields(player) + mapOf("reason" to reason),
+            )
+            return
+        }
         if (now - lastKeepAlivePrepareAtMs < KEEP_ALIVE_PREPARE_COOLDOWN_MS) return
         lastKeepAlivePrepareAtMs = now
 
@@ -294,6 +305,8 @@ class PipoPlaybackService : MediaSessionService() {
         }
         val mediaId = player.currentMediaItem?.mediaId
         val token = ++badSourceSkipToken
+        badSourceRecoveryMediaId = mediaId
+        badSourceRecoveryUntilMs = SystemClock.elapsedRealtime() + BAD_SOURCE_CONTROLLER_GRACE_MS
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "bad_source_wait",
@@ -305,21 +318,25 @@ class PipoPlaybackService : MediaSessionService() {
         mainHandler.postDelayed({
             if (token != badSourceSkipToken) return@postDelayed
             if (!player.playWhenReady || player.currentMediaItem?.mediaId != mediaId) {
+                clearBadSourceRecovery(mediaId)
                 recordBadSourceSkipAbort(player, error, "changed-or-paused")
                 return@postDelayed
             }
             val stuckState = player.playbackState == Player.STATE_IDLE ||
                 player.playbackState == Player.STATE_BUFFERING
             if (!stuckState) {
+                clearBadSourceRecovery(mediaId)
                 recordBadSourceSkipAbort(player, error, "recovered")
                 return@postDelayed
             }
             val nextIndex = player.nextMediaItemIndex
             if (nextIndex == C.INDEX_UNSET || nextIndex == player.currentMediaItemIndex) {
+                clearBadSourceRecovery(mediaId)
                 recordBadSourceSkipAbort(player, error, "no-next")
                 return@postDelayed
             }
             runCatching {
+                clearBadSourceRecovery(mediaId)
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "bad_source_skip",
@@ -342,6 +359,17 @@ class PipoPlaybackService : MediaSessionService() {
                 )
             }
         }, BAD_SOURCE_CONTROLLER_GRACE_MS)
+    }
+
+    private fun isWaitingForBadSourceController(player: Player, now: Long): Boolean {
+        val mediaId = player.currentMediaItem?.mediaId ?: return false
+        return mediaId == badSourceRecoveryMediaId && now < badSourceRecoveryUntilMs
+    }
+
+    private fun clearBadSourceRecovery(mediaId: String? = null) {
+        if (mediaId != null && mediaId != badSourceRecoveryMediaId) return
+        badSourceRecoveryMediaId = null
+        badSourceRecoveryUntilMs = 0L
     }
 
     private fun recordBadSourceSkipAbort(player: Player, error: PlaybackException, reason: String) {

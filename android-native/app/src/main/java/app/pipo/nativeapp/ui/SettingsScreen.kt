@@ -5,20 +5,24 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -30,12 +34,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -80,153 +89,173 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
             "账号、播放和 AI 都在本机。",
             color = PipoColors.TextDim,
             style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(bottom = 20.dp),
+            modifier = Modifier.padding(bottom = 12.dp),
         )
 
-        SettingsGroup("音乐来源") {
-            LabelRow("网易云登录", account?.nickname ?: "未登录 —— 点下面用网易云 App 扫码")
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = {
-                    qrJob?.cancel()
-                    qrJob = scope.launch {
-                        qrContent = null
-                        loginStatus = "正在请求二维码…"
-                        val startResult = runCatching { repository.startQrLogin() }
-                        val start = startResult.getOrNull()
-                        if (start == null || start.qrContent.isBlank()) {
-                            startResult.exceptionOrNull()?.let { err ->
-                                DiagnosticsLogStore.record(
-                                    area = "login",
-                                    event = "qr_start_failed",
-                                    fields = mapOf(
-                                        "errorType" to err::class.java.simpleName,
-                                        "errorMessage" to err.message.orEmpty().take(180),
-                                    ),
-                                )
-                            }
-                            loginStatus = "二维码加载失败，检查网络后刷新"
-                            return@launch
-                        }
-                        qrContent = start.qrContent
-                        loginStatus = "等待扫码"
-                        repeat(30) {
-                            val statusResult = runCatching { repository.checkQrLogin(start.key) }
-                            val status = statusResult.getOrElse { err ->
-                                DiagnosticsLogStore.record(
-                                    area = "login",
-                                    event = "qr_check_failed",
-                                    fields = mapOf(
-                                        "errorType" to err::class.java.simpleName,
-                                        "errorMessage" to err.message.orEmpty().take(180),
-                                    ),
-                                )
-                                loginStatus = "登录状态获取失败，稍等后刷新"
-                                qrContent = null
-                                return@launch
-                            }
-                            loginStatus = when (status.code) {
-                                801 -> "等待扫码"
-                                802 -> "等待手机端确认"
-                                803 -> status.nickname?.let { "已登录 · $it" } ?: "登录成功"
-                                800 -> "二维码已过期 —— 点刷新重新生成"
-                                else -> status.message ?: "等待中"
-                            }
-                            if (status.code == 803) {
-                                DiagnosticsLogStore.record(
-                                    area = "login",
-                                    event = "qr_login_success",
-                                    fields = mapOf("hasNickname" to !status.nickname.isNullOrBlank()),
-                                )
-                                qrContent = null
-                                repository.refreshAccount()
-                                return@launch
-                            }
-                            if (status.code == 800 || status.code < 0) {
-                                qrContent = null
-                                return@launch
-                            }
-                            delay(2_000)
-                        }
-                        if (qrContent != null) {
-                            loginStatus = "二维码超时 —— 点刷新重新生成"
+        // 01 / SERVICES
+        SettingsSectionHeader("01", "SERVICES")
+        
+        // 网易云登录
+        PipoRow(
+            title = "网易云登录",
+            subtitle = account?.nickname ?: "未登录 —— 用网易云 App 扫码"
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PipoButton(
+                    text = if (qrContent == null) "扫码登录" else "刷新二维码",
+                    onClick = {
+                        qrJob?.cancel()
+                        qrJob = scope.launch {
                             qrContent = null
+                            loginStatus = "正在请求二维码…"
+                            val startResult = runCatching { repository.startQrLogin() }
+                            val start = startResult.getOrNull()
+                            if (start == null || start.qrContent.isBlank()) {
+                                startResult.exceptionOrNull()?.let { err ->
+                                    DiagnosticsLogStore.record(
+                                        area = "login",
+                                        event = "qr_start_failed",
+                                        fields = mapOf(
+                                            "errorType" to err::class.java.simpleName,
+                                            "errorMessage" to err.message.orEmpty().take(180),
+                                        ),
+                                    )
+                                }
+                                loginStatus = "二维码加载失败，检查网络后刷新"
+                                return@launch
+                            }
+                            qrContent = start.qrContent
+                            loginStatus = "等待扫码"
+                            repeat(30) {
+                                val statusResult = runCatching { repository.checkQrLogin(start.key) }
+                                val status = statusResult.getOrElse { err ->
+                                    DiagnosticsLogStore.record(
+                                        area = "login",
+                                        event = "qr_check_failed",
+                                        fields = mapOf(
+                                            "errorType" to err::class.java.simpleName,
+                                            "errorMessage" to err.message.orEmpty().take(180),
+                                        ),
+                                    )
+                                    loginStatus = "登录状态获取失败，稍等后刷新"
+                                    qrContent = null
+                                    return@launch
+                                }
+                                loginStatus = when (status.code) {
+                                    801 -> "等待扫码"
+                                    802 -> "等待手机端确认"
+                                    803 -> status.nickname?.let { "已登录 · $it" } ?: "登录成功"
+                                    800 -> "二维码已过期 —— 点刷新重新生成"
+                                    else -> status.message ?: "等待中"
+                                }
+                                if (status.code == 803) {
+                                    DiagnosticsLogStore.record(
+                                        area = "login",
+                                        event = "qr_login_success",
+                                        fields = mapOf("hasNickname" to !status.nickname.isNullOrBlank()),
+                                    )
+                                    qrContent = null
+                                    repository.refreshAccount()
+                                    return@launch
+                                }
+                                if (status.code == 800 || status.code < 0) {
+                                    qrContent = null
+                                    return@launch
+                                }
+                                delay(2_000)
+                            }
+                            if (qrContent != null) {
+                                loginStatus = "二维码超时 —— 点刷新重新生成"
+                                qrContent = null
+                            }
                         }
-                    }
-                }) {
-                    Text(if (qrContent == null) "扫码登录" else "刷新二维码", color = PipoColors.Mint)
-                }
+                    },
+                    isPrimary = account == null
+                )
                 if (account != null) {
-                    TextButton(onClick = {
-                        scope.launch {
-                            qrContent = null
-                            repository.logout()
-                            runCatching { PipoGraph.lastPlayback.clear() }
-                            runCatching { PipoGraph.library.invalidate() }
-                            DiagnosticsLogStore.record("login", "logout")
-                            loginStatus = "已退出"
+                    PipoButton(
+                        text = "退出登录",
+                        onClick = {
+                            scope.launch {
+                                qrContent = null
+                                repository.logout()
+                                runCatching { PipoGraph.lastPlayback.clear() }
+                                runCatching { PipoGraph.library.invalidate() }
+                                DiagnosticsLogStore.record("login", "logout")
+                                loginStatus = "已退出"
+                            }
                         }
-                    }) { Text("退出", color = PipoColors.TextDim) }
+                    )
                 }
             }
-            qrContent?.let { content ->
+        }
+
+        qrContent?.let { content ->
+            Box(
+                modifier = Modifier
+                    .padding(vertical = 10.dp)
+                    .border(1.dp, PipoColors.GlassStroke, RectangleShape)
+                    .padding(8.dp)
+            ) {
                 QrCode(
                     content = content,
-                    modifier = Modifier
-                        .padding(top = 6.dp)
-                        .size(180.dp)
-                        .clip(RoundedCornerShape(8.dp)),
+                    modifier = Modifier.size(160.dp),
                 )
             }
-            loginStatus?.let { LabelRow("登录状态", it) }
         }
 
-        SettingsGroup("音频缓存") {
-            LabelRow("歌曲原始字节缓存", "${cacheStats.totalMb} MB / ${cacheStats.maxMb} MB · ${cacheStats.count} 首")
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = { scope.launch { repository.clearAudioCache() } }) {
-                    Text("清空缓存", color = PipoColors.Blue)
-                }
-                TextButton(onClick = { scope.launch { repository.setCacheMaxMb(4096) } }) {
-                    Text("上限 4 GB", color = PipoColors.Gold)
+        loginStatus?.let { status ->
+            PipoRow(title = "登录状态", subtitle = status)
+        }
+
+        // AI Provider 配置
+        val activeProvider = aiConfig.providers.firstOrNull { it.id == aiConfig.activeProvider }
+        val anyHasKey = aiConfig.providers.any { it.hasKey }
+        
+        PipoRow(
+            title = "服务商",
+            subtitle = activeProvider?.let { "${it.label} · ${it.model}" } ?: "DeepSeek / OpenAI / MiMo"
+        )
+        if (!anyHasKey) {
+            PipoRow(title = "提示", subtitle = "填入任一 key 后启用 AI")
+        }
+
+        aiConfig.providers.forEach { provider ->
+            val isActive = provider.id == aiConfig.activeProvider
+            PipoRow(
+                title = provider.label,
+                subtitle = if (provider.hasKey) "key ${provider.keyPreview ?: "已存"}" else "未填 key",
+                showDivider = provider != aiConfig.providers.lastOrNull()
+            ) {
+                if (isActive) {
+                    Text(
+                        text = "当前",
+                        color = PipoColors.Ink,
+                        style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    )
+                } else {
+                    PipoButton(
+                        text = "切换",
+                        onClick = { scope.launch { repository.setAiProvider(provider.id) } }
+                    )
                 }
             }
         }
 
-        SettingsGroup("AI key") {
-            val activeProvider = aiConfig.providers.firstOrNull { it.id == aiConfig.activeProvider }
-            val anyHasKey = aiConfig.providers.any { it.hasKey }
-            LabelRow("服务商", activeProvider?.let { "${it.label} · ${it.model}" } ?: "DeepSeek / OpenAI / MiMo")
-            if (!anyHasKey) {
-                LabelRow("未配置", "填入任一 key 后启用 AI")
-            }
-            ToggleRow("封面短提示", settings.aiNarration) {
-                logSettingToggle("aiNarration", it)
-                scope.launch { repository.updateSettings(settings.copy(aiNarration = it)) }
-            }
-            aiConfig.providers.forEach { provider ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        LabelRow(provider.label, if (provider.hasKey) "key ${provider.keyPreview ?: "已存"}" else "未填 key")
-                    }
-                    TextButton(onClick = { scope.launch { repository.setAiProvider(provider.id) } }) {
-                        Text(if (provider.id == aiConfig.activeProvider) "当前" else "切换", color = PipoColors.Mint)
-                    }
-                }
-            }
-            OutlinedTextField(
-                value = apiKeyDraft,
-                onValueChange = { apiKeyDraft = it },
-                label = { Text("API key") },
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = {
+        Spacer(modifier = Modifier.height(14.dp))
+        PipoTextField(
+            value = apiKeyDraft,
+            onValueChange = { apiKeyDraft = it },
+            label = "API KEY",
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            placeholder = "输入新 key"
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PipoButton(
+                text = "保存 KEY",
+                onClick = {
                     scope.launch {
                         DiagnosticsLogStore.record(
                             area = "settings",
@@ -238,8 +267,12 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                         )
                         repository.aiSetApiKey(aiConfig.activeProvider, apiKeyDraft)
                     }
-                }) { Text("保存 key", color = PipoColors.Blue) }
-                TextButton(onClick = {
+                },
+                isPrimary = true
+            )
+            PipoButton(
+                text = "PING",
+                onClick = {
                     scope.launch {
                         val result = runCatching { repository.aiPing() }
                         result.onSuccess {
@@ -264,84 +297,161 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                         }
                         aiReply = result.getOrElse { "断线了。" }
                     }
-                }) { Text("Ping", color = PipoColors.Gold) }
-            }
-            aiReply?.let { LabelRow("AI 回复", it) }
+                }
+            )
+        }
+        
+        aiReply?.let { reply ->
+            Spacer(modifier = Modifier.height(10.dp))
+            PipoRow(title = "AI 回复", subtitle = reply, showDivider = false)
         }
 
-        SettingsGroup("播放规则") {
-            ToggleRow("主动安排一段", settings.smartSessionPlanner) {
+        // 02 / RULES
+        SettingsSectionHeader("02", "RULES")
+        
+        PipoToggleRow(
+            title = "主动安排一段",
+            subtitle = "让 AI 主动为你插播一段推荐",
+            checked = settings.smartSessionPlanner,
+            onCheckedChange = {
                 logSettingToggle("smartSessionPlanner", it)
                 scope.launch { repository.updateSettings(settings.copy(smartSessionPlanner = it)) }
             }
-            ToggleRow("工作时段自动播放", settings.workdayAutoplay) {
+        )
+        PipoToggleRow(
+            title = "工作时段自动播放",
+            subtitle = "在你的工作时间段内自动启动播放",
+            checked = settings.workdayAutoplay,
+            onCheckedChange = {
                 logSettingToggle("workdayAutoplay", it)
                 scope.launch { repository.updateSettings(settings.copy(workdayAutoplay = it)) }
             }
-            ToggleRow("午休换放松歌单", settings.lunchRelaxMode) {
+        )
+        PipoToggleRow(
+            title = "午休换放松歌单",
+            subtitle = "午休时间段自动切换到舒缓轻音乐",
+            checked = settings.lunchRelaxMode,
+            onCheckedChange = {
                 logSettingToggle("lunchRelaxMode", it)
                 scope.launch { repository.updateSettings(settings.copy(lunchRelaxMode = it)) }
             }
-            ToggleRow("深夜低刺激", settings.lateNightCalmMode) {
+        )
+        PipoToggleRow(
+            title = "深夜低刺激",
+            subtitle = "深夜自动调低音量并播放温和曲目",
+            checked = settings.lateNightCalmMode,
+            onCheckedChange = {
                 logSettingToggle("lateNightCalmMode", it)
                 scope.launch { repository.updateSettings(settings.copy(lateNightCalmMode = it)) }
             }
-            OutlinedTextField(
-                value = settings.promptedRadioRule,
-                onValueChange = { value ->
-                    scope.launch {
-                        repository.updateSettings(settings.copy(promptedRadioRule = value.take(240)))
-                    }
-                },
-                label = { Text("Prompted Radio") },
-                placeholder = { Text("上午不吵，熟歌 70%，新歌 30%") },
-                minLines = 2,
-                maxLines = 4,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
+        )
+        PipoToggleRow(
+            title = "封面短提示",
+            subtitle = "让 AI 生成更简短个性的音乐封面介绍",
+            checked = settings.aiNarration,
+            onCheckedChange = {
+                logSettingToggle("aiNarration", it)
+                scope.launch { repository.updateSettings(settings.copy(aiNarration = it)) }
+            }
+        )
+        
+        Spacer(modifier = Modifier.height(14.dp))
+        PipoTextField(
+            value = settings.promptedRadioRule,
+            onValueChange = { value ->
+                scope.launch {
+                    repository.updateSettings(settings.copy(promptedRadioRule = value.take(240)))
+                }
+            },
+            label = "PROMPTED RADIO RULE",
+            placeholder = "上午不吵，熟歌 70%，新歌 30%",
+            singleLine = false,
+            minLines = 2,
+            maxLines = 4
+        )
 
-        SettingsGroup("外观") {
-            ToggleRow("隐藏点阵叠加", settings.hideDotPattern) {
+        // 03 / PREFERENCES
+        SettingsSectionHeader("03", "PREFERENCES")
+        
+        PipoToggleRow(
+            title = "隐藏点阵叠加",
+            subtitle = "在界面上隐藏复古像素点阵滤镜效果",
+            checked = settings.hideDotPattern,
+            onCheckedChange = {
                 logSettingToggle("hideDotPattern", it)
                 scope.launch { repository.updateSettings(settings.copy(hideDotPattern = it)) }
             }
-            ToggleRow("隐藏 AI 圆球", settings.hideAiPetOrb) {
+        )
+        PipoToggleRow(
+            title = "隐藏 AI 圆球",
+            subtitle = "在播放页隐藏 Claudio Pet 的物理实体悬浮球",
+            checked = settings.hideAiPetOrb,
+            onCheckedChange = {
                 logSettingToggle("hideAiPetOrb", it)
                 scope.launch { repository.updateSettings(settings.copy(hideAiPetOrb = it)) }
             }
+        )
+        
+        Spacer(modifier = Modifier.height(14.dp))
+        PipoTextField(
+            value = settings.userFacts,
+            onValueChange = { value ->
+                val facts = value.take(400)
+                scope.launch { repository.updateSettings(settings.copy(userFacts = facts)) }
+                runCatching { PipoGraph.petMemory.setUserFacts(facts) }
+            },
+            label = "ABOUT YOU (工作时间 / 作息 / 习惯 / 喜好)",
+            placeholder = "写下你的喜好与习惯，以便 AI 更好地为你排歌...",
+            singleLine = false,
+            minLines = 3,
+            maxLines = 6
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End
+        ) {
+            Text(
+                text = "${settings.userFacts.length} / 400",
+                color = PipoColors.TextDim,
+                style = TextStyle(fontSize = 11.sp)
+            )
         }
 
-        SettingsGroup("诊断日志") {
-            LabelRow("范围", "记录播放、歌词、混音、AI 排歌、Taste Radar、网络错误和崩溃摘要；不会记录 cookie、API key、完整 URL 或完整歌词。")
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(onClick = {
-                    scope.launch { copyDiagnosticsToClipboard(context) }
-                }) {
-                    Text("复制日志", color = PipoColors.Mint)
-                }
-                TextButton(onClick = {
-                    scope.launch { shareDiagnosticsTxt(context) }
-                }) {
-                    Text("分享 txt", color = PipoColors.Blue)
-                }
+        // 04 / SYSTEM
+        SettingsSectionHeader("04", "SYSTEM")
+        
+        PipoRow(
+            title = "音频缓存",
+            subtitle = "${cacheStats.totalMb} MB / ${cacheStats.maxMb} MB · ${cacheStats.count} 首"
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PipoButton(
+                    text = "清空缓存",
+                    onClick = { scope.launch { repository.clearAudioCache() } }
+                )
+                PipoButton(
+                    text = "上限 4 GB",
+                    onClick = { scope.launch { repository.setCacheMaxMb(4096) } }
+                )
             }
         }
-
-        SettingsGroup("关于你") {
-            OutlinedTextField(
-                value = settings.userFacts,
-                onValueChange = { value ->
-                    val facts = value.take(400)
-                    scope.launch { repository.updateSettings(settings.copy(userFacts = facts)) }
-                    runCatching { PipoGraph.petMemory.setUserFacts(facts) }
-                },
-                label = { Text("工作时间 / 作息 / 习惯 / 喜好") },
-                minLines = 4,
-                maxLines = 6,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            LabelRow("已写", "${settings.userFacts.length} / 400")
+        
+        PipoRow(
+            title = "诊断日志",
+            subtitle = "记录播放、歌词、混音、AI 排歌、Taste Radar 和崩溃摘要；不含个人隐私数据。",
+            showDivider = false
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PipoButton(
+                    text = "复制日志",
+                    onClick = { scope.launch { copyDiagnosticsToClipboard(context) } }
+                )
+                PipoButton(
+                    text = "分享 TXT",
+                    onClick = { scope.launch { shareDiagnosticsTxt(context) } }
+                )
+            }
         }
     }
 }
@@ -396,56 +506,233 @@ private fun logSettingToggle(name: String, value: Boolean) {
 }
 
 @Composable
-private fun SettingsGroup(label: String, content: @Composable ColumnScope.() -> Unit) {
-    Text(
-        text = label,
-        color = PipoColors.Ink,
-        style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold),
-        modifier = Modifier.padding(top = 24.dp, bottom = 12.dp),
-    )
-    Column(content = content)
+private fun SettingsSectionHeader(index: String, title: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 28.dp, bottom = 12.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = index,
+                color = PipoColors.TextDim,
+                style = TextStyle(
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp
+                )
+            )
+            Text(
+                text = "/",
+                color = PipoColors.TextDim.copy(alpha = 0.5f),
+                style = TextStyle(fontSize = 11.sp)
+            )
+            Text(
+                text = title.uppercase(),
+                color = PipoColors.Ink,
+                style = TextStyle(
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 3.sp
+                )
+            )
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        PipoDivider()
+    }
 }
 
 @Composable
-private fun LabelRow(label: String, detail: String) {
-    Row(
+private fun PipoDivider() {
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .height(1.dp)
+            .background(PipoColors.GlassStroke)
+    )
+}
+
+@Composable
+private fun PipoRow(
+    title: String,
+    subtitle: String? = null,
+    showDivider: Boolean = true,
+    content: @Composable (() -> Unit)? = null
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth()
     ) {
-        Column {
-            Text(label, color = PipoColors.Ink, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-            Text(
-                detail,
-                color = PipoColors.TextDim,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    color = PipoColors.Ink,
+                    style = TextStyle(
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                )
+                if (subtitle != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = subtitle,
+                        color = PipoColors.TextDim,
+                        style = TextStyle(
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
+                        )
+                    )
+                }
+            }
+            if (content != null) {
+                Spacer(modifier = Modifier.width(16.dp))
+                content()
+            }
+        }
+        if (showDivider) {
+            PipoDivider()
         }
     }
 }
 
 @Composable
-private fun ToggleRow(label: String, value: Boolean, onChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+private fun PipoToggleRow(
+    title: String,
+    subtitle: String? = null,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    showDivider: Boolean = true
+) {
+    PipoRow(
+        title = title,
+        subtitle = subtitle,
+        showDivider = showDivider
     ) {
-        Text(label, color = PipoColors.Ink, style = MaterialTheme.typography.titleSmall)
         Switch(
-            checked = value,
-            onCheckedChange = onChange,
+            checked = checked,
+            onCheckedChange = onCheckedChange,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = PipoColors.Bg0,
-                checkedTrackColor = PipoColors.Mint,
+                checkedTrackColor = PipoColors.Ink,
                 uncheckedThumbColor = PipoColors.TextDim,
-                uncheckedTrackColor = Color(0x22FFFFFF),
+                uncheckedTrackColor = Color(0x14FFFFFF),
+                checkedBorderColor = Color.Transparent,
+                uncheckedBorderColor = Color.Transparent
+            )
+        )
+    }
+}
+
+@Composable
+private fun PipoButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    isPrimary: Boolean = false
+) {
+    val backgroundColor = if (isPrimary) PipoColors.Ink else Color.Transparent
+    val textColor = if (isPrimary) PipoColors.Bg0 else PipoColors.Ink
+    val borderModifier = if (isPrimary) {
+        Modifier
+    } else {
+        Modifier.border(1.dp, PipoColors.GlassStroke, RectangleShape)
+    }
+    
+    Box(
+        modifier = modifier
+            .background(backgroundColor, RectangleShape)
+            .then(borderModifier)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = textColor,
+            style = TextStyle(
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 1.sp
+            )
+        )
+    }
+}
+
+@Composable
+private fun PipoTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+    singleLine: Boolean = true,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    placeholder: String? = null,
+    minLines: Int = 1,
+    maxLines: Int = 1
+) {
+    var isFocused by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    
+    Column(modifier = modifier.fillMaxWidth()) {
+        Text(
+            text = label,
+            color = PipoColors.InkDim,
+            style = TextStyle(
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 1.sp
             ),
+            modifier = Modifier.padding(bottom = 6.dp)
+        )
+        
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = singleLine,
+            minLines = minLines,
+            maxLines = maxLines,
+            visualTransformation = visualTransformation,
+            textStyle = TextStyle(
+                color = PipoColors.Ink,
+                fontSize = 13.sp,
+                lineHeight = 18.sp
+            ),
+            cursorBrush = SolidColor(PipoColors.Ink),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(focusRequester)
+                .onFocusChanged { isFocused = it.isFocused }
+                .background(PipoColors.Bg1, RectangleShape)
+                .border(
+                    width = 1.dp,
+                    color = if (isFocused) PipoColors.Ink else PipoColors.GlassStroke,
+                    shape = RectangleShape
+                )
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            decorationBox = { innerTextField ->
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    if (value.isEmpty() && placeholder != null) {
+                        Text(
+                            text = placeholder,
+                            color = PipoColors.TextDim,
+                            style = TextStyle(
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp
+                            )
+                        )
+                    }
+                    innerTextField()
+                }
+            }
         )
     }
 }

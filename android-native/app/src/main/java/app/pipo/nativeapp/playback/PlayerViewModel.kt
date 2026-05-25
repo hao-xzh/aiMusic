@@ -280,6 +280,14 @@ class PlayerViewModel(
     private fun retryTransientNetworkError(error: PlaybackException) {
         val player = controller ?: return
         val track = currentTrackFor(player) ?: return
+        if (transientRetryJob?.isActive == true && resolvingPlayback) {
+            DiagnosticsLogStore.record(
+                area = "playback",
+                event = "network_retry_ignored_during_delay",
+                fields = trackFields(track) + mapOf("code" to error.errorCodeName),
+            )
+            return
+        }
         if (transientRetryForTrack == track.id) {
             transientRetryCount += 1
         } else {

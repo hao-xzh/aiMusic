@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.ui
 
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -512,6 +514,7 @@ internal fun PetOrb(
     pulseScale: Float,
     attached: Boolean,
     palette: PetPalette,
+    pending: Boolean = false,
     onClick: () -> Unit,
 ) {
     val haloScale = 1f + haloPulse * 0.3f
@@ -600,7 +603,7 @@ internal fun PetOrb(
                     val s = size.minDimension
 
                     val eyeW = s * 0.09f
-                    val eyeH = s * 0.16f
+                    val eyeH = if (pending) s * 0.04f else s * 0.16f
                     val eyeY = h * 0.36f
                     val leftEyeCx = w * 0.34f
                     val rightEyeCx = w * 0.66f
@@ -642,6 +645,113 @@ internal fun PetOrb(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+internal fun ChatHistoryPanel(
+    messages: List<PetMessage>,
+    pending: Boolean,
+    palette: PetPalette,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(messages.size, pending) {
+        val totalItems = messages.size + (if (pending) 1 else 0)
+        if (totalItems > 0) {
+            listState.animateScrollToItem(totalItems - 1)
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(max = 280.dp)
+            .clip(RoundedCornerShape(20.dp))
+            .background(palette.panel)
+            .drawBehind {
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(palette.accent.copy(alpha = 0.18f), Color.Transparent),
+                        startY = 0f,
+                        endY = 32f,
+                    )
+                )
+            }
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(messages.size) { index ->
+                val msg = messages[index]
+                MessageBubbleItem(msg = msg, palette = palette)
+            }
+            if (pending) {
+                item {
+                    ThinkingBubbleItem(palette = palette)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun MessageBubbleItem(msg: PetMessage, palette: PetPalette) {
+    val alignment = if (msg.fromUser) Alignment.End else Alignment.Start
+    val bubbleColor = if (msg.fromUser) {
+        palette.accent.copy(alpha = 0.22f)
+    } else {
+        Color(0x1AFFFFFF)
+    }
+    val shape = if (msg.fromUser) {
+        RoundedCornerShape(14.dp, 14.dp, 3.dp, 14.dp)
+    } else {
+        RoundedCornerShape(14.dp, 14.dp, 14.dp, 3.dp)
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = alignment
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = 260.dp)
+                .clip(shape)
+                .background(bubbleColor)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text = msg.text,
+                color = palette.panelText,
+                style = TextStyle(
+                    fontSize = 13.5.sp,
+                    lineHeight = 18.sp,
+                    letterSpacing = 0.1.sp
+                )
+            )
+        }
+    }
+}
+
+@Composable
+internal fun ThinkingBubbleItem(palette: PetPalette) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = 260.dp)
+                .clip(RoundedCornerShape(14.dp, 14.dp, 14.dp, 3.dp))
+                .background(Color(0x1AFFFFFF))
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
+            ThinkingDots(tint = palette.accent)
         }
     }
 }

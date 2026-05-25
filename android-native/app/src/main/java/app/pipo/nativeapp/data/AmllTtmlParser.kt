@@ -20,7 +20,7 @@ import java.io.StringReader
  *           <span ttm:role="x-translation" xml:lang="zh-CN">翻译文本</span>
  *           <span ttm:role="x-roman">罗马音</span>
  *         </p>
- *         <p ... ttm:agent="v2">          ← v2 = 副唱 / 合唱
+ *         <p ... ttm:agent="v2">          ← 第二位演唱者（对唱 / 合唱）
  *           ...
  *         </p>
  *       </div>
@@ -29,9 +29,12 @@ import java.io.StringReader
  * ```
  *
  * 输出按既有 [PipoLyricLine] 模型组装：
- *   · `<p>` → 一行（agent=v1 → Primary；agent≠v1 → Companion，附到上一条 Primary）
+ *   · `<p>` → 一行 Primary（agent=v1 → alignment=Start 左对齐；agent≠v1 → alignment=End 右对齐）。
+ *     和 AMLL 官方播放器一致 —— 不同演唱者的整行各自占一行，第二位歌手靠右展示。
  *   · `<span begin end>` → [PipoLyricChar]（字级 timing）
  *   · `<span ttm:role="x-translation">` → 一条 `role = Translation` 的 companion
+ *   · `<span ttm:role="x-bg">` → 一条 `role = Companion` 的副词（"和声 / backing vocal"），
+ *     附在所在 `<p>` 的 companionLines 上，由渲染层走小字浮入通道。
  *   · `<span ttm:role="x-roman">` → 暂不消费（保留位置，未来要展示罗马音再加）
  *
  * 时间格式支持 `HH:MM:SS.fff`、`MM:SS.fff`、`SS.fff`、纯整数毫秒。
@@ -45,34 +48,30 @@ object AmllTtmlParser {
             setInput(StringReader(ttml))
         }
         val primaries = mutableListOf<PipoLyricLine>()
-        val companionsForPrev = mutableListOf<PipoLyricLine>()
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
             if (event == XmlPullParser.START_TAG && parser.name == "p") {
                 val parsed = parseP(parser)
                 if (parsed != null) {
-                    val isPrimary = parsed.agent == null || parsed.agent == "v1"
-                    if (isPrimary) {
-                        // 上一条 primary 还没结算的 companions 先合上
-                        if (companionsForPrev.isNotEmpty() && primaries.isNotEmpty()) {
-                            val last = primaries.removeAt(primaries.lastIndex)
-                            primaries.add(
-                                last.copy(companionLines = last.companionLines + companionsForPrev.toList())
-                            )
-                            companionsForPrev.clear()
-                        }
-                        primaries.add(parsed.toPipoLine(role = PipoLyricRole.Primary))
+                    // 所有 <p> 都作为独立 Primary：
+                    //   · agent="v1" / 缺省 → 主唱，左对齐
+                    //   · agent="v2" / "v3" / ... → 其他演唱者（对唱 / 合唱主旋律），右对齐
+                    //     之前把它们一律塞进上一条 v1 的 companionLines 会得到
+                    //     "一行主歌词 + 多行小字副词" 的别扭排版（对唱整段被压成副词）。
+                    // 真正的 "和声 / 副词" 只通过 <span ttm:role="x-bg"> 表达，
+                    // 在 parseP 内部已挂到当前 <p> 的 companions 上，仍按副词通道渲染。
+                    val isPrimaryAgent = parsed.agent == null || parsed.agent == "v1"
+                    val alignment = if (isPrimaryAgent) {
+                        PipoLyricAlignment.Start
                     } else {
-                        companionsForPrev.add(parsed.toPipoLine(role = PipoLyricRole.Companion))
+                        PipoLyricAlignment.End
                     }
+                    primaries.add(
+                        parsed.toPipoLine(role = PipoLyricRole.Primary, alignment = alignment)
+                    )
                 }
             }
             event = parser.next()
-        }
-        // 文档结束时还有未挂的 companions
-        if (companionsForPrev.isNotEmpty() && primaries.isNotEmpty()) {
-            val last = primaries.removeAt(primaries.lastIndex)
-            primaries.add(last.copy(companionLines = last.companionLines + companionsForPrev.toList()))
         }
         return primaries.sortedBy { it.startMs }
     }
@@ -331,18 +330,29 @@ object AmllTtmlParser {
         val chars: List<PipoLyricChar>,
         val companions: List<PipoLyricLine>,
     ) {
-        fun toPipoLine(role: PipoLyricRole): PipoLyricLine {
+        fun toPipoLine(
+            role: PipoLyricRole,
+            alignment: PipoLyricAlignment = PipoLyricAlignment.Start,
+        ): PipoLyricLine {
             val durationMs = (endMs - beginMs).coerceAtLeast(1L)
             val finalText = if (text.isNotEmpty()) text else chars.joinToString("") { it.text }
             val timing = if (chars.isNotEmpty()) PipoLyricTiming.Word else PipoLyricTiming.Line
+            // 副词跟随所在 <p> 的对齐方向 —— v2 行里的 x-bg 也右对齐，
+            // 视觉上跟主行配成一对。Translation 同理由渲染层判断。
+            val alignedCompanions = if (alignment == PipoLyricAlignment.Start) {
+                companions
+            } else {
+                companions.map { it.copy(alignment = alignment) }
+            }
             return PipoLyricLine(
                 startMs = beginMs,
                 durationMs = durationMs,
                 text = finalText,
                 chars = chars,
                 timing = timing,
-                companionLines = companions,
+                companionLines = alignedCompanions,
                 role = role,
+                alignment = alignment,
             )
         }
     }
