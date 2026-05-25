@@ -123,9 +123,11 @@ fun pickFgDim(tone: Tone): Color =
     if (tone == Tone.Dark) Color(0x8C000000) else Color(0x9EFFFFFF)
 
 /** 未唱字符色：YRC/慢词/普通逐字都从这里取底色。
- *  浅色文字再提亮一档，保证慢词扫色前的最低亮度不低于没唱词观感。 */
+ *  Apple Music 的"灰一档"观感：浅底（白字）压到 ~0.44，深底（黑字）压到 ~0.40，
+ *  跟已唱字符（fg=1.0）形成清晰对比；同时守住 distance=1 行 rowAlpha(0.36) < fgUnsung
+ *  的红线（未来邻句不会比 active 行未唱字符更亮）。 */
 fun pickFgUnsung(tone: Tone): Color =
-    if (tone == Tone.Dark) Color(0x8C000000) else Color(0xB8FFFFFF)
+    if (tone == Tone.Dark) Color(0x66000000) else Color(0x70FFFFFF)
 
 fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback

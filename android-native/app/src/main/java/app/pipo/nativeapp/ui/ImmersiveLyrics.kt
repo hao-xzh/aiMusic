@@ -392,6 +392,33 @@ private const val CLICK_SEEK_SCROLL_HOLD_MS = 1_100L
  *
  * 稳态滞后 ≈ 40ms（视觉上无感，远低于人眼 80ms 同步阈值）；不漂移、不抖动。
  */
+/**
+ * Apple Music 风格切句"拉扯"动画状态。镜像 dokar3/amlv 的 currItemsOffsetY + initialItemsOffsetY。
+ *
+ * 切句时：
+ *   1. dispatchRawDelta(initial) 瞬间 snap LazyColumn 到目标位置（用户看不到滚动）
+ *   2. 给所有可视行 translateY = initial（视觉上"还在原位"）
+ *   3. animate current: initial → 0（spring/tween 都行）
+ *   4. 每行 offset 公式让远行被"拽住"更久：
+ *        factor = 1 + max(0, idx - activeIdxAtStart) * 0.08
+ *        progress = current / initial               // 1 → 0
+ *        finalProgress = (progress * factor).coerceIn(0, 1)
+ *        offset = initial * finalProgress
+ *
+ * 视觉：active 行先松手归位，越远的未唱行越晚松手 → 中段行间距拉大 → 末段统一归零。
+ *
+ * initial == 0f 表示稳态（无 active stretch），所有行 offset = 0。
+ */
+private data class StretchAnim(
+    val initial: Float,
+    val current: Float,
+    val activeIdxAtStart: Int,
+) {
+    companion object {
+        val Idle = StretchAnim(initial = 0f, current = 0f, activeIdxAtStart = -1)
+    }
+}
+
 private data class SmoothPositionAnchor(
     val positionMs: Long,
     val capturedAtNanos: Long,
@@ -618,6 +645,9 @@ internal fun AppleMusicLyricColumn(
     val density = LocalDensity.current
     var containerHeightPx by remember { mutableStateOf(0) }
 
+    // 切句拉扯动画状态 —— per-row offset 由它驱动，公式见 StretchAnim 注释
+    var stretchAnim by remember(lyricSessionKey) { mutableStateOf(StretchAnim.Idle) }
+
     // listState 创建时就用当前 active 行作为初始位置 —— 避免「LazyColumn 先渲染 index=0 顶部，
     // 再异步 LaunchedEffect 滚到 active」中间那一帧；用户在 immersive 打开 / 切歌瞬间能立刻
     // 看到正在唱的那行歌词，不会出现「行 N 唱完切到 N+1 时 N 才出来」的滞后现象。
@@ -685,8 +715,16 @@ internal fun AppleMusicLyricColumn(
         }
     }
 
-    // ---- Apple Music 风滚动：~720ms FastOutSlowIn，CSS ease 同曲线 ----
-    // animateScrollToItem 默认是 spring，对长歌词来说太弹；这里手写 tween 让滚动更线性 + 后段缓收。
+    // ---- Apple Music 风切句"拉扯"滚动（dokar3/amlv 同款算法）----
+    // 旧方案：spring 把 LazyColumn 滚到目标位置，整列一起平移 = 行间距恒定。
+    // 新方案：
+    //   1. dispatchRawDelta(delta) 把 LazyColumn 瞬间 snap 到终点（用户看不见物理滚动）
+    //   2. stretchAnim 记下 delta（initial=current=delta），所有可视行 translateY = delta
+    //      → 视觉上行还在原处，等于"假装没滚"
+    //   3. animate current: delta → 0（spring），每帧公式让远行落后 active 行
+    //      → active 行先松手归位，距离每 +1 → 在前 ~7% 进度静止再追，越远静止越久
+    //      → 中段未唱行的视觉位置离 active 比稳态更远 = 行间距"撑大"
+    //   4. anim 结束所有行 offset=0，列表已经在 step 1 滚到了终点 → 完美归位
     LaunchedEffect(scrollTargetIdx, containerHeightPx, manualScrollHoldUntilMs, clickSeekHoldUntilMs) {
         val heldClickIndex = clickSeekFocusIndex
         val now = SystemClock.elapsedRealtime()
@@ -702,26 +740,31 @@ internal fun AppleMusicLyricColumn(
         if (targetIdx !in lines.indices || containerHeightPx == 0) return@LaunchedEffect
         val waitMs = manualScrollHoldUntilMs - now
         val returningFromManualScroll = waitMs > 0L
-        if (waitMs > 0L) delay(waitMs)
+        if (waitMs > 0L) {
+            // 用户手动拖过，先把上次切句残留的 stretch 清零，避免"还在拽"
+            stretchAnim = StretchAnim.Idle
+            delay(waitMs)
+        }
         // 焦点位置：容器顶 11%，正好让活动行上方只露出 1 句历史歌词
         val info = listState.layoutInfo
         val visibleHit = info.visibleItemsInfo.firstOrNull { it.index == targetIdx }
         // 用户点击歌词行触发的 seek —— 立即把目标行 snap 到焦点位（11% from top），
-        // 不走 720ms spring，避免 "点了一下还要等 1/3 秒被拽过去" 的迟滞感。
-        // 自然播放切句仍走下方的 spring，保留 Apple Music "被拽过去" 的物理感。
+        // 不走拉扯，避免 "点了一下还要等回弹" 的迟滞感。
         val isClickSeekScroll = heldClickIndex != null && heldClickIndex == targetIdx
         if (isClickSeekScroll) {
+            stretchAnim = StretchAnim.Idle
             listState.scrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
             return@LaunchedEffect
         }
         if (visibleHit == null) {
+            // 跨很远切句（目标行不在可视范围）：直接 snap，不走拉扯（位移太大拉扯反而别扭）
+            stretchAnim = StretchAnim.Idle
             if (returningFromManualScroll) {
                 listState.animateScrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
                 if (manualScrollHoldUntilMs <= SystemClock.elapsedRealtime()) {
                     manualScrollHoldUntilMs = 0L
                 }
             } else {
-                // 正常播放跨很远切句时先 snap 到大致位置，避免一段超长滚动追不上音频。
                 listState.scrollToItem(targetIdx, scrollOffset = -focusOffsetPx)
             }
             return@LaunchedEffect
@@ -733,21 +776,25 @@ internal fun AppleMusicLyricColumn(
             }
             return@LaunchedEffect
         }
-        // tween 720ms FastOutSlowIn 跑增量积分：每帧给 LazyListState 一个 scrollBy(d-prev)
-        var prev = 0f
+        // 步骤 1：瞬间 snap 滚动（用户看不到，因为 step 2 立刻补偿）
+        listState.dispatchRawDelta(delta)
+        // 步骤 2：所有可视行先停留在视觉原位（current = delta）
+        stretchAnim = StretchAnim(
+            initial = delta,
+            current = delta,
+            activeIdxAtStart = targetIdx,
+        )
+        // 步骤 3：animate current → 0；每行 offset 由 graphicsLayer 块按 factor 公式独立计算
+        //   spring(ζ=0.86, k=110) ≈ 800ms 收敛，比 amlv 的 tween(1000) 略紧凑
+        //   ζ 比"标准 scroll"低（0.86 vs 0.92）= 收尾更柔，拉扯的"回弹"更明显
         animate(
-            initialValue = 0f,
-            targetValue = delta,
-            // Apple Music 行级滚动：从 AMLL 的 posY spring（mass=0.9 damping=15 stiffness=90）
-            // 翻译过来 → ζ≈0.83, k≈100。spring 比 tween 的 cubic-bezier 更"有重量"——
-            // 起步沉、收尾微弹，是 Apple Music 切句时那种"被拽过去"的物理感的核心。
-            animationSpec = spring(dampingRatio = 0.92f, stiffness = 190f),
+            initialValue = delta,
+            targetValue = 0f,
+            animationSpec = spring(dampingRatio = 0.86f, stiffness = 110f),
         ) { value, _ ->
-            val step = value - prev
-            prev = value
-            // suspend 不能直接调，但 listState.dispatchRawDelta 是同步的
-            listState.dispatchRawDelta(step)
+            stretchAnim = stretchAnim.copy(current = value)
         }
+        stretchAnim = StretchAnim.Idle
         if (returningFromManualScroll && manualScrollHoldUntilMs <= SystemClock.elapsedRealtime()) {
             manualScrollHoldUntilMs = 0L
         }
@@ -973,6 +1020,22 @@ internal fun AppleMusicLyricColumn(
                     // ease-out cubic
                     1f - (1f - raw).let { it * it * it }
                 }
+                // 切句"拉扯" per-row offset（amlv getItemOffsetY 公式）：
+                //   factor = 1 + max(0, idx - activeIdxAtStart) * 0.08
+                //   progress = current / initial            // 1 → 0
+                //   offset = initial * min(progress * factor, 1)
+                // 远的未唱行 factor>1，前 (1 - 1/factor) 进度静止 → 比 active 行慢回归 → 间距拉大。
+                val rowStretchPx = stretchAnim.let { anim ->
+                    if (anim.initial == 0f) {
+                        0f
+                    } else {
+                        val d = (idx - anim.activeIdxAtStart).coerceAtLeast(0)
+                        val factor = 1f + d * 0.08f
+                        val progress = anim.current / anim.initial
+                        val finalProgress = (progress * factor).coerceIn(0f, 1f)
+                        anim.initial * finalProgress
+                    }
+                }
                 // heightIn(min) 而不是 height(fixed) —— 长歌词自然换行成两行不被切。
                 // LazyColumn 内部支持变高 item，animateScrollToItem 仍能按 idx 定位。
                 val hasCompanionCue = hasVisibleCompanionLyric(line, smoothedPositionMs)
@@ -981,8 +1044,9 @@ internal fun AppleMusicLyricColumn(
                         .fillMaxWidth()
                         .heightIn(min = rowMinHeight)
                         .graphicsLayer {
-                            // 整列已经做了 24dp 抬升，这里行级只补 alpha，避免双层位移叠加。
+                            // 整列已经做了 24dp 抬升，这里行级只补 alpha + 切句拉扯位移。
                             alpha = rowStaggerAlpha
+                            translationY = rowStretchPx
                         }
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
@@ -1176,7 +1240,7 @@ private fun AppleMusicLyricRow(
     // 焦点感靠 alpha 对比 + 字符级 ramp 上浮，不靠 scale。
     //
     // alpha 关键约束：**past line（distance=1）必须比 fgUnsung（active 行未唱字符）更暗**。
-    // pickFgUnsung 现在是 0.40（深底）/ 0.43（浅底），所以 distance=1 必须 < 0.40。
+    // pickFgUnsung 现在是 0.40（深底）/ 0.44（浅底），所以 distance=1 必须 < 0.40。
     // 整体提一档，过去/未来行更亮更可读，仍守住"past 不亮于 active 未唱"红线。
     val baseTargetAlpha = if (hasCompanionCue) {
         1.0f
