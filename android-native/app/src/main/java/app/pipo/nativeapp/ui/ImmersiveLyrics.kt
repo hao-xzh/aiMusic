@@ -183,7 +183,8 @@ fun ImmersiveBackdrop(
 
 @Composable
 fun ImmersiveLyricsOverlay(
-    progress: Float,                  // 0=compact, 1=immersive
+    progress: Float,                  // 0=compact, 1=immersive（封面 FLIP 时间线）
+    contentProgress: Float,           // 0=未入场, 1=已入场（标题/歌词的独立内容时间线）
     coverUrl: String?,
     title: String,
     artist: String,
@@ -208,8 +209,7 @@ fun ImmersiveLyricsOverlay(
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
 
-    // 切歌淡出淡入：title 变了就 fade 0 → 1。封面和背景由外层 TransitioningCover /
-    // ImmersiveBackdrop 自己处理过渡，这里只管标题 + 歌词的内容层。
+    // 切歌淡出淡入：title 变了就 fade 0 → 1。跟入场/出场的 contentProgress 解耦。
     var lastTitle by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
     val contentFade = remember { androidx.compose.animation.core.Animatable(1f) }
     androidx.compose.runtime.LaunchedEffect(title) {
@@ -223,39 +223,45 @@ fun ImmersiveLyricsOverlay(
         lastTitle = title
     }
 
-    // 计算封面占据屏幕顶部的高度（跟 TransitioningCover 同步）
+    // 布局：标题 / 歌词列的位置**固定在 immersive 终态**（不再跟着封面 progress 走），
+    // 入场只做小幅 translateY + alpha。封面 FLIP 时其它东西不再跟着大幅平移 = "丝滑" 的关键。
     val configuration = LocalConfiguration.current
     val screenWDp = configuration.screenWidthDp.dp
-    val coverAreaHeight = screenWDp * progress.coerceIn(0f, 1f)
+    // tap 关闭区域仍跟着封面 progress 增长，避免点空封面尚未飞到的位置
+    val coverTapHeight = screenWDp * progress.coerceIn(0f, 1f)
+    val density = LocalDensity.current
+    val cp = contentProgress.coerceIn(0f, 1f)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            // progress 控制 immersive 进出整体透明度，contentFade 控制切歌时内容淡入淡出
-            .graphicsLayer { alpha = progress * contentFade.value },
+            // 只承载切歌的 cross-fade；入场 alpha 由内层每个元素独立处理
+            .graphicsLayer { alpha = contentFade.value },
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(coverAreaHeight)
+                .height(coverTapHeight)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                     onClick = onClose,
                 ),
         )
-        // 内容用绝对定位（Box.padding(top=...)），不再用 Column 顺序排：
-        //   - 标题压在封面下 1/4 处（progress=1 时 y ≈ coverArea - 80dp，叠在封面之上）
-        //   - 歌词从 coverArea - 28dp 开始（轻微"啃"进封面底）
-        //     由于 TransitioningCover 在底部加了 progress 驱动的渐隐 mask，
-        //     重叠区域看起来是封面平滑溶进歌词页
+        // 标题 / 歌词列绝对定位到 immersive 终态。封面 FLIP 期间它们还是 alpha 0，
+        // 由 contentProgress（延后 120ms 起跳）控制软入。
 
-        // 标题 + 副标题 + 控件条 —— 绝对定位在封面下 1/4
-        val titleTopPadding = (coverAreaHeight - 84.dp).coerceAtLeast(14.dp)
+        // 标题 + 副标题 + 控件条 —— 固定在封面下 1/4
+        val titleTopPadding = (screenWDp - 84.dp).coerceAtLeast(14.dp)
+        val titleRiseDp = 16.dp
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = titleTopPadding, start = 24.dp, end = 24.dp),
+                .padding(top = titleTopPadding, start = 24.dp, end = 24.dp)
+                .graphicsLayer {
+                    alpha = cp
+                    translationY = (1f - cp) * titleRiseDp.toPx()
+                },
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(
@@ -309,8 +315,10 @@ fun ImmersiveLyricsOverlay(
             }
         }
 
-        // 歌词列 —— 绝对定位，顶部"啃"进封面底 28dp（mask 让边界自然溶解）
-        val lyricsTopPadding = (coverAreaHeight - 28.dp).coerceAtLeast(80.dp)
+        // 歌词列 —— 固定在封面终态底部下方 28dp。封面 FLIP 期间整列 translateY 抬起 24dp，
+        // 内部各行按距 active 行的索引差 stagger 入场（cascade 焦点感）。
+        val lyricsTopPadding = (screenWDp - 28.dp).coerceAtLeast(80.dp)
+        val lyricsRiseDp = 24.dp
         AppleMusicLyricColumn(
             lines = lyrics,
             sessionId = trackId,
@@ -322,10 +330,14 @@ fun ImmersiveLyricsOverlay(
             fgUnsung = fgUnsung,
             showTranslation = showTranslation,
             onSeekToMs = onSeekToMs,
+            enterProgress = cp,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
-                .navigationBarsPadding(),
+                .navigationBarsPadding()
+                .graphicsLayer {
+                    translationY = (1f - cp) * lyricsRiseDp.toPx()
+                },
         )
     }
 }
@@ -571,6 +583,9 @@ internal fun AppleMusicLyricColumn(
     lyricFontWeight: FontWeight = FontWeight.ExtraBold,
     bottomFadeStart: Float = 0.80f,
     bottomFadeSoftEnd: Float = 0.94f,
+    // 0=未入场，1=完全入场。<1 时按行距 active 索引差做 stagger（active 先现，外圈延后），
+    // =1 时公式恒等返回 1，对稳态无任何影响（横屏 / 默认场景安全）。
+    enterProgress: Float = 1f,
 ) {
     val lyricSessionKey = remember(sessionId, lines) { lyricColumnSessionKey(sessionId, lines) }
     // 把 player 的 30Hz tick 平滑成按帧位置（120Hz 屏丝滑度提升关键）
@@ -947,6 +962,17 @@ internal fun AppleMusicLyricColumn(
                 } else {
                     kotlin.math.abs(idx - effectiveActiveIdx)
                 }
+                // 入场 stagger：active 行先到 1，距离每 +1 → 延后约 4% 的 enterProgress。
+                // 公式特点：enterProgress=1 时对任意 distance 恒返回 1（无副作用）。
+                val rowStaggerAlpha = if (enterProgress >= 0.999f) {
+                    1f
+                } else {
+                    val delayFrac = (distance * 0.04f).coerceAtMost(0.36f)
+                    val raw = ((enterProgress - delayFrac) / (1f - delayFrac))
+                        .coerceIn(0f, 1f)
+                    // ease-out cubic
+                    1f - (1f - raw).let { it * it * it }
+                }
                 // heightIn(min) 而不是 height(fixed) —— 长歌词自然换行成两行不被切。
                 // LazyColumn 内部支持变高 item，animateScrollToItem 仍能按 idx 定位。
                 val hasCompanionCue = hasVisibleCompanionLyric(line, smoothedPositionMs)
@@ -954,6 +980,10 @@ internal fun AppleMusicLyricColumn(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = rowMinHeight)
+                        .graphicsLayer {
+                            // 整列已经做了 24dp 抬升，这里行级只补 alpha，避免双层位移叠加。
+                            alpha = rowStaggerAlpha
+                        }
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,

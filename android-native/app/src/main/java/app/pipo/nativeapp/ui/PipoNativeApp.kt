@@ -5,7 +5,10 @@ import android.content.res.Configuration
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -116,15 +119,54 @@ fun PipoNativeApp() {
             }
         }
 
-        // 600ms FlipEase 入 / 540ms CloseEase 出，驱动整个沉浸式过渡
+        // 封面 FLIP 形变：spring 物理，~360ms 软着陆 + 半路反向时无跳变。
+        // 入场 ζ≈0.86 / k=380 是"沉一点、稳一点"的 iOS 手感；
+        // 出场 ζ≈0.95 / k=520 更快收，避免回到 compact 时还有人能感受到的滞留。
         val coverProgress by animateFloatAsState(
             targetValue = if (immersive) 1f else 0f,
-            animationSpec = tween(
-                durationMillis = if (immersive) PipoMotion.FlipDurationMs else PipoMotion.CloseDurationMs,
-                easing = if (immersive) PipoMotion.FlipEase else PipoMotion.CloseEase,
-            ),
+            animationSpec = if (immersive) {
+                spring(
+                    dampingRatio = 0.86f,
+                    stiffness = 380f,
+                    visibilityThreshold = 0.001f,
+                )
+            } else {
+                spring(
+                    dampingRatio = 0.95f,
+                    stiffness = 520f,
+                    visibilityThreshold = 0.001f,
+                )
+            },
             label = "coverProgress",
         )
+
+        // 内容时间线（标题 / 控件 / 歌词列）—— 与封面解耦：
+        //   入场：延后 120ms 让封面先飞，再 340ms ease-out 软入
+        //   出场：无延迟，180ms ease-in，"内容先消失、封面再收回"
+        // 这样封面在飞时其它东西不会跟着大幅平移 / 透明度阶跃，"丝滑感"的关键。
+        val contentProgressAnim = remember { Animatable(0f) }
+        LaunchedEffect(immersive) {
+            if (immersive) {
+                delay(120)
+                contentProgressAnim.animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(
+                        durationMillis = 340,
+                        easing = CubicBezierEasing(0.2f, 0.9f, 0.15f, 1f),
+                    ),
+                )
+            } else {
+                contentProgressAnim.animateTo(
+                    targetValue = 0f,
+                    animationSpec = tween(
+                        durationMillis = 180,
+                        easing = CubicBezierEasing(0.4f, 0f, 1f, 1f),
+                    ),
+                )
+            }
+        }
+        val contentProgress = contentProgressAnim.value
+
         // compact 封面 / nav 图标在过渡期间都隐藏（0.02 阈值给浮点误差留余量）
         val coverInTransition by remember {
             derivedStateOf { coverProgress > 0.02f }
@@ -297,6 +339,7 @@ fun PipoNativeApp() {
                     )
                     ImmersiveLyricsOverlay(
                         progress = coverProgress,
+                        contentProgress = contentProgress,
                         coverUrl = viewModel.state.artworkUrl,
                         title = viewModel.state.title,
                         artist = viewModel.state.artist,
