@@ -17,6 +17,14 @@ use serde_json::json;
 use super::client::NeteaseClient;
 use super::models::*;
 
+#[derive(Default)]
+struct CloudHydrationResult {
+    tracks: Vec<TrackInfo>,
+    returned_count: usize,
+    pages: usize,
+    error: Option<String>,
+}
+
 impl NeteaseClient {
     pub async fn qr_unikey(&self) -> Result<String> {
         let resp: QrUnikeyResp = self
@@ -108,20 +116,56 @@ impl NeteaseClient {
     }
 
     pub async fn playlist_detail(&self, id: i64) -> Result<PlaylistDetail> {
-        let resp: PlaylistDetailResp = self
-            .weapi("v6/playlist/detail", json!({ "id": id, "n": 1000 }))
-            .await?;
-        if resp.code != 200 {
-            return Err(anyhow!("playlist_detail code={}", resp.code));
-        }
-        self.hydrate_playlist_tracks(resp.playlist).await
+        let mut fallback_error = None;
+        let (resp, source): (PlaylistDetailResp, &'static str) = match self
+            .linuxapi::<PlaylistDetailResp>(
+                "v3/playlist/detail",
+                json!({ "id": id, "n": 100000, "s": 8 }),
+            )
+            .await
+        {
+            Ok(resp) if resp.code == 200 => (resp, "linuxapi_v3"),
+            Ok(resp) => {
+                fallback_error = Some(compact_error(format!("linuxapi_v3 code={}", resp.code)));
+                let fallback: PlaylistDetailResp = self
+                    .weapi("v6/playlist/detail", json!({ "id": id, "n": 1000 }))
+                    .await?;
+                if fallback.code != 200 {
+                    return Err(anyhow!("playlist_detail fallback code={}", fallback.code));
+                }
+                (fallback, "weapi_v6")
+            }
+            Err(e) => {
+                fallback_error = Some(compact_error(format!("{e:#}")));
+                let fallback: PlaylistDetailResp = self
+                    .weapi("v6/playlist/detail", json!({ "id": id, "n": 1000 }))
+                    .await?;
+                if fallback.code != 200 {
+                    return Err(anyhow!("playlist_detail fallback code={}", fallback.code));
+                }
+                (fallback, "weapi_v6")
+            }
+        };
+        self.hydrate_playlist_tracks(resp.playlist, source, fallback_error)
+            .await
     }
 
     async fn hydrate_playlist_tracks(
         &self,
         mut playlist: PlaylistDetail,
+        source: &'static str,
+        fallback_error: Option<String>,
     ) -> Result<PlaylistDetail> {
+        let mut diagnostics = PlaylistHydrationDiagnostics {
+            playlist_detail_source: source.to_string(),
+            playlist_detail_fallback_error: fallback_error.unwrap_or_default(),
+            original_tracks_count: playlist.tracks.len(),
+            track_ids_count: playlist.track_ids.len(),
+            ..Default::default()
+        };
         if playlist.track_ids.is_empty() || playlist.tracks.len() >= playlist.track_ids.len() {
+            diagnostics.final_tracks_count = playlist.tracks.len();
+            playlist.hydration_diagnostics = diagnostics;
             return Ok(playlist);
         }
 
@@ -132,9 +176,47 @@ impl NeteaseClient {
             .copied()
             .filter(|id| !by_id.contains_key(id))
             .collect::<Vec<_>>();
+        diagnostics.song_detail_requested = missing_ids.len();
 
-        for track in self.song_detail_best_effort(&missing_ids).await {
+        let song_detail_tracks = self.song_detail_best_effort(&missing_ids).await;
+        diagnostics.song_detail_resolved = song_detail_tracks.len();
+        for track in song_detail_tracks {
             by_id.insert(track.id, track);
+        }
+
+        let still_missing = playlist
+            .track_ids
+            .iter()
+            .copied()
+            .filter(|id| !by_id.contains_key(id))
+            .collect::<Vec<_>>();
+        if !still_missing.is_empty() {
+            diagnostics.cloud_by_ids_requested = still_missing.len();
+            let cloud_result = self.cloud_tracks_by_ids_best_effort(&still_missing).await;
+            diagnostics.cloud_by_ids_returned = cloud_result.returned_count;
+            diagnostics.cloud_by_ids_resolved = cloud_result.tracks.len();
+            diagnostics.cloud_by_ids_error = cloud_result.error.unwrap_or_default();
+            for track in cloud_result.tracks {
+                by_id.insert(track.id, track);
+            }
+        }
+
+        let still_missing = playlist
+            .track_ids
+            .iter()
+            .copied()
+            .filter(|id| !by_id.contains_key(id))
+            .collect::<Vec<_>>();
+        if !still_missing.is_empty() {
+            diagnostics.cloud_scan_requested = still_missing.len();
+            let cloud_result = self.cloud_tracks_best_effort(&still_missing).await;
+            diagnostics.cloud_scan_pages = cloud_result.pages;
+            diagnostics.cloud_scan_returned = cloud_result.returned_count;
+            diagnostics.cloud_scan_resolved = cloud_result.tracks.len();
+            diagnostics.cloud_scan_error = cloud_result.error.unwrap_or_default();
+            for track in cloud_result.tracks {
+                by_id.insert(track.id, track);
+            }
         }
 
         let ordered = playlist
@@ -142,9 +224,19 @@ impl NeteaseClient {
             .iter()
             .filter_map(|id| by_id.get(id).cloned())
             .collect::<Vec<_>>();
+        let final_missing = playlist
+            .track_ids
+            .iter()
+            .copied()
+            .filter(|id| !by_id.contains_key(id))
+            .collect::<Vec<_>>();
+        diagnostics.final_tracks_count = ordered.len();
+        diagnostics.missing_after_hydration = final_missing.len();
+        diagnostics.missing_id_sample = final_missing.into_iter().take(16).collect();
         if !ordered.is_empty() {
             playlist.tracks = ordered;
         }
+        playlist.hydration_diagnostics = diagnostics;
         Ok(playlist)
     }
 
@@ -181,6 +273,117 @@ impl NeteaseClient {
             pending = still_missing;
         }
         out
+    }
+
+    async fn cloud_tracks_by_ids_best_effort(&self, ids: &[i64]) -> CloudHydrationResult {
+        let needed = ids.iter().copied().collect::<HashSet<_>>();
+        let mut found = HashSet::new();
+        let mut result = CloudHydrationResult::default();
+
+        for chunk in ids.chunks(100) {
+            let page = match self.user_cloud_tracks_by_ids(chunk).await {
+                Ok(page) => page,
+                Err(e) => {
+                    result.error = Some(compact_error(format!("{e:#}")));
+                    eprintln!(
+                        "[netease] user_cloud_byids failed: size={} first_id={:?}: {e:#}",
+                        chunk.len(),
+                        chunk.first(),
+                    );
+                    continue;
+                }
+            };
+            result.pages += 1;
+            result.returned_count += page.data.len();
+            for item in page.data {
+                for (candidate_id, track) in item.into_track_candidates() {
+                    if needed.contains(&candidate_id) && found.insert(candidate_id) {
+                        result.tracks.push(track);
+                    }
+                }
+            }
+            if found.len() >= needed.len() {
+                break;
+            }
+        }
+
+        result
+    }
+
+    async fn cloud_tracks_best_effort(&self, ids: &[i64]) -> CloudHydrationResult {
+        let needed = ids.iter().copied().collect::<HashSet<_>>();
+        let mut found = HashSet::new();
+        let mut result = CloudHydrationResult::default();
+        let limit = 200i64;
+        let mut offset = 0i64;
+
+        // The cloud library is private-user scoped and can be large. Page gently and stop
+        // once all missing playlist ids are found.
+        for _ in 0..25 {
+            let page = match self.user_cloud_tracks_page(limit, offset).await {
+                Ok(page) => page,
+                Err(e) => {
+                    result.error = Some(compact_error(format!("{e:#}")));
+                    eprintln!("[netease] user_cloud page failed offset={offset}: {e:#}");
+                    break;
+                }
+            };
+            let has_more = page.has_more
+                || page
+                    .count
+                    .map(|count| offset + (page.data.len() as i64) < count)
+                    .unwrap_or(false);
+            let page_len = page.data.len();
+            result.pages += 1;
+            result.returned_count += page_len;
+            for item in page.data {
+                for (candidate_id, track) in item.into_track_candidates() {
+                    if needed.contains(&candidate_id) && found.insert(candidate_id) {
+                        result.tracks.push(track);
+                    }
+                }
+            }
+            if found.len() >= needed.len() || !has_more || page_len == 0 {
+                break;
+            }
+            offset += limit;
+        }
+
+        result
+    }
+
+    async fn user_cloud_tracks_page(&self, limit: i64, offset: i64) -> Result<UserCloudResp> {
+        let resp: UserCloudResp = self
+            .weapi(
+                "v1/cloud/get",
+                json!({
+                    "limit": limit,
+                    "offset": offset,
+                }),
+            )
+            .await?;
+        let code = resp.code_or_ok();
+        if code != 200 {
+            return Err(anyhow!("user_cloud code={}", code));
+        }
+        Ok(resp)
+    }
+
+    async fn user_cloud_tracks_by_ids(&self, ids: &[i64]) -> Result<UserCloudResp> {
+        let song_ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let resp: UserCloudResp = self
+            .weapi(
+                "v1/cloud/get/byids",
+                json!({
+                    "songIds": song_ids,
+                }),
+            )
+            .await?;
+        let code = resp.code_or_ok();
+        if code != 200 {
+            return Err(anyhow!("user_cloud_byids code={}", code));
+        }
+        Ok(resp)
     }
 
     pub async fn song_detail(&self, ids: &[i64]) -> Result<Vec<TrackInfo>> {
@@ -277,4 +480,13 @@ impl NeteaseClient {
             uncollected: resp.uncollected,
         })
     }
+}
+
+fn compact_error(message: String) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut out = message.chars().take(MAX_CHARS).collect::<String>();
+    if message.chars().count() > MAX_CHARS {
+        out.push_str("...");
+    }
+    out
 }

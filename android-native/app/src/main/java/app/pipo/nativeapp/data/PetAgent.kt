@@ -163,7 +163,7 @@ class PetAgent(
                 )
             }
             runCatching {
-                recommendationLog.log(toInsert.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
+                recommendationLog.logTracks(toInsert, RecommendationLog.Source.Pet)
             }
             DiagnosticsLogStore.record(
                 area = "ai_agent",
@@ -224,8 +224,12 @@ class PetAgent(
             )
             // smooth-queue 平滑接歌
             val asTracks = ranked.map { it.candidate.track }
+            // 全池 artist 多样性:用户没点名艺人时,把 ranker 输出按"同 artist ≤ cap" 切
+            // primary + overflow(round-robin),保证 reservoir 也是混合的,续杯不会扎堆。
+            val diversified = if (requestedArtistKeys.isNotEmpty()) asTracks
+                else diversifyByArtist(asTracks)
             val promptScopedTracks = prioritizeRequestedArtists(
-                tracks = asTracks,
+                tracks = diversified,
                 artistKeys = requestedArtistKeys,
                 desired = desired * 3,
             )
@@ -315,7 +319,7 @@ class PetAgent(
         // 3) 记 recommendation log（防 24h 内重复）—— 只记 initialBatch；reservoir
         //    在 makeContinuousSource 真被 drain 时才记，避免双重计数让 recencyPen 翻倍
         runCatching {
-            recommendationLog.log(initialBatch.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet)
+            recommendationLog.logTracks(initialBatch, RecommendationLog.Source.Pet)
         }
         val reservoir = final.drop(12)
         DiagnosticsLogStore.record(
@@ -380,7 +384,7 @@ class PetAgent(
      */
     private fun resolvePinnedTracks(intent: PetIntent, library: List<NativeTrack>): List<NativeTrack> {
         if (library.isEmpty()) return emptyList()
-        val titles = (intent.hardTracks + intent.textTracks).map { it.trim() }.filter { it.isNotEmpty() }
+        val titles = namedTrackTitles(intent)
         if (titles.isEmpty()) return emptyList()
         val artistKeys = (intent.hardArtists + intent.textArtists)
             .map(::normalizeForMatch).filter { it.isNotEmpty() }.toSet()
@@ -434,11 +438,12 @@ class PetAgent(
         intent: PetIntent,
         alreadyPinned: List<NativeTrack>,
     ): List<NativeTrack> {
-        val titles = (intent.hardTracks + intent.textTracks).map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val titles = namedTrackTitles(intent)
         if (titles.isEmpty()) return emptyList()
 
-        val pinnedTitleKeys = alreadyPinned.mapTo(HashSet()) { normalizeForMatch(it.title) }
-        val missing = titles.filter { normalizeForMatch(it) !in pinnedTitleKeys }
+        val missing = titles.filter { title ->
+            alreadyPinned.none { pinned -> titleMatchesRequest(pinned.title, title) }
+        }
         if (missing.isEmpty()) return emptyList()
 
         // 多 artist 时只用第一个不靠谱（"陈奕迅 浮夸 + 周杰伦 七里香" → "七里香 陈奕迅"）。
@@ -452,11 +457,9 @@ class PetAgent(
                 async {
                     val q = if (singleArtistHint.isNotEmpty()) "$title $singleArtistHint" else title
                     runCatching { repository.searchTracks(q, limit = 3) }.getOrDefault(emptyList())
-                        .firstOrNull { hit ->
+                        .filter { hit ->
                             // 只接受标题 fuzzy 命中的，避免搜索引擎乱推不相干的
-                            val tk = normalizeForMatch(hit.title)
-                            val want = normalizeForMatch(title)
-                            if (tk.isEmpty() || (tk != want && want !in tk && tk !in want)) return@firstOrNull false
+                            if (!titleMatchesRequest(hit.title, title)) return@filter false
                             // 单 artist hint 时也校验 artist 命中（防搜索引擎乱推同名）
                             if (singleArtistHint.isNotEmpty()) {
                                 val artistKey = normalizeForMatch(singleArtistHint)
@@ -465,10 +468,26 @@ class PetAgent(
                                 }
                             } else true
                         }
+                        .minByOrNull { hit -> trackVariantWeight(hit.title) }
                 }
             }
             deferred.mapNotNull { it.await() }
         }
+    }
+
+    private fun namedTrackTitles(intent: PetIntent): List<String> {
+        return (intent.hardTracks + intent.textTracks)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { normalizeForMatch(it) }
+    }
+
+    private fun titleMatchesRequest(actualTitle: String, requestedTitle: String): Boolean {
+        val actual = normalizeForMatch(actualTitle)
+        val requested = normalizeForMatch(requestedTitle)
+        return actual.isNotEmpty() &&
+            requested.isNotEmpty() &&
+            (actual == requested || requested in actual || actual in requested)
     }
 
     /** 按 songKey 去重保序合并 */
@@ -533,7 +552,7 @@ class PetAgent(
                 drained.add(t)
             }
             if (drained.isNotEmpty()) {
-                runCatching { recommendationLog.log(drained.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet) }
+                runCatching { recommendationLog.logTracks(drained, RecommendationLog.Source.Pet) }
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
                     event = "continuous_drain",
@@ -567,7 +586,7 @@ class PetAgent(
                     if (collected.size >= 12) break
                 }
                 val refill = collected.take(8)
-                runCatching { recommendationLog.log(refill.mapNotNull { it.neteaseId }, RecommendationLog.Source.Pet) }
+                runCatching { recommendationLog.logTracks(refill, RecommendationLog.Source.Pet) }
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
                     event = "continuous_refill",
@@ -669,6 +688,41 @@ class PetAgent(
         if (part == requested) return true
         if (requested.length < 3 || part.length < 3) return false
         return requested in part || part in requested
+    }
+
+    /**
+     * 全池 artist 多样性:同 artist 上限按池大小动态算 max(2, len/8),溢出按 artist
+     * 轮转(round-robin)拼到尾部。镜像 Web 端 diversifyTrackInfos —— 保证 reservoir
+     * 里也是不同艺人混合,续杯不再 8 首全是 Taylor。
+     */
+    private fun diversifyByArtist(items: List<NativeTrack>): List<NativeTrack> {
+        if (items.isEmpty()) return items
+        val seenSongs = HashSet<String>()
+        val artistCounts = HashMap<String, Int>()
+        val cap = maxOf(2, items.size / 8)
+        val primary = ArrayList<NativeTrack>(items.size)
+        val overflow = LinkedHashMap<String, MutableList<NativeTrack>>()
+        for (t in items) {
+            val sk = TrackDedupe.songKey(t)
+            if (!seenSongs.add(sk)) continue
+            val ak = normalizeForMatch(t.artist.split('/', '&', ',', '、').firstOrNull().orEmpty())
+            val count = artistCounts[ak] ?: 0
+            if (ak.isNotEmpty() && count >= cap) {
+                overflow.getOrPut(ak) { mutableListOf() }.add(t)
+                continue
+            }
+            if (ak.isNotEmpty()) artistCounts[ak] = count + 1
+            primary.add(t)
+        }
+        // round-robin overflow
+        val overflowOut = ArrayList<NativeTrack>()
+        val buckets = overflow.values.map { it.toMutableList() }
+        while (buckets.any { it.isNotEmpty() }) {
+            for (b in buckets) {
+                if (b.isNotEmpty()) overflowOut.add(b.removeAt(0))
+            }
+        }
+        return primary + overflowOut
     }
 
     private fun errorFields(error: Throwable): Map<String, Any?> =

@@ -11,6 +11,8 @@ object CandidateRanker {
     data class Ranked(
         val candidate: CandidateRecall.Candidate,
         val finalScore: Double,
+        /** 分位 bucket(0..3,0 最高分位),供续杯端跨段抽样 */
+        val bucket: Int = 0,
     )
 
     data class Options(
@@ -19,11 +21,14 @@ object CandidateRanker {
         val recentRecommendation: RecommendationLog.RecentContext? = null,
     )
 
-    private const val W_INTENT = 0.35
-    private const val W_TRANSITION = 0.15
+    // 权重 v2(2026-05) —— 跟 Web 端 candidate-ranker.ts 对齐。
+    // TASTE 0.25 → 0.40,内部走 max(profileTags/1.2, acoustic*0.9, profile*0.5, audio*0.7),
+    // 让画像维度(风格/情绪/年代/文化/声学)替代旧版"只看 topArtists"的主信号。
+    private const val W_INTENT = 0.30
+    private const val W_TRANSITION = 0.13
     private const val W_FRESHNESS = 0.07
-    private const val W_TASTE = 0.25
-    private const val W_BEHAVIOR = 0.18
+    private const val W_TASTE = 0.40
+    private const val W_BEHAVIOR = 0.10
 
     fun rank(
         candidates: List<CandidateRecall.Candidate>,
@@ -53,9 +58,16 @@ object CandidateRanker {
                 c.sourceScores[CandidateRecall.Source.Semantic] ?: 0.0,
                 (c.sourceScores[CandidateRecall.Source.SemanticBroad] ?: 0.0) * 0.65,
             ))
+            // taste 内部:ProfileTags(风格维度) + Acoustic(声学维度)主导,Profile(artist) 0.5×
             val tasteScore = clamp01(maxOf(
-                c.sourceScores[CandidateRecall.Source.Profile] ?: 0.0,
-                (c.sourceScores[CandidateRecall.Source.Audio] ?: 0.0) * 0.7,
+                maxOf(
+                    (c.sourceScores[CandidateRecall.Source.ProfileTags] ?: 0.0) / 1.2,
+                    (c.sourceScores[CandidateRecall.Source.Acoustic] ?: 0.0) * 0.9,
+                ),
+                maxOf(
+                    (c.sourceScores[CandidateRecall.Source.Profile] ?: 0.0) * 0.5,
+                    (c.sourceScores[CandidateRecall.Source.Audio] ?: 0.0) * 0.7,
+                ),
             ))
             val behaviorScore = clamp01((c.sourceScores[CandidateRecall.Source.Behavior] ?: 0.0) / 1.5)
             val transitionScore = clamp01(c.sourceScores[CandidateRecall.Source.Transition] ?: 0.0)
@@ -65,18 +77,23 @@ object CandidateRanker {
             )
 
             val w = rankWeights(intent)
+            // 扰动 0.025 → 0.08(跟 Web 对齐),配合 bucket 洗牌共破"同 query 总同结果"
             val baseScore = intentScore * W_INTENT +
                 tagScore * w.tag + semanticScore * w.semantic +
                 tasteScore * w.taste + behaviorScore * w.behavior +
                 transitionScore * W_TRANSITION + freshnessScore * W_FRESHNESS +
-                rnd.nextDouble() * 0.025
+                rnd.nextDouble() * 0.08
 
             val recentPlayPenalty = if (explicitlyMentioned) 0.0
                 else recentPenalty(neteaseId, options.recentPlay?.last24hTrackIds, options.recentPlay?.last7dTrackIds, 0.5, 0.25)
             val recentRecPenalty = if (explicitlyMentioned) 0.0
                 else recentPenalty(neteaseId, options.recentRecommendation?.last24hTrackIds, options.recentRecommendation?.last7dTrackIds, 0.35, 0.15)
+            // artist-level fatigue —— 修"自由推荐总是同一歌手"。
+            // 阈值: 24h ≥5 次 -0.30, ≥10 -0.30(累计), 7d ≥20 -0.20。explicit 时不 fatigue。
+            val artistFatiguePenalty = if (explicitlyMentioned) 0.0
+                else computeArtistFatigue(c.track, options.recentRecommendation)
 
-            val finalScore = baseScore - recentPlayPenalty - recentRecPenalty
+            val finalScore = baseScore - recentPlayPenalty - recentRecPenalty - artistFatiguePenalty
             if (finalScore <= 0) continue
             ranked.add(Ranked(c, finalScore))
         }
@@ -86,8 +103,63 @@ object CandidateRanker {
             intent.musicHintsGenres + intent.musicHintsMoods + intent.textTracks + intent.textArtists + intent.textAlbums
         )
         val deduped = if (asksVersion) ranked else dedupeByCandidate(ranked)
-        return deduped.take(options.topN)
+
+        // 分位 bucket 洗牌(同 query 重复触发时让顺序在每段内变化,跨段保持优先级)
+        val withBuckets = if (!asksVersion && deduped.size > 8) {
+            shuffleByBuckets(deduped)
+        } else {
+            // 至少打 bucket 标签
+            deduped.mapIndexed { idx, r -> r.copy(bucket = pickBucket(idx, deduped.size)) }
+        }
+        return withBuckets.take(options.topN)
     }
+
+    private fun pickBucket(rank: Int, total: Int): Int {
+        val ratio = rank.toDouble() / maxOf(1, total)
+        return when {
+            ratio < 0.25 -> 0
+            ratio < 0.50 -> 1
+            ratio < 0.75 -> 2
+            else -> 3
+        }
+    }
+
+    private fun shuffleByBuckets(items: List<Ranked>): List<Ranked> {
+        val withBucket = items.mapIndexed { idx, r -> r.copy(bucket = pickBucket(idx, items.size)) }
+        val groups = Array(4) { ArrayList<Ranked>() }
+        for (r in withBucket) groups[r.bucket].add(r)
+        for (g in groups) g.shuffle()
+        val out = ArrayList<Ranked>(items.size)
+        for (g in groups) out.addAll(g)
+        return out
+    }
+
+    /**
+     * artist-level fatigue —— 镜像 Web 端 computeArtistFatigue。
+     *
+     * 阈值 v2(2026-05 放宽):用户反馈"压完同艺人浮上来的歌偏冷门",原来 24h ≥5 -0.30
+     * 触发太早。放宽到 24h ≥8 -0.15 / ≥15 -0.20(累计 -0.35) / 7d ≥30 -0.15(累计 -0.50)。
+     * 让"用户喜欢的艺人继续推"的空间更大,fatigue 仍能挡住"连推 20 首同人"的极端情况,
+     * 但不会把"听了 5 首 Taylor"就立刻切到非 Taylor 的歌。
+     */
+    private fun computeArtistFatigue(
+        track: NativeTrack,
+        ctx: RecommendationLog.RecentContext?,
+    ): Double {
+        if (ctx == null) return 0.0
+        val key = normalizeArtistKey(track.artist.split('/', '&', ',', '、').firstOrNull().orEmpty())
+        if (key.isEmpty()) return 0.0
+        val c24 = ctx.last24hArtistCounts[key] ?: 0
+        val c7 = ctx.last7dArtistCounts[key] ?: 0
+        var penalty = 0.0
+        if (c24 >= 8) penalty += 0.15
+        if (c24 >= 15) penalty += 0.20
+        if (c7 >= 30) penalty += 0.15
+        return penalty
+    }
+
+    private fun normalizeArtistKey(s: String): String =
+        s.lowercase().replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？]+"), "")
 
     private fun dedupeByCandidate(items: List<Ranked>): List<Ranked> {
         val seen = HashSet<String>()

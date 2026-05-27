@@ -37,25 +37,75 @@ export type DiscoveryOptions = {
   perSeedLimit?: number;
   finalCount?: number;
   onProgress?: (p: DiscoveryProgress) => void;
+  /**
+   * 用户此刻的提示词(从对话 intent 透传)。让 seed 偏向当下的口味
+   * 而不是只看长期画像。
+   */
+  intentHint?: {
+    artists?: string[];
+    moods?: string[];
+    genres?: string[];
+  };
+  /**
+   * "最近推过太多次"的艺人,seed prompt 里告诉 AI 别再围着他们转 —— 修
+   * "AI 老 seed 同一批艺人"的根因。Normalize 后的 artist name list。
+   */
+  avoidArtists?: string[];
 };
 
 // ---------- 主入口 ----------
+
+// 15 分钟内存缓存:同画像 + 同意图近似(同 artists/moods)在窗口内复用同一批
+// discovery 结果。窗口短是为了让画像更新 / 用户切换诉求时能尽快重算。
+type DiscoveryCacheEntry = {
+  ts: number;
+  picks: DiscoveryPick[];
+};
+const DISCOVERY_CACHE_MS = 15 * 60 * 1000;
+const discoveryCache = new Map<string, DiscoveryCacheEntry>();
+
+function discoveryCacheKey(
+  profile: TasteProfile,
+  opts: DiscoveryOptions,
+): string {
+  const intent = opts.intentHint
+    ? [...(opts.intentHint.artists ?? []), ...(opts.intentHint.moods ?? []), ...(opts.intentHint.genres ?? [])]
+        .join("|")
+        .toLowerCase()
+    : "";
+  const avoid = (opts.avoidArtists ?? []).slice(0, 5).join("|").toLowerCase();
+  // profile 用 sourceHash + derivedAt 标识同一次蒸馏
+  return `${profile.sourceHash}::${profile.derivedAt}::${opts.finalCount ?? "d"}::${intent}::${avoid}`;
+}
 
 export async function discoverBeyondLibrary(
   profile: TasteProfile,
   ownedTrackIds: Set<number>,
   opts: DiscoveryOptions = {},
 ): Promise<DiscoveryPick[]> {
+  // 缓存命中直接返回(过滤掉这次的 ownedTrackIds —— 用户可能在窗口内加了新歌)
+  const ck = discoveryCacheKey(profile, opts);
+  const cached = discoveryCache.get(ck);
+  if (cached && Date.now() - cached.ts < DISCOVERY_CACHE_MS) {
+    const filtered = cached.picks.filter((p) => !ownedTrackIds.has(p.track.id));
+    if (filtered.length > 0) {
+      opts.onProgress?.({ phase: "done", pickCount: filtered.length });
+      return filtered;
+    }
+  }
+
   const {
     seedCount = 12,
     perSeedLimit = 10,
     finalCount = 15,
     onProgress = () => {},
+    intentHint,
+    avoidArtists,
   } = opts;
 
   // ---- 1) AI 出 seeds ----
   onProgress({ phase: "seeding" });
-  const seeds = await generateSeeds(profile, seedCount);
+  const seeds = await generateSeeds(profile, seedCount, { intentHint, avoidArtists });
 
   // ---- 2) 真实搜索聚合 ----
   // 简单串行（Netease 不喜欢瞬时并发太多） + 失败容错（单 seed 挂了不影响整体）
@@ -94,6 +144,9 @@ export async function discoverBeyondLibrary(
   onProgress({ phase: "ranking", candidateCount: candidateList.length });
   const ranked = await rankCandidates(profile, candidateList, finalCount);
 
+  // 写缓存(15min 内同 key 复用)
+  discoveryCache.set(ck, { ts: Date.now(), picks: ranked });
+
   onProgress({ phase: "done", pickCount: ranked.length });
   return ranked;
 }
@@ -103,6 +156,10 @@ export async function discoverBeyondLibrary(
 async function generateSeeds(
   profile: TasteProfile,
   count: number,
+  ctx: {
+    intentHint?: DiscoveryOptions["intentHint"];
+    avoidArtists?: string[];
+  } = {},
 ): Promise<DiscoverySeed[]> {
   // 把画像中关键字段提炼成 prompt 上下文
   const profileSnippet = JSON.stringify({
@@ -116,30 +173,49 @@ async function generateSeeds(
   });
 
   const acousticBlock = formatAcousticBlock(profile);
+  const intentBlock =
+    ctx.intentHint &&
+    ((ctx.intentHint.artists?.length ?? 0) +
+      (ctx.intentHint.moods?.length ?? 0) +
+      (ctx.intentHint.genres?.length ?? 0) >
+      0)
+      ? `\n用户此刻说想要:${JSON.stringify(ctx.intentHint)}\n→ seed 优先贴这个当下诉求,画像作为长期锚点;两者冲突时听当下。\n`
+      : "";
+  const avoidBlock =
+    ctx.avoidArtists && ctx.avoidArtists.length > 0
+      ? `\n近期已经反复推过的艺人(seed 不要再围着他们转):${ctx.avoidArtists.slice(0, 8).join("、")}\n` +
+        `→ 把 seed 的重心放在画像里的 genres / culturalContext / 相邻艺人上,而不是这几个已经听腻的人。\n`
+      : "";
 
   const user =
     `这是用户的口味画像（JSON）：\n${profileSnippet}\n` +
     acousticBlock +
+    intentBlock +
+    avoidBlock +
     `\n任务：为这个用户生成 ${count} 个"搜索 seed"，去网易云搜出 TA 可能喜欢但歌单里**还没有**的歌。\n` +
     `要求：\n` +
-    `1) seed 要"窄而准"——具体艺人 + 代表专辑、或者"子流派 + 年代"、或者"情绪 + 文化语境"。\n` +
+    `1) **核心目标:贴 TA 的口味**。画像 genres / moods / culturalContext / 声学指纹是 ground truth,\n` +
+    `   seed 要让搜出来的歌"听起来像 TA 会喜欢的"。冷门不是目标,是**可以接受的副作用** ——\n` +
+    `   优先级是 [贴口味] >> [新鲜度] > [冷门度]。\n` +
+    `2) seed 要"窄而准"——具体艺人 + 代表专辑、或者"子流派 + 年代"、或者"情绪 + 文化语境"。\n` +
     `   反例：太宽（"流行歌曲"）、太通用（"古典音乐"）、纯英文情绪词（"sad songs"）\n` +
-    `2) 优先推荐用户**没列出**的艺人 / 同流派的相邻艺人 / 那一脉的"挖宝"曲目。\n` +
-    `3) seeds 可以有自然变化，但不要为了多样性刻意避开同一艺人；贴口味更重要。\n` +
+    `3) topArtists 已经在 TA 库里了不用 seed 他们本人,但**风格相邻**的艺人是首选 ——\n` +
+    `   听 Taylor 的用户 seed Phoebe Bridgers / Lorde / Mitski 这种,而不是 seed 一个完全风格不搭的 indie 实验艺人。\n` +
     (acousticBlock
-      ? `   特别地：声学指纹给的 BPM 区间 / 响度气质 / 音色亮度是 ground truth，` +
-        `seed 要尽量贴这份指纹（比如指纹偏慢就别推 EDM，偏暗就别推干净 pop）。\n`
+      ? `4) 声学指纹给的 BPM 区间 / 响度气质 / 音色亮度是硬约束:` +
+        `指纹偏慢就别推 EDM,偏暗就别推干净 pop,跑偏的 seed 直接不要。\n`
       : "") +
-    `4) query 字段就是要塞进搜索框的那串字符（中英都行，看哪个更精准）。\n` +
-    `5) 不要解释。\n\n` +
+    `5) query 字段就是要塞进搜索框的那串字符（中英都行，看哪个更精准）。\n` +
+    `6) 不要解释。\n\n` +
     `严格只输出一行 JSON：{"seeds":[{"query":"..."}]}\n` +
     `不要 markdown，不要解释，不要代码块包裹。`;
 
   const raw = await ai.chat({
     system:
-      "你是 Claudio 的库外探索器。听过比客人多的曲库，懂得帮 TA 挖到 TA 自己还没找到的同气质宝藏。只输出 JSON。",
+      "你是 Claudio 的库外探索器。听过比客人多的曲库,目标是让 TA 听到符合口味的好歌 —— " +
+      "用户库里已有的就别 seed 了,但风格相邻的邻居艺人是首选。冷门不是目标,贴口味才是。只输出 JSON。",
     user,
-    temperature: 0.7, // seeds 要有点发散
+    temperature: 0.7, // 0.85 → 0.7:保留一些发散度,但不再特意往冷门偏
     maxTokens: 1200,
   });
 

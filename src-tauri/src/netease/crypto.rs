@@ -13,7 +13,10 @@
 
 use aes::Aes128;
 use base64::prelude::*;
-use cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use cipher::{
+    block_padding::Pkcs7, generic_array::GenericArray, BlockEncrypt, BlockEncryptMut, KeyInit,
+    KeyIvInit,
+};
 use num_bigint::BigUint;
 use rand::Rng;
 
@@ -21,6 +24,7 @@ type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 
 const FIRST_KEY: &[u8; 16] = b"0CoJUm6Qyw8W8jud";
 const IV: &[u8; 16] = b"0102030405060708";
+const LINUXAPI_KEY: &[u8; 16] = b"rFgB&h#%2?^eDg:Q";
 
 // 官方 weapi 公钥（模数，十六进制；公钥指数固定 65537）
 const PUB_MOD_HEX: &str = "00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7";
@@ -34,8 +38,25 @@ pub struct WeapiBody {
     pub enc_sec_key: String,
 }
 
+pub struct LinuxApiBody {
+    pub eparams: String,
+}
+
 fn aes_cbc_encrypt(data: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
     Aes128CbcEnc::new(key.into(), iv.into()).encrypt_padded_vec_mut::<Pkcs7>(data)
+}
+
+fn aes_ecb_encrypt(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
+    let pad_len = 16 - (data.len() % 16);
+    let mut out = Vec::with_capacity(data.len() + pad_len);
+    out.extend_from_slice(data);
+    out.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+
+    let cipher = Aes128::new_from_slice(key).expect("AES-128 key length");
+    for chunk in out.chunks_exact_mut(16) {
+        cipher.encrypt_block(GenericArray::from_mut_slice(chunk));
+    }
+    out
 }
 
 /// 生成 16 个随机 alphanumeric 字符，符合官方 JS 里的 `createSecretKey` 约定。
@@ -78,6 +99,15 @@ pub fn weapi_encrypt(params: &serde_json::Value) -> WeapiBody {
     WeapiBody {
         params: params_b64,
         enc_sec_key,
+    }
+}
+
+/// linuxapi: AES-128-ECB(PKCS7) 后十六进制大写，提交到 `/api/linux/forward`。
+pub fn linuxapi_encrypt(params: &serde_json::Value) -> LinuxApiBody {
+    let text = serde_json::to_string(params).expect("serializable");
+    let encrypted = aes_ecb_encrypt(text.as_bytes(), LINUXAPI_KEY);
+    LinuxApiBody {
+        eparams: hex::encode_upper(encrypted),
     }
 }
 

@@ -172,7 +172,7 @@ interface PipoRepository {
     suspend fun sendPhoneCaptcha(phone: String, countryCode: Int = 86): CaptchaSentStatus
     suspend fun loginWithPhone(phone: String, captcha: String, countryCode: Int = 86): PhoneLoginStatus
     suspend fun refreshPlaylists()
-    suspend fun tracksForPlaylist(playlistId: Long): List<NativeTrack>
+    suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean = false): List<NativeTrack>
     suspend fun searchTracks(query: String, limit: Int = 30): List<NativeTrack>
     suspend fun songUrls(ids: List<Long>, level: String = "lossless"): List<NativeSongUrl>
     suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine>

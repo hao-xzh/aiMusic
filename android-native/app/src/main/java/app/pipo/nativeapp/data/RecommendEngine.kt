@@ -231,13 +231,15 @@ class RecommendEngine(
         }
         if (artistAffinity.isEmpty()) return emptyList()
 
+        // affinity × 0.7 → × 0.25(跟 Web/Android 主推流对齐):艺人维度变成"加分项",
+        // 修"自由推荐总是同一歌手"。RecommendEngine 是 anchor 续杯路径,影响更直接。
         val out = ArrayList<Candidate>()
         for (t in lib) {
             if (hardExclude(t)) continue
             var score = 0.0
             t.artist.split('/', '&', ',', '、').forEach { a ->
                 val key = normalizeKey(a)
-                artistAffinity[key]?.let { score += it.toDouble() * 0.7 }
+                artistAffinity[key]?.let { score += it.toDouble() * 0.25 }
             }
             if (score > 0.0) {
                 out.add(Candidate(track = t, tasteScore = score.coerceAtMost(1.0), source = SOURCE_TASTE))
@@ -395,9 +397,8 @@ class RecommendEngine(
     // ============== utility ==============
 
     private fun logRecommendations(picks: List<Candidate>) {
-        val ids = picks.mapNotNull { it.track.neteaseId }
-        if (ids.isEmpty()) return
-        runCatching { recommendationLog.log(ids, RecommendationLog.Source.Pet) }
+        if (picks.isEmpty()) return
+        runCatching { recommendationLog.logTracks(picks.map { it.track }, RecommendationLog.Source.Pet) }
     }
 
     private data class Candidate(

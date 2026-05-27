@@ -63,7 +63,7 @@ class EmptyPipoRepository : PipoRepository {
     ): PhoneLoginStatus = PhoneLoginStatus(code = -1, message = "Bridge unavailable")
 
     override suspend fun refreshPlaylists() = Unit
-    override suspend fun tracksForPlaylist(playlistId: Long): List<NativeTrack> = emptyList()
+    override suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean): List<NativeTrack> = emptyList()
     override suspend fun searchTracks(query: String, limit: Int): List<NativeTrack> = emptyList()
     override suspend fun songUrls(ids: List<Long>, level: String): List<NativeSongUrl> =
         ids.map { NativeSongUrl(id = it, url = null, bitrate = 0, sizeBytes = 0) }

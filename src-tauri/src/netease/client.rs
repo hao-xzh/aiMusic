@@ -21,11 +21,13 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use url::Url;
 
-use super::crypto::weapi_encrypt;
+use super::crypto::{linuxapi_encrypt, weapi_encrypt};
 
 // 模拟官方 PC 客户端的 UA —— Safari UA 会被部分端点 (-462) 打回。
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36";
+const LINUX_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+                        (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36";
 const HOST: &str = "https://music.163.com";
 
 /// "realIP" 业务参数：网易云风控信这个参数里的 IP，不看 TCP 源。
@@ -180,6 +182,48 @@ impl NeteaseClient {
         }
         serde_json::from_str::<T>(&text)
             .with_context(|| format!("parse {endpoint} response: {}", truncate(&text, 400)))
+    }
+
+    /// linuxapi 转发请求。NeteaseCloudMusicApi 的歌单详情实现用这条链路：
+    /// 业务 url 放进加密体，再统一发到 `/api/linux/forward`。
+    pub async fn linuxapi<T: DeserializeOwned>(&self, endpoint: &str, params: Value) -> Result<T> {
+        let endpoint = endpoint.trim_start_matches('/');
+        let api_endpoint = endpoint
+            .strip_prefix("api/")
+            .or_else(|| endpoint.strip_prefix("weapi/"))
+            .unwrap_or(endpoint);
+        let inner_url = format!("{HOST}/api/{}", api_endpoint.trim_start_matches('/'));
+        let body = linuxapi_encrypt(&json!({
+            "method": "POST",
+            "url": inner_url,
+            "params": params,
+        }));
+        let url = format!("{HOST}/api/linux/forward");
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Referer", format!("{HOST}/"))
+            .header("User-Agent", LINUX_UA)
+            .form(&[("eparams", body.eparams)])
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.context("read body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "netease linuxapi {api_endpoint} -> {status}: {}",
+                truncate(&text, 400)
+            ));
+        }
+        serde_json::from_str::<T>(&text).with_context(|| {
+            format!(
+                "parse linuxapi {api_endpoint} response: {}",
+                truncate(&text, 400)
+            )
+        })
     }
 
     /// 从 cookie jar 里读某个 cookie 的 value。

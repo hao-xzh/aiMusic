@@ -1,12 +1,18 @@
 package app.pipo.nativeapp.playback
 
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.audio.AudioProcessor
@@ -16,10 +22,26 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaLibraryService.LibraryParams
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 镜像 src/lib/player-state.tsx 里的播放器配置：
@@ -29,15 +51,197 @@ import app.pipo.nativeapp.data.PipoGraph
  *   - 队列循环 + Media3 自带的"曲尾无缝过渡"
  */
 @UnstableApi
-class PipoPlaybackService : MediaSessionService() {
-    private var mediaSession: MediaSession? = null
+class PipoPlaybackService : MediaLibraryService() {
+    private var mediaSession: MediaLibrarySession? = null
     private var notificationPlayer: RecoveringNotificationPlayer? = null
     private var smartAutoMixer: SmartAutoMixer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var lastKeepAlivePrepareAtMs: Long = 0L
     private var badSourceSkipToken: Long = 0L
     private var badSourceRecoveryMediaId: String? = null
     private var badSourceRecoveryUntilMs: Long = 0L
+    private var badSourceRefreshJob: Job? = null
+    private var audioFocusResumeJob: Job? = null
+    private var resumeAfterAudioFocusLoss = false
+    private var playbackCallbackRegistered = false
+    private val audioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+    private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
+            maybeResumeAfterExternalAudioStops("playback-callback", configs)
+        }
+    }
+    private val serviceUrlRefreshTried = LinkedHashSet<String>()
+    private val urlResolver by lazy {
+        PlaybackUrlResolver(PipoGraph.repository, STREAM_LEVEL_FALLBACKS, STREAM_URL_TIMEOUT_MS)
+    }
+    private val mediaFactory by lazy {
+        PlayerMediaFactory(PipoGraph.audioFeaturesStore)
+    }
+    private val libraryCallback = object : MediaLibrarySession.Callback {
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "library_root_requested",
+                fields = mapOf("controller" to browser.packageName),
+            )
+            return Futures.immediateFuture(LibraryResult.ofItem(libraryRootItem(), params))
+        }
+
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            val item = when (mediaId) {
+                LIBRARY_ROOT_ID -> libraryRootItem()
+                CURRENT_QUEUE_ID -> currentQueueFolder(session.player)
+                else -> currentQueueBrowserItems(session.player)
+                    .firstOrNull { it.mediaId == mediaId }
+            }
+            return Futures.immediateFuture(
+                item?.let { LibraryResult.ofItem(it, null) }
+                    ?: LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE),
+            )
+        }
+
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            val children = when (parentId) {
+                LIBRARY_ROOT_ID -> listOf(currentQueueFolder(session.player))
+                CURRENT_QUEUE_ID -> currentQueueBrowserItems(session.player)
+                else -> emptyList()
+            }
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "library_children_requested",
+                fields = mapOf(
+                    "controller" to browser.packageName,
+                    "parentId" to parentId,
+                    "count" to children.size,
+                ),
+            )
+            return Futures.immediateFuture(LibraryResult.ofItemList(pagedItems(children, page, pageSize), params))
+        }
+
+        override fun onSearch(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "library_search_requested",
+                fields = mapOf("controller" to browser.packageName, "query" to query),
+            )
+            return Futures.immediateFuture(LibraryResult.ofVoid(params))
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            val trimmedQuery = query.trim()
+            if (trimmedQuery.isBlank()) {
+                return Futures.immediateFuture(
+                    LibraryResult.ofItemList(pagedItems(currentQueueBrowserItems(session.player), page, pageSize), params),
+                )
+            }
+            val future = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+            serviceScope.launch {
+                val items = withContext(Dispatchers.IO) {
+                    runCatching {
+                        PipoGraph.repository.searchTracks(trimmedQuery, ASSISTANT_SEARCH_LIMIT)
+                    }.getOrDefault(emptyList())
+                }.map(::metadataOnlyTrackItem)
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "library_search_result",
+                    fields = mapOf(
+                        "controller" to browser.packageName,
+                        "query" to trimmedQuery,
+                        "count" to items.size,
+                    ),
+                )
+                future.set(LibraryResult.ofItemList(pagedItems(items, page, pageSize), params))
+            }
+            return future
+        }
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+        ): ListenableFuture<MutableList<MediaItem>> {
+            if (mediaItems.isEmpty()) return Futures.immediateFuture(mutableListOf())
+            val future = SettableFuture.create<MutableList<MediaItem>>()
+            serviceScope.launch {
+                val resolved = runCatching {
+                    resolveAssistantMediaItems(mediaItems)
+                }.onFailure { err ->
+                    DiagnosticsLogStore.record(
+                        area = "playback_service",
+                        event = "assistant_media_resolve_failed",
+                        fields = mapOf(
+                            "controller" to controller.packageName,
+                            "requestedCount" to mediaItems.size,
+                            "errorType" to err::class.java.simpleName,
+                            "message" to err.message,
+                        ),
+                    )
+                }.getOrDefault(mutableListOf())
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "assistant_media_resolved",
+                    fields = mapOf(
+                        "controller" to controller.packageName,
+                        "requestedCount" to mediaItems.size,
+                        "resolvedCount" to resolved.size,
+                    ),
+                )
+                future.set(resolved)
+            }
+            return future
+        }
+
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val player = mediaSession.player
+            val items = currentQueuePlayableItems(player)
+            val startIndex = if (items.isEmpty()) {
+                C.INDEX_UNSET
+            } else {
+                player.currentMediaItemIndex.coerceIn(0, items.lastIndex)
+            }
+            val positionMs = if (startIndex == C.INDEX_UNSET) {
+                C.TIME_UNSET
+            } else {
+                player.currentPosition.coerceAtLeast(0L)
+            }
+            return Futures.immediateFuture(
+                MediaSession.MediaItemsWithStartPosition(items, startIndex, positionMs),
+            )
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -120,6 +324,11 @@ class PipoPlaybackService : MediaSessionService() {
                         )
                         badSourceSkipToken += 1L
                         clearBadSourceRecovery()
+                        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
+                            serviceUrlRefreshTried.clear()
+                        } else {
+                            mediaItem?.mediaId?.let { serviceUrlRefreshTried.remove(it) }
+                        }
                         smartAutoMixer?.onMediaItemTransition(mediaItem, reason)
                     }
 
@@ -137,7 +346,7 @@ class PipoPlaybackService : MediaSessionService() {
                         smartAutoMixer?.onMainPlayerError()
                         notificationPlayer?.armRecoveryWindow()
                         if (isLikelyBadSource(error)) {
-                            scheduleBadSourceSkip(this@apply, error)
+                            recoverBadSourceOrSkip(this@apply, error)
                         } else {
                             keepMediaNotificationAlive(this@apply, "error")
                         }
@@ -178,10 +387,24 @@ class PipoPlaybackService : MediaSessionService() {
                                 "reason" to playWhenReadyReason(reason),
                             ),
                         )
+                        when (reason) {
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> {
+                                if (!playWhenReady) {
+                                    armAudioFocusAutoResume(this@apply)
+                                }
+                            }
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST,
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> {
+                                clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
+                            }
+                        }
                     }
 
                     override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
-                        if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE) return
+                        if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE) {
+                            maybeResumeAfterExternalAudioStops("suppression-cleared")
+                            return
+                        }
                         DiagnosticsLogStore.record(
                             area = "playback_service",
                             event = "playback_suppressed",
@@ -189,6 +412,9 @@ class PipoPlaybackService : MediaSessionService() {
                                 "reason" to playbackSuppressionReasonName(playbackSuppressionReason),
                             ),
                         )
+                        if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
+                            armAudioFocusAutoResume(this@apply)
+                        }
                     }
 
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -199,6 +425,7 @@ class PipoPlaybackService : MediaSessionService() {
                             fields = playerFields(this@apply) + mapOf("isPlaying" to isPlaying),
                         )
                         if (isPlaying) {
+                            clearAudioFocusAutoResume("playing")
                             notificationPlayer?.clearRecoveryWindow()
                             mediaSession?.let { session ->
                                 updateNotificationSafely(session, true, "playing")
@@ -230,13 +457,178 @@ class PipoPlaybackService : MediaSessionService() {
         val sessionPlayer = RecoveringNotificationPlayer(player).also {
             notificationPlayer = it
         }
-        mediaSession = MediaSession.Builder(this, sessionPlayer)
+        mediaSession = MediaLibrarySession.Builder(this, sessionPlayer, libraryCallback)
             .setSessionActivity(sessionActivity)
             .build()
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
         return mediaSession
+    }
+
+    private fun libraryRootItem(): MediaItem {
+        return browserFolder(
+            mediaId = LIBRARY_ROOT_ID,
+            title = "PIPO",
+            mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_MIXED,
+        )
+    }
+
+    private fun currentQueueFolder(player: Player): MediaItem {
+        val count = player.mediaItemCount
+        val title = if (count > 0) "当前播放列表" else "PIPO 音乐"
+        return browserFolder(
+            mediaId = CURRENT_QUEUE_ID,
+            title = title,
+            mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS,
+        )
+    }
+
+    private fun browserFolder(mediaId: String, title: String, mediaType: Int): MediaItem {
+        val metadata = MediaMetadata.Builder()
+            .setTitle(title)
+            .setIsBrowsable(true)
+            .setIsPlayable(false)
+            .setMediaType(mediaType)
+            .build()
+        return MediaItem.Builder()
+            .setMediaId(mediaId)
+            .setMediaMetadata(metadata)
+            .build()
+    }
+
+    private fun currentQueueBrowserItems(player: Player): List<MediaItem> {
+        return currentQueuePlayableItems(player).map(::decoratePlayableBrowserItem)
+    }
+
+    private fun currentQueuePlayableItems(player: Player): List<MediaItem> {
+        return (0 until player.mediaItemCount).map { index -> player.getMediaItemAt(index) }
+    }
+
+    private fun decoratePlayableBrowserItem(item: MediaItem): MediaItem {
+        return item.buildUpon()
+            .setMediaMetadata(playableMetadata(item.mediaMetadata))
+            .build()
+    }
+
+    private fun metadataOnlyTrackItem(track: NativeTrack): MediaItem {
+        val metadata = MediaMetadata.Builder()
+            .setTitle(track.title)
+            .setArtist(track.artist)
+            .setAlbumTitle(track.album)
+            .setArtworkUri(secureArtworkUri(track.artworkUrl))
+            .setIsBrowsable(false)
+            .setIsPlayable(true)
+            .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+            .build()
+        return MediaItem.Builder()
+            .setMediaId(track.id)
+            .setMediaMetadata(metadata)
+            .build()
+    }
+
+    private fun playableMetadata(metadata: MediaMetadata): MediaMetadata {
+        return metadata.buildUpon()
+            .setIsBrowsable(false)
+            .setIsPlayable(true)
+            .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+            .build()
+    }
+
+    private fun secureArtworkUri(url: String?): Uri? {
+        val value = url?.takeIf { it.isNotBlank() } ?: return null
+        val secureUrl = if (value.startsWith("http://")) {
+            value.replaceFirst("http://", "https://")
+        } else {
+            value
+        }
+        return runCatching { Uri.parse(secureUrl) }.getOrNull()
+    }
+
+    private fun pagedItems(items: List<MediaItem>, page: Int, pageSize: Int): List<MediaItem> {
+        if (page < 0 || pageSize <= 0) return emptyList()
+        val from = page.toLong() * pageSize.toLong()
+        if (from > Int.MAX_VALUE || from >= items.size) return emptyList()
+        val start = from.toInt()
+        val end = (start + pageSize).coerceAtMost(items.size)
+        return items.subList(start, end)
+    }
+
+    private suspend fun resolveAssistantMediaItems(mediaItems: List<MediaItem>): MutableList<MediaItem> {
+        val resolved = mutableListOf<MediaItem>()
+        for (item in mediaItems) {
+            resolveAssistantMediaItem(item)?.let { resolved += it }
+        }
+        return resolved
+    }
+
+    private suspend fun resolveAssistantMediaItem(item: MediaItem): MediaItem? {
+        if (item.localConfiguration?.uri != null) {
+            return decoratePlayableBrowserItem(item)
+        }
+
+        findCurrentQueueMediaItem(item.mediaId)?.let { queueItem ->
+            if (queueItem.localConfiguration?.uri != null) return decoratePlayableBrowserItem(queueItem)
+        }
+
+        item.requestMetadata.mediaUri?.let { mediaUri ->
+            return item.buildUpon()
+                .setUri(mediaUri)
+                .setMediaMetadata(playableMetadata(item.mediaMetadata))
+                .build()
+        }
+
+        mediaIdTrackId(item.mediaId)?.let { trackId ->
+            val freshUrl = withContext(Dispatchers.IO) {
+                urlResolver.fetchPlayableUrl(trackId)
+            }
+            if (!freshUrl.isNullOrBlank()) {
+                return item.buildUpon()
+                    .setMediaId(trackId.toString())
+                    .setUri(freshUrl)
+                    .setMediaMetadata(playableMetadata(item.mediaMetadata))
+                    .build()
+            }
+        }
+
+        val query = queryFromRequestedItem(item) ?: return null
+        val track = withContext(Dispatchers.IO) {
+            val candidates = runCatching {
+                PipoGraph.repository.searchTracks(query, ASSISTANT_SEARCH_LIMIT)
+            }.getOrDefault(emptyList())
+            urlResolver.resolveFirstPlayable(candidates, ASSISTANT_PLAY_SCAN_LIMIT)
+        } ?: return null
+        return mediaFactory.toMediaItem(track)
+    }
+
+    private fun findCurrentQueueMediaItem(mediaId: String): MediaItem? {
+        if (mediaId.isBlank()) return null
+        val player = mediaSession?.player ?: return null
+        return (0 until player.mediaItemCount)
+            .firstNotNullOfOrNull { index ->
+                player.getMediaItemAt(index).takeIf { it.mediaId == mediaId }
+            }
+    }
+
+    private fun mediaIdTrackId(mediaId: String): Long? {
+        if (mediaId.isBlank()) return null
+        val raw = mediaId.removePrefix(TRACK_MEDIA_ID_PREFIX)
+        return raw.toLongOrNull()
+    }
+
+    private fun queryFromRequestedItem(item: MediaItem): String? {
+        item.requestMetadata.searchQuery
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        return listOfNotNull(
+            item.mediaMetadata.title?.toString(),
+            item.mediaMetadata.artist?.toString(),
+            item.mediaMetadata.albumTitle?.toString(),
+        )
+            .joinToString(" ")
+            .trim()
+            .takeIf { it.isNotBlank() }
     }
 
     private fun keepMediaNotificationAlive(player: Player, reason: String) {
@@ -289,6 +681,199 @@ class PipoPlaybackService : MediaSessionService() {
                 }
             }, KEEP_ALIVE_NOTIFICATION_DELAY_MS)
         }
+    }
+
+    private fun armAudioFocusAutoResume(player: Player) {
+        if (player.mediaItemCount == 0 || player.currentMediaItem == null) return
+        resumeAfterAudioFocusLoss = true
+        registerPlaybackCallback()
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "audio_focus_auto_resume_armed",
+            fields = playerFields(player),
+        )
+        audioFocusResumeJob?.cancel()
+        audioFocusResumeJob = serviceScope.launch {
+            delay(AUDIO_FOCUS_RESUME_PROBE_MS)
+            maybeResumeAfterExternalAudioStops("delayed-probe")
+        }
+    }
+
+    private fun registerPlaybackCallback() {
+        if (playbackCallbackRegistered) return
+        runCatching {
+            audioManager.registerAudioPlaybackCallback(playbackCallback, mainHandler)
+            playbackCallbackRegistered = true
+        }.onFailure { err ->
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "audio_playback_callback_register_failed",
+                fields = mapOf(
+                    "errorType" to err::class.java.simpleName,
+                    "message" to err.message,
+                ),
+            )
+        }
+    }
+
+    private fun unregisterPlaybackCallback() {
+        if (!playbackCallbackRegistered) return
+        runCatching {
+            audioManager.unregisterAudioPlaybackCallback(playbackCallback)
+        }
+        playbackCallbackRegistered = false
+    }
+
+    private fun maybeResumeAfterExternalAudioStops(
+        reason: String,
+        configs: List<AudioPlaybackConfiguration> = audioManager.activePlaybackConfigurations,
+    ) {
+        if (!resumeAfterAudioFocusLoss) return
+        val player = mediaSession?.player ?: return
+        if (player.isPlaying || player.mediaItemCount == 0 || player.currentMediaItem == null) {
+            clearAudioFocusAutoResume("not-needed-$reason")
+            return
+        }
+        if (hasExternalActiveMedia(configs)) return
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "audio_focus_auto_resume",
+            fields = playerFields(player) + mapOf("reason" to reason),
+        )
+        player.prepare()
+        player.play()
+    }
+
+    private fun hasExternalActiveMedia(configs: List<AudioPlaybackConfiguration>): Boolean {
+        return configs.any { config ->
+            isMediaPlaybackUsage(config.audioAttributes.usage)
+        }
+    }
+
+    private fun isMediaPlaybackUsage(usage: Int): Boolean {
+        return usage == android.media.AudioAttributes.USAGE_MEDIA ||
+            usage == android.media.AudioAttributes.USAGE_GAME
+    }
+
+    private fun clearAudioFocusAutoResume(reason: String) {
+        if (!resumeAfterAudioFocusLoss && !playbackCallbackRegistered) return
+        resumeAfterAudioFocusLoss = false
+        audioFocusResumeJob?.cancel()
+        audioFocusResumeJob = null
+        unregisterPlaybackCallback()
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "audio_focus_auto_resume_cleared",
+            fields = mapOf("reason" to reason),
+        )
+    }
+
+    private fun recoverBadSourceOrSkip(player: Player, error: PlaybackException) {
+        if (startServiceUrlRefresh(player, error)) return
+        scheduleBadSourceSkip(player, error)
+    }
+
+    private fun startServiceUrlRefresh(player: Player, error: PlaybackException): Boolean {
+        if (!player.playWhenReady || player.mediaItemCount == 0) return false
+        val mediaItem = player.currentMediaItem ?: return false
+        val mediaId = mediaItem.mediaId.takeIf { it.isNotBlank() } ?: return false
+        val neteaseId = mediaId.toLongOrNull()
+        if (neteaseId == null) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "bad_source_refresh_unavailable",
+                fields = playerFields(player) + mapOf(
+                    "code" to error.errorCodeName,
+                    "reason" to "non-numeric-media-id",
+                ),
+            )
+            return false
+        }
+        if (!serviceUrlRefreshTried.add(mediaId)) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "bad_source_refresh_unavailable",
+                fields = playerFields(player) + mapOf(
+                    "code" to error.errorCodeName,
+                    "reason" to "already-tried",
+                ),
+            )
+            return false
+        }
+
+        val token = ++badSourceSkipToken
+        val startPositionMs = player.currentPosition.coerceAtLeast(0L)
+        badSourceRecoveryMediaId = mediaId
+        badSourceRecoveryUntilMs = SystemClock.elapsedRealtime() + BAD_SOURCE_SERVICE_REFRESH_GRACE_MS
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "bad_source_refresh_start",
+            fields = playerFields(player) + mapOf(
+                "code" to error.errorCodeName,
+                "neteaseId" to neteaseId,
+                "resumePositionMs" to startPositionMs,
+            ),
+        )
+
+        badSourceRefreshJob?.cancel()
+        badSourceRefreshJob = serviceScope.launch {
+            val freshUrl = withContext(Dispatchers.IO) {
+                urlResolver.fetchPlayableUrl(neteaseId)
+            }
+            if (token != badSourceSkipToken) return@launch
+            if (!player.playWhenReady || player.currentMediaItem?.mediaId != mediaId) {
+                clearBadSourceRecovery(mediaId)
+                recordBadSourceSkipAbort(player, error, "changed-or-paused")
+                return@launch
+            }
+            if (freshUrl.isNullOrBlank()) {
+                clearBadSourceRecovery(mediaId)
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "bad_source_refresh_empty",
+                    fields = playerFields(player) + mapOf(
+                        "code" to error.errorCodeName,
+                        "neteaseId" to neteaseId,
+                    ),
+                )
+                scheduleBadSourceSkip(player, error)
+                return@launch
+            }
+
+            runCatching {
+                val liveItem = player.currentMediaItem ?: return@runCatching
+                val itemIndex = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
+                if (itemIndex !in 0 until player.mediaItemCount) return@runCatching
+                clearBadSourceRecovery(mediaId)
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "bad_source_refresh_success",
+                    fields = playerFields(player) + mapOf(
+                        "code" to error.errorCodeName,
+                        "neteaseId" to neteaseId,
+                        "resumePositionMs" to startPositionMs,
+                    ),
+                )
+                player.replaceMediaItem(itemIndex, liveItem.buildUpon().setUri(freshUrl).build())
+                player.seekTo(itemIndex, startPositionMs)
+                player.prepare()
+                player.play()
+            }.onFailure { err ->
+                clearBadSourceRecovery(mediaId)
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "bad_source_refresh_failed",
+                    fields = playerFields(player) + mapOf(
+                        "code" to error.errorCodeName,
+                        "neteaseId" to neteaseId,
+                        "errorType" to err::class.java.simpleName,
+                        "message" to err.message,
+                    ),
+                )
+                scheduleBadSourceSkip(player, error)
+            }
+        }
+        return true
     }
 
     private fun scheduleBadSourceSkip(player: Player, error: PlaybackException) {
@@ -359,6 +944,10 @@ class PipoPlaybackService : MediaSessionService() {
                 )
             }
         }, BAD_SOURCE_CONTROLLER_GRACE_MS)
+    }
+
+    private fun Player.indexOfMediaId(mediaId: String): Int? {
+        return (0 until mediaItemCount).firstOrNull { i -> getMediaItemAt(i).mediaId == mediaId }
     }
 
     private fun isWaitingForBadSourceController(player: Player, now: Long): Boolean {
@@ -468,6 +1057,10 @@ class PipoPlaybackService : MediaSessionService() {
         }
         smartAutoMixer?.release()
         smartAutoMixer = null
+        badSourceRefreshJob?.cancel()
+        audioFocusResumeJob?.cancel()
+        unregisterPlaybackCallback()
+        serviceScope.cancel()
         mediaSession?.let { session ->
             session.player.release()
             session.release()
@@ -480,7 +1073,16 @@ class PipoPlaybackService : MediaSessionService() {
     private companion object {
         private const val KEEP_ALIVE_PREPARE_COOLDOWN_MS = 1_500L
         private const val KEEP_ALIVE_NOTIFICATION_DELAY_MS = 80L
+        private const val STREAM_URL_TIMEOUT_MS = 15_000L
+        private const val BAD_SOURCE_SERVICE_REFRESH_GRACE_MS = STREAM_URL_TIMEOUT_MS + 2_000L
         private const val BAD_SOURCE_CONTROLLER_GRACE_MS = 5_000L
+        private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
+        private const val LIBRARY_ROOT_ID = "pipo:root"
+        private const val CURRENT_QUEUE_ID = "pipo:current-queue"
+        private const val TRACK_MEDIA_ID_PREFIX = "pipo:track:"
+        private const val ASSISTANT_SEARCH_LIMIT = 20
+        private const val ASSISTANT_PLAY_SCAN_LIMIT = 8
+        private val STREAM_LEVEL_FALLBACKS = listOf("lossless", "exhigh", "higher", "standard")
     }
 }
 

@@ -13,11 +13,21 @@ import org.json.JSONObject
 class RecommendationLog(context: Context) {
     enum class Source(val key: String) { Pet("pet"), Auto("auto"), Radio("radio"), Search("search") }
 
-    data class Event(val trackId: Long, val tsSec: Long, val source: Source)
+    data class Event(
+        val trackId: Long,
+        val tsSec: Long,
+        val source: Source,
+        /** 主艺人名 —— v2 新增,做 artist-level fatigue;老事件没这字段当 null */
+        val artist: String? = null,
+    )
 
     data class RecentContext(
         val last24hTrackIds: Set<Long>,
         val last7dTrackIds: Set<Long>,
+        /** 近 24h 每个艺人(normalize 后)被推荐的次数 */
+        val last24hArtistCounts: Map<String, Int> = emptyMap(),
+        /** 近 7d 同上 */
+        val last7dArtistCounts: Map<String, Int> = emptyMap(),
     )
 
     private val prefs = context.applicationContext
@@ -38,7 +48,9 @@ class RecommendationLog(context: Context) {
                     val o = arr.optJSONObject(i) ?: continue
                     val srcKey = o.optString("source")
                     val src = Source.entries.firstOrNull { it.key == srcKey } ?: Source.Pet
-                    out.add(Event(o.optLong("trackId"), o.optLong("ts"), src))
+                    val artistField = o.optString("artist", "")
+                    val artist = if (artistField.isBlank()) null else artistField
+                    out.add(Event(o.optLong("trackId"), o.optLong("ts"), src, artist))
                 }
             }
         }
@@ -48,9 +60,6 @@ class RecommendationLog(context: Context) {
 
     @Synchronized
     fun log(trackIds: List<Long>, source: Source = Source.Pet) {
-        // @Synchronized:之前 ensureBuffer/flush 都加了锁,但 log 自己没加。多个线程
-        // 同时 log 时拿到同一个 MutableList,并发 add 会 ConcurrentModificationException
-        // 或丢条目。PetAgent / Discovery / RecommendEngine 真有几条线并行写日志。
         if (trackIds.isEmpty()) return
         val buf = ensureBuffer()
         val now = System.currentTimeMillis() / 1000
@@ -58,6 +67,25 @@ class RecommendationLog(context: Context) {
         for (id in trackIds) {
             if (!seen.add(id)) continue
             buf.add(Event(id, now, source))
+        }
+        flush()
+    }
+
+    /**
+     * v2:支持传 NativeTrack[],把主艺人名一起写进日志,后续 fatigue 才能按艺人聚合。
+     * 新代码请尽量用这个;老的 log(List<Long>) 保留兼容。
+     */
+    @Synchronized
+    fun logTracks(tracks: List<NativeTrack>, source: Source = Source.Pet) {
+        if (tracks.isEmpty()) return
+        val buf = ensureBuffer()
+        val now = System.currentTimeMillis() / 1000
+        val seen = HashSet<Long>()
+        for (t in tracks) {
+            val id = t.neteaseId ?: continue
+            if (!seen.add(id)) continue
+            val artist = t.artist.split('/', '&', ',', '、').firstOrNull()?.trim()
+            buf.add(Event(id, now, source, artist))
         }
         flush()
     }
@@ -71,6 +99,7 @@ class RecommendationLog(context: Context) {
         trimmed.forEach {
             arr.put(JSONObject().apply {
                 put("trackId", it.trackId); put("ts", it.tsSec); put("source", it.source.key)
+                if (!it.artist.isNullOrBlank()) put("artist", it.artist)
             })
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
@@ -83,13 +112,25 @@ class RecommendationLog(context: Context) {
         val now = System.currentTimeMillis() / 1000
         val day = mutableSetOf<Long>()
         val week = mutableSetOf<Long>()
+        val dayArtist = HashMap<String, Int>()
+        val weekArtist = HashMap<String, Int>()
         for (e in events) {
             val age = now - e.tsSec
-            if (age <= DAY_S) day.add(e.trackId)
-            if (age <= 7 * DAY_S) week.add(e.trackId)
+            val in7d = age <= 7 * DAY_S
+            val in24h = age <= DAY_S
+            if (in24h) day.add(e.trackId)
+            if (in7d) week.add(e.trackId)
+            val artist = e.artist ?: continue
+            val key = normalizeArtistKey(artist)
+            if (key.isEmpty()) continue
+            if (in24h) dayArtist[key] = (dayArtist[key] ?: 0) + 1
+            if (in7d) weekArtist[key] = (weekArtist[key] ?: 0) + 1
         }
-        return RecentContext(day, week)
+        return RecentContext(day, week, dayArtist, weekArtist)
     }
+
+    private fun normalizeArtistKey(s: String): String =
+        s.lowercase().replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？]+"), "")
 
     companion object {
         private const val PREFS_NAME = "claudio_recommendation_log"

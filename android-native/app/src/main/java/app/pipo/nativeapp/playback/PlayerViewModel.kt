@@ -3,6 +3,7 @@ package app.pipo.nativeapp.playback
 import android.app.Application
 import android.content.ComponentName
 import android.os.SystemClock
+import android.util.Base64
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -52,14 +53,14 @@ data class PlayerUiState(
     val lyrics: List<PipoLyricLine> = emptyList(),
     val isReady: Boolean = false,
     val isLoading: Boolean = false,
-    val playbackMode: PlaybackQueueMode = PlaybackQueueMode.PlaylistLoop,
+    val playbackMode: PlaybackQueueMode = PlaybackQueueMode.ShufflePlay,
 ) {
     val activeLyricIndex: Int
         get() = LyricTiming.resolve(positionMs, lyrics).activeIndex.coerceAtLeast(0)
 }
 
 enum class PlaybackQueueMode {
-    PlaylistLoop,
+    ShufflePlay,
     OrderOnce,
     AiRadio,
 }
@@ -182,7 +183,7 @@ class PlayerViewModel(
     private var stablePlaybackResetJob: Job? = null
     private var userPausedPlayback = false
     private var resolvingPlayback = false
-    private var preferredPlaybackMode: PlaybackQueueMode = PlaybackQueueMode.PlaylistLoop
+    private var preferredPlaybackMode: PlaybackQueueMode = PlaybackQueueMode.ShufflePlay
     private var stallWatchTrackId: String? = null
     private var stallWatchPositionMs: Long = 0L
     private var stallWatchSinceMs: Long = 0L
@@ -777,10 +778,27 @@ class PlayerViewModel(
                     live.play()
                     return@launch
                 }
+                val baseQueue = queueMatchingPlayerTimeline(live, state.queue)
+                if (!sameQueueOrder(baseQueue, state.queue)) {
+                    DiagnosticsLogStore.record(
+                        area = "queue",
+                        event = "state_queue_reconciled",
+                        fields = mapOf(
+                            "reason" to "insert_next",
+                            "stateQueueSize" to state.queue.size,
+                            "mediaItemCount" to live.mediaItemCount,
+                            "alignedQueueSize" to baseQueue.size,
+                        ),
+                    )
+                    state = state.copy(
+                        queue = baseQueue,
+                        currentIndex = currentQueueIndexFor(live, baseQueue),
+                    )
+                }
                 val curIdx = live.currentMediaItemIndex.coerceAtLeast(0)
                 val insertIdx = (curIdx + 1).coerceAtMost(live.mediaItemCount)
                 // state.queue 跟着 player 队列一起插
-                val newQueue = state.queue.toMutableList().apply {
+                val newQueue = baseQueue.toMutableList().apply {
                     add(insertIdx.coerceAtMost(size), resolved)
                 }
                 state = state.copy(queue = newQueue)
@@ -795,6 +813,83 @@ class PlayerViewModel(
                 live.seekTo(insertIdx, 0L)
                 ensurePlayerLive(live)
                 applyPlaybackMode(live)
+                userPausedPlayback = false
+                live.play()
+            } finally {
+                setResolvingPlayback(false)
+            }
+        }
+    }
+
+    fun removeTrack(trackId: String) {
+        val player = controller ?: return
+        val stateIdx = state.queue.indexOfFirst { it.id == trackId }
+        if (stateIdx < 0) return
+        
+        val playerIdx = player.indexOfMediaId(trackId)
+        if (playerIdx != null) {
+            player.removeMediaItem(playerIdx)
+        }
+        
+        val newQueue = state.queue.filter { it.id != trackId }
+        val newCurrentIndex = if (newQueue.isEmpty()) {
+            0
+        } else {
+            currentQueueIndexFor(player, newQueue)
+        }
+        
+        state = state.copy(
+            queue = newQueue,
+            currentIndex = newCurrentIndex
+        )
+        syncFrom(player)
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    fun playCurrentQueueTrack(trackId: String) {
+        val player = controller ?: return
+        val queueSnapshot = state.queue
+        val stateIdx = queueSnapshot.indexOfFirst { it.id == trackId }
+        if (stateIdx < 0) return
+        DiagnosticsLogStore.record(
+            area = "queue",
+            event = "play_current_queue_track",
+            fields = trackFields(queueSnapshot[stateIdx]) + mapOf(
+                "queueIndex" to stateIdx,
+                "queueSize" to queueSnapshot.size,
+            ),
+        )
+
+        val playerIdx = player.indexOfMediaId(trackId)
+        if (playerIdx != null) {
+            applyPlaybackMode(player)
+            player.seekTo(playerIdx, 0L)
+            ensurePlayerLive(player)
+            player.prepare()
+            userPausedPlayback = false
+            player.play()
+            state = state.copy(currentIndex = stateIdx)
+            syncFrom(player)
+            return
+        }
+
+        val gen = ++playGen
+        setResolvingPlayback(true)
+        viewModelScope.launch {
+            try {
+                val resolvedQueue = resolvePlayableQueue(queueSnapshot).filter { it.streamUrl.isNotBlank() }
+                val resolvedIdx = resolvedQueue.indexOfFirst { it.id == trackId }
+                if (gen != playGen || resolvedIdx < 0) return@launch
+                val live = controller ?: return@launch
+                val mergedQueue = mergeResolvedTracks(queueSnapshot, resolvedQueue)
+                state = state.copy(
+                    queue = mergedQueue,
+                    currentIndex = stateIdx,
+                )
+                live.setMediaItems(toMediaItems(resolvedQueue, mergedQueue), resolvedIdx, 0L)
+                applyPlaybackMode(live)
+                live.volume = 1f
+                live.prepare()
                 userPausedPlayback = false
                 live.play()
             } finally {
@@ -929,20 +1024,24 @@ class PlayerViewModel(
                 val queueMode = preferredPlaybackMode
                 continuousSource = continuousSourceForMode(queueMode, explicitSource = null)
                 app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
-                // 播放器先只装第一首以尽快出声，但 state 保留完整候选队列。
-                // 如果 phase-2 网络慢/失败，ENDED/next 仍能从 state 里找到下一首并单独解析。
+                
                 val pickedIdxInPlayable = playable.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-                val continuousRun = continuousAudioTail(playable, pickedIdxInPlayable)
-                    .mapIndexed { idx, candidate -> if (idx == 0) pickedResolved else candidate }
-                val continuousRunIds = continuousRun.mapTo(HashSet()) { it.id }
-                val phaseOneQueue = continuousRun +
-                    playable.filter { it.id !in continuousRunIds }
+                val plannedQueue = if (queueMode == PlaybackQueueMode.ShufflePlay) {
+                    val restShuffled = playable.filter { it.id != track.id }.shuffled()
+                    listOf(pickedResolved) + restShuffled
+                } else {
+                    val continuousRun = continuousAudioTail(playable, pickedIdxInPlayable)
+                        .mapIndexed { idx, candidate -> if (idx == 0) pickedResolved else candidate }
+                    val continuousRunIds = continuousRun.mapTo(HashSet()) { it.id }
+                    continuousRun + playable.filter { it.id !in continuousRunIds }
+                }
+
                 state = state.copy(
-                    queue = phaseOneQueue,
+                    queue = plannedQueue,
                     currentIndex = 0,
                     playbackMode = queueMode,
                 )
-                player.setMediaItems(listOf(toMediaItem(pickedResolved, phaseOneQueue, 0)), 0, 0L)
+                player.setMediaItems(listOf(toMediaItem(pickedResolved, plannedQueue, 0)), 0, 0L)
                 applyPlaybackMode(player)
                 player.volume = 1f
                 player.prepare()
@@ -954,23 +1053,8 @@ class PlayerViewModel(
 
             // -------- 阶段 2：后台分批补完整队列 --------
             val pickedResolved = pickedResolvedForAppend ?: return@launch
-            val pickedIdxInPlayable = playable.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-            val continuousRun = continuousAudioTail(playable, pickedIdxInPlayable)
-                .mapIndexed { idx, candidate -> if (idx == 0) pickedResolved else candidate }
-            val continuousRunIds = continuousRun.mapTo(HashSet()) { it.id }
-            val rest = playable.filter { it.id !in continuousRunIds }
-            if (rest.isEmpty()) return@launch
-            val smoothAnchor = continuousRun.last()
-            val orderedRest = if (smooth) {
-                app.pipo.nativeapp.data.SmoothQueue.smooth(
-                    tracks = listOf(smoothAnchor) + rest,
-                    featuresStore = featuresStore,
-                    startTrackId = smoothAnchor.id,
-                    mode = app.pipo.nativeapp.data.SmoothQueue.Mode.Library,
-                ).filter { it.id != smoothAnchor.id }
-            } else rest
-            val plannedQueue = continuousRun + orderedRest
-            state = state.copy(queue = plannedQueue, currentIndex = 0, playbackMode = preferredPlaybackMode)
+            val plannedQueue = state.queue
+            if (plannedQueue.size <= 1) return@launch
             val tailCandidates = plannedQueue.drop(1)
             for (chunk in appendResolveChunks(tailCandidates)) {
                 // 同 playFromAgent:resolvePlayableQueue 期间用户可能切到别的歌单
@@ -1040,11 +1124,98 @@ class PlayerViewModel(
             syncFrom(p)
             return
         }
+        
+        if (offset > 0 && targetIdx < currentIdx && state.playbackMode == PlaybackQueueMode.AiRadio) {
+            triggerForceExtendAndPlayNext(p)
+            return
+        }
+        
         applyPlaybackMode(p)
         p.seekTo(targetIdx, 0L)
         p.prepare()
         p.play()
         syncFrom(p)
+    }
+
+    private fun triggerForceExtendAndPlayNext(player: Player) {
+        val sourceSnapshot = continuousSource ?: run {
+            fallbackWrapAround(player)
+            return
+        }
+        val gen = ++playGen
+        setResolvingPlayback(true)
+        viewModelScope.launch {
+            try {
+                val queueSnapshot = queueMatchingPlayerTimeline(player, state.queue)
+                if (!sameQueueOrder(queueSnapshot, state.queue)) {
+                    DiagnosticsLogStore.record(
+                        area = "queue",
+                        event = "state_queue_reconciled",
+                        fields = mapOf(
+                            "reason" to "force_extend",
+                            "stateQueueSize" to state.queue.size,
+                            "mediaItemCount" to player.mediaItemCount,
+                            "alignedQueueSize" to queueSnapshot.size,
+                        ),
+                    )
+                    state = state.copy(
+                        queue = queueSnapshot,
+                        currentIndex = currentQueueIndexFor(player, queueSnapshot),
+                    )
+                }
+                val excludeIds = queueSnapshot.mapNotNull { it.neteaseId }.toSet()
+                val more = try {
+                    sourceSnapshot.fetchMore(excludeIds)
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                if (gen != playGen) return@launch
+                if (more.isEmpty()) {
+                    fallbackWrapAround(player)
+                    return@launch
+                }
+                val resolved = try {
+                    resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                if (gen != playGen) return@launch
+                if (resolved.isEmpty()) {
+                    fallbackWrapAround(player)
+                    return@launch
+                }
+                val existingSongKeys = queueSnapshot.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+                val append = resolved.filter { existingSongKeys.add(TrackDedupe.songKey(it)) }
+                if (append.isEmpty() || gen != playGen) {
+                    fallbackWrapAround(player)
+                    return@launch
+                }
+                val live = controller ?: return@launch
+                val insertIdx = live.mediaItemCount
+                state = state.copy(queue = queueSnapshot + append)
+                live.addMediaItems(append.map(::toMediaItem))
+                
+                live.seekTo(insertIdx, 0L)
+                ensurePlayerLive(live)
+                live.prepare()
+                userPausedPlayback = false
+                live.play()
+                resetQueueExtendBackoff()
+            } finally {
+                setResolvingPlayback(false)
+                syncFrom(player)
+            }
+        }
+    }
+
+    private fun fallbackWrapAround(player: Player) {
+        val count = player.mediaItemCount
+        if (count > 0) {
+            player.seekTo(0, 0L)
+            player.prepare()
+            userPausedPlayback = false
+            player.play()
+        }
     }
 
     private fun recoverFromStateQueue(player: Player, offset: Int): Boolean {
@@ -1153,10 +1324,16 @@ class PlayerViewModel(
     }
 
     private fun applyPlaybackModePreference(mode: PlaybackQueueMode, persist: Boolean) {
+        val previousMode = state.playbackMode
         preferredPlaybackMode = mode
         continuousSource = continuousSourceForMode(mode, explicitSource = null)
         state = state.copy(playbackMode = mode)
         controller?.let(::applyPlaybackMode)
+        // 用户在播放中切到随机播放,把当前曲后面的队列实际打乱 ——
+        // applyPlaybackMode 只改 repeatMode,不改顺序,光靠它"下一首"还是原顺序的下一首。
+        if (persist && mode == PlaybackQueueMode.ShufflePlay && previousMode != PlaybackQueueMode.ShufflePlay) {
+            reshuffleUpcomingQueue()
+        }
         DiagnosticsLogStore.record(
             area = "settings",
             event = if (persist) "playback_mode_selected" else "playback_mode_loaded",
@@ -1170,6 +1347,45 @@ class PlayerViewModel(
                 }
             }
         }
+    }
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun reshuffleUpcomingQueue() {
+        val player = controller ?: return
+        val queue = state.queue
+        val count = player.mediaItemCount
+        if (queue.size < 2 || count < 2) return
+        val currentIdx = player.currentMediaItemIndex.coerceIn(0, count - 1)
+        val firstUpcoming = currentIdx + 1
+        if (firstUpcoming >= queue.size || firstUpcoming >= count) return
+        val upcomingOriginal = queue.subList(firstUpcoming, queue.size).toList()
+        if (upcomingOriginal.size < 2) return
+        var upcomingShuffled = upcomingOriginal.shuffled()
+        // 极小概率 shuffle 出原顺序,再洗一次保证视觉上确实变了
+        if (upcomingShuffled == upcomingOriginal) {
+            upcomingShuffled = upcomingOriginal.shuffled()
+        }
+        val newQueue = queue.subList(0, firstUpcoming).toList() + upcomingShuffled
+        val newMediaItems = toMediaItems(upcomingShuffled, newQueue)
+        runCatching {
+            player.replaceMediaItems(firstUpcoming, count, newMediaItems)
+        }.onFailure {
+            // 部分老 player 实现可能没有 replaceMediaItems,退到 remove+add
+            player.removeMediaItems(firstUpcoming, count)
+            player.addMediaItems(newMediaItems)
+        }
+        state = state.copy(
+            queue = newQueue,
+            currentIndex = currentQueueIndexFor(player, newQueue),
+        )
+        DiagnosticsLogStore.record(
+            area = "playback",
+            event = "shuffle_upcoming_reshuffled",
+            fields = mapOf(
+                "queueSize" to queue.size,
+                "reshuffledFrom" to firstUpcoming,
+            ),
+        )
     }
 
     private fun modeForNewQueue(explicitSource: ContinuousQueueSource?): PlaybackQueueMode {
@@ -1288,7 +1504,9 @@ class PlayerViewModel(
             artist = player.mediaMetadata.artist?.toString() ?: track?.artist.orEmpty(),
             album = player.mediaMetadata.albumTitle?.toString() ?: track?.album.orEmpty(),
             currentTrackId = authoritativeTrackId,
-            artworkUrl = player.mediaMetadata.artworkUri?.toString() ?: track?.artworkUrl,
+            artworkUrl = player.mediaMetadata.artworkUri?.toString()
+                ?: track?.artworkUrl
+                ?: embeddedArtworkDataUri(authoritativeTrackId, player.mediaMetadata.artworkData),
             isPlaying = player.isPlaying,
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = player.duration.takeIf { it > 0 } ?: track?.durationMs ?: 0L,
@@ -1460,7 +1678,7 @@ class PlayerViewModel(
     private fun applyPlaybackMode(player: Player) {
         player.repeatMode = when (state.playbackMode) {
             PlaybackQueueMode.OrderOnce -> Player.REPEAT_MODE_OFF
-            PlaybackQueueMode.PlaylistLoop,
+            PlaybackQueueMode.ShufflePlay,
             PlaybackQueueMode.AiRadio -> Player.REPEAT_MODE_ALL
         }
     }
@@ -1555,6 +1773,24 @@ class PlayerViewModel(
     private fun sameQueueOrder(left: List<NativeTrack>, right: List<NativeTrack>): Boolean {
         if (left.size != right.size) return false
         return left.indices.all { idx -> left[idx].id == right[idx].id }
+    }
+
+    private fun queueMatchingPlayerTimeline(
+        player: Player,
+        plannedQueue: List<NativeTrack>,
+    ): List<NativeTrack> {
+        if (plannedQueue.isEmpty() || player.mediaItemCount <= 0) return plannedQueue
+        val timelineIds = (0 until player.mediaItemCount).map { idx ->
+            player.getMediaItemAt(idx).mediaId
+        }
+        if (timelineIds.size == plannedQueue.size &&
+            timelineIds.indices.all { idx -> plannedQueue.getOrNull(idx)?.id == timelineIds[idx] }
+        ) {
+            return plannedQueue
+        }
+        val byId = plannedQueue.associateBy { it.id }
+        val aligned = timelineIds.mapNotNull { id -> byId[id] }
+        return if (aligned.size == timelineIds.size) aligned else plannedQueue
     }
 
     private fun mergeResolvedTracks(queue: List<NativeTrack>, resolved: List<NativeTrack>): List<NativeTrack> {
@@ -1689,7 +1925,8 @@ class PlayerViewModel(
         return when (raw) {
             PlaybackQueueMode.OrderOnce.name -> PlaybackQueueMode.OrderOnce
             PlaybackQueueMode.AiRadio.name -> PlaybackQueueMode.AiRadio
-            else -> PlaybackQueueMode.PlaylistLoop
+            "PlaylistLoop" -> PlaybackQueueMode.ShufflePlay
+            else -> PlaybackQueueMode.ShufflePlay
         }
     }
 
@@ -1716,6 +1953,43 @@ class PlayerViewModel(
 
     private suspend fun resolvePlayableQueue(queue: List<NativeTrack>): List<NativeTrack> =
         urlResolver.resolvePlayableQueue(queue)
+
+    // 云盘上传 / 没对上库的歌没有 NetEase 封面 URL，但 ExoPlayer 会从 MP3 ID3 / FLAC
+    // metadata 把内嵌封面解出来塞进 mediaMetadata.artworkData —— 系统状态栏播放器就靠
+    // 这条线显示封面。in-app UI 走 String? URL pipeline，所以把字节流转成 data: URI 喂
+    // 给同一个管道。按 trackId 缓存避免每次 syncFrom 重新 base64。
+    private var cachedArtworkTrackId: String? = null
+    private var cachedArtworkUri: String? = null
+
+    private fun embeddedArtworkDataUri(trackId: String?, data: ByteArray?): String? {
+        if (trackId == null || data == null || data.isEmpty()) return null
+        if (cachedArtworkTrackId == trackId) {
+            cachedArtworkUri?.let { return it }
+        }
+        val mime = sniffImageMime(data)
+        val base64 = Base64.encodeToString(data, Base64.NO_WRAP)
+        val uri = "data:$mime;base64,$base64"
+        cachedArtworkTrackId = trackId
+        cachedArtworkUri = uri
+        return uri
+    }
+
+    private fun sniffImageMime(data: ByteArray): String {
+        // 仅看魔术字节：PNG=89 50 4E 47，JPEG=FF D8 FF，WEBP=RIFF....WEBP
+        return when {
+            data.size >= 4 &&
+                data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
+                data[2] == 0x4E.toByte() && data[3] == 0x47.toByte() -> "image/png"
+            data.size >= 3 &&
+                data[0] == 0xFF.toByte() && data[1] == 0xD8.toByte() && data[2] == 0xFF.toByte() -> "image/jpeg"
+            data.size >= 12 &&
+                data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
+                data[2] == 0x46.toByte() && data[3] == 0x46.toByte() &&
+                data[8] == 0x57.toByte() && data[9] == 0x45.toByte() &&
+                data[10] == 0x42.toByte() && data[11] == 0x50.toByte() -> "image/webp"
+            else -> "image/jpeg" // ID3 嵌入封面绝大多数是 JPEG；猜错最坏 Coil 解码失败
+        }
+    }
 
     companion object {
         private const val STREAM_URL_TIMEOUT_MS = 15_000L

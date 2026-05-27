@@ -12,7 +12,11 @@
  *   - text：用户句子里直接点名的歌名/艺人/专辑（最高优先级，单路命中就保送）
  *   - tag：TrackSemanticProfile 硬标签召回（语言/地区/流派/人声）
  *   - semantic：TrackSemanticProfile embeddingText/summary 的轻量语义召回
- *   - profile：从 taste-profile 的 topArtists / genres / moods 派生
+ *   - profile：从 taste-profile 的 topArtists 派生（艺人维度，弱权重）
+ *   - profile_tags：从 taste-profile 的 genres/moods/eras/culturalContext 派生
+ *     （以画像的"风格维度"为锚 —— 这是修"老推同几个艺人"的关键路径）
+ *   - acoustic：从 taste-profile.acoustics（BPM/响度/音色）派生
+ *     （声学指纹距离匹配，让画像里的"物理特征"参与召回，不只靠标签字符串）
  *   - audio：musicHints.energy / transitionStyle 推出的 BPM/能量过滤
  *   - behavior：行为日志里 liked / completed 多的（近 90 天）
  *   - transition：当前播放中的那首接得上的（transitionRisk 低）
@@ -42,6 +46,8 @@ export type CandidateSource =
   | "semantic"
   | "semantic_broad"
   | "profile"
+  | "profile_tags"
+  | "acoustic"
   | "audio"
   | "behavior"
   | "transition"
@@ -129,9 +135,20 @@ export async function recallCandidates(
     hit(track.track, "semantic_broad", track.score);
   }
 
-  // 4) profile：长期画像
+  // 4) profile：长期画像 —— 艺人维度（弱信号，避免老推同几个艺人）
   for (const track of recallByProfile(intent, library, profile)) {
     hit(track.track, "profile", track.score);
+  }
+
+  // 4.1) profile_tags：画像派生的风格维度（genres/moods/eras/culturalContext）
+  //      跟 semanticProfile 匹配，让"风格"接管"艺人"成为主信号
+  for (const track of recallByProfileTags(profile, library, semanticMap)) {
+    hit(track.track, "profile_tags", track.score);
+  }
+
+  // 4.2) acoustic：画像声学指纹距离匹配 —— BPM/响度/音色
+  for (const track of recallByAcoustic(profile, library, analysisMap)) {
+    hit(track.track, "acoustic", track.score);
   }
 
   // 5) audio：musicHints 推 BPM/能量过滤
@@ -230,12 +247,14 @@ function recallByProfile(
 ): Hit[] {
   if (!profile) return [];
 
+  // 旧版本 affinity × 0.45 让 top 艺人天然垄断池子 —— 用户反馈"自由推荐总是
+  // 同一个歌手"。降到 0.15,让艺人变成"加分项"而不是"主信号";真正主推该由
+  // profile_tags / acoustic 的风格维度承担。
   const topArtistKeys = new Map(
     profile.topArtists.slice(0, 40).map((a) => [normalize(a.name), a.affinity]),
   );
-  // moods/genres/scenes 都是字符串标签 —— 库里没有结构化 tag，
-  // 先做最粗的"标签出现在歌名里"匹配，作为弱信号。
-  // 真要做精细匹配需要给曲目打 tag（属于 Stage 3 之后的事）。
+  // intent.musicHints 是用户当前句子里的偏好,跟"画像派生"是两件事。
+  // 这里保留原有"标签出现在歌名"的弱信号当兜底,真正的风格匹配走 profile_tags。
   const tagWords = new Set(
     [...intent.musicHints.moods, ...intent.musicHints.genres]
       .map(normalize)
@@ -247,7 +266,7 @@ function recallByProfile(
     let score = 0;
     for (const a of t.artists) {
       const aff = topArtistKeys.get(normalize(a.name));
-      if (aff !== undefined) score += aff * 0.45;
+      if (aff !== undefined) score += aff * 0.15;
     }
     if (tagWords.size > 0) {
       const titleN = normalize(t.name);
@@ -262,6 +281,145 @@ function recallByProfile(
   }
   out.sort((a, b) => b.score - a.score);
   return out.slice(0, 120);
+}
+
+/**
+ * 用画像的"风格维度"(genres / moods / eras / culturalContext) 对 semanticProfile
+ * 做匹配。这是修"老推同几个艺人"的核心路径 —— 不再按"是不是 top artist"挑,
+ * 而是按"风格对不对得上"挑,允许命中口味相符但艺人不在 topArtists 里的歌。
+ *
+ * 命中规则:
+ *   - profile.genres ↔ semanticProfile.style.{genres,subGenres,styleAnchors}: +0.45/命中
+ *   - profile.moods ↔ semanticProfile.vibe.{moods,scenes,textures}: +0.30/命中
+ *   - profile.eras ↔ semanticProfile.era.decade: +0.25/命中
+ *   - profile.culturalContext ↔ semanticProfile.region.primary + language.primary: +0.30/命中
+ * 命中 ≥2 类的会拿到 ≥0.55 起步分,放进候选池跟 top-artist 的歌竞争。
+ */
+function recallByProfileTags(
+  profile: TasteProfile | null,
+  library: TrackInfo[],
+  semanticMap: Map<number, TrackSemanticProfile>,
+): Hit[] {
+  if (!profile) return [];
+  const genreKeys = new Map(
+    profile.genres.slice(0, 12).map((g) => [normalize(g.tag), g.weight]),
+  );
+  const moodKeys = new Set(profile.moods.map(normalize).filter(Boolean));
+  const eraKeys = new Set(profile.eras.map((e) => normalize(e.label)).filter(Boolean));
+  const culturalKeys = new Set(
+    profile.culturalContext.map(normalize).filter(Boolean),
+  );
+
+  if (
+    genreKeys.size === 0 &&
+    moodKeys.size === 0 &&
+    eraKeys.size === 0 &&
+    culturalKeys.size === 0
+  ) {
+    return [];
+  }
+
+  const out: Hit[] = [];
+  for (const t of library) {
+    const sp = semanticMap.get(t.id);
+    if (!sp) continue;
+    let score = 0;
+
+    // genres:权重按 profile 自带的 weight 加权,主流派比次流派得分高
+    const trackGenres = [
+      ...sp.style.genres,
+      ...sp.style.subGenres,
+      ...sp.style.styleAnchors,
+    ].map(normalize);
+    for (const g of trackGenres) {
+      for (const [key, weight] of genreKeys) {
+        if (g === key || g.includes(key) || key.includes(g)) {
+          score += 0.45 * weight;
+          break;
+        }
+      }
+    }
+
+    // moods:画像里"午夜独白""带潮汐感"这种,跟 semanticProfile.vibe 比
+    const trackVibes = [
+      ...sp.vibe.moods,
+      ...sp.vibe.scenes,
+      ...sp.vibe.textures,
+    ].map(normalize);
+    for (const v of trackVibes) {
+      if (moodKeys.has(v)) {
+        score += 0.30;
+        break; // 单 vibe 命中一次就够,不累计
+      }
+    }
+
+    // eras
+    if (sp.era.decade && eraKeys.has(normalize(sp.era.decade))) {
+      score += 0.25;
+    }
+
+    // culturalContext ↔ region/language
+    if (culturalKeys.size > 0) {
+      const cultureHits = [normalize(sp.region.primary), normalize(sp.language.primary)];
+      for (const ch of cultureHits) {
+        for (const ck of culturalKeys) {
+          if (ch === ck || ch.includes(ck) || ck.includes(ch)) {
+            score += 0.30;
+            break;
+          }
+        }
+      }
+    }
+
+    if (score > 0) out.push({ track: t, score: Math.min(1.5, score) });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, 180);
+}
+
+/**
+ * 声学指纹距离匹配 —— 用画像的 acoustics(BPM/响度/音色亮度)对每首歌的 analysis
+ * 算欧氏距离,距离越近分越高。这一路是"画像物理特征"的本地落地,跟 discovery
+ * 里给 AI 看的声学 prompt 是同一份指标,但这里在本地算,不占 AI tokens。
+ *
+ * 老画像没有 acoustics(蒸馏时还没接 Symphonia) → 直接返回空,不影响其它路径。
+ */
+function recallByAcoustic(
+  profile: TasteProfile | null,
+  library: TrackInfo[],
+  analyses: Map<number, TrackAnalysis>,
+): Hit[] {
+  if (!profile?.acoustics || profile.acoustics.analyzed < 20) return [];
+  const a = profile.acoustics.metrics;
+  // 中位值作为画像的中心点;响度做归一化(-60..0 → 0..1)避免量纲压制 BPM
+  const targetBpm = a.bpmMedian ?? a.bpmMean ?? 100;
+  const targetRmsNorm = clamp01((a.rmsDbMean + 60) / 60);
+  const targetCentroidKHz = a.centroidMean / 1000;
+
+  const out: Hit[] = [];
+  for (const t of library) {
+    const an = analyses.get(t.id);
+    if (!an) continue;
+    // 距离三维:BPM 差归一化(±60 BPM → 0..1)、响度差归一化、亮度差(谱重心 kHz)
+    const bpm = an.bpm ?? targetBpm;
+    const dBpm = Math.min(1, Math.abs(bpm - targetBpm) / 60);
+    const rmsNorm = clamp01((an.rmsDb + 60) / 60);
+    const dRms = Math.abs(rmsNorm - targetRmsNorm);
+    // 谱重心:analysis 里没直接存,用 introVocalDensity 当弱代理(高 vocal density
+    // 多半带亮色人声) —— 不完美,但比没有强。后续 v4 把 native 的 spectral
+    // centroid merge 进 TrackAnalysis 时换掉。
+    const proxyCentroidKHz = (an.introVocalDensity ?? 0.5) * 3;
+    const dCentroid = Math.min(1, Math.abs(proxyCentroidKHz - targetCentroidKHz) / 3);
+    const distance = Math.sqrt(dBpm * dBpm + dRms * dRms + dCentroid * dCentroid) / Math.sqrt(3);
+    const score = 1 - distance;
+    if (score > 0.4) out.push({ track: t, score });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, 140);
+}
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
 function recallByAudio(

@@ -4,15 +4,20 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -46,13 +51,21 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -66,7 +79,22 @@ import app.pipo.nativeapp.data.PipoPlaylist
 import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.playback.PlaybackQueueMode
 import app.pipo.nativeapp.playback.PlayerViewModel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material3.Icon
 
 /** 子页面用的返回回调 —— PipoNativeApp 在 push 进入前提供，返回到 Player root。 */
 val LocalOnBack = staticCompositionLocalOf<(() -> Unit)?> { null }
@@ -187,13 +215,196 @@ private fun DistillLibrary(
     }
     val focusedQueue = (focused as? LibraryPage.CurrentQueue)?.queue
     val focusedPlaylist = (focused as? LibraryPage.PlaylistItem)?.playlist
-    val trackListTransitionAlpha = remember { Animatable(1f) }
+
+    // Search and pull-to-refresh state
+    var searchQuery by remember { mutableStateOf("") }
+    var pullOffset by remember { mutableStateOf(0f) }
+    var isRefreshing by remember { mutableStateOf(false) }
+    var refreshDragBlockedUntilRelease by remember { mutableStateOf(false) }
+    var searchSettledListKey by remember { mutableStateOf(focusedListKey) }
+    var locateTargetListKey by remember { mutableStateOf<String?>(null) }
+
+    val searchBarMaxHeight = 44.dp
+    val localDensity = androidx.compose.ui.platform.LocalDensity.current
+    val searchBarMaxHeightPx = with(localDensity) { searchBarMaxHeight.toPx() }
+    val refreshThresholdPx = with(localDensity) { 92.dp.toPx() }
+    val refreshHoldOffsetPx = with(localDensity) { 38.dp.toPx() }
+    val refreshMaxGapPx = with(localDensity) { 54.dp.toPx() }
+    val trackTopTolerancePx = with(localDensity) { 6.dp.toPx() }.toInt()
+    val searchHeightAnim = remember { Animatable(0f) }
+    val searchFocusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    val scope = rememberCoroutineScope()
+    val isTrackListAwayFromTop by remember(trackListState, trackTopTolerancePx) {
+        derivedStateOf {
+            trackListState.firstVisibleItemIndex > 0 ||
+                trackListState.firstVisibleItemScrollOffset > trackTopTolerancePx
+        }
+    }
+    val isSwitchingTrackList = focusedListKey != searchSettledListKey
+    val shouldShowSearchBar = !isSwitchingTrackList &&
+        (isTrackListAwayFromTop || searchQuery.isNotBlank())
+
+    fun closeSearch() {
+        searchQuery = ""
+        focusManager.clearFocus()
+        keyboardController?.hide()
+    }
+
+    LaunchedEffect(shouldShowSearchBar) {
+        val target = if (shouldShowSearchBar) searchBarMaxHeightPx else 0f
+        searchHeightAnim.animateTo(
+            target,
+            tween(durationMillis = 220, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+        )
+        if (!shouldShowSearchBar) {
+            focusManager.clearFocus()
+            keyboardController?.hide()
+        }
+    }
+
+    LaunchedEffect(isTrackListAwayFromTop) {
+        if (isTrackListAwayFromTop) {
+            pullOffset = 0f
+        } else {
+            if (searchQuery.isBlank()) {
+                focusManager.clearFocus()
+                keyboardController?.hide()
+            }
+        }
+    }
+
+    val filteredTracks = remember(tracks, searchQuery) {
+        if (searchQuery.isBlank()) {
+            tracks
+        } else {
+            tracks.filter {
+                it.title.contains(searchQuery, ignoreCase = true) ||
+                it.artist.contains(searchQuery, ignoreCase = true)
+            }
+        }
+    }
+
+    val refreshInfiniteTransition = rememberInfiniteTransition(label = "refreshSpinner")
+    val refreshRotation by refreshInfiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1400, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "rotation"
+    )
+    val refreshGapPx by animateFloatAsState(
+        targetValue = when {
+            pullOffset > 0f -> (pullOffset * 0.62f).coerceAtMost(refreshMaxGapPx)
+            isRefreshing -> refreshHoldOffsetPx
+            else -> 0f
+        },
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMediumLow,
+        ),
+        label = "refreshGap",
+    )
+
+    val nestedScrollConnection = remember(focusedListKey, focused, libraryPages, pagerState) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                val delta = available.y
+                if (source == NestedScrollSource.UserInput && delta < 0) { // scrolling up
+                    // 1. If we are currently pulling down (pullOffset > 0)
+                    if (pullOffset > 0f) {
+                        val consumed = pullOffset.coerceAtMost(-delta)
+                        pullOffset -= consumed
+                        return Offset(0f, -consumed)
+                    }
+                }
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource
+            ): Offset {
+                val delta = available.y
+                val isManualPull = source == NestedScrollSource.UserInput
+                if (isManualPull && consumed.y > 0f && pullOffset <= 0f) {
+                    // If this drag had to scroll the list back to top first, do not treat the
+                    // same gesture as a refresh confirmation. Release, then pull again.
+                    refreshDragBlockedUntilRelease = true
+                }
+                if (isManualPull &&
+                    delta > 0 &&
+                    focused is LibraryPage.PlaylistItem &&
+                    trackListState.firstVisibleItemIndex == 0 &&
+                    trackListState.firstVisibleItemScrollOffset == 0 &&
+                    !isRefreshing &&
+                    searchQuery.isBlank() &&
+                    !refreshDragBlockedUntilRelease
+                ) {
+                    val oldPull = pullOffset
+                    pullOffset = (pullOffset + delta).coerceAtMost(refreshThresholdPx)
+                    val added = pullOffset - oldPull
+                    return Offset(0f, added)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                refreshDragBlockedUntilRelease = false
+                if (pullOffset > 0f && !isRefreshing) {
+                    if (focused is LibraryPage.PlaylistItem && pullOffset >= refreshThresholdPx) {
+                        // Trigger refresh
+                        isRefreshing = true
+                        pullOffset = 0f
+                        scope.launch {
+                            val focusedPage = libraryPages.getOrNull(pagerState.currentPage)
+                            if (focusedPage is LibraryPage.PlaylistItem) {
+                                runCatching {
+                                    // 并行刷 playlist 元数据(trackCount/cover/name),
+                                    // 让顶部"X 首"数字和列表保持一致;元数据失败不影响 tracks。
+                                    coroutineScope {
+                                        launch { runCatching { repository.refreshPlaylists() } }
+                                        repository.tracksForPlaylist(focusedPage.playlist.id, forceRefresh = true)
+                                    }
+                                }.onSuccess { refreshedTracks ->
+                                    tracks = refreshedTracks
+                                }
+                            }
+                            isRefreshing = false
+                        }
+                    } else {
+                        pullOffset = 0f
+                    }
+                }
+                return Velocity.Zero
+            }
+        }
+    }
+
     LaunchedEffect(focusedListKey) {
-        if (!pendingLocateCurrent) {
+        val preserveExplicitLocate = pendingLocateCurrent && locateTargetListKey == focusedListKey
+        if (!preserveExplicitLocate) {
+            pendingLocateCurrent = false
+            locateTargetListKey = null
             trackListState.scrollToItem(0)
         }
-        trackListTransitionAlpha.snapTo(0.88f)
-        trackListTransitionAlpha.animateTo(1f, tween(durationMillis = 160))
+        // 不再做任何 alpha 过场。试过两种都被用户判为"闪"：
+        //   1) snapTo(0.88) + animateTo(1, 160ms): snap 那一帧瞬变 → 小闪
+        //   2) animateTo(0) → animateTo(1): 列表完全不可见再出现 → 大闪
+        // 干脆让 LazyColumn 自己换内容，背景 blur / 标题 / cover-flow 不动，整体感觉
+        // 就是"歌单切了，曲目跟着换"，没有任何附加的明暗过场可被察觉成"闪"。
+        searchQuery = ""
+        focusManager.clearFocus()
+        keyboardController?.hide()
+        pullOffset = 0f
+        refreshDragBlockedUntilRelease = false
+        // searchHeightAnim 不 snap —— shouldShowSearchBar=false 已经在驱动它自然渐隐
+        // （原 snapTo(0f) 会抢掉 220ms 的 animateTo，体感像被一刀切）。
+        searchSettledListKey = focusedListKey
     }
     LaunchedEffect(focusedListKey, focusedQueue, focusedPlaylist, trackLoadRetry) {
         when (val page = focused) {
@@ -238,13 +449,13 @@ private fun DistillLibrary(
         if (idx >= 0) {
             trackListState.animateScrollToItem(idx)
             pendingLocateCurrent = false
+            locateTargetListKey = null
         }
     }
 
     // ---- 蒸馏状态 + 进度 + 多选模式 ----
     // 蒸馏跑在 app-level coordinator（DistillCoordinator），跟 Composable 进出无关。
     // 这里只用它的 StateFlow 来呈现 UI。即使用户切走，蒸馏仍在后台跑。
-    val scope = rememberCoroutineScope()
     val nav = LocalNav.current
     val coordinator = app.pipo.nativeapp.data.PipoGraph.distillCoordinator
     val distillRunning by coordinator.running.collectAsState()
@@ -308,7 +519,7 @@ private fun DistillLibrary(
                 modifier = Modifier
                     .fillMaxSize()
                     .statusBarsPadding()
-                    .padding(top = 6.dp, bottom = 60.dp),
+                    .padding(top = 2.dp, bottom = 12.dp),
             ) {
                 // header —— title 紧贴返回箭头，跟 ScreenScaffold（设置页）对齐
                 Row(
@@ -356,7 +567,7 @@ private fun DistillLibrary(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 if (mode == "select") {
                     // 多选模式：歌单 + checkbox 列表 + 底部"开始 N 张"操作
@@ -442,18 +653,18 @@ private fun DistillLibrary(
                 }
 
                 // cover-flow pager
-                //   - 焦点 cover 加大到 280dp（之前 220dp）
+                //   - 焦点 cover 控制在 260dp，给下方曲目列表多留空间
                 //   - contentPadding 不对称：左 24dp 让焦点 cover 左边沿恰好对齐下方"歌单标题"的左边沿
                 //     右 80dp 让"下一张"以小片露出来作为下一页提示（Apple Music 风）
                 //   - pageSpacing 缩小到 8dp，左右两侧的封面更紧凑
                 androidx.compose.foundation.pager.HorizontalPager(
                     state = pagerState,
-                    pageSize = androidx.compose.foundation.pager.PageSize.Fixed(280.dp),
+                    pageSize = androidx.compose.foundation.pager.PageSize.Fixed(260.dp),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 24.dp, end = 80.dp),
                     pageSpacing = 8.dp,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(310.dp)
+                        .height(276.dp)
                         .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                         .drawWithContent {
                             drawContent()
@@ -479,7 +690,7 @@ private fun DistillLibrary(
                     val rotY = pageOffset * 24f
                     Box(
                         modifier = Modifier
-                            .size(280.dp)
+                            .size(260.dp)
                             .graphicsLayer {
                                 scaleX = scale
                                 scaleY = scale
@@ -501,20 +712,25 @@ private fun DistillLibrary(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // 焦点歌单标题 —— 左边沿严格对齐 cover 左边沿 24dp
                 if (focused != null) {
-                    Text(
-                        text = focused.title,
-                        color = PipoColors.Ink,
-                        style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.SemiBold),
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(start = 24.dp, end = 24.dp),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = focused.title,
+                            color = PipoColors.Ink,
+                            style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.SemiBold),
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                     Text(
                         text = "${focused.trackCount} 首",
                         color = PipoColors.TextDim,
@@ -538,16 +754,68 @@ private fun DistillLibrary(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                        .padding(top = 12.dp),
+                        .padding(top = 6.dp)
+                        .nestedScroll(nestedScrollConnection),
                 ) {
-                    LazyColumn(
-                        state = trackListState,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .graphicsLayer { alpha = trackListTransitionAlpha.value },
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp),
-                    ) {
-                        when {
+	                    LazyColumn(
+	                        state = trackListState,
+	                        modifier = Modifier.fillMaxSize(),
+	                        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 8.dp),
+	                    ) {
+	                        if ((refreshGapPx > 0.5f || isRefreshing) && focused is LibraryPage.PlaylistItem) {
+	                            item(key = "__pull_refresh__") {
+	                                val refreshGapDp = with(localDensity) { refreshGapPx.toDp() }
+	                                val pullProgress = (pullOffset / refreshThresholdPx).coerceIn(0f, 1f)
+	                                val sweepAngle = if (isRefreshing) 260f else (pullProgress * 280f)
+	                                val rotation = if (isRefreshing) refreshRotation else (-90f + pullProgress * 150f)
+	                                val indicatorAlpha = if (isRefreshing) 0.92f else (0.24f + pullProgress * 0.68f)
+	                                val indicatorScale = if (isRefreshing) 1f else (0.74f + pullProgress * 0.26f)
+	                                Box(
+	                                    modifier = Modifier
+	                                        .fillMaxWidth()
+	                                        .height(refreshGapDp),
+	                                    contentAlignment = Alignment.Center,
+	                                ) {
+	                                    Canvas(
+	                                        modifier = Modifier
+	                                            .size(20.dp)
+	                                            .graphicsLayer {
+	                                                alpha = indicatorAlpha
+	                                                scaleX = indicatorScale
+	                                                scaleY = indicatorScale
+	                                                rotationZ = rotation
+	                                            }
+	                                    ) {
+	                                        val strokeWidthPx = 1.6.dp.toPx()
+	                                        val diameter = size.minDimension - strokeWidthPx
+	                                        val arcSize = androidx.compose.ui.geometry.Size(diameter, diameter)
+	                                        val topLeft = androidx.compose.ui.geometry.Offset(
+	                                            (size.width - diameter) / 2f,
+	                                            (size.height - diameter) / 2f,
+	                                        )
+	                                        drawArc(
+	                                            color = Color.White.copy(alpha = 0.18f),
+	                                            startAngle = 0f,
+	                                            sweepAngle = 360f,
+	                                            useCenter = false,
+	                                            style = Stroke(width = strokeWidthPx, cap = StrokeCap.Round),
+	                                            size = arcSize,
+	                                            topLeft = topLeft,
+	                                        )
+	                                        drawArc(
+	                                            color = Color(0xEEF4F6F8),
+	                                            startAngle = 0f,
+	                                            sweepAngle = sweepAngle,
+	                                            useCenter = false,
+	                                            style = Stroke(width = strokeWidthPx, cap = StrokeCap.Round),
+	                                            size = arcSize,
+	                                            topLeft = topLeft,
+	                                        )
+	                                    }
+	                                }
+	                            }
+	                        }
+	                        when {
                             loading -> item {
                                 Text(
                                     "加载中…",
@@ -578,49 +846,146 @@ private fun DistillLibrary(
                                     modifier = Modifier.padding(start = 24.dp),
                                 )
                             }
+                            filteredTracks.isEmpty() -> item {
+                                Text(
+                                    "未找到匹配歌曲",
+                                    color = PipoColors.TextDim,
+                                    style = TextStyle(fontSize = 13.sp),
+                                    modifier = Modifier.padding(start = 24.dp),
+                                )
+                            }
                             else -> {
-                                items(
-                                    items = tracks,
-                                    key = { it.id },
-                                ) { t ->
-                                    TrackListRow(
-                                        track = t,
-                                        isCurrentTrack = t.id == currentTrackId,
-                                        isPlaying = playerState.isPlaying,
-                                        onClick = {
-                                            playerVm.playTrack(t, tracks)
-                                            onBack?.invoke()
-                                        },
-                                    )
+                                itemsIndexed(
+                                    items = filteredTracks,
+                                    key = { index, track -> "${track.id}:$index" },
+                                ) { _, t ->
+                                    val isCurrent = t.id == currentTrackId
+                                    if (focused is LibraryPage.CurrentQueue) {
+                                        SwipeToRevealDeleteRow(
+                                            track = t,
+                                            isCurrentTrack = isCurrent,
+                                            isPlaying = playerState.isPlaying,
+                                            onDelete = {
+                                                playerVm.removeTrack(t.id)
+                                            },
+                                            onClick = {
+                                                playerVm.playCurrentQueueTrack(t.id)
+                                                onBack?.invoke()
+                                            }
+                                        )
+                                    } else {
+                                        TrackListRow(
+                                            track = t,
+                                            isCurrentTrack = isCurrent,
+                                            isPlaying = playerState.isPlaying,
+                                            onClick = {
+                                                playerVm.playTrack(t, filteredTracks)
+                                                onBack?.invoke()
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
-                    if (shouldShowLocateCurrent) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(end = 18.dp, bottom = 18.dp)
-                                .size(44.dp)
-                                .clip(CircleShape)
-                                .background(PipoColors.Mint.copy(alpha = 0.18f))
+
+                    // 搜索框作为覆盖层，不参与 LazyColumn 测量，避免出现/收起时挤压列表导致抖动。
+                    if (searchHeightAnim.value > 0f) {
+	                        val searchProgress = (searchHeightAnim.value / searchBarMaxHeightPx).coerceIn(0f, 1f)
+	                        val searchShape = RoundedCornerShape(14.dp)
+	                        Row(
+	                            modifier = Modifier
+	                                .align(Alignment.TopCenter)
+	                                .fillMaxWidth()
+	                                .padding(horizontal = 16.dp)
+	                                .height(38.dp)
+	                                .graphicsLayer {
+	                                    alpha = searchProgress
+	                                    translationY = with(localDensity) {
+	                                        (-10).dp.toPx() * (1f - searchProgress)
+	                                    }
+	                                }
+	                                .clip(searchShape)
+	                                .background(Color(0xF238403A))
+	                                .border(1.dp, Color.White.copy(alpha = 0.12f), searchShape)
+	                                .padding(horizontal = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SearchIcon(
+                                color = PipoColors.TextDim,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            androidx.compose.foundation.text.BasicTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                textStyle = TextStyle(
+                                    color = PipoColors.Ink,
+                                    fontSize = 13.sp
+                                ),
+                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                                ),
+                                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                                    onSearch = { keyboardController?.hide() }
+                                ),
+	                                modifier = Modifier
+	                                    .weight(1f)
+	                                    .focusRequester(searchFocusRequester),
+	                                cursorBrush = androidx.compose.ui.graphics.SolidColor(PipoColors.Ink),
+                                decorationBox = { innerTextField ->
+                                    if (searchQuery.isEmpty()) {
+                                        Text(
+                                            text = "搜索当前歌单歌曲",
+                                            color = PipoColors.TextDim,
+                                            style = TextStyle(fontSize = 13.sp)
+                                        )
+                                    }
+                                    innerTextField()
+                                }
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .clickable { closeSearch() }
+                                    .semantics { contentDescription = "关闭搜索" }
+                                    .padding(4.dp)
+                            ) {
+                                CloseIcon(
+                                    color = PipoColors.TextDim,
+                                    modifier = Modifier.size(10.dp)
+                                )
+                            }
+                        }
+                    }
+
+	                    if (shouldShowLocateCurrent) {
+	                        Box(
+	                            modifier = Modifier
+	                                .align(Alignment.BottomEnd)
+	                                .padding(end = 76.dp, bottom = 20.dp)
+	                                .size(38.dp)
+	                                .clip(CircleShape)
+	                                .background(Color(0xD9424842))
+	                                .border(1.dp, Color.White.copy(alpha = 0.14f), CircleShape)
                                 .semantics { contentDescription = "定位到当前播放" }
                                 .clickable {
                                     scope.launch {
                                         if (currentTrackIndexInVisibleTracks >= 0) {
                                             trackListState.animateScrollToItem(currentTrackIndexInVisibleTracks)
                                         } else {
-                                            val queuePage = libraryPages.indexOfFirst { it is LibraryPage.CurrentQueue }
-                                            if (queuePage >= 0) {
-                                                pendingLocateCurrent = true
-                                                pagerState.animateScrollToPage(queuePage)
-                                            }
+	                                            val queuePage = libraryPages.indexOfFirst { it is LibraryPage.CurrentQueue }
+	                                            if (queuePage >= 0) {
+	                                                pendingLocateCurrent = true
+	                                                locateTargetListKey = "current"
+	                                                pagerState.animateScrollToPage(queuePage)
+	                                            }
                                         }
                                     }
-                                },
+                            },
                             contentAlignment = Alignment.Center,
                         ) {
-                            LocateCurrentIcon(color = PipoColors.Ink, modifier = Modifier.size(21.dp))
+                            LocateCurrentIcon(color = Color(0xEEF4F6F8), modifier = Modifier.size(18.dp))
                         }
                     }
                 }
@@ -699,6 +1064,96 @@ private fun TrackListRow(
 }
 
 @Composable
+private fun SwipeToRevealDeleteRow(
+    track: NativeTrack,
+    isCurrentTrack: Boolean,
+    isPlaying: Boolean,
+    onDelete: () -> Unit,
+    onClick: () -> Unit,
+) {
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val deleteButtonWidth = 72.dp
+    val deleteButtonWidthPx = with(density) { deleteButtonWidth.toPx() }
+
+    val swipeOffset = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(track.id) {
+        swipeOffset.snapTo(0f)
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Max)
+            .clipToBounds(),
+    ) {
+        // 删除按钮跟随 row 一起平移：row 不滑动时按钮停在屏幕外，
+        // 这样底层 cover 背景能完整透出来，跟其他歌单列表视觉一致。
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .width(deleteButtonWidth)
+                .fillMaxHeight()
+                .graphicsLayer {
+                    translationX = swipeOffset.value + deleteButtonWidthPx
+                }
+                .background(Color(0xFFE53935))
+                .clickable(onClick = onDelete),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "删除",
+                color = Color.White,
+                style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .graphicsLayer {
+                    translationX = swipeOffset.value
+                }
+                .pointerInput(track.id) {
+                    detectHorizontalDragGestures(
+                        onDragEnd = {
+                            val target = if (swipeOffset.value < -deleteButtonWidthPx / 2f) {
+                                -deleteButtonWidthPx
+                            } else {
+                                0f
+                            }
+                            scope.launch {
+                                swipeOffset.animateTo(
+                                    target,
+                                    spring(
+                                        dampingRatio = Spring.DampingRatioLowBouncy,
+                                        stiffness = Spring.StiffnessMediumLow,
+                                    ),
+                                )
+                            }
+                        },
+                        onHorizontalDrag = { change, dragAmount ->
+                            change.consume()
+                            val newOffset = (swipeOffset.value + dragAmount).coerceIn(-deleteButtonWidthPx, 0f)
+                            scope.launch {
+                                swipeOffset.snapTo(newOffset)
+                            }
+                        }
+                    )
+                }
+        ) {
+            TrackListRow(
+                track = track,
+                isCurrentTrack = isCurrentTrack,
+                isPlaying = isPlaying,
+                onClick = onClick
+            )
+        }
+    }
+}
+
+@Composable
 private fun PlaybackModeStrip(
     mode: PlaybackQueueMode,
     onMode: (PlaybackQueueMode) -> Unit,
@@ -710,11 +1165,16 @@ private fun PlaybackModeStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         PlaybackModeChip(
-            label = "列表循环",
-            selected = mode == PlaybackQueueMode.PlaylistLoop,
-            onClick = { onMode(PlaybackQueueMode.PlaylistLoop) },
+            label = "随机播放",
+            selected = mode == PlaybackQueueMode.ShufflePlay,
+            onClick = { onMode(PlaybackQueueMode.ShufflePlay) },
         ) { tint ->
-            RepeatModeIcon(color = tint, modifier = Modifier.size(19.dp))
+            Icon(
+                imageVector = Icons.Rounded.Shuffle,
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(19.dp)
+            )
         }
         PlaybackModeChip(
             label = "顺序播放",

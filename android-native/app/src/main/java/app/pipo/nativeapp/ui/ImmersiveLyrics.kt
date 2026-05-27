@@ -702,10 +702,15 @@ internal fun AppleMusicLyricColumn(
     }
     // 活动行也用按帧平滑后的时钟直接判定，避免 ViewModel 的 position tick 让快歌切句慢半拍。
     // 这里只提前行焦点；逐词/逐字扫色仍由 token timing 控制。
-    val playbackActiveIdx = if (lineClockPositionMs + lineFocusLeadMs >= LyricTiming.audioStartMs(lines.first())) {
-        lines.indexOfLast { line -> lineClockPositionMs + lineFocusLeadMs >= LyricTiming.audioStartMs(line) }
-            .coerceAtLeast(0)
-    } else -1
+    // 关键：前奏期（position < 第一行 audioStart，如 Taylor Swift "The Fate of Ophelia" 前奏 11.2s）
+    // 也把"第一行"视为 active —— 否则 effectiveActiveIdx=-1 让所有行都按 future 渲染
+    //（rowAlpha ≤0.36），且 isActiveYrc=false 让 drawPerCharLiftedSweep 完全不调用，
+    // 视觉上变成"全是暗的未唱行、没有任何字级 wave"，跟"行级歌词"几乎一样。用户点下面任一行
+    // seek 跳过前奏后才"看起来"恢复字级。下面用 coerceAtLeast(0) 把前奏期 indexOfLast=-1 钉到 0，
+    // 让首行始终处于 active：层级 alpha=1.0 提前点亮，等到第一个 token 真正起播时 sweep 无缝接上。
+    val playbackActiveIdx = lines
+        .indexOfLast { line -> lineClockPositionMs + lineFocusLeadMs >= LyricTiming.audioStartMs(line) }
+        .coerceAtLeast(0)
     val effectiveActiveIdx = manualFocusIndex ?: playbackActiveIdx
     LaunchedEffect(scrollTargetIdx, clickSeekFocusIndex, clickSeekHoldUntilMs) {
         val heldIndex = clickSeekFocusIndex ?: return@LaunchedEffect

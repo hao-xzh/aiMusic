@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.data
 
+import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
@@ -47,6 +48,35 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     override suspend fun neteasePlaylistTracks(playlistId: Long): List<NativeTrack> {
         val o = callObject("netease_playlist_detail", jsonObject("id" to playlistId))
         val tracks = o.optJSONArray("tracks") ?: return emptyList()
+        val diagnostics = o.optJSONObject("hydrationDiagnostics")
+        DiagnosticsLogStore.record(
+            area = "library",
+            event = "playlist_detail_hydration",
+            fields = mapOf(
+                "playlistId" to playlistId,
+                "playlistName" to o.optString("name"),
+                "trackCount" to o.optInt("trackCount", 0),
+                "trackIdsCount" to (o.optJSONArray("trackIds")?.length() ?: 0),
+                "tracksCount" to tracks.length(),
+                "playlistDetailSource" to diagnostics?.optString("playlistDetailSource"),
+                "playlistDetailFallbackError" to diagnostics?.optString("playlistDetailFallbackError"),
+                "originalTracksCount" to diagnostics?.optInt("originalTracksCount", -1),
+                "songDetailRequested" to diagnostics?.optInt("songDetailRequested", -1),
+                "songDetailResolved" to diagnostics?.optInt("songDetailResolved", -1),
+                "cloudByIdsRequested" to diagnostics?.optInt("cloudByIdsRequested", -1),
+                "cloudByIdsReturned" to diagnostics?.optInt("cloudByIdsReturned", -1),
+                "cloudByIdsResolved" to diagnostics?.optInt("cloudByIdsResolved", -1),
+                "cloudByIdsError" to diagnostics?.optString("cloudByIdsError"),
+                "cloudScanRequested" to diagnostics?.optInt("cloudScanRequested", -1),
+                "cloudScanPages" to diagnostics?.optInt("cloudScanPages", -1),
+                "cloudScanReturned" to diagnostics?.optInt("cloudScanReturned", -1),
+                "cloudScanResolved" to diagnostics?.optInt("cloudScanResolved", -1),
+                "cloudScanError" to diagnostics?.optString("cloudScanError"),
+                "finalTracksCount" to diagnostics?.optInt("finalTracksCount", -1),
+                "missingAfterHydration" to diagnostics?.optInt("missingAfterHydration", -1),
+                "missingIdSample" to diagnostics?.optJSONArray("missingIdSample")?.toCompactList(),
+            ),
+        )
         return parseTracks(tracks)
     }
 
@@ -75,6 +105,10 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
                 streamUrl = "",
             )
         }
+    }
+
+    private fun JSONArray.toCompactList(limit: Int = 16): List<Any> {
+        return List(kotlin.math.min(length(), limit)) { i -> opt(i) }
     }
 
     override suspend fun neteaseQrStart(): QrLoginStart {

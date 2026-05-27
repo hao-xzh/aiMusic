@@ -32,7 +32,7 @@
  * AiPet 组件不需要改。
  */
 
-import { ai, cache } from "./tauri";
+import { ai, cache, netease } from "./tauri";
 import type { TrackInfo } from "./tauri";
 import { getMemoryDigest, recordUserUtterance } from "./pet-memory";
 import { loadTasteProfile } from "./taste-profile";
@@ -44,15 +44,23 @@ import {
   parseMusicIntent,
   type MusicIntent,
 } from "./music-intent";
-import { recallCandidates } from "./candidate-recall";
+import { recallCandidates, type Candidate } from "./candidate-recall";
 import { rankCandidates } from "./candidate-ranker";
 import { readRecentPlayContext } from "./behavior-log";
 import {
   logRecommendations,
   readRecentRecommendationContext,
+  type RecentRecommendationContext,
 } from "./recommendation-log";
+import { discoverBeyondLibrary } from "./discovery";
+import {
+  getSemanticProfiles,
+  type TrackSemanticProfile,
+} from "./track-semantic-profile";
+import { loadAnalysis, type TrackAnalysis } from "./audio-analysis";
 import {
   dedupeTrackInfos,
+  normalizeTitle,
   queryAsksForSpecificVersion,
   songKey,
 } from "./track-dedupe";
@@ -313,25 +321,94 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
   const currentTrackInfo = input.currentTrack
     ? library.find((t) => t.id === input.currentTrack?.neteaseId) ?? null
     : null;
+  const namedTrackHints = getNamedTrackHints(intent);
+  const hasNamedTrackHints = namedTrackHints.length > 0;
+  const preserveVersions = queryAsksForSpecificVersion(intent);
+  const isInsert = intent.queueIntent.action === "insert";
+  const pinnedLocal = hasNamedTrackHints ? resolvePinnedTracks(intent, library) : [];
+
+  // 用户明确点名某首歌时，insert 不走泛推荐：先用户歌单，本地没覆盖才搜库外。
+  if (isInsert && hasNamedTrackHints) {
+    const pinnedOnline = await resolvePinnedFromOnline(intent, pinnedLocal);
+    const toInsert = mergeUniqueTrackInfos(
+      [...pinnedLocal, ...pinnedOnline],
+      preserveVersions,
+    ).slice(0, 1);
+    if (toInsert.length === 0) {
+      void writeDebugRecord({
+        userText: input.userText,
+        intent,
+        reply: replyText,
+        reason: "named insert not found",
+        finalTrackIds: [],
+      });
+      return {
+        text: `${replyText}（这首我没找到，换个名字？）`,
+        play: null,
+        resolvedTracks: [],
+        queueAction: "insert",
+      };
+    }
+    const picked = toInsert[0];
+    void logRecommendations([picked], "pet");
+    void writeDebugRecord({
+      userText: input.userText,
+      intent,
+      reply: replyText,
+      reason: "named insert local-first",
+      finalTrackIds: [picked.id],
+    });
+    return {
+      text: replyText,
+      play: {
+        trackIds: [picked.id],
+        reason: "insert",
+      },
+      resolvedTracks: [picked],
+      queueAction: "insert",
+      continuous: null,
+    };
+  }
 
   // 召回 + 本地打分
-  const candidates = await recallCandidates({
+  // 并行做三件事:本地 recall / 行为日志 / 推荐日志 —— 三路都涉及 cache I/O,
+  // 串行没意义。
+  const [candidatesFromLibrary, recentPlay, recentRecommendation] = await Promise.all([
+    recallCandidates({
+      intent,
+      library,
+      currentTrack: currentTrackInfo,
+      limit: 240,
+    }),
+    readRecentPlayContext().catch(() => undefined),
+    readRecentRecommendationContext().catch(() => undefined),
+  ]);
+
+  // 库外 discovery 注入:满足触发条件时,并发跑一次轻量 discovery 把库外冷门
+  // 候选混进主流。修两个痛点 —— "歌手有更多歌不继续推"(库外补)、"小众冷门
+  // 也想要"(seed 出冷门)。
+  const discoveryHits = await maybeDiscoverExtra({
     intent,
     library,
-    currentTrack: currentTrackInfo,
-    limit: 240,
+    candidateCount: candidatesFromLibrary.length,
+    recentRecommendation,
   });
-  if (candidates.length === 0) {
+  const pinnedOnline = hasNamedTrackHints
+    ? await resolvePinnedFromOnline(intent, pinnedLocal)
+    : [];
+  const pinnedTracks = mergeUniqueTrackInfos(
+    [...pinnedLocal, ...pinnedOnline],
+    preserveVersions,
+  );
+  const candidates = [...candidatesFromLibrary, ...discoveryHits];
+
+  if (candidates.length === 0 && pinnedTracks.length === 0) {
     return {
       text: `${replyText}（这次库里真没贴的，换个说法？）`,
       play: null,
       resolvedTracks: [],
     };
   }
-  const [recentPlay, recentRecommendation] = await Promise.all([
-    readRecentPlayContext().catch(() => undefined),
-    readRecentRecommendationContext().catch(() => undefined),
-  ]);
   // topN 240 ≈ recall 上限,基本不裁。
   // 续杯模式需要尽可能大的池子（reservoir 喂得越饱,fetchMore 才有得续杯）；
   // 即使没续杯,这里多收点候选给 dedupe 之后也只用前 wanted 首,代价只是
@@ -341,7 +418,7 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
     recentPlay,
     recentRecommendation,
   });
-  if (ranked.length === 0) {
+  if (ranked.length === 0 && pinnedTracks.length === 0) {
     return {
       text: `${replyText}（符合得太少，换个说法？）`,
       play: null,
@@ -356,10 +433,16 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
   // 多少次都不会跟初始批撞同一首歌的另一版本（VIP 重唱 / Live / Remix 等），
   // 因为 dedupe 是在切批之前一次性做完的。
   const allRankedTracks = ranked.map((c) => c.track);
-  const dedupedBase = queryAsksForSpecificVersion(intent)
+  // bucketMap:从 ranker 阶段抽出每首歌的 bucket(0-3 分位档位),给续杯端跨段
+  // 抽样用,这样 fetchMore 8 首里有不同档位的歌混合,而不是把第 0 段抽完再抽第 1 段。
+  const bucketMap = new Map<number, 0 | 1 | 2 | 3>();
+  for (const r of ranked) bucketMap.set(r.track.id, r.bucket);
+  const rankedBase = preserveVersions
     ? allRankedTracks
     : dedupeTrackInfos(allRankedTracks);
-  const isInsert = intent.queueIntent.action === "insert";
+  const dedupedBase = pinnedTracks.length > 0
+    ? mergeUniqueTrackInfos([...pinnedTracks, ...rankedBase], preserveVersions)
+    : rankedBase;
 
   if (isInsert) {
     const picked = dedupedBase[0] ?? ranked[0]?.track;
@@ -371,7 +454,7 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
         queueAction: "insert",
       };
     }
-    void logRecommendations([picked.id], "pet");
+    void logRecommendations([picked], "pet");
     void writeDebugRecord({
       userText: input.userText,
       intent,
@@ -436,9 +519,10 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
     intent,
     library,
     currentTrack: currentTrackInfo,
+    bucketMap,
   });
 
-  void logRecommendations(smoothed.map((t) => t.id), "pet");
+  void logRecommendations(smoothed, "pet");
 
   void writeDebugRecord({
     userText: input.userText,
@@ -500,23 +584,51 @@ function buildContinuousSource(args: {
   intent: MusicIntent;
   library: TrackInfo[];
   currentTrack: TrackInfo | null;
+  /** 每首歌的 bucket(0-3 分位)。drainPool 按 bucket 跨段抽样,保持混合。 */
+  bucketMap: Map<number, 0 | 1 | 2 | 3>;
 }): ContinuousSource {
-  const { initialBatch, reservoir, intent, library, currentTrack } = args;
+  const { initialBatch, reservoir, intent, library, currentTrack, bucketMap } = args;
   const consumed = new Set<string>(initialBatch.map(songKey));
   let pool: TrackInfo[] = reservoir;
   let refillTried = false;
 
-  // 从当前 pool 里挑符合条件的下一批。pool 是只读迭代,不 splice ——
-  // 靠 consumed 跳过已经推过的,简单稳。
+  // 跨 bucket 抽样:8 首 = 4(top) + 2(2nd) + 1(3rd) + 1(4th)。
+  // 这样续杯每一批都是"主调 + 边缘"混合,不会先把第 0 段抽完才碰冷门候选。
+  // bucket 不在 map 里的(refill 之后的新候选)统一当 bucket 1 处理。
+  const BUCKET_QUOTA: Record<0 | 1 | 2 | 3, number> = { 0: 4, 1: 2, 2: 1, 3: 1 };
+
   const drainPool = (excludeIds: Set<number>, want: number): TrackInfo[] => {
+    const quotas: Record<0 | 1 | 2 | 3, number> = { ...BUCKET_QUOTA };
+    // 按 want 比例缩放(默认设定按 want=8 算的)
+    const scale = want / 8;
+    quotas[0] = Math.max(1, Math.round(quotas[0] * scale));
+    quotas[1] = Math.max(0, Math.round(quotas[1] * scale));
+    quotas[2] = Math.max(0, Math.round(quotas[2] * scale));
+    quotas[3] = Math.max(0, Math.round(quotas[3] * scale));
+
     const out: TrackInfo[] = [];
+    // 先按 bucket 配额走一遍
     for (const t of pool) {
       if (out.length >= want) break;
       const k = songKey(t);
       if (consumed.has(k)) continue;
       if (excludeIds.has(t.id)) continue;
+      const b = bucketMap.get(t.id) ?? 1;
+      if (quotas[b] <= 0) continue;
+      quotas[b]--;
       consumed.add(k);
       out.push(t);
+    }
+    // 配额没用满(某个 bucket 已枯竭)的话,再扫一遍补齐
+    if (out.length < want) {
+      for (const t of pool) {
+        if (out.length >= want) break;
+        const k = songKey(t);
+        if (consumed.has(k)) continue;
+        if (excludeIds.has(t.id)) continue;
+        consumed.add(k);
+        out.push(t);
+      }
     }
     return out;
   };
@@ -543,6 +655,8 @@ function buildContinuousSource(args: {
         limit: 240,
       });
       const ranked = rankCandidates(candidates, relaxedIntent, { topN: 240 });
+      // refill 阶段的 bucket 也写进同一个 map,让续杯端继续按段抽样
+      for (const r of ranked) bucketMap.set(r.track.id, r.bucket);
       const fresh = ranked.map((c) => c.track);
       // refilled pool 只放还没被 consume 的,fetchMore 内 drainPool 还会再过一遍
       pool = fresh.filter((t) => !consumed.has(songKey(t)));
@@ -566,9 +680,264 @@ function buildContinuousSource(args: {
   return { fetchMore };
 }
 
+// ---------- 库外 discovery 注入 ----------
+
+const DISCOVERY_TRIGGER_WORDS = [
+  "随便", "随意", "探索", "挖", "挖宝", "小众", "冷门", "没听过", "陌生",
+  "新东西", "新歌", "新一点", "新的", "discover", "explore",
+];
+
+/**
+ * 判断当前一次 chat 是否值得跑一次库外 discovery。
+ *
+ * 触发条件(任一):
+ *   1) 库内候选 < 20 —— 召回太少,补几首画像匹配的库外歌凑数
+ *   2) intent.queryText / userText 含探索关键词 —— 用户明示想发现新东西
+ *
+ * 不触发的情况:
+ *   - 点名了某艺人 / 具体歌名 / 专辑(artistLocked) —— 该听库内匹配的,别岔出去
+ *   - intent.queueIntent.action === "insert" —— 单曲插队,不要库外的
+ *   - 一般的"放点歌""推荐一下" —— 库内排序足够,别引入 2-3 秒延迟
+ *
+ * 决策动机:用户要的是"贴口味",不是"非冷门不可"。discovery 是兜底/明示触发,
+ * 不是默认副菜。每条对话都跑 discovery 会拖慢响应且引入不必要的库外噪声。
+ */
+function shouldEnableDiscovery(
+  intent: MusicIntent,
+  candidateCount: number,
+): boolean {
+  if (intent.queueIntent.action === "insert") return false;
+  if (intent.hardConstraints.artists.length > 0) return false;
+  if (intent.textHints.artists.length > 0) return false;
+  if (intent.textHints.tracks.length > 0 || intent.textHints.albums.length > 0) {
+    return false;
+  }
+
+  if (candidateCount < 20) return true;
+  const q = (intent.queryText ?? "").toLowerCase();
+  if (DISCOVERY_TRIGGER_WORDS.some((w) => q.includes(w))) return true;
+  return false;
+}
+
+/**
+ * 跑一次 discovery,把 picks 转成 Candidate[] 注入主流。
+ *
+ * 失败容错:任何环节挂(画像缺 / 网络问题 / AI 解析失败)就静默返回空数组,
+ * 库内候选照走 —— discovery 是锦上添花,不能拖主流程。
+ */
+async function maybeDiscoverExtra(args: {
+  intent: MusicIntent;
+  library: TrackInfo[];
+  candidateCount: number;
+  recentRecommendation: RecentRecommendationContext | undefined;
+}): Promise<Candidate[]> {
+  const { intent, library, candidateCount, recentRecommendation } = args;
+  if (!shouldEnableDiscovery(intent, candidateCount)) return [];
+
+  const profile = await loadTasteProfile().catch(() => null);
+  if (!profile) return []; // 没画像就跑不了 seed
+
+  // 最近 24h 内推得最多的几个艺人,作为 avoidArtists 传进去
+  const avoidArtists: string[] = [];
+  if (recentRecommendation && recentRecommendation.last24hArtistCounts.size > 0) {
+    const sorted = [...recentRecommendation.last24hArtistCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .filter(([, count]) => count >= 3); // 至少推过 3 次才算"反复推"
+    for (const [key] of sorted.slice(0, 5)) avoidArtists.push(key);
+  }
+
+  const ownedIds = new Set(library.map((t) => t.id));
+  try {
+    const picks = await discoverBeyondLibrary(profile, ownedIds, {
+      seedCount: 4,
+      perSeedLimit: 8,
+      finalCount: 10,
+      intentHint: {
+        artists: intent.textHints.artists,
+        moods: intent.musicHints.moods,
+        genres: intent.musicHints.genres,
+      },
+      avoidArtists,
+    });
+    if (picks.length === 0) return [];
+
+    // 把 discovery 的 TrackInfo 算上 semantic / analysis(本地缓存里有就用,没有就 null)
+    const tracks = picks.map((p) => p.track);
+    const [semanticMap, analysisMap] = await Promise.all([
+      getSemanticProfiles(tracks, { includeRuleBasedFallback: true }).catch(
+        () => new Map<number, TrackSemanticProfile>(),
+      ),
+      loadAnalysesBulk(tracks),
+    ]);
+
+    return tracks.map<Candidate>((track) => ({
+      track,
+      analysis: analysisMap.get(track.id) ?? null,
+      semanticProfile: semanticMap.get(track.id) ?? null,
+      sources: ["explore", "profile_tags"],
+      // discovery 的 AI 按"画像匹配度"已 rerank,但毕竟是库外候选,不该跟本地高分歌
+      // 完全平起平坐。0.7/0.7 让 discovery 的歌进得了主流但通常排在本地匹配后面;
+      // 只有本地池薄 / 用户明示探索 时才会有 discovery 的歌排到前面。
+      sourceScores: { explore: 0.70, profile_tags: 0.70 },
+    }));
+  } catch (e) {
+    console.debug("[claudio] discovery 注入失败", e);
+    return [];
+  }
+}
+
+async function loadAnalysesBulk(tracks: TrackInfo[]): Promise<Map<number, TrackAnalysis>> {
+  const out = new Map<number, TrackAnalysis>();
+  await Promise.all(
+    tracks.map(async (t) => {
+      const a = await loadAnalysis(t.id).catch(() => null);
+      if (a) out.set(t.id, a);
+    }),
+  );
+  return out;
+}
+
+// ---------- 命名歌曲优先级 ----------
+
+function getNamedTrackHints(intent: MusicIntent): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [...intent.hardConstraints.tracks, ...intent.textHints.tracks]) {
+    const title = raw.trim();
+    const key = normalizeForMatch(title);
+    if (!title || !key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(title);
+  }
+  return out;
+}
+
+function getArtistHints(intent: MusicIntent): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [...intent.hardConstraints.artists, ...intent.textHints.artists]) {
+    const artist = raw.trim();
+    const key = normalizeForMatch(artist);
+    if (!artist || !key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(artist);
+  }
+  return out;
+}
+
+function resolvePinnedTracks(intent: MusicIntent, library: TrackInfo[]): TrackInfo[] {
+  if (library.length === 0) return [];
+  const titles = getNamedTrackHints(intent);
+  if (titles.length === 0) return [];
+  const artistKeys = new Set(getArtistHints(intent).map(normalizeForMatch).filter(Boolean));
+
+  const out = new Map<string, TrackInfo>();
+  for (const rawTitle of titles) {
+    const titleKey = normalizeForMatch(rawTitle);
+    if (!titleKey) continue;
+    const artistLocked = artistKeys.size > 0;
+    const exact: TrackInfo[] = [];
+    const partial: TrackInfo[] = [];
+    for (const track of library) {
+      if (artistLocked && !trackMatchesAnyArtist(track, artistKeys)) continue;
+      const trackTitle = normalizeForMatch(track.name);
+      if (!trackTitle) continue;
+      if (trackTitle === titleKey) exact.push(track);
+      else if (trackTitle.includes(titleKey) || titleKey.includes(trackTitle)) partial.push(track);
+    }
+    const pick = [...exact, ...partial].sort((a, b) => trackVariantWeight(a.name) - trackVariantWeight(b.name))[0];
+    if (!pick) continue;
+    const key = songKey(pick);
+    if (!out.has(key)) out.set(key, pick);
+  }
+  return [...out.values()];
+}
+
+async function resolvePinnedFromOnline(
+  intent: MusicIntent,
+  alreadyPinned: TrackInfo[],
+): Promise<TrackInfo[]> {
+  const missingTitles = getNamedTrackHints(intent).filter((title) =>
+    !alreadyPinned.some((track) => titleMatchesRequest(track.name, title)),
+  );
+  if (missingTitles.length === 0) return [];
+
+  const artistHints = getArtistHints(intent);
+  const singleArtistHint = artistHints.length === 1 ? artistHints[0] : "";
+  const singleArtistKey = normalizeForMatch(singleArtistHint);
+  const picks = await Promise.all(
+    missingTitles.map(async (title) => {
+      const query = singleArtistHint ? `${title} ${singleArtistHint}` : title;
+      const hits = await netease.search(query, 5).catch(() => []);
+      return hits
+        .filter((track) => titleMatchesRequest(track.name, title))
+        .filter((track) => !singleArtistKey || trackMatchesAnyArtist(track, new Set([singleArtistKey])))
+        .sort((a, b) => trackVariantWeight(a.name) - trackVariantWeight(b.name))[0] ?? null;
+    }),
+  );
+  return picks.filter((track): track is TrackInfo => Boolean(track));
+}
+
+function mergeUniqueTrackInfos(items: TrackInfo[], preserveVersions: boolean): TrackInfo[] {
+  const seen = new Set<string>();
+  const out: TrackInfo[] = [];
+  for (const track of items) {
+    const key = preserveVersions ? String(track.id) : songKey(track);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(track);
+  }
+  return out;
+}
+
+function titleMatchesRequest(actualTitle: string, requestedTitle: string): boolean {
+  const actual = normalizeForMatch(actualTitle);
+  const requested = normalizeForMatch(requestedTitle);
+  return Boolean(
+    actual &&
+      requested &&
+      (actual === requested || actual.includes(requested) || requested.includes(actual)),
+  );
+}
+
+function trackMatchesAnyArtist(track: TrackInfo, artistKeys: Set<string>): boolean {
+  return track.artists.some((artist) => {
+    const key = normalizeForMatch(artist.name);
+    if (!key) return false;
+    for (const wanted of artistKeys) {
+      if (key === wanted || key.includes(wanted) || wanted.includes(key)) return true;
+    }
+    return false;
+  });
+}
+
+function trackVariantWeight(title: string): number {
+  const lower = title.toLowerCase();
+  let weight = title.length;
+  if (lower.includes("live") || lower.includes("现场") || lower.includes("演唱会")) weight += 1000;
+  if (lower.includes("伴奏") || lower.includes("instrumental") || lower.includes("karaoke")) weight += 1000;
+  if (lower.includes("cover") || lower.includes("翻唱")) weight += 800;
+  if (lower.includes("remix") || lower.includes("混音")) weight += 700;
+  if (lower.includes("acoustic") || lower.includes("unplugged")) weight += 600;
+  if (lower.includes("demo")) weight += 500;
+  if (lower.includes("remaster") || lower.includes("重制")) weight += 300;
+  return weight;
+}
+
+function normalizeForMatch(value: string): string {
+  return normalizeTitle(value).replace(/[\s'"`·・\-－—_,，。.、!?！？()（）\[\]【】《》<>&\/]+/g, "");
+}
+
 function diversifyTrackInfos(items: TrackInfo[], intent: MusicIntent): TrackInfo[] {
-  // 用户明确点艺人时，同艺人扎堆不是问题；否则做一层轻量多样性，贴 Android
-  // RecommendEngine 的“同 artist 上限 2、同 songKey 不重复”思路。
+  // 用户明确点艺人时,同艺人扎堆不是问题;否则做"全池 artist 多样性"。
+  //
+  // 旧版本:只 cap 同 artist ≤ 2,溢出的拼在尾部 —— 初始批 15 首是混合,
+  // 但 reservoir 里仍然全是 Taylor,fetchMore 续杯就又是 Taylor 一统天下。
+  //
+  // 新版本:
+  //   1) cap 按池大小动态算 —— 240 首池 → max(2, 240/8) = 30 首/艺人
+  //   2) 溢出的按 artist 轮转重排,而不是一锅塞尾巴,保证 reservoir 里也是
+  //      混合;fetchMore 8 首拿到的是 8 个不同艺人,而不是 8 首 Taylor。
   const artistLocked =
     intent.hardConstraints.artists.length > 0 ||
     intent.textHints.artists.length > 0;
@@ -576,8 +945,9 @@ function diversifyTrackInfos(items: TrackInfo[], intent: MusicIntent): TrackInfo
 
   const seenSongs = new Set<string>();
   const artistCounts = new Map<string, number>();
+  const cap = Math.max(2, Math.floor(items.length / 8));
   const primary: TrackInfo[] = [];
-  const overflow: TrackInfo[] = [];
+  const overflowByArtist = new Map<string, TrackInfo[]>();
 
   for (const track of items) {
     const sk = songKey(track);
@@ -586,15 +956,32 @@ function diversifyTrackInfos(items: TrackInfo[], intent: MusicIntent): TrackInfo
 
     const ak = normalizeArtistKey(track);
     const count = artistCounts.get(ak) ?? 0;
-    if (ak && count >= 2) {
-      overflow.push(track);
+    if (ak && count >= cap) {
+      const bucket = overflowByArtist.get(ak) ?? [];
+      bucket.push(track);
+      overflowByArtist.set(ak, bucket);
       continue;
     }
     if (ak) artistCounts.set(ak, count + 1);
     primary.push(track);
   }
 
-  return [...primary, ...overflow];
+  // 溢出按 artist 轮转(round-robin): 先每个艺人各拿 1 首,再各拿 1 首...
+  const overflowRoundRobin: TrackInfo[] = [];
+  const buckets = Array.from(overflowByArtist.values());
+  let consumed = true;
+  while (consumed) {
+    consumed = false;
+    for (const b of buckets) {
+      const next = b.shift();
+      if (next) {
+        overflowRoundRobin.push(next);
+        consumed = true;
+      }
+    }
+  }
+
+  return [...primary, ...overflowRoundRobin];
 }
 
 function normalizeArtistKey(track: TrackInfo): string {

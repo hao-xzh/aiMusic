@@ -428,6 +428,40 @@ private val GearIconVector: ImageVector by lazy {
     }
 }
 
+private val SearchIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            // 圆：放大镜镜身（中心 11,11 半径 7）
+            moveTo(18f, 11f)
+            arcToRelative(7f, 7f, 0f, true, true, -14f, 0f)
+            arcToRelative(7f, 7f, 0f, true, true, 14f, 0f)
+            close()
+            // 把柄
+            moveTo(16.2f, 16.2f)
+            lineTo(20.5f, 20.5f)
+        }
+    }
+}
+
+private val CloseIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.4f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(6f, 6f); lineTo(18f, 18f)
+            moveTo(18f, 6f); lineTo(6f, 18f)
+        }
+    }
+}
+
 private fun iconVector(builder: ImageVector.Builder.() -> Unit): ImageVector {
     return ImageVector.Builder(
         name = "PipoGlyph",
@@ -542,4 +576,20 @@ fun ProfileIcon(
     modifier: Modifier = Modifier.size(20.dp),
 ) {
     Icon(imageVector = ProfileIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun SearchIcon(
+    color: Color = Color(0xD1F5F7FF),
+    modifier: Modifier = Modifier.size(18.dp),
+) {
+    Icon(imageVector = SearchIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun CloseIcon(
+    color: Color = Color(0xD1F5F7FF),
+    modifier: Modifier = Modifier.size(14.dp),
+) {
+    Icon(imageVector = CloseIconVector, contentDescription = null, tint = color, modifier = modifier)
 }

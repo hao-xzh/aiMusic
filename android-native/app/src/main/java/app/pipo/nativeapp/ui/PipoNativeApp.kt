@@ -222,7 +222,8 @@ fun PipoNativeApp() {
             }
         }
 
-        val hideSystemBars = route == Route.Player && isLandscape
+        // 横屏 Player 全程隐藏；竖屏只有沉浸式歌词页隐藏（让 cover 真正贴到屏幕顶）。
+        val hideSystemBars = route == Route.Player && (isLandscape || immersive)
         DisposableEffect(hideSystemBars) {
             val window = (view.context as? Activity)?.window
             val controller = window?.let { WindowCompat.getInsetsController(it, view) }

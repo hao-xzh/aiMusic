@@ -5,12 +5,14 @@ import android.app.Application
 import android.content.ComponentCallbacks2
 import android.os.Bundle
 import coil.Coil
+import coil.ImageLoader
+import coil.ImageLoaderFactory
 import app.pipo.nativeapp.data.JsonRustPipoBridge
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.RustBridgeRepository
 import app.pipo.nativeapp.runtime.AppForeground
 
-class PipoApplication : Application() {
+class PipoApplication : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
         DiagnosticsLogStore.install(this)
@@ -32,6 +34,15 @@ class PipoApplication : Application() {
         super.onLowMemory()
         Coil.imageLoader(this).memoryCache?.clear()
     }
+
+    // Coil 单例 ImageLoader 工厂入口。注册 Base64UriFetcher 是为了让 PlayerViewModel
+    // 用 data URI 喂出来的 ExoPlayer 内嵌封面（MP3 ID3 / FLAC / M4A）能被 AsyncImage
+    // 解出来 —— 默认 Coil 2.7 不带 data: scheme fetcher，不注册的话云盘上传歌的封面
+    // 在 in-app UI 永远是空的（系统状态栏走 MediaSession 不受影响）。
+    override fun newImageLoader(): ImageLoader =
+        ImageLoader.Builder(this)
+            .components { add(Base64UriFetcher.Factory()) }
+            .build()
 
     private fun installRustBridgeWhenPackaged() {
         try {

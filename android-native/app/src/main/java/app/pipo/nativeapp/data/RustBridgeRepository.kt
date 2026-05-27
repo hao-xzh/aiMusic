@@ -184,16 +184,26 @@ class RustBridgeRepository(
         }
     }
 
-    override suspend fun tracksForPlaylist(playlistId: Long): List<NativeTrack> {
-        synchronized(tracksCacheLock) {
-            tracksMemoryCache[playlistId]
-        }?.let {
+    override suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean): List<NativeTrack> {
+        if (!forceRefresh) {
+            synchronized(tracksCacheLock) {
+                tracksMemoryCache[playlistId]
+            }?.let {
+                DiagnosticsLogStore.record(
+                    area = "library",
+                    event = "playlist_tracks_cache_hit",
+                    fields = mapOf("playlistId" to playlistId, "count" to it.size),
+                )
+                return it
+            }
+        } else {
+            // 手动下拉刷新：先抹掉 in-memory cache 让本次拿到 fresh 数据再重新写回。
+            synchronized(tracksCacheLock) { tracksMemoryCache.remove(playlistId) }
             DiagnosticsLogStore.record(
                 area = "library",
-                event = "playlist_tracks_cache_hit",
-                fields = mapOf("playlistId" to playlistId, "count" to it.size),
+                event = "playlist_tracks_force_refresh",
+                fields = mapOf("playlistId" to playlistId),
             )
-            return it
         }
         val expectedCount = playlistState.value.firstOrNull { it.id == playlistId }?.trackCount
         val fresh = try {
