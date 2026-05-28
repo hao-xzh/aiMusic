@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
@@ -46,13 +47,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import androidx.core.content.FileProvider
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.AudioCacheStats
 import app.pipo.nativeapp.data.AiConfigView
 import app.pipo.nativeapp.data.NativeSettings
+import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoRepository
 import kotlinx.coroutines.Dispatchers
@@ -308,43 +317,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
 
         // 02 / RULES
         SettingsSectionHeader("02", "RULES")
-        
-        PipoToggleRow(
-            title = "主动安排一段",
-            subtitle = "让 AI 主动为你插播一段推荐",
-            checked = settings.smartSessionPlanner,
-            onCheckedChange = {
-                logSettingToggle("smartSessionPlanner", it)
-                scope.launch { repository.updateSettings(settings.copy(smartSessionPlanner = it)) }
-            }
-        )
-        PipoToggleRow(
-            title = "工作时段自动播放",
-            subtitle = "在你的工作时间段内自动启动播放",
-            checked = settings.workdayAutoplay,
-            onCheckedChange = {
-                logSettingToggle("workdayAutoplay", it)
-                scope.launch { repository.updateSettings(settings.copy(workdayAutoplay = it)) }
-            }
-        )
-        PipoToggleRow(
-            title = "午休换放松歌单",
-            subtitle = "午休时间段自动切换到舒缓轻音乐",
-            checked = settings.lunchRelaxMode,
-            onCheckedChange = {
-                logSettingToggle("lunchRelaxMode", it)
-                scope.launch { repository.updateSettings(settings.copy(lunchRelaxMode = it)) }
-            }
-        )
-        PipoToggleRow(
-            title = "深夜低刺激",
-            subtitle = "深夜自动调低音量并播放温和曲目",
-            checked = settings.lateNightCalmMode,
-            onCheckedChange = {
-                logSettingToggle("lateNightCalmMode", it)
-                scope.launch { repository.updateSettings(settings.copy(lateNightCalmMode = it)) }
-            }
-        )
+
         PipoToggleRow(
             title = "封面短提示",
             subtitle = "让 AI 生成更简短个性的音乐封面介绍",
@@ -354,25 +327,27 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                 scope.launch { repository.updateSettings(settings.copy(aiNarration = it)) }
             }
         )
-        
-        Spacer(modifier = Modifier.height(14.dp))
-        PipoTextField(
-            value = settings.promptedRadioRule,
-            onValueChange = { value ->
-                scope.launch {
-                    repository.updateSettings(settings.copy(promptedRadioRule = value.take(240)))
-                }
-            },
-            label = "PROMPTED RADIO RULE",
-            placeholder = "上午不吵，熟歌 70%，新歌 30%",
-            singleLine = false,
-            minLines = 2,
-            maxLines = 4
-        )
 
         // 03 / PREFERENCES
         SettingsSectionHeader("03", "PREFERENCES")
-        
+
+        // Claudio 性格：5 选 1 改成下拉，体感跟其它一行设置项一致，不再撑满半屏。
+        // 当前人格作为 trigger 文案，点开 Popup 在原位置弹出全部选项；选中即写
+        // settings.personaId。视觉对齐 PipoButton（透明底 + GlassStroke 边框 + Ink 文字）。
+        val currentPersona = PetPersona.fromId(settings.personaId)
+        PipoRow(
+            title = "Claudio 性格",
+            subtitle = "TA 跟你说话的语气。切换立即生效；下次开 app 用新人格打招呼。",
+        ) {
+            PipoPersonaDropdown(
+                current = currentPersona,
+                onSelect = { persona ->
+                    logSettingToggle("persona:${persona.id}", true)
+                    scope.launch { repository.updateSettings(settings.copy(personaId = persona.id)) }
+                },
+            )
+        }
+
         PipoToggleRow(
             title = "隐藏点阵叠加",
             subtitle = "在界面上隐藏复古像素点阵滤镜效果",
@@ -664,6 +639,122 @@ private fun PipoButton(
                 letterSpacing = 1.sp
             )
         )
+    }
+}
+
+/**
+ * 单选下拉，复用 PipoButton 的视觉（透明底 + GlassStroke 边框 + Ink/SemiBold/12sp/letter-spacing 1）。
+ * trigger 显示当前 [PetPersona.label]，点开 Popup 在 trigger 正下方对齐右边线弹出选项面板，
+ * 选项内 (当前) 项 mint 高亮 + "当前" 角标。Popup 用 PopupPositionProvider 精确对齐，
+ * 避免默认 alignment 把弹层贴到右侧外面。
+ */
+@Composable
+private fun PipoPersonaDropdown(
+    current: PetPersona,
+    onSelect: (PetPersona) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val positionProvider = remember {
+        object : PopupPositionProvider {
+            override fun calculatePosition(
+                anchorBounds: IntRect,
+                windowSize: IntSize,
+                layoutDirection: LayoutDirection,
+                popupContentSize: IntSize,
+            ): IntOffset {
+                // 右边线对齐 anchor 右边线，往下偏 6px 给点缝隙
+                val x = (anchorBounds.right - popupContentSize.width).coerceAtLeast(0)
+                val y = anchorBounds.bottom + 6
+                return IntOffset(x, y)
+            }
+        }
+    }
+    Box(modifier = modifier) {
+        // trigger：跟 PipoButton 同款 chip
+        Box(
+            modifier = Modifier
+                .border(1.dp, PipoColors.GlassStroke, RectangleShape)
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = current.label,
+                    color = PipoColors.Ink,
+                    style = TextStyle(
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 1.sp,
+                    ),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (expanded) "▴" else "▾",
+                    color = PipoColors.Ink,
+                    style = TextStyle(fontSize = 10.sp),
+                )
+            }
+        }
+        if (expanded) {
+            Popup(
+                popupPositionProvider = positionProvider,
+                onDismissRequest = { expanded = false },
+                properties = PopupProperties(focusable = true),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(min = 240.dp, max = 320.dp)
+                        .background(PipoColors.Bg1)
+                        .border(1.dp, PipoColors.GlassStroke, RectangleShape)
+                        .padding(vertical = 4.dp),
+                ) {
+                    PetPersona.entries.forEach { persona ->
+                        val isCurrent = persona.id == current.id
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    onSelect(persona)
+                                    expanded = false
+                                }
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                        ) {
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = persona.label,
+                                        color = if (isCurrent) PipoColors.Mint else PipoColors.Ink,
+                                        style = TextStyle(
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Medium,
+                                        ),
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (isCurrent) {
+                                        Text(
+                                            text = "当前",
+                                            color = PipoColors.Mint,
+                                            style = TextStyle(
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                letterSpacing = 1.sp,
+                                            ),
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = persona.description,
+                                    color = PipoColors.TextDim,
+                                    style = TextStyle(fontSize = 11.sp, lineHeight = 14.sp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -12,6 +12,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.width
@@ -66,6 +67,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -73,6 +75,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.pipo.nativeapp.R
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoPlaylist
@@ -155,10 +158,27 @@ private sealed class LibraryPage(
 
     data class PlaylistItem(
         val playlist: PipoPlaylist,
+        /** 兜底：当 playlist 自己没有 coverUrl 时拿第一首歌的 artworkUrl 显示，
+         *  和"我的网盘"页是同一套思路。一般会在曲目加载完成后回填。 */
+        val firstTrackCover: String? = null,
     ) : LibraryPage(
         title = playlist.name,
         trackCount = playlist.trackCount,
-        coverUrl = playlist.coverUrl,
+        coverUrl = playlist.coverUrl?.takeIf { it.isNotBlank() } ?: firstTrackCover,
+    )
+
+    /**
+     * "我的网盘"：用户在网易云网盘里上传的全部歌曲。
+     * - trackCount 加载完才填，所以初始用 0；UI 拿到 tracks 之后用 size 显示
+     * - coverUrl 用网盘里第一首歌的封面（要等 tracks 拿到才能填，初始 null）
+     */
+    data class CloudDisk(
+        val cachedCoverUrl: String?,
+        val knownCount: Int,
+    ) : LibraryPage(
+        title = "我的网盘",
+        trackCount = knownCount,
+        coverUrl = cachedCoverUrl,
     )
 }
 
@@ -170,23 +190,49 @@ private fun DistillLibrary(
 ) {
     val playerVm: PlayerViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
     val playerState = playerVm.state
-    val libraryPages = remember(
+    // 网盘曲目走 repository.cloudTracks Flow —— 冷启动从磁盘 cache 恢复立刻有值，跨
+    // DistillLibrary 重挂载不丢，cover-flow 那页 cover/count 始终对得上。initial 也
+    // 直接吃同步 cache，避免 collectAsState 第一帧 emptyList 把 tile 抖一下。
+    val cloudTracksFlow by repository.cloudTracks.collectAsState(
+        initial = repository.cachedTracksFor(app.pipo.nativeapp.data.CLOUD_DISK_PLAYLIST_ID) ?: emptyList(),
+    )
+    val cloudDiskCover = remember(cloudTracksFlow) {
+        cloudTracksFlow.firstNotNullOfOrNull { it.artworkUrl?.takeIf(String::isNotBlank) }
+    }
+    val cloudDiskCount = cloudTracksFlow.size
+    // 没有自带 coverUrl 的歌单（少数）用第一首歌的 artworkUrl 兜底；用 mutableStateMap +
+    // derivedStateOf 让 buildList 在 map 写入时自动重算（普通 remember 不订阅 map 内变化）。
+    val firstTrackCovers = remember { mutableStateMapOf<Long, String>() }
+    val libraryPages by remember(
         playlists,
         playerState.queue,
         playerState.currentIndex,
         playerState.artworkUrl,
+        cloudDiskCover,
+        cloudDiskCount,
     ) {
-        buildList {
-            if (playerState.queue.isNotEmpty()) {
-                add(
-                    LibraryPage.CurrentQueue(
-                        queue = playerState.queue,
-                        currentIndex = playerState.currentIndex,
-                        artworkUrl = playerState.artworkUrl,
-                    ),
+        derivedStateOf {
+            buildList {
+                if (playerState.queue.isNotEmpty()) {
+                    add(
+                        LibraryPage.CurrentQueue(
+                            queue = playerState.queue,
+                            currentIndex = playerState.currentIndex,
+                            artworkUrl = playerState.artworkUrl,
+                        ),
+                    )
+                }
+                // 网盘永远显示，没登录或网盘为空时点开能看到提示。放在用户歌单之前。
+                add(LibraryPage.CloudDisk(cachedCoverUrl = cloudDiskCover, knownCount = cloudDiskCount))
+                addAll(
+                    playlists.map {
+                        LibraryPage.PlaylistItem(
+                            playlist = it,
+                            firstTrackCover = firstTrackCovers[it.id],
+                        )
+                    },
                 )
             }
-            addAll(playlists.map { LibraryPage.PlaylistItem(it) })
         }
     }
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(
@@ -202,17 +248,31 @@ private fun DistillLibrary(
         }
     }
     val focused = libraryPages.getOrNull(pagerState.currentPage)
-    var tracks by remember { mutableStateOf<List<NativeTrack>>(emptyList()) }
-    var loading by remember { mutableStateOf(false) }
+    val focusedListKey = when (val page = focused) {
+        is LibraryPage.CurrentQueue -> "current"
+        is LibraryPage.PlaylistItem -> "playlist:${page.playlist.id}"
+        is LibraryPage.CloudDisk -> "cloud"
+        null -> "none"
+    }
+    // tracks 初始值同步从 repository in-memory cache 灌：进 / 切歌单 / 进网盘的瞬间就有
+    // 内容渲染，重入不闪"加载中"。LaunchedEffect 仍会跑一次拿最新数据（cache 命中是同步的，
+    // 等同 no-op），未命中 cache 走原本的网络流程；初始 loading 状态也按 cache 命中与否
+    // 预设——cache miss 直接进 loading=true，免得先闪一帧"空"再切到"加载中"。
+    val cachedInitial: List<NativeTrack>? = remember(focusedListKey) {
+        when (val page = focused) {
+            is LibraryPage.CurrentQueue -> page.queue
+            is LibraryPage.PlaylistItem -> repository.cachedTracksFor(page.playlist.id)
+            is LibraryPage.CloudDisk ->
+                repository.cachedTracksFor(app.pipo.nativeapp.data.CLOUD_DISK_PLAYLIST_ID)
+            null -> emptyList()
+        }
+    }
+    var tracks by remember(focusedListKey) { mutableStateOf(cachedInitial ?: emptyList()) }
+    var loading by remember(focusedListKey) { mutableStateOf(cachedInitial == null) }
     var trackLoadError by remember { mutableStateOf<String?>(null) }
     var trackLoadRetry by remember { mutableStateOf(0) }
     val trackListState = rememberLazyListState()
     var pendingLocateCurrent by remember { mutableStateOf(false) }
-    val focusedListKey = when (val page = focused) {
-        is LibraryPage.CurrentQueue -> "current"
-        is LibraryPage.PlaylistItem -> "playlist:${page.playlist.id}"
-        null -> "none"
-    }
     val focusedQueue = (focused as? LibraryPage.CurrentQueue)?.queue
     val focusedPlaylist = (focused as? LibraryPage.PlaylistItem)?.playlist
 
@@ -338,7 +398,7 @@ private fun DistillLibrary(
                 }
                 if (isManualPull &&
                     delta > 0 &&
-                    focused is LibraryPage.PlaylistItem &&
+                    (focused is LibraryPage.PlaylistItem || focused is LibraryPage.CloudDisk) &&
                     trackListState.firstVisibleItemIndex == 0 &&
                     trackListState.firstVisibleItemScrollOffset == 0 &&
                     !isRefreshing &&
@@ -356,23 +416,34 @@ private fun DistillLibrary(
             override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
                 refreshDragBlockedUntilRelease = false
                 if (pullOffset > 0f && !isRefreshing) {
-                    if (focused is LibraryPage.PlaylistItem && pullOffset >= refreshThresholdPx) {
+                    val refreshable = focused is LibraryPage.PlaylistItem || focused is LibraryPage.CloudDisk
+                    if (refreshable && pullOffset >= refreshThresholdPx) {
                         // Trigger refresh
                         isRefreshing = true
                         pullOffset = 0f
                         scope.launch {
-                            val focusedPage = libraryPages.getOrNull(pagerState.currentPage)
-                            if (focusedPage is LibraryPage.PlaylistItem) {
-                                runCatching {
-                                    // 并行刷 playlist 元数据(trackCount/cover/name),
-                                    // 让顶部"X 首"数字和列表保持一致;元数据失败不影响 tracks。
-                                    coroutineScope {
-                                        launch { runCatching { repository.refreshPlaylists() } }
-                                        repository.tracksForPlaylist(focusedPage.playlist.id, forceRefresh = true)
+                            when (val focusedPage = libraryPages.getOrNull(pagerState.currentPage)) {
+                                is LibraryPage.PlaylistItem -> {
+                                    runCatching {
+                                        // 并行刷 playlist 元数据(trackCount/cover/name),
+                                        // 让顶部"X 首"数字和列表保持一致;元数据失败不影响 tracks。
+                                        coroutineScope {
+                                            launch { runCatching { repository.refreshPlaylists() } }
+                                            repository.tracksForPlaylist(focusedPage.playlist.id, forceRefresh = true)
+                                        }
+                                    }.onSuccess { refreshedTracks ->
+                                        tracks = refreshedTracks
                                     }
-                                }.onSuccess { refreshedTracks ->
-                                    tracks = refreshedTracks
                                 }
+                                is LibraryPage.CloudDisk -> {
+                                    runCatching {
+                                        repository.cloudDiskTracks(forceRefresh = true)
+                                    }.onSuccess { refreshedTracks ->
+                                        // cover/count 自动从 cloudTracks Flow 派生，不用再手动设
+                                        tracks = refreshedTracks
+                                    }
+                                }
+                                else -> Unit
                             }
                             isRefreshing = false
                         }
@@ -407,6 +478,10 @@ private fun DistillLibrary(
         searchSettledListKey = focusedListKey
     }
     LaunchedEffect(focusedListKey, focusedQueue, focusedPlaylist, trackLoadRetry) {
+        // 关键原则：cache 已经把 tracks 灌成非空时，整个 LaunchedEffect 走"静默 verify"——
+        // 不再翻 loading=true，失败也不擦掉已有内容、不报 trackLoadError，只在拿到新数据时
+        // 替换 tracks。这样重入 / 切回有缓存的歌单完全 0 闪烁、0 网络抖动感知。
+        // tracks 为空（首次进 / 真的没缓存）才走 loading=true → 网请求 → 报错的常规流程。
         when (val page = focused) {
             is LibraryPage.CurrentQueue -> {
                 loading = false
@@ -414,14 +489,53 @@ private fun DistillLibrary(
                 tracks = page.queue
             }
             is LibraryPage.PlaylistItem -> {
-                loading = true
-                trackLoadError = null
-                val result = runCatching { repository.tracksForPlaylist(page.playlist.id) }
-                tracks = result.getOrElse {
-                    trackLoadError = "这张歌单刚才没拉下来"
-                    emptyList()
+                val hadCache = tracks.isNotEmpty()
+                if (!hadCache) {
+                    loading = true
+                    trackLoadError = null
                 }
-                loading = false
+                val result = runCatching { repository.tracksForPlaylist(page.playlist.id) }
+                result.fold(
+                    onSuccess = { fresh ->
+                        tracks = fresh
+                        loading = false
+                        // 没自带 cover 的歌单回填首曲 artworkUrl 作 cover-flow 兜底
+                        if (page.playlist.coverUrl.isNullOrBlank()) {
+                            fresh.firstNotNullOfOrNull { it.artworkUrl?.takeIf(String::isNotBlank) }
+                                ?.let { firstTrackCovers[page.playlist.id] = it }
+                        }
+                    },
+                    onFailure = {
+                        if (!hadCache) {
+                            trackLoadError = "这张歌单刚才没拉下来"
+                            tracks = emptyList()
+                        }
+                        // hadCache=true 时静默吞错，保留旧 tracks 让用户继续看
+                        loading = false
+                    },
+                )
+            }
+            is LibraryPage.CloudDisk -> {
+                val hadCache = tracks.isNotEmpty()
+                if (!hadCache) {
+                    loading = true
+                    trackLoadError = null
+                }
+                val result = runCatching { repository.cloudDiskTracks() }
+                result.fold(
+                    onSuccess = { fresh ->
+                        tracks = fresh
+                        loading = false
+                        // cover/count 由 cloudTracks Flow 自动派生到 cloudDiskCover/Count
+                    },
+                    onFailure = {
+                        if (!hadCache) {
+                            trackLoadError = "网盘列表刚才没拉下来"
+                            tracks = emptyList()
+                        }
+                        loading = false
+                    },
+                )
             }
             null -> {
                 loading = false
@@ -700,6 +814,7 @@ private fun DistillLibrary(
                             }
                             .clip(RoundedCornerShape(14.dp))
                             .background(Color(0x16FFFFFF)),
+                        contentAlignment = Alignment.Center,
                     ) {
                         if (!page.coverUrl.isNullOrBlank()) {
                             coil.compose.AsyncImage(
@@ -707,6 +822,17 @@ private fun DistillLibrary(
                                 contentDescription = page.title,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize(),
+                            )
+                        } else {
+                            // 没 cover 也没首曲兜底（多见于刚拉到、tracks 还没回来的网盘
+                            // 页和极少数全空歌单）：用 app logo 居中显示，比空白盒子更有
+                            // 视觉锚点。
+                            Image(
+                                painter = painterResource(R.mipmap.ic_launcher_round),
+                                contentDescription = page.title,
+                                modifier = Modifier
+                                    .fillMaxSize(0.42f)
+                                    .graphicsLayer { this.alpha = 0.85f },
                             )
                         }
                     }
@@ -762,7 +888,7 @@ private fun DistillLibrary(
 	                        modifier = Modifier.fillMaxSize(),
 	                        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 8.dp),
 	                    ) {
-	                        if ((refreshGapPx > 0.5f || isRefreshing) && focused is LibraryPage.PlaylistItem) {
+	                        if ((refreshGapPx > 0.5f || isRefreshing) && (focused is LibraryPage.PlaylistItem || focused is LibraryPage.CloudDisk)) {
 	                            item(key = "__pull_refresh__") {
 	                                val refreshGapDp = with(localDensity) { refreshGapPx.toDp() }
 	                                val pullProgress = (pullOffset / refreshThresholdPx).coerceIn(0f, 1f)
@@ -816,7 +942,10 @@ private fun DistillLibrary(
 	                            }
 	                        }
 	                        when {
-                            loading -> item {
+                            // 只有"真没东西可显"才让位给加载文案；切歌单时 cache 命中很快，
+                            // 旧 tracks 先撑着，新 tracks 一到直接替换 → 用户看不到"多行→
+                            // 一行→多行"那一下 strobe。这是上次"闪"的真正源头。
+                            loading && tracks.isEmpty() -> item {
                                 Text(
                                     "加载中…",
                                     color = PipoColors.TextDim,
@@ -840,7 +969,7 @@ private fun DistillLibrary(
                             }
                             tracks.isEmpty() -> item {
                                 Text(
-                                    "这张歌单是空的",
+                                    if (focused is LibraryPage.CloudDisk) "网盘里还没有歌" else "这张歌单是空的",
                                     color = PipoColors.TextDim,
                                     style = TextStyle(fontSize = 13.sp),
                                     modifier = Modifier.padding(start = 24.dp),

@@ -45,10 +45,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.pipo.nativeapp.DiagnosticsLogStore
-import app.pipo.nativeapp.data.AppContext
 import app.pipo.nativeapp.data.AiPetCommandBus
-import app.pipo.nativeapp.data.BehaviorEvent
-import app.pipo.nativeapp.data.BehaviorSummary
 import app.pipo.nativeapp.data.BehaviorType
 import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.LyricTiming
@@ -56,14 +53,13 @@ import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoLyricRole
 import app.pipo.nativeapp.data.PetAgent
+import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoGraph
-import app.pipo.nativeapp.data.Weather
 import app.pipo.nativeapp.playback.PlayerUiState
 import app.pipo.nativeapp.playback.PlayerViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.Calendar
 
 /**
  * 应用根 —— 镜像 src/app/layout.tsx + page.tsx 的根组合。
@@ -91,9 +87,6 @@ fun PipoNativeApp() {
         val viewModel: PlayerViewModel = viewModel()
         val playerState = viewModel.state
         val settings by PipoGraph.repository.settings.collectAsState(initial = NativeSettings())
-        var smartSessionRefreshNonce by remember { mutableStateOf(0) }
-        var smartSessionTrigger by remember { mutableStateOf<String?>(null) }
-        var smartSessionCanReplace by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
         val showLyricTranslation = settings.lyricTranslation
         val toggleLyricTranslation: () -> Unit = {
@@ -239,60 +232,14 @@ fun PipoNativeApp() {
             }
         }
 
-        SmartSessionPlannerEffect(
+        SkipCorrectionEffect(
             settings = settings,
             route = route,
             immersive = immersive,
             isLandscape = isLandscape,
             playerState = playerState,
-            refreshNonce = smartSessionRefreshNonce,
-            extraIntent = smartSessionTrigger,
-            canReplaceNow = smartSessionCanReplace,
-            onReady = { tracks, continuous, canReplaceNow ->
-                if ((playerState.isPlaying || playerState.queue.isNotEmpty()) && !canReplaceNow) {
-                    DiagnosticsLogStore.record(
-                        area = "smart_session",
-                        event = "auto_play_skipped_stale",
-                        fields = mapOf(
-                            "trackCount" to tracks.size,
-                            "queueSize" to playerState.queue.size,
-                        ),
-                    )
-                } else {
-                    DiagnosticsLogStore.record(
-                        area = "smart_session",
-                        event = "auto_play",
-                        fields = mapOf(
-                            "trackCount" to tracks.size,
-                            "canReplace" to canReplaceNow,
-                        ),
-                    )
-                    smartSessionTrigger = null
-                    smartSessionCanReplace = false
-                    viewModel.playFromAgent(tracks, continuous)
-                }
-            },
-        )
-
-        SmartPlaybackRuleEffect(
-            settings = settings,
-            route = route,
-            immersive = immersive,
-            isLandscape = isLandscape,
-            playerState = playerState,
-            onTrigger = { intent, canReplace, autoPlay ->
-                DiagnosticsLogStore.record(
-                    area = "smart_session",
-                    event = "rule_triggered",
-                    fields = mapOf(
-                        "canReplace" to canReplace,
-                        "autoPlay" to autoPlay,
-                        "intentLen" to intent.length,
-                    ),
-                )
-                smartSessionTrigger = intent
-                smartSessionCanReplace = canReplace
-                smartSessionRefreshNonce += 1
+            onReady = { tracks, continuous ->
+                viewModel.playFromAgent(tracks, continuous)
             },
         )
 
@@ -412,6 +359,7 @@ fun PipoNativeApp() {
                         onInsertFromAgent = { track ->
                             viewModel.insertNext(track)
                         },
+                        onSkipFromAgent = { viewModel.next() },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -450,320 +398,93 @@ fun PipoNativeApp() {
 
 private enum class Route { Player, Distill, Settings, Taste, Login }
 
+/**
+ * Skip-Correction —— 用户连跳 3 首 / 15 分钟内 → 主动换队列。
+ *
+ * 跟被删的 4 个"时段自动播放"完全不同：这是**响应用户行为**（连跳是明确的不爱听信号），
+ * 不是 AI 凭时钟决定"现在该放什么"。所以保留 + 增强，不挂任何 settings 开关。
+ *
+ * - 默认开启（AI 的本职工作）
+ * - 30 分钟冷却防循环纠偏
+ * - 增强：检测"同艺人连跳" → prompt 里点名让 PetAgent 在新队列里避开
+ */
 @Composable
-private fun SmartSessionPlannerEffect(
+private fun SkipCorrectionEffect(
     settings: NativeSettings,
     route: Route,
     immersive: Boolean,
     isLandscape: Boolean,
     playerState: PlayerUiState,
-    refreshNonce: Int,
-    extraIntent: String?,
-    canReplaceNow: Boolean,
-    onReady: (List<NativeTrack>, ContinuousQueueSource?, Boolean) -> Unit,
+    onReady: (List<NativeTrack>, ContinuousQueueSource?) -> Unit,
 ) {
-    var requestedNonce by remember { mutableStateOf<Int?>(null) }
-    LaunchedEffect(
-        settings.smartSessionPlanner,
-        settings.workdayAutoplay,
-        settings.lunchRelaxMode,
-        settings.lateNightCalmMode,
-        settings.promptedRadioRule,
-        route,
-        immersive,
-        isLandscape,
-        playerState.isPlaying,
-        playerState.queue.size,
-        refreshNonce,
-        extraIntent,
-        canReplaceNow,
-    ) {
-        if (requestedNonce == refreshNonce || !settings.smartSessionPlanner) return@LaunchedEffect
-        if (route != Route.Player || immersive || isLandscape) return@LaunchedEffect
-        if ((playerState.isPlaying || playerState.queue.isNotEmpty()) && !canReplaceNow) {
-            return@LaunchedEffect
-        }
+    var lastTriggerTs by remember { mutableStateOf(0L) }
+    LaunchedEffect(route, immersive, isLandscape) {
+        while (route == Route.Player && !immersive && !isLandscape) {
+            delay(20_000)
+            val events = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
+            val skipped = events
+                .filter { it.type == BehaviorType.Skipped }
+                .sortedBy { it.tsMs }
+                .takeLast(3)
+            if (skipped.size < 3) continue
+            val newest = skipped.last()
+            val oldest = skipped.first()
+            // 15 分钟窗口内连跳 3 首
+            if (newest.tsMs - oldest.tsMs > 15L * 60 * 1000) continue
+            // 30 分钟冷却防循环
+            if (newest.tsMs - lastTriggerTs < 30L * 60 * 1000) continue
 
-        val slot = currentSmartSessionSlot()
-        if (refreshNonce == 0) delay(9000)
-        if ((playerState.isPlaying || playerState.queue.isNotEmpty()) && !canReplaceNow) return@LaunchedEffect
-        requestedNonce = refreshNonce
+            lastTriggerTs = newest.tsMs
 
-        DiagnosticsLogStore.record(
-            area = "smart_session",
-            event = "request_start",
-            fields = mapOf(
-                "slot" to slot.name,
-                "refresh" to (refreshNonce > 0),
-                "canReplace" to canReplaceNow,
-                "hasPromptedRule" to settings.promptedRadioRule.isNotBlank(),
-                "extraIntent" to (!extraIntent.isNullOrBlank()),
-            ),
-        )
-        try {
-            val weather = runCatching { Weather.get() }.getOrNull()
-            val contextLine = AppContext.describe(weather)
-            val digest = runCatching { AppContext.memoryDigest(settings.userFacts) }.getOrNull()
-            val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrNull().orEmpty()
-            val behavior = runCatching { PipoGraph.behaviorLog.summary() }.getOrNull()
-            val lastEvent = behaviorEvents.maxByOrNull { it.tsMs }
-            val brief = smartSessionBrief(
-                settings = settings,
-                slot = slot,
-                contextLine = contextLine,
-                digest = digest,
-                behavior = behavior,
-                lastEvent = lastEvent,
-            )
-            val prompt = smartSessionPrompt(
-                brief = brief,
-                refresh = refreshNonce > 0,
-                extraIntent = extraIntent,
-            )
-            val response = PetAgent(PipoGraph.repository).chat(
-                userText = prompt,
-                history = emptyList(),
-                currentTrack = null,
-                userFacts = settings.userFacts,
-            )
-            if (response.action == PetAgent.Action.Play && response.initialBatch.isNotEmpty()) {
-                DiagnosticsLogStore.record(
-                    area = "smart_session",
-                    event = "request_ready",
-                    fields = mapOf(
-                        "slot" to slot.name,
-                        "trackCount" to response.initialBatch.size,
-                        "hasContinuous" to (response.continuous != null),
-                    ),
-                )
-                onReady(response.initialBatch, response.continuous, canReplaceNow)
+            // 增强：识别"同艺人连跳" → prompt 里点名让 PetAgent 避开
+            val skipArtists = skipped.mapNotNull { it.artist.takeIf { a -> a.isNotBlank() } }
+            val artistRepeated = skipArtists.size >= 2 && skipArtists.toSet().size == 1
+            val hintLine = if (artistRepeated) {
+                "我刚连跳了 3 首 ${skipArtists.first()} 的歌。换个艺人，能量再降一点。"
             } else {
-                DiagnosticsLogStore.record(
-                    area = "smart_session",
-                    event = "request_empty",
-                    fields = mapOf(
-                        "slot" to slot.name,
-                        "action" to response.action.name,
-                        "trackCount" to response.initialBatch.size,
-                    ),
-                )
+                "我刚连跳了 3 首。这队列不对劲，换一段更稳更不闹的，能量降一点、风格换一下。"
             }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
+
             DiagnosticsLogStore.record(
-                area = "smart_session",
-                event = "request_failed",
+                area = "skip_correction",
+                event = "trigger",
                 fields = mapOf(
-                    "slot" to slot.name,
-                    "errorType" to e::class.java.simpleName,
-                    "errorMessage" to e.message.orEmpty().take(180),
+                    "skipCount" to skipped.size,
+                    "windowMs" to (newest.tsMs - oldest.tsMs),
+                    "artistRepeated" to artistRepeated,
                 ),
             )
-            requestedNonce = null
-        }
-    }
-}
 
-@Composable
-private fun SmartPlaybackRuleEffect(
-    settings: NativeSettings,
-    route: Route,
-    immersive: Boolean,
-    isLandscape: Boolean,
-    playerState: PlayerUiState,
-    onTrigger: (String, Boolean, Boolean) -> Unit,
-) {
-    var lastRuleKey by remember { mutableStateOf("") }
-    LaunchedEffect(
-        settings.smartSessionPlanner,
-        settings.promptedRadioRule,
-        settings.workdayAutoplay,
-        settings.lunchRelaxMode,
-        settings.lateNightCalmMode,
-        route,
-        immersive,
-        isLandscape,
-        playerState.isPlaying,
-        playerState.queue.size,
-    ) {
-        while (settings.smartSessionPlanner && route == Route.Player && !immersive && !isLandscape) {
-            delay(45_000)
-            val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrNull().orEmpty()
-            val correction = skipCorrectionRule(behaviorEvents)
-            val rule = correction ?: activePlaybackRule(settings, playerState)
-            if (rule != null && rule.key != lastRuleKey) {
-                lastRuleKey = rule.key
+            val response = try {
+                PetAgent(PipoGraph.repository).chat(
+                    userText = hintLine,
+                    history = emptyList(),
+                    currentTrack = null,
+                    userFacts = settings.userFacts,
+                    persona = PetPersona.fromId(settings.personaId),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
                 DiagnosticsLogStore.record(
-                    area = "smart_session",
-                    event = "rule_match",
+                    area = "skip_correction",
+                    event = "failed",
                     fields = mapOf(
-                        "ruleKey" to rule.key,
-                        "canReplace" to rule.canReplaceNow,
-                        "autoPlay" to rule.autoPlay,
-                        "isCorrection" to rule.key.startsWith("skip-correction"),
+                        "errorType" to e::class.java.simpleName,
+                        "errorMessage" to e.message.orEmpty().take(180),
                     ),
                 )
-                onTrigger(rule.intent, rule.canReplaceNow, rule.autoPlay)
+                null
+            } ?: continue
+
+            if (response.action == PetAgent.Action.Play && response.initialBatch.isNotEmpty()) {
+                DiagnosticsLogStore.record(
+                    area = "skip_correction",
+                    event = "applied",
+                    fields = mapOf("trackCount" to response.initialBatch.size),
+                )
+                onReady(response.initialBatch, response.continuous)
             }
         }
-    }
-}
-
-private data class SmartPlaybackRule(
-    val key: String,
-    val intent: String,
-    val canReplaceNow: Boolean,
-    val autoPlay: Boolean,
-)
-
-private fun activePlaybackRule(settings: NativeSettings, playerState: PlayerUiState): SmartPlaybackRule? {
-    val slot = currentSmartSessionSlot()
-    val today = Calendar.getInstance()
-    val dayKey = "${today.get(Calendar.YEAR)}-${today.get(Calendar.DAY_OF_YEAR)}"
-    val prompted = settings.promptedRadioRule.trim()
-    val idle = !playerState.isPlaying && playerState.queue.isEmpty()
-    if (prompted.isNotBlank() && !playerState.isPlaying) {
-        return SmartPlaybackRule(
-            key = "prompted:$dayKey:${slot.name}",
-            intent = "执行长期电台规则：$prompted",
-            canReplaceNow = false,
-            autoPlay = idle,
-        )
-    }
-    if (slot == SmartSessionSlot.Lunch && settings.lunchRelaxMode) {
-        return SmartPlaybackRule(
-            key = "lunch:$dayKey",
-            intent = "午休到了，切到柔和、低注意力占用的队列。",
-            canReplaceNow = playerState.queue.isNotEmpty(),
-            autoPlay = idle,
-        )
-    }
-    if (slot == SmartSessionSlot.Night && settings.lateNightCalmMode) {
-        return SmartPlaybackRule(
-            key = "night:$dayKey",
-            intent = "深夜降低 BPM、能量和鼓点密度，避免突然炸起来。",
-            canReplaceNow = playerState.queue.isNotEmpty(),
-            autoPlay = idle,
-        )
-    }
-    if (slot == SmartSessionSlot.Work && settings.workdayAutoplay && !playerState.isPlaying) {
-        return SmartPlaybackRule(
-            key = "work:$dayKey",
-            intent = "工作时段自动安排低打扰背景队列。",
-            canReplaceNow = false,
-            autoPlay = idle,
-        )
-    }
-    return null
-}
-
-private fun skipCorrectionRule(events: List<BehaviorEvent>): SmartPlaybackRule? {
-    val skipped = events
-        .filter { it.type == BehaviorType.Skipped }
-        .sortedBy { it.tsMs }
-        .takeLast(3)
-    if (skipped.size < 3) return null
-    val newest = skipped.last()
-    val oldest = skipped.first()
-    if (newest.tsMs - oldest.tsMs > 15L * 60 * 1000) return null
-    return SmartPlaybackRule(
-        key = "skip-correction:${newest.tsMs}",
-        intent = "用户刚连续跳过三首，主动降能量、减少同类歌，换一段更贴耳的队列。",
-        canReplaceNow = true,
-        autoPlay = false,
-    )
-}
-
-private enum class SmartSessionSlot { Work, Lunch, Night, General }
-
-private fun currentSmartSessionSlot(now: Calendar = Calendar.getInstance()): SmartSessionSlot {
-    val hour = now.get(Calendar.HOUR_OF_DAY)
-    val day = now.get(Calendar.DAY_OF_WEEK)
-    val isWeekday = day in Calendar.MONDAY..Calendar.FRIDAY
-    return when {
-        hour in 12..13 -> SmartSessionSlot.Lunch
-        hour >= 22 || hour <= 5 -> SmartSessionSlot.Night
-        isWeekday && hour in 8..17 -> SmartSessionSlot.Work
-        else -> SmartSessionSlot.General
-    }
-}
-
-private data class SmartSessionBrief(
-    val mode: String,
-    val contextLine: String,
-    val behaviorLine: String,
-)
-
-private fun smartSessionBrief(
-    settings: NativeSettings,
-    slot: SmartSessionSlot,
-    contextLine: String,
-    digest: String?,
-    behavior: BehaviorSummary?,
-    lastEvent: BehaviorEvent?,
-): SmartSessionBrief {
-    val intent = when {
-        settings.promptedRadioRule.isNotBlank() ->
-            "Prompted Radio：${settings.promptedRadioRule.take(240)}"
-        slot == SmartSessionSlot.Lunch && settings.lunchRelaxMode ->
-            "午休模式：轻、松、不抢注意力，能恢复精力。"
-        slot == SmartSessionSlot.Night && settings.lateNightCalmMode ->
-            "深夜模式：低刺激、音量感柔和、不要突然炸起来。"
-        slot == SmartSessionSlot.Work ->
-            "工作模式：专注、干净、低打扰。"
-        else ->
-            "日常模式：自然开场，后面慢慢展开。"
-    }
-    val behaviorLine = buildList {
-        lastEvent?.takeIf { it.title.isNotBlank() }?.let {
-            add("上次播放:${it.title} — ${it.artist}(${behaviorTypeLabel(it.type)})")
-        }
-        digest?.takeIf { it.isNotBlank() }?.let { add("TA 的人:$it") }
-        behavior?.loveArtists?.takeIf { it.isNotEmpty() }
-            ?.let { add("最近更能听完:${it.take(4).joinToString("、")}") }
-        behavior?.skipHotArtists?.takeIf { it.isNotEmpty() }
-            ?.let { add("最近反复跳过:${it.take(4).joinToString("、")}") }
-        if (behavior != null && behavior.total > 0) {
-            add("近况:听过${behavior.total}次,跳过${behavior.skipped}次")
-        }
-    }.joinToString("；").ifBlank { "最近行为样本还少，先保守安排。" }
-    return SmartSessionBrief(
-        mode = intent,
-        contextLine = contextLine,
-        behaviorLine = behaviorLine,
-    )
-}
-
-private fun behaviorTypeLabel(type: BehaviorType): String = when (type) {
-    BehaviorType.PlayStarted -> "开始"
-    BehaviorType.Completed -> "听完"
-    BehaviorType.Skipped -> "跳过"
-    BehaviorType.ManualCut -> "切走"
-}
-
-private fun smartSessionPrompt(
-    brief: SmartSessionBrief,
-    refresh: Boolean,
-    extraIntent: String?,
-): String {
-    return buildString {
-        append(if (refresh) "给我换一版 Claudio 电台，不要重复刚才那版。" else "你现在替我安排一段 Claudio 电台。")
-        append('\n')
-        append("当下:")
-        append(brief.contextLine)
-        append('\n')
-        append("规则:")
-        append(brief.mode)
-        append('\n')
-        if (!extraIntent.isNullOrBlank()) {
-            append("临时纠偏:")
-            append(extraIntent)
-            append('\n')
-        }
-        append("近期行为:")
-        append(brief.behaviorLine)
-        append('\n')
-        append("队列 10 到 15 首即可，能续杯，接歌要顺。回复只要一句很短的话；不要解释。")
     }
 }

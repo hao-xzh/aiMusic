@@ -44,9 +44,25 @@ import app.pipo.nativeapp.runtime.Amp
 import app.pipo.nativeapp.runtime.AppForeground
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.sin
+
+/**
+ * AI 说"加到 [工作] 歌单" → 在用户 playlist 列表里模糊匹配一个出来。
+ * 1) 精确同名 2) playlist 名含查询 3) 查询含 playlist 名（用户说短、歌单名长）。
+ */
+private fun matchPlaylist(
+    playlists: List<app.pipo.nativeapp.data.PipoPlaylist>,
+    query: String,
+): app.pipo.nativeapp.data.PipoPlaylist? {
+    val q = query.lowercase().trim()
+    if (q.isEmpty()) return null
+    return playlists.firstOrNull { it.name.lowercase() == q }
+        ?: playlists.firstOrNull { it.name.lowercase().contains(q) }
+        ?: playlists.firstOrNull { q.contains(it.name.lowercase()) }
+}
 
 @Composable
 fun NativeAiPet(
@@ -58,6 +74,7 @@ fun NativeAiPet(
     coverUrl: String?,
     onPlayFromAgent: (List<app.pipo.nativeapp.data.NativeTrack>, app.pipo.nativeapp.data.ContinuousQueueSource?) -> Unit,
     onInsertFromAgent: (app.pipo.nativeapp.data.NativeTrack) -> Unit,
+    onSkipFromAgent: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -227,7 +244,7 @@ fun NativeAiPet(
             if (!AppForeground.isForeground.value) return@LaunchedEffect
             val text = try {
                 repository.aiChat(
-                    system = GREETING_SYSTEM,
+                    system = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId).greetingSystemPrompt,
                     user = user.ifBlank { "当下:$ctxLine" },
                     temperature = 0.95f,
                     maxTokens = 80,
@@ -407,19 +424,91 @@ fun NativeAiPet(
                                 history = messages.map { it.fromUser to it.text },
                                 currentTrack = currentTrack,
                                 userFacts = settings.userFacts,
+                                persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
                             )
                             messages += PetMessage(fromUser = false, text = response.reply)
                             latestReply = response.reply
                             AiCaptionBus.show(response.reply)
                             when {
+                                response.action == app.pipo.nativeapp.data.PetAgent.Action.Skip -> {
+                                    onSkipFromAgent()
+                                }
+                                response.action == app.pipo.nativeapp.data.PetAgent.Action.Like ||
+                                    response.action == app.pipo.nativeapp.data.PetAgent.Action.Unlike -> {
+                                    val tid = currentTrack?.neteaseId
+                                    val like = response.action == app.pipo.nativeapp.data.PetAgent.Action.Like
+                                    if (tid != null) {
+                                        app.pipo.nativeapp.DiagnosticsLogStore.record(
+                                            area = "ai_agent",
+                                            event = "like_intent_invoke",
+                                            fields = mapOf(
+                                                "neteaseId" to tid,
+                                                "like" to like,
+                                                "title" to currentTrack?.title,
+                                            ),
+                                        )
+                                        runCatching { repository.likeSong(tid, like) }
+                                            .onSuccess {
+                                                // AI 的 reply 是人格化文案，未必明确告诉用户"已收藏"。
+                                                // 这里追加一条系统态反馈，让用户确认操作真的执行了。
+                                                messages += PetMessage(
+                                                    fromUser = false,
+                                                    text = if (like) "（已加心：「${currentTrack?.title.orEmpty()}」→ 我喜欢的音乐）"
+                                                        else "（已取消收藏：「${currentTrack?.title.orEmpty()}」）",
+                                                )
+                                            }
+                                            .onFailure { err ->
+                                                messages += PetMessage(
+                                                    fromUser = false,
+                                                    text = "（${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}）",
+                                                )
+                                            }
+                                    } else {
+                                        messages += PetMessage(fromUser = false, text = "（现在没在放歌。）")
+                                    }
+                                }
+                                response.action == app.pipo.nativeapp.data.PetAgent.Action.AddToPlaylist ||
+                                    response.action == app.pipo.nativeapp.data.PetAgent.Action.RemoveFromPlaylist -> {
+                                    val tid = currentTrack?.neteaseId
+                                    val pname = response.trackOp?.playlistName
+                                    val opStr = if (response.action == app.pipo.nativeapp.data.PetAgent.Action.AddToPlaylist) "add" else "del"
+                                    when {
+                                        tid == null -> messages += PetMessage(fromUser = false, text = "（现在没在放歌。）")
+                                        pname == null -> messages += PetMessage(fromUser = false, text = "（没说要加到哪个歌单。）")
+                                        else -> {
+                                            val playlists = repository.playlists.first()
+                                            val target = matchPlaylist(playlists, pname)
+                                            if (target == null) {
+                                                messages += PetMessage(fromUser = false, text = "（没找到歌单「$pname」。）")
+                                            } else {
+                                                runCatching {
+                                                    repository.playlistModifyTracks(target.id, opStr, listOf(tid))
+                                                }.onSuccess {
+                                                    val verb = if (opStr == "add") "已加入" else "已移出"
+                                                    messages += PetMessage(
+                                                        fromUser = false,
+                                                        text = "（$verb「${target.name}」：${currentTrack?.title.orEmpty()}）",
+                                                    )
+                                                }.onFailure { err ->
+                                                    messages += PetMessage(
+                                                        fromUser = false,
+                                                        text = "（操作歌单失败：${err.message ?: err::class.java.simpleName}）",
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 response.action == app.pipo.nativeapp.data.PetAgent.Action.Insert &&
                                     response.initialBatch.isNotEmpty() -> {
                                     onInsertFromAgent(response.initialBatch.first())
                                 }
-                                response.action == app.pipo.nativeapp.data.PetAgent.Action.Play &&
+                                (response.action == app.pipo.nativeapp.data.PetAgent.Action.Play ||
+                                    response.action == app.pipo.nativeapp.data.PetAgent.Action.Similar) &&
                                     response.initialBatch.isNotEmpty() -> {
                                     onPlayFromAgent(response.initialBatch, response.continuous)
                                 }
+                                // Action.Explain / Action.Chat：reply 已入 messages，无需额外动作
                             }
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e

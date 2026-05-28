@@ -15,7 +15,8 @@ import org.json.JSONObject
  *   5) 本地 candidates 不够 → 用 netease lexical 搜索补
  *   6) 记录到 RecommendationLog 防止 24h 内重复
  *
- * SYSTEM_PROMPT 完全对齐 src/lib/music-intent.ts，DeepSeek prompt cache 跨平台命中。
+ * 主对话 SYSTEM_PROMPT 来自 PetPersona —— 用户选定的人格决定语气。
+ * 默认人格 (PetPersona.TOXIC) 对齐 src/lib/music-intent.ts，DeepSeek prompt cache 跨平台命中。
  */
 class PetAgent(
     private val repository: PipoRepository,
@@ -36,13 +37,38 @@ class PetAgent(
         Play,
         /** 插队到当前队列下一首（"放浮夸"、"来一首XX"——只想听这一首，别毁掉当前列表） */
         Insert,
+        /** 跳过当前歌（"下一首""跳过""换"）—— 不走召回 */
+        Skip,
+        /** 解释当前歌 / 推荐理由（"这首啥意思""为啥推这首"）—— reply 字段放宽到 ≤120 字，不走召回 */
+        Explain,
+        /** 基于当前曲找类似（"再来几首类似的""类似但更慢"）—— 走 Play 召回路径但 action 保留 Similar */
+        Similar,
+        /** 收藏当前曲到"我喜欢的音乐"红心歌单 */
+        Like,
+        /** 取消收藏 */
+        Unlike,
+        /** 加到指定歌单 —— trackOp.playlistName 给名字（UI 端模糊匹配 playlist id） */
+        AddToPlaylist,
+        /** 从指定歌单移除 */
+        RemoveFromPlaylist,
     }
+
+    /**
+     * 写动作的参数。like/unlike 不需要 playlistName，
+     * add_to_playlist / remove_from_playlist 必须有。
+     */
+    data class TrackOpRequest(
+        val kind: String,
+        val playlistName: String? = null,
+    )
 
     data class AgentResponse(
         val reply: String,
         val action: Action,
         val initialBatch: List<NativeTrack>,
         val continuous: ContinuousQueueSource?,
+        /** Like/Unlike/AddToPlaylist/RemoveFromPlaylist 时 UI 端用来执行写操作 */
+        val trackOp: TrackOpRequest? = null,
     )
 
     suspend fun chat(
@@ -50,6 +76,7 @@ class PetAgent(
         history: List<Pair<Boolean, String>>,
         currentTrack: NativeTrack?,
         userFacts: String,
+        persona: PetPersona = PetPersona.DEFAULT,
     ): AgentResponse {
         DiagnosticsLogStore.record(
             area = "ai_agent",
@@ -59,12 +86,13 @@ class PetAgent(
                 "historyCount" to history.size,
                 "hasCurrentTrack" to (currentTrack != null),
                 "userFactsLen" to userFacts.length,
+                "persona" to persona.id,
             ),
         )
         val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
         val aiResult = runCatching {
             repository.aiChat(
-                system = SYSTEM_PROMPT,
+                system = persona.chatSystemPrompt,
                 user = buildUserMessage(userText, history, currentTrack, userFacts, behaviorEvents),
                 temperature = 0.75f,
                 maxTokens = 4000,
@@ -97,20 +125,35 @@ class PetAgent(
                 )
             }
 
-        if (parsed.action != Action.Play) {
+        if (parsed.action != Action.Play && parsed.action != Action.Similar) {
+            // 非召回类 action —— 直接返回带 reply（可能附 trackOp）。
+            // NativeAiPet 按 action 决定后续：
+            //   Skip → viewModel.next()
+            //   Explain / Chat → 只展示 reply
+            //   Like / Unlike → repository.likeSong
+            //   AddToPlaylist / RemoveFromPlaylist → repository.playlistModifyTracks（含模糊匹配 playlist）
+            val trackOp = when (parsed.action) {
+                Action.Like -> TrackOpRequest(kind = "like")
+                Action.Unlike -> TrackOpRequest(kind = "unlike")
+                Action.AddToPlaylist -> TrackOpRequest(kind = "add_to_playlist", playlistName = parsed.playlistName)
+                Action.RemoveFromPlaylist -> TrackOpRequest(kind = "remove_from_playlist", playlistName = parsed.playlistName)
+                else -> null
+            }
             DiagnosticsLogStore.record(
                 area = "ai_agent",
-                event = "intent_chat",
+                event = "intent_${parsed.action.name.lowercase()}",
                 fields = mapOf(
                     "replyLen" to parsed.reply.length,
                     "rawAction" to parsed.action.name,
+                    "playlistName" to (parsed.playlistName ?: ""),
                 ),
             )
             return AgentResponse(
                 reply = parsed.reply,
-                action = Action.Chat,
+                action = parsed.action,
                 initialBatch = emptyList(),
                 continuous = null,
+                trackOp = trackOp,
             )
         }
 
@@ -184,6 +227,9 @@ class PetAgent(
         val recentRec = runCatching { recommendationLog.recentContext() }.getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
         val tasteProfile = tasteProfileStore.flow.value
 
+        // 保留 ranked 记录(含 bucket / sourceScores) → composeOpening 拿 bucket
+        // 标记探索曲, rankRefill 也能复用同份 candidate 形态。
+        var localRankedRecord: List<CandidateRanker.Ranked> = emptyList()
         val localRanked: List<NativeTrack> = if (localTracks.isNotEmpty()) {
             // 用户原话向量化（OpenAI 才支持；DeepSeek/MiMo 失败时返回 null，自动 fallback lexical）
             val queryVector = if (embeddingStore.count() > 0) {
@@ -212,6 +258,7 @@ class PetAgent(
                     recentRecommendation = recentRec,
                 ),
             )
+            localRankedRecord = ranked
             DiagnosticsLogStore.record(
                 area = "ai_agent",
                 event = "local_ranked",
@@ -315,13 +362,24 @@ class PetAgent(
         }
 
         // 4) 拆 initialBatch + reservoir
-        val initialBatch = final.take(12)
+        //    - initialTarget 动态: min(12, max(6, desired/2)) —— 小曲库不会被抽干
+        //    - composeOpening 把开场重排成 [head 熟悉 + mid 主推 + tail 探索],
+        //      让"第一耳朵"命中已知偏好, 再渐进过渡到探索曲
+        val initialTarget = minOf(12, maxOf(6, desired / 2))
+        val rankedByKey = localRankedRecord.associateBy { TrackDedupe.songKey(it.candidate.track) }
+        val initialBatch = composeOpening(
+            final = final,
+            rankedByKey = rankedByKey,
+            recentPlay = recentPlay,
+            target = initialTarget,
+        )
+        val initialKeys = initialBatch.mapTo(HashSet()) { TrackDedupe.songKey(it) }
         // 3) 记 recommendation log（防 24h 内重复）—— 只记 initialBatch；reservoir
         //    在 makeContinuousSource 真被 drain 时才记，避免双重计数让 recencyPen 翻倍
         runCatching {
             recommendationLog.logTracks(initialBatch, RecommendationLog.Source.Pet)
         }
-        val reservoir = final.drop(12)
+        val reservoir = final.filterNot { TrackDedupe.songKey(it) in initialKeys }
         DiagnosticsLogStore.record(
             area = "ai_agent",
             event = "queue_ready",
@@ -337,9 +395,16 @@ class PetAgent(
 
         return AgentResponse(
             reply = parsed.reply,
-            action = Action.Play,
+            action = parsed.action,  // Play 或 Similar —— Similar 走同样召回但 UI 可区分提示
             initialBatch = initialBatch,
-            continuous = makeContinuousSource(reservoir, artistSearchQueries, requestedArtistKeys),
+            continuous = makeContinuousSource(
+                reservoir = reservoir,
+                seedQueries = artistSearchQueries,
+                requestedArtistKeys = requestedArtistKeys,
+                intent = intent,
+                recentPlay = recentPlay,
+                recentRec = recentRec,
+            ),
         )
     }
 
@@ -520,20 +585,49 @@ class PetAgent(
     }
 
     /**
-     * 续杯 source：先消费 reservoir，空了之后再发一次"放宽"搜索补一批。
+     * 续杯 source —— 长会话不断流的关键链路。
+     *
+     * 三件事:
+     * 1) 优先 drain reservoir(本地排序好的池子);每次 drain 前根据本会话最近 10 分钟
+     *    的 Skipped/ManualCut 反馈把 pool 里同 artist 的歌往后挤,让"刚跳过的歌
+     *    还会被推"的尴尬立刻收敛。
+     * 2) reservoir 空了 → 在线 seedQueries 搜 raw → 过 CandidateRanker(对齐
+     *    initialBatch 的口味打分) → 接到队尾,听感分布跟首批一致。
+     * 3) refill 不再是一次性 latch —— 旧版 refillTried=true 之后任何 fetchMore 都
+     *    返回空,叠加上层 PlayerViewModel 看到空就 continuousSource=null 的设计
+     *    会让长会话(超过 reservoir 容量 + 8)彻底断流。改成"每 6 首允许再 refill",
+     *    既挡住"空 refill 反复打"又保证有歌就有得续。
      */
     private fun makeContinuousSource(
         reservoir: List<NativeTrack>,
         seedQueries: List<String>,
         requestedArtistKeys: Set<String>,
+        intent: PetIntent,
+        recentPlay: BehaviorLog.RecentPlay,
+        recentRec: RecommendationLog.RecentContext,
     ): ContinuousQueueSource {
         val pool = reservoir.toMutableList()
         val consumed = mutableSetOf<Long>()
         // 同一首歌的 Live/Karaoke/Acoustic 多版本归一到同 songKey —— 续杯不能再灌进重复版本
         val consumedSongKeys = HashSet<String>()
-        var refillTried = false
+        var drainedTotal = 0
+        // 上次成功 refill 之后, 至少再 drain 这么多首才允许再 refill,
+        // 把"空 refill 反复触发"压成"每 6 首才允许尝试一次"。
+        var lastRefillDrainMark = -1000
+        val refillCooldown = 6
 
         return ContinuousQueueSource { excludeIds ->
+            // 1) 本会话 skip 反馈: 命中"最近 10 分钟被跳的 artist"的歌往后挤
+            val freshSkipArtists = recentSessionSkipArtists(windowMs = 10L * 60_000L)
+            if (freshSkipArtists.isNotEmpty() && pool.size > 1) {
+                val resorted = pool.sortedBy { t ->
+                    if (firstArtistKey(t.artist) in freshSkipArtists) 1 else 0
+                }
+                pool.clear()
+                pool.addAll(resorted)
+            }
+
+            // 2) drain
             val drained = mutableListOf<NativeTrack>()
             var index = 0
             while (index < pool.size && drained.size < 8) {
@@ -552,6 +646,7 @@ class PetAgent(
                 drained.add(t)
             }
             if (drained.isNotEmpty()) {
+                drainedTotal += drained.size
                 runCatching { recommendationLog.logTracks(drained, RecommendationLog.Source.Pet) }
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
@@ -559,57 +654,199 @@ class PetAgent(
                     fields = mapOf(
                         "count" to drained.size,
                         "poolLeft" to pool.size,
+                        "drainedTotal" to drainedTotal,
+                        "skipArtistCount" to freshSkipArtists.size,
                         "promptArtistCount" to requestedArtistKeys.size,
                     ),
                 )
                 return@ContinuousQueueSource drained
             }
 
-            if ((requestedArtistKeys.isNotEmpty() || !refillTried) && seedQueries.isNotEmpty()) {
-                refillTried = true
-                val collected = mutableListOf<NativeTrack>()
-                for (q in seedQueries) {
-                    val hits = runCatching {
-                        repository.searchTracks(q, limit = if (requestedArtistKeys.isNotEmpty()) 16 else 8)
-                    }.getOrDefault(emptyList())
-                    for (t in hits) {
-                        if (requestedArtistKeys.isNotEmpty() && !matchesRequestedArtist(t, requestedArtistKeys)) continue
-                        val id = t.neteaseId ?: continue
-                        if (id in excludeIds || id in consumed) continue
-                        val k = TrackDedupe.songKey(t)
-                        if (k in consumedSongKeys) continue
-                        consumed.add(id)
-                        consumedSongKeys.add(k)
-                        collected.add(t)
-                        if (collected.size >= 12) break
-                    }
-                    if (collected.size >= 12) break
-                }
-                val refill = collected.take(8)
-                runCatching { recommendationLog.logTracks(refill, RecommendationLog.Source.Pet) }
+            // 3) reservoir 空了 → refill(cooldown 控制, 不再是一次性 latch)
+            val cooldownPassed = drainedTotal - lastRefillDrainMark >= refillCooldown
+            if (!cooldownPassed || seedQueries.isEmpty()) {
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
-                    event = "continuous_refill",
+                    event = if (seedQueries.isEmpty()) "continuous_empty" else "continuous_cooldown",
                     fields = mapOf(
-                        "queryCount" to seedQueries.size,
-                        "collected" to collected.size,
-                        "returned" to refill.size,
-                        "promptArtistCount" to requestedArtistKeys.size,
+                        "seedQueryCount" to seedQueries.size,
+                        "drainedTotal" to drainedTotal,
+                        "lastRefillDrainMark" to lastRefillDrainMark,
                     ),
                 )
-                return@ContinuousQueueSource refill
+                return@ContinuousQueueSource emptyList()
             }
+
+            val collected = LinkedHashMap<String, NativeTrack>()
+            for (q in seedQueries) {
+                val hits = runCatching {
+                    repository.searchTracks(q, limit = if (requestedArtistKeys.isNotEmpty()) 16 else 8)
+                }.getOrDefault(emptyList())
+                for (t in hits) {
+                    if (requestedArtistKeys.isNotEmpty() && !matchesRequestedArtist(t, requestedArtistKeys)) continue
+                    val id = t.neteaseId ?: continue
+                    if (id in excludeIds || id in consumed) continue
+                    val k = TrackDedupe.songKey(t)
+                    if (k in consumedSongKeys || k in collected) continue
+                    collected[k] = t
+                    if (collected.size >= 18) break  // 多收点给 ranker 选
+                }
+                if (collected.size >= 18) break
+            }
+            if (collected.isEmpty()) {
+                lastRefillDrainMark = drainedTotal  // 入 cooldown, 防反复空 refill
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "continuous_refill_empty",
+                    fields = mapOf("queryCount" to seedQueries.size),
+                )
+                return@ContinuousQueueSource emptyList()
+            }
+
+            // refill 也走 ranker —— raw search hits 直接接到队尾会有"前 12 是精选,
+            // 后面是搜索原始结果"的听感断崖。让同一份 intent / recentPlay / recentRec
+            // 打分, 质量分布跟 initialBatch 对齐。
+            val refill = rankRefill(
+                tracks = collected.values.toList(),
+                intent = intent,
+                recentPlay = recentPlay,
+                recentRec = recentRec,
+                target = 8,
+            )
+            if (refill.isEmpty()) {
+                lastRefillDrainMark = drainedTotal
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "continuous_refill_filtered",
+                    fields = mapOf("collected" to collected.size),
+                )
+                return@ContinuousQueueSource emptyList()
+            }
+            for (t in refill) {
+                val id = t.neteaseId ?: continue
+                consumed.add(id)
+                consumedSongKeys.add(TrackDedupe.songKey(t))
+            }
+            drainedTotal += refill.size
+            lastRefillDrainMark = drainedTotal
+            runCatching { recommendationLog.logTracks(refill, RecommendationLog.Source.Pet) }
             DiagnosticsLogStore.record(
                 area = "ai_agent",
-                event = "continuous_empty",
+                event = "continuous_refill",
                 fields = mapOf(
-                    "seedQueryCount" to seedQueries.size,
-                    "excludeCount" to excludeIds.size,
-                    "promptArtistCount" to requestedArtistKeys.size,
+                    "queryCount" to seedQueries.size,
+                    "collected" to collected.size,
+                    "returned" to refill.size,
+                    "drainedTotal" to drainedTotal,
                 ),
             )
-            emptyList()
+            refill
         }
+    }
+
+    /**
+     * 三段开场: [head 熟悉(7d 听过) + mid 主推 + tail 探索(ranker bucket=3)]。
+     *
+     * head/tail 各取 ≤2 首避免"前 3 全是听过的卡碟"或"末 3 都太冷"。
+     * 没有 ranker bucket(localRankedRecord 空, 即纯在线分支)时 tail 段自然为空,
+     * 退化为"head + mid", 不影响行为正确性。
+     */
+    private fun composeOpening(
+        final: List<NativeTrack>,
+        rankedByKey: Map<String, CandidateRanker.Ranked>,
+        recentPlay: BehaviorLog.RecentPlay,
+        target: Int,
+    ): List<NativeTrack> {
+        if (final.size <= target) return final.take(target)
+        val headCap = if (target >= 9) 2 else 1
+        val tailCap = if (target >= 9) 2 else 1
+        val taken = HashSet<String>()
+
+        val familiar = final.asSequence()
+            .filter { t ->
+                val id = t.neteaseId ?: return@filter false
+                id in recentPlay.last7dTrackIds
+            }
+            .take(headCap)
+            .toList()
+        familiar.forEach { taken.add(TrackDedupe.songKey(it)) }
+
+        val explorers = final.asSequence()
+            .filterNot { TrackDedupe.songKey(it) in taken }
+            .filter { rankedByKey[TrackDedupe.songKey(it)]?.bucket == 3 }
+            .take(tailCap)
+            .toList()
+        explorers.forEach { taken.add(TrackDedupe.songKey(it)) }
+
+        val midNeeded = target - familiar.size - explorers.size
+        val mid = final.asSequence()
+            .filterNot { TrackDedupe.songKey(it) in taken }
+            .take(midNeeded)
+            .toList()
+
+        return (familiar + mid + explorers).take(target)
+    }
+
+    /**
+     * 拿最近 windowMs 内 Skipped / ManualCut 事件的 artist 集合(normalize 过的 key)。
+     */
+    private suspend fun recentSessionSkipArtists(windowMs: Long): Set<String> {
+        val now = System.currentTimeMillis()
+        val events = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
+        val out = HashSet<String>()
+        for (e in events) {
+            if (e.type != BehaviorType.Skipped && e.type != BehaviorType.ManualCut) continue
+            if (now - e.tsMs > windowMs) continue
+            val key = firstArtistKey(e.artist)
+            if (key.isNotEmpty()) out.add(key)
+        }
+        return out
+    }
+
+    /** "Artist1 / Artist2 & Artist3" → normalize 后的第一位 artist key, 空串表无名 */
+    private fun firstArtistKey(raw: String): String {
+        val first = raw.split('/', '&', ',', '、').firstOrNull().orEmpty().trim()
+        return normalizeForMatch(first)
+    }
+
+    /**
+     * 续杯 refill 走 ranker —— 跟 initialBatch 同一套口味打分,
+     * 让"前 12 精选 / 后续粗放"的听感断崖消失。
+     *
+     * raw 列表里有的歌没 features / 没 semanticProfile, ranker 自己会 fallback
+     * 到 0 分不会崩;真没分的(全 0)在 finalScore<=0 自然被过滤掉。
+     */
+    private fun rankRefill(
+        tracks: List<NativeTrack>,
+        intent: PetIntent,
+        recentPlay: BehaviorLog.RecentPlay,
+        recentRec: RecommendationLog.RecentContext,
+        target: Int,
+    ): List<NativeTrack> {
+        if (tracks.isEmpty()) return emptyList()
+        val candidates = tracks.map { t ->
+            val features = runCatching { featuresStore.get(t.id) }.getOrNull()
+            val semanticProfile = runCatching {
+                semanticStore.get(t.id) ?: indexer.buildRuleBasedProfile(t, features)
+            }.getOrNull()
+            CandidateRecall.Candidate(
+                track = t,
+                features = features,
+                semanticProfile = semanticProfile,
+                sources = mutableListOf(CandidateRecall.Source.Text),
+                sourceScores = mutableMapOf(CandidateRecall.Source.Text to 0.45),
+            )
+        }
+        val ranked = CandidateRanker.rank(
+            candidates = candidates,
+            intent = intent,
+            options = CandidateRanker.Options(
+                topN = target * 2,
+                recentPlay = recentPlay,
+                recentRecommendation = recentRec,
+            ),
+        )
+        return ranked.map { it.candidate.track }.take(target)
     }
 
     private fun requestedArtistKeys(intent: PetIntent): Set<String> =
@@ -781,6 +1018,22 @@ class PetAgent(
             ctxLines.add("最近被切的歌(负反馈)：\n$skipBlock")
         }
 
+        // 最近播放历史 —— 让 AI 能回答"我刚才在听啥""上一首叫啥""昨天听的那首"这类回忆问题。
+        // 取 PlayStarted/Completed 两种事件，按曲名去重，最多 5 条。
+        val recentPlayed = behaviorEvents
+            .filter { it.type == BehaviorType.PlayStarted || it.type == BehaviorType.Completed }
+            .sortedByDescending { it.tsMs }
+            .distinctBy { "${it.title}|${it.artist}" }
+            .take(5)
+        if (recentPlayed.isNotEmpty()) {
+            val dateFmt = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+            val playedBlock = recentPlayed.joinToString("\n") { e ->
+                val tsStr = dateFmt.format(java.util.Date(e.tsMs))
+                "- $tsStr ${e.title} — ${e.artist}"
+            }
+            ctxLines.add("最近播放历史：\n$playedBlock")
+        }
+
         val tail = history.takeLast(4)
         if (tail.isNotEmpty()) {
             val block = tail.joinToString("\n") { (fromUser, text) ->
@@ -800,6 +1053,8 @@ class PetAgent(
         val intent: PetIntent,
         /** 来自 LLM queueIntent.action："insert" / "replace"，缺省 "replace" */
         val queueAction: String,
+        /** AddToPlaylist/RemoveFromPlaylist 时 AI 给的歌单名（原样回传，UI 端做模糊匹配） */
+        val playlistName: String? = null,
     )
 
     private fun parseIntent(raw: String): Parsed? {
@@ -814,6 +1069,13 @@ class PetAgent(
             val actionStr = obj.optString("action").lowercase()
             val action = when (actionStr) {
                 "play", "recommend", "continue", "adjust_queue" -> Action.Play
+                "skip", "next" -> Action.Skip
+                "explain", "info", "about", "why" -> Action.Explain
+                "similar", "more_like_this", "more" -> Action.Similar
+                "like", "favorite" -> Action.Like
+                "unlike", "dislike", "unfavorite" -> Action.Unlike
+                "add_to_playlist", "add" -> Action.AddToPlaylist
+                "remove_from_playlist", "remove" -> Action.RemoveFromPlaylist
                 else -> Action.Chat
             }
             val hard = obj.optJSONObject("hardConstraints")
@@ -862,7 +1124,8 @@ class PetAgent(
             )
             val queueAction = queue?.optString("action")?.lowercase()?.trim().orEmpty()
                 .let { if (it == "insert") "insert" else "replace" }
-            Parsed(reply, action, intent, queueAction)
+            val playlistName = obj.optString("playlistName").trim().ifBlank { null }
+            Parsed(reply, action, intent, queueAction, playlistName)
         } catch (_: Exception) { null }
     }
 
@@ -877,86 +1140,6 @@ class PetAgent(
         return out
     }
 
-    companion object {
-        /**
-         * SYSTEM_PROMPT —— 完全对齐 src/lib/music-intent.ts:255。
-         * 跨平台共享同一份 system 字符串 → DeepSeek prompt cache 命中。
-         */
-        private val SYSTEM_PROMPT: String = """
-你是 Claudio —— 一只幽默抽象的音乐宠物。你既会接话，也会顺手放歌；这两件事不是互斥的。
-
-# 任务
-用户每说一句话，你输出一个 JSON。reply 是你以人格说出来的话；其他字段告诉本地音乐引擎要不要放歌、放什么。
-
-# 人格调性（reply 字段）
-- 永远短，中文一般 ≤24 字，最多两句。
-- 抽象的比喻 OK："打工是吧""老天爷在哭""把音量旋大点""上班就是吃公司的电压"。
-- 关系熟到不用客气的朋友：随便、懒、偶尔损一下。
-- 决定放歌就直接说"放着""听着""点火"，不要问"要不要"。
-- 绝不要：客服腔（"好的""为您"）/ 鸡汤（"加油"）/ 双形容词对仗（既…又…）/ 三连问 / 感叹号 / emoji / "嘿"起手 / "这首歌很适合你"这种夸奖。
-
-# action 怎么判
-- play：用户表达任何想听歌的信号（说情绪/累/烦/开心、点名艺人、催促"放歌啊"）
-- chat：纯打招呼/问名字/感谢/闲聊
-- 模糊就偏 play —— 这是音乐宠物，沉默是失败。
-
-# queueIntent.action 怎么判（决定"插一首" 还是"换一整套"）
-- "insert"：用户**只指名一首**歌想听（"放浮夸"、"来一首七百年后"、"插一首 XX"）。
-  当前队列保留，新歌插到下一首立刻播；新歌结束后回到原本的下一首。
-- "replace"（默认）：用户在指定一个**音乐主题/情境/艺人探索**（"听陈奕迅"、"放点蓝调"、
-  "想听陈奕迅从浮夸开始"、"排几首慢的"、"陪我熬夜"）。把整个队列换成新的。
-- 判定要点：单歌名 → insert；指名艺人 / 指名艺人+起始歌 / 描述情绪场景 → replace。
-  不确定就 replace。
-
-# 字段约定（用得上才填，默认值都 OK）
-- queryText: 用户原句
-- textHints.{artists,tracks,albums}: 句子里直接点名的（不要瞎补）
-- musicHints.{moods,scenes,genres,avoid,energy,transitionStyle}
-- hardConstraints: 用户明确说死的语言/地区/流派/排除项
-- softPreferences.{moods,scenes,textures,energy,tempoFeel,eras,qualityWords}
-- queueIntent.orderStyle: 默认 smooth；激情用 energy_up；派对 party；睡眠 sleep
-- desiredCount: 1-60，默认 30
-
-# 输出格式
-严格只输出一个 JSON 对象，不要 markdown，不要 ```，不要解释。
-
-# 当下上下文怎么用
-USER 部分会带"时段"、可能含"明天就周末"/"再 3 天就国庆"/"今天下雨"这种锚点。
-如果命中 TA 的话题或当下情绪,reply 里可以借力一下("周末已经在门口""假期心情先到");
-不要硬塞,挑相关的一个用就行。
-
-# 示例
-1) "今天好累" →
-{"reply":"打工是吧。来点能把电量充满的。","action":"play","queryText":"今天好累","softPreferences":{"moods":["uplifting","punchy"],"energy":"mid_high"},"hardConstraints":{"excludeTags":["sad","mellow"]},"queueIntent":{"orderStyle":"energy_up","transitionStyle":"tight"}}
-
-2) "下雨了，放点好听的" →
-{"reply":"老天爷在哭。我配点。","action":"play","queryText":"下雨了，放点好听的","softPreferences":{"scenes":["rainy day","night"],"moods":["melancholic","calm","atmospheric"],"energy":"mid_low"},"queueIntent":{"orderStyle":"smooth"}}
-
-3) "我刚分手了" →
-{"reply":"那你需要点猛的。","action":"play","queryText":"我刚分手了","softPreferences":{"moods":["cathartic","defiant"],"energy":"high"},"queueIntent":{"orderStyle":"energy_up","transitionStyle":"tight"}}
-
-4) "你叫什么" →
-{"reply":"Claudio。一只放歌的。","action":"chat","queryText":"你叫什么"}
-
-5) "你知道火星哥吗" →
-{"reply":"Bruno Mars。给你来一组。","action":"play","queryText":"你知道火星哥吗","textHints":{"artists":["Bruno Mars"]},"hardConstraints":{"artists":["Bruno Mars"]}}
-
-5b) "想听陈奕迅，从七百年后开始" → (replace 整列：探索一个艺人)
-{"reply":"行。先开七百年后。","action":"play","queryText":"想听陈奕迅，从七百年后开始","textHints":{"artists":["陈奕迅"],"tracks":["七百年后"]},"hardConstraints":{"artists":["陈奕迅"],"tracks":["七百年后"]},"queueIntent":{"action":"replace"}}
-
-5c) "放浮夸" → (insert：只想听这一首，不毁掉当前队列)
-{"reply":"插一首。","action":"play","queryText":"放浮夸","textHints":{"tracks":["浮夸"]},"hardConstraints":{"tracks":["浮夸"]},"queueIntent":{"action":"insert"}}
-
-5d) "来一首七百年后" → (insert)
-{"reply":"来。","action":"play","queryText":"来一首七百年后","textHints":{"tracks":["七百年后"]},"hardConstraints":{"tracks":["七百年后"]},"queueIntent":{"action":"insert"}}
-
-6) "谢谢" →
-{"reply":"嗯。","action":"chat","queryText":"谢谢"}
-
-7) "我饿了" →
-{"reply":"吃饭跟听歌一起。下饭的来一组。","action":"play","queryText":"我饿了","softPreferences":{"scenes":["dining"],"moods":["mellow","groovy"]},"queueIntent":{"orderStyle":"smooth"}}
-""".trim()
-    }
 }
 
 /**

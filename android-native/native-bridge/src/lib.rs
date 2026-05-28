@@ -113,6 +113,10 @@ fn dispatch(command: &str, args: Value) -> String {
                 Ok(serde_json::to_value(tracks)?)
             })
         }
+        "netease_user_cloud_tracks" => run_json(async {
+            let tracks = netease_client().user_cloud_all_tracks().await?;
+            Ok(serde_json::to_value(tracks)?)
+        }),
         "netease_qr_start" => run_json(async {
             let key = netease_client().qr_unikey().await?;
             Ok(json!({
@@ -194,6 +198,33 @@ fn dispatch(command: &str, args: Value) -> String {
             run_json(async move {
                 let lyric = netease_client().song_lyric(id).await?;
                 Ok(serde_json::to_value(lyric)?)
+            })
+        }
+        "netease_like_song" => {
+            let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+            let like = args.get("like").and_then(Value::as_bool).unwrap_or(true);
+            run_json(async move {
+                let ok = netease_client().like_song(id, like).await?;
+                Ok(json!({ "ok": ok }))
+            })
+        }
+        "netease_playlist_modify_tracks" => {
+            let playlist_id = args.get("playlistId").and_then(Value::as_i64).unwrap_or(0);
+            let op = args
+                .get("op")
+                .and_then(Value::as_str)
+                .unwrap_or("add")
+                .to_string();
+            let track_ids = args
+                .get("trackIds")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+                .unwrap_or_default();
+            run_json(async move {
+                let ok = netease_client()
+                    .playlist_modify_tracks(playlist_id, &op, &track_ids)
+                    .await?;
+                Ok(json!({ "ok": ok }))
             })
         }
         "audio_cache_set_max_mb" => {

@@ -147,19 +147,21 @@ data class NativeSettings(
     val hideDotPattern: Boolean = false,
     val hideAiPetOrb: Boolean = true,
     val lyricTranslation: Boolean = false,
-    val smartSessionPlanner: Boolean = true,
-    val workdayAutoplay: Boolean = true,
-    val lunchRelaxMode: Boolean = false,
-    val lateNightCalmMode: Boolean = true,
-    val promptedRadioRule: String = "",
     val aiNarration: Boolean = false,
     val playbackMode: String = "PlaylistLoop",
     val userFacts: String = "",
+    val personaId: String = PetPersona.DEFAULT.id,
 )
 
 interface PipoRepository {
     val account: Flow<PipoAccount?>
     val playlists: Flow<List<PipoPlaylist>>
+    /**
+     * "我的网盘"曲目 Flow。冷启动时从磁盘 cache 同步恢复；[cloudDiskTracks] 加载完会 emit
+     * 新值。让 UI 把 cover / count 派生过来，跨 DistillLibrary 重挂载不丢，对齐正常
+     * 歌单的体验（其 cover 也是从 [playlists] Flow 拿到）。
+     */
+    val cloudTracks: Flow<List<NativeTrack>>
     val distillState: Flow<DistillState>
     val settings: Flow<NativeSettings>
     val audioCacheStats: Flow<AudioCacheStats>
@@ -173,9 +175,25 @@ interface PipoRepository {
     suspend fun loginWithPhone(phone: String, captcha: String, countryCode: Int = 86): PhoneLoginStatus
     suspend fun refreshPlaylists()
     suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean = false): List<NativeTrack>
+    /**
+     * 加载"我的网盘"全部上传歌曲。和 [tracksForPlaylist] 行为对齐：
+     * 第一次命中网，后续走内存 / 磁盘缓存；forceRefresh=true 触发重抓。
+     * 加载完会 emit 到 [cloudTracks] Flow 让 cover-flow tile 跨 UI 重挂载持久。
+     */
+    suspend fun cloudDiskTracks(forceRefresh: Boolean = false): List<NativeTrack>
+    /**
+     * 同步读已加载到内存的歌单 / 网盘曲目（命中时返回，否则 null），用于 DistillLibrary
+     * 重新挂载时把 tracks 初始值从 cache 直接灌进去，避免 `loading=true && tracks.isEmpty()`
+     * 触发"加载中…"那一帧 strobe。对齐"正常歌单也不要闪"。
+     */
+    fun cachedTracksFor(playlistId: Long): List<NativeTrack>?
     suspend fun searchTracks(query: String, limit: Int = 30): List<NativeTrack>
     suspend fun songUrls(ids: List<Long>, level: String = "lossless"): List<NativeSongUrl>
     suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine>
+    /** 收藏 / 取消收藏单曲（写到网易云"我喜欢的音乐"红心歌单） */
+    suspend fun likeSong(id: Long, like: Boolean)
+    /** 歌单加 / 删歌；op = "add" | "del" */
+    suspend fun playlistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>)
     suspend fun updateSettings(settings: NativeSettings)
     suspend fun refreshAudioCacheStats()
     suspend fun setCacheMaxMb(mb: Long)

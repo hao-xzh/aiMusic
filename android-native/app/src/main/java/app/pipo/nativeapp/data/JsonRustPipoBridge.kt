@@ -85,6 +85,11 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         return parseTracks(tracks)
     }
 
+    override suspend fun neteaseUserCloudTracks(): List<NativeTrack> {
+        val tracks = callArray("netease_user_cloud_tracks")
+        return parseTracks(tracks)
+    }
+
     private fun parseTracks(tracks: JSONArray): List<NativeTrack> {
         return List(tracks.length()) { i ->
             val t = tracks.getJSONObject(i)
@@ -182,6 +187,25 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         }
         val lrc = raw.optStringOrNull("lyric") ?: return emptyList()
         return attachTranslationLines(LrcParser.parse(lrc), translations)
+    }
+
+    override suspend fun neteaseLikeSong(id: Long, like: Boolean) {
+        callRaw("netease_like_song", jsonObject("id" to id, "like" to like))
+    }
+
+    override suspend fun neteasePlaylistModifyTracks(
+        playlistId: Long,
+        op: String,
+        trackIds: List<Long>,
+    ) {
+        callRaw(
+            "netease_playlist_modify_tracks",
+            jsonObject(
+                "playlistId" to playlistId,
+                "op" to op,
+                "trackIds" to JSONArray(trackIds),
+            ),
+        )
     }
 
     override suspend fun audioCacheClear() {

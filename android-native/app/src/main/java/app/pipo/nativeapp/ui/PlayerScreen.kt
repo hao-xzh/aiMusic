@@ -52,7 +52,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.Image
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import app.pipo.nativeapp.R
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
@@ -434,6 +437,26 @@ private fun CompactCover(coverUrl: String?, isPlaying: Boolean, hidden: Boolean)
                 contentScale = ContentScale.Crop,
                 durationMs = 720, // COVER_TRANSITION_MS
             )
+        } else {
+            // 网盘上传 / 没匹配到库的歌经常拿不到 NetEase 封面也没内嵌 artwork ——
+            // 这里用 app logo 做兜底，比纯绿色渐变更易识别"这首歌没有封面"。
+            // 不铺满，居中显示 ~40% 让蒙层 + 渐变背景还透得出来。
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = androidx.compose.ui.Alignment.Center,
+            ) {
+                Image(
+                    painter = painterResource(R.mipmap.ic_launcher_round),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxSize(0.42f)
+                        .graphicsLayer {
+                            alpha = 0.85f
+                            scaleX = playScale
+                            scaleY = playScale
+                        },
+                )
+            }
         }
     }
 }

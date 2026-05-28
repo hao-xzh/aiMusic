@@ -352,6 +352,36 @@ impl NeteaseClient {
         result
     }
 
+    /// 拉用户云盘里全部歌曲，去重 + 保留 NetEase 返回顺序（一般是 上传时间倒序）。
+    /// 给"我的网盘"歌单页用：和正常歌单一样喂给 PipoRepository.tracksForPlaylist。
+    pub async fn user_cloud_all_tracks(&self) -> Result<Vec<TrackInfo>> {
+        let limit = 200i64;
+        let mut offset = 0i64;
+        let mut out = Vec::<TrackInfo>::new();
+        let mut seen = HashSet::<i64>::new();
+        for _ in 0..50 {
+            let page = self.user_cloud_tracks_page(limit, offset).await?;
+            let has_more = page.has_more
+                || page
+                    .count
+                    .map(|count| offset + (page.data.len() as i64) < count)
+                    .unwrap_or(false);
+            let page_len = page.data.len();
+            for item in page.data {
+                if let Some((id, track)) = item.into_primary_track() {
+                    if seen.insert(id) {
+                        out.push(track);
+                    }
+                }
+            }
+            if !has_more || page_len == 0 {
+                break;
+            }
+            offset += limit;
+        }
+        Ok(out)
+    }
+
     async fn user_cloud_tracks_page(&self, limit: i64, offset: i64) -> Result<UserCloudResp> {
         let resp: UserCloudResp = self
             .weapi(
@@ -479,6 +509,65 @@ impl NeteaseClient {
             instrumental: resp.nolyric,
             uncollected: resp.uncollected,
         })
+    }
+
+    /// 收藏 / 取消收藏单曲 —— 写到用户的"我喜欢的音乐"红心歌单。
+    /// weapi: radio/like，参数 trackId + like(bool) + time(秒，一般 25)。
+    pub async fn like_song(&self, id: i64, like: bool) -> Result<bool> {
+        let resp: SimpleCodeResp = self
+            .weapi(
+                "radio/like",
+                json!({
+                    "alg": "itembased",
+                    "trackId": id,
+                    "like": like,
+                    "time": 25,
+                }),
+            )
+            .await?;
+        if resp.code != 200 {
+            return Err(anyhow!(
+                "like_song code={} msg={:?}",
+                resp.code,
+                resp.message
+            ));
+        }
+        Ok(true)
+    }
+
+    /// 歌单加 / 删歌 —— op = "add" | "del"。
+    /// weapi: playlist/manipulate/tracks，trackIds 必须是 JSON 字符串形式（网易服务端要求）。
+    /// code 200 = 成功；code 502 = "已存在 / 不存在" 算无需操作也当 ok 不抛错。
+    pub async fn playlist_modify_tracks(
+        &self,
+        playlist_id: i64,
+        op: &str,
+        track_ids: &[i64],
+    ) -> Result<bool> {
+        if op != "add" && op != "del" {
+            return Err(anyhow!(
+                "playlist_modify_tracks: op must be add/del, got {op}"
+            ));
+        }
+        let ids_json = serde_json::to_string(track_ids)?;
+        let resp: SimpleCodeResp = self
+            .weapi(
+                "playlist/manipulate/tracks",
+                json!({
+                    "op": op,
+                    "pid": playlist_id,
+                    "trackIds": ids_json,
+                }),
+            )
+            .await?;
+        if resp.code != 200 && resp.code != 502 {
+            return Err(anyhow!(
+                "playlist_modify_tracks op={op} pid={playlist_id} code={} msg={:?}",
+                resp.code,
+                resp.message
+            ));
+        }
+        Ok(true)
     }
 }
 

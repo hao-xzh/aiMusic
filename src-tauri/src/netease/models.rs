@@ -8,6 +8,17 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 //
+// --- 写接口通用响应 ---
+//
+
+#[derive(Debug, Deserialize)]
+pub struct SimpleCodeResp {
+    pub code: i32,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+//
 // --- 二维码登录 ---
 //
 
@@ -423,6 +434,58 @@ where
 }
 
 impl UserCloudTrack {
+    /// 云盘"列表"用：每条 cloud entry 只产出一个 (id, TrackInfo)。
+    /// 优先级：simpleSong.id > privateCloud.songId > songId > id > fileId。
+    /// hydration 那条路径要用 [`Self::into_track_candidates`] 拿到所有可能的 id（
+    /// 因为 NetEase 一条云盘记录在歌单 trackIds 里可能出现多种 id 形式）。
+    pub fn into_primary_track(self) -> Option<(i64, TrackInfo)> {
+        let private_id = self.private_cloud.as_ref().and_then(|p| p.song_id);
+        let simple_id = self.simple_song.as_ref().map(|t| t.id);
+        let primary_id = simple_id
+            .or(private_id)
+            .or(self.song_id)
+            .or(self.id)
+            .or(self.file_id)
+            .filter(|id| *id != 0)?;
+
+        let base = if let Some(track) = self.simple_song {
+            track
+        } else {
+            let pc = self.private_cloud.as_ref();
+            let name = self
+                .song_name
+                .or_else(|| pc.and_then(|p| p.song.clone()))
+                .or(self.file_name)
+                .or_else(|| pc.and_then(|p| p.file_name.clone()))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "未知云盘歌曲".into());
+            let artist_name = self
+                .artist
+                .or_else(|| pc.and_then(|p| p.artist.clone()))
+                .filter(|name| !name.is_empty());
+            let album_name = self
+                .album
+                .or_else(|| pc.and_then(|p| p.album.clone()))
+                .filter(|name| !name.is_empty());
+            TrackInfo {
+                id: primary_id,
+                name,
+                duration_ms: 0,
+                artists: artist_name
+                    .map(|name| vec![ArtistShort { id: 0, name }])
+                    .unwrap_or_default(),
+                album: album_name.map(|name| AlbumShort {
+                    id: 0,
+                    name,
+                    pic_url: None,
+                }),
+            }
+        };
+        let mut track = base;
+        track.id = primary_id;
+        Some((primary_id, track))
+    }
+
     pub fn into_track_candidates(self) -> Vec<(i64, TrackInfo)> {
         let mut ids = Vec::new();
         for id in [self.id, self.song_id, self.file_id] {

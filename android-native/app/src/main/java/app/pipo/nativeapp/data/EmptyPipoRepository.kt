@@ -37,8 +37,11 @@ class EmptyPipoRepository : PipoRepository {
         )
     )
 
+    private val cloudTracksState = MutableStateFlow<List<NativeTrack>>(emptyList())
+
     override val account: Flow<PipoAccount?> = accountState.asStateFlow()
     override val playlists: Flow<List<PipoPlaylist>> = playlistState.asStateFlow()
+    override val cloudTracks: Flow<List<NativeTrack>> = cloudTracksState.asStateFlow()
     override val distillState: Flow<DistillState> = distillStateValue.asStateFlow()
     override val settings: Flow<NativeSettings> = settingsState.asStateFlow()
     override val audioCacheStats: Flow<AudioCacheStats> = audioCacheStatsState.asStateFlow()
@@ -64,11 +67,15 @@ class EmptyPipoRepository : PipoRepository {
 
     override suspend fun refreshPlaylists() = Unit
     override suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean): List<NativeTrack> = emptyList()
+    override suspend fun cloudDiskTracks(forceRefresh: Boolean): List<NativeTrack> = emptyList()
+    override fun cachedTracksFor(playlistId: Long): List<NativeTrack>? = null
     override suspend fun searchTracks(query: String, limit: Int): List<NativeTrack> = emptyList()
     override suspend fun songUrls(ids: List<Long>, level: String): List<NativeSongUrl> =
         ids.map { NativeSongUrl(id = it, url = null, bitrate = 0, sizeBytes = 0) }
 
     override suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine> = emptyList()
+    override suspend fun likeSong(id: Long, like: Boolean) = Unit
+    override suspend fun playlistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>) = Unit
 
     override suspend fun updateSettings(settings: NativeSettings) {
         settingsState.value = settings

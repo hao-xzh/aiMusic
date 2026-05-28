@@ -34,6 +34,9 @@ class RustBridgeRepository(
     private val amllSource = appContext?.let(::AmllLyricsSource)
     private val accountState = MutableStateFlow<PipoAccount?>(null)
     private val playlistState = MutableStateFlow<List<PipoPlaylist>>(emptyList())
+    /** 网盘曲目 Flow —— init 从磁盘 cache 恢复，cloudDiskTracks 加载后 emit。让
+     *  DistillLibrary 把 cover-flow 那一页的 cover / count 跨重挂载持久化。 */
+    private val cloudTracksState = MutableStateFlow<List<NativeTrack>>(emptyList())
     private val audioCacheStatsState = MutableStateFlow(AudioCacheStats(0, 0, 0))
     private val aiConfigState = MutableStateFlow(AiConfigView(activeProvider = "", providers = emptyList()))
 
@@ -61,6 +64,9 @@ class RustBridgeRepository(
             synchronized(tracksCacheLock) {
                 tracksMemoryCache.putAll(snap.tracks)
             }
+            // 网盘也用同一磁盘 cache（sentinel id）——恢复后立刻 emit 到 Flow，让 cover-flow
+            // 那一页冷启动就有 cover / count，不用等 LaunchedEffect 触发再回填。
+            snap.tracks[CLOUD_DISK_PLAYLIST_ID]?.let { cloudTracksState.value = it }
             cacheStale = snap.isStale
             cachedUserId = snap.userId
         }
@@ -68,6 +74,7 @@ class RustBridgeRepository(
 
     override val account: Flow<PipoAccount?> = accountState.asStateFlow()
     override val playlists: Flow<List<PipoPlaylist>> = playlistState.asStateFlow()
+    override val cloudTracks: Flow<List<NativeTrack>> = cloudTracksState.asStateFlow()
     override val distillState: Flow<DistillState> = fallback.distillState
     override val settings: Flow<NativeSettings> = settingsStore?.settings ?: fallback.settings
     override val audioCacheStats: Flow<AudioCacheStats> = audioCacheStatsState.asStateFlow()
@@ -264,6 +271,66 @@ class RustBridgeRepository(
         return fresh
     }
 
+    override fun cachedTracksFor(playlistId: Long): List<NativeTrack>? =
+        synchronized(tracksCacheLock) { tracksMemoryCache[playlistId] }
+
+    override suspend fun cloudDiskTracks(forceRefresh: Boolean): List<NativeTrack> {
+        // 复用 tracksMemoryCache，用 sentinel ID 走和正常 playlist 一样的缓存/落盘链路。
+        // PlaylistCacheStore 用 Long 当 key，负值跟正常 playlistId 永远不会冲突。
+        val sentinel = CLOUD_DISK_PLAYLIST_ID
+        if (!forceRefresh) {
+            synchronized(tracksCacheLock) {
+                tracksMemoryCache[sentinel]
+            }?.let {
+                DiagnosticsLogStore.record(
+                    area = "library",
+                    event = "cloud_disk_tracks_cache_hit",
+                    fields = mapOf("count" to it.size),
+                )
+                // 确保 Flow 跟内存 cache 同步（init 已经灌过一次，这里幂等）
+                if (cloudTracksState.value !== it) cloudTracksState.value = it
+                return it
+            }
+        } else {
+            synchronized(tracksCacheLock) { tracksMemoryCache.remove(sentinel) }
+            DiagnosticsLogStore.record(area = "library", event = "cloud_disk_tracks_force_refresh")
+        }
+        val fresh = try {
+            bridge.neteaseUserCloudTracks()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "cloud_disk_tracks_fetch_failed",
+                fields = mapOf(
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
+            // 退回 fallback（一般 EmptyPipoRepository 给空 list），让 UI 显示"空网盘"提示
+            return runCatching { fallback.cloudDiskTracks(forceRefresh) }.getOrDefault(emptyList())
+        }
+        DiagnosticsLogStore.record(
+            area = "library",
+            event = "cloud_disk_tracks_fetch_ok",
+            fields = mapOf("count" to fresh.size),
+        )
+        if (fresh.isNotEmpty()) {
+            val tracksSnapshot = synchronized(tracksCacheLock) {
+                tracksMemoryCache[sentinel] = fresh
+                HashMap(tracksMemoryCache)
+            }
+            cloudTracksState.value = fresh  // emit 到 Flow，UI cover/count 自动更新
+            val uid = accountState.value?.userId ?: cachedUserId
+            val playlists = playlistState.value
+            if (uid != null && playlists.isNotEmpty()) {
+                playlistCache?.save(uid, playlists, tracksSnapshot)
+            }
+        }
+        return fresh
+    }
+
     override suspend fun searchTracks(query: String, limit: Int): List<NativeTrack> {
         return safe({ bridge.neteaseSearch(query, limit) }, { fallback.searchTracks(query, limit) })
     }
@@ -278,6 +345,66 @@ class RustBridgeRepository(
         // AmllLyricsSource 内部已经做了本地永久缓存 + 404 哨兵，重复播同一首不会反复打网络。
         amllSource?.lyricsForTrack(trackId)?.takeIf { it.isNotEmpty() }?.let { return it }
         return safe({ bridge.neteaseSongLyric(trackId) }, { fallback.lyricsForTrack(trackId) })
+    }
+
+    override suspend fun likeSong(id: Long, like: Boolean) {
+        // 写操作不能走 safe()：那个 helper 会把所有非 Cancellation 异常吞掉去跑 fallback
+        // (EmptyPipoRepository.likeSong = Unit) —— 结果就是 AI 说"加心"接口失败时
+        // 上层 runCatching 永远看到 Success，没反馈、没诊断，用户感知就是"没反应"。
+        // 改成异常透传给 NativeAiPet 的 runCatching 触发失败消息，并打 diagnostic 让日志能看到。
+        try {
+            bridge.neteaseLikeSong(id, like)
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "like_song_ok",
+                fields = mapOf("id" to id, "like" to like),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "like_song_failed",
+                fields = mapOf(
+                    "id" to id,
+                    "like" to like,
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
+            throw e
+        }
+    }
+
+    override suspend fun playlistModifyTracks(
+        playlistId: Long,
+        op: String,
+        trackIds: List<Long>,
+    ) {
+        // 同 likeSong：写操作要让失败可见 —— 不再用 safe 吞错。
+        try {
+            bridge.neteasePlaylistModifyTracks(playlistId, op, trackIds)
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "playlist_modify_ok",
+                fields = mapOf("playlistId" to playlistId, "op" to op, "count" to trackIds.size),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "playlist_modify_failed",
+                fields = mapOf(
+                    "playlistId" to playlistId,
+                    "op" to op,
+                    "count" to trackIds.size,
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
+            throw e
+        }
     }
 
     override suspend fun updateSettings(settings: NativeSettings) {
@@ -375,6 +502,7 @@ class RustBridgeRepository(
 
     private fun clearAccountCaches() {
         playlistState.value = emptyList()
+        cloudTracksState.value = emptyList()
         synchronized(tracksCacheLock) {
             tracksMemoryCache.clear()
         }
@@ -392,13 +520,23 @@ class RustBridgeRepository(
             fallbackCall()
         }
     }
+
 }
+
+/**
+ * "我的网盘" 在 tracksMemoryCache / PlaylistCacheStore 里复用的 sentinel id。
+ * 用负数永远跟真实 NetEase playlistId（>0）不冲突。提到顶层让 UI 层不用依赖
+ * RustBridgeRepository 具体实现，直接 `import app.pipo.nativeapp.data.CLOUD_DISK_PLAYLIST_ID`。
+ */
+const val CLOUD_DISK_PLAYLIST_ID: Long = -1L
 
 interface RustPipoBridge {
     suspend fun neteaseAccount(): PipoAccount?
     suspend fun neteaseLogout()
     suspend fun neteaseUserPlaylists(userId: Long): List<PipoPlaylist>
     suspend fun neteasePlaylistTracks(playlistId: Long): List<NativeTrack>
+    /** 拉用户网盘里全部上传歌曲。和正常歌单一样可以喂给 tracksForPlaylist 用。 */
+    suspend fun neteaseUserCloudTracks(): List<NativeTrack>
     suspend fun neteaseSearch(query: String, limit: Int): List<NativeTrack>
     suspend fun neteaseQrStart(): QrLoginStart
     suspend fun neteaseQrCheck(key: String): QrLoginStatus
@@ -406,6 +544,8 @@ interface RustPipoBridge {
     suspend fun neteasePhoneLogin(phone: String, captcha: String, countryCode: Int): PhoneLoginStatus
     suspend fun neteaseSongUrls(ids: List<Long>, level: String): List<NativeSongUrl>
     suspend fun neteaseSongLyric(trackId: String): List<PipoLyricLine>
+    suspend fun neteaseLikeSong(id: Long, like: Boolean)
+    suspend fun neteasePlaylistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>)
     suspend fun audioCacheStats(): AudioCacheStats
     suspend fun audioCacheSetMaxMb(mb: Long)
     suspend fun audioCacheClear()
