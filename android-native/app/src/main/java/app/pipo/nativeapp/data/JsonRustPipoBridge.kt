@@ -1,12 +1,13 @@
 package app.pipo.nativeapp.data
 
 import app.pipo.nativeapp.DiagnosticsLogStore
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
 
 class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     init {
@@ -359,7 +360,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         // AI chat / embed 类大 payload 偶尔慢,所以不能太短。
         return try {
             withTimeout(30_000L) {
-                withContext(Dispatchers.IO) {
+                withContext(bridgeDispatcher) {
                     invokeNative(command, args.toString()).also { raw ->
                         val trimmed = raw.trimStart()
                         if (trimmed.startsWith("{")) {
@@ -395,6 +396,11 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     }
 
     companion object {
+        private const val BRIDGE_PARALLELISM = 6
+        private val bridgeDispatcher = Executors.newFixedThreadPool(BRIDGE_PARALLELISM) { task ->
+            Thread(task, "pipo-rust-bridge").apply { isDaemon = true }
+        }.asCoroutineDispatcher()
+
         init {
             System.loadLibrary("pipo_native_bridge")
         }

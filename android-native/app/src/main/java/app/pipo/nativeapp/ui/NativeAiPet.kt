@@ -123,6 +123,7 @@ fun NativeAiPet(
     val coverRect = anchor.state.value.rect
     // 封面采样色统一驱动宠物、输入条和回复气泡，避免常驻球体在播放页里突兀。
     val petPalette = rememberPetPalette(useCoverEdgeColors(coverUrl))
+    val petAgent = remember(repository) { app.pipo.nativeapp.data.PetAgent(repository) }
 
     // 风场弹簧物理 + 节拍包络 —— 镜像 src/components/AiPet.tsx 159-289 行
     //   - 三层不同频率正弦叠加形成"自然风"
@@ -132,7 +133,13 @@ fun NativeAiPet(
     val sway = remember { mutableFloatStateOf(0f) }
     val pulseScale = remember { mutableFloatStateOf(1f) }
     val haloPulse = remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(settings.hideAiPetOrb) {
+        if (settings.hideAiPetOrb) {
+            sway.floatValue = 0f
+            pulseScale.floatValue = 1f
+            haloPulse.floatValue = 0f
+            return@LaunchedEffect
+        }
         val rnd = kotlin.random.Random(System.currentTimeMillis())
         val phaseA = rnd.nextFloat() * 2f * PI.toFloat()
         val phaseB = rnd.nextFloat() * 2f * PI.toFloat()
@@ -469,8 +476,7 @@ fun NativeAiPet(
 	                            } catch (_: Exception) {
 	                                // 记忆失败不能阻塞点歌。
 	                            }
-	                            val agent = app.pipo.nativeapp.data.PetAgent(repository)
-	                            val response = agent.chat(
+	                            val response = petAgent.chat(
 		                                userText = text,
 		                                history = promptContext.turns,
 		                                historySummary = promptContext.summary,

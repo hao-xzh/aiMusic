@@ -435,10 +435,7 @@ class PipoPlaybackService : MediaLibraryService() {
                 })
             }
         smartAutoMixer = SmartAutoMixer(
-            context = this,
             mainPlayer = player,
-            dataSourceFactory = cacheDataSourceFactory,
-            audioAttributes = musicAttrs,
             featuresStore = PipoGraph.audioFeaturesStore,
         )
 

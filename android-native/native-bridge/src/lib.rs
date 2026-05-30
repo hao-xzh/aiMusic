@@ -256,13 +256,9 @@ fn dispatch(command: &str, args: Value) -> String {
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             run_json(async move {
-                match audio_store()
+                audio_store()
                     .features_json(track_id, url, cache_bytes)
                     .await
-                {
-                    Ok(v) => Ok(v),
-                    Err(_) => Ok(audio::zero_features(track_id)),
-                }
             })
         }
         "ai_set_provider" => {

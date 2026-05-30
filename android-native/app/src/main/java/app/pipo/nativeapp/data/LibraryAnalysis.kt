@@ -1,9 +1,9 @@
 package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 批量预分析库 —— 镜像 src/lib/library-analysis.ts。
@@ -81,12 +81,16 @@ class LibraryAnalysis(
                 }
             }
 
-        // 3) 并发跑 audio_get_features
-        val sem = Semaphore(concurrency.coerceAtLeast(1))
+        // 3) 并发跑 audio_get_features。固定 worker 数，避免大曲库一次创建几千个协程。
+        val workerCount = concurrency.coerceAtLeast(1).coerceAtMost(pending.size.coerceAtLeast(1))
+        val nextIndex = AtomicInteger(0)
         coroutineScope {
-            pending.map { t ->
+            List(workerCount) {
                 async {
-                    sem.withPermit {
+                    while (true) {
+                        val index = nextIndex.getAndIncrement()
+                        if (index >= pending.size) break
+                        val t = pending[index]
                         val ne = t.neteaseId
                         val url = if (t.streamUrl.isNotBlank()) t.streamUrl else ne?.let { idToUrl[it] }
                         if (ne == null || url.isNullOrBlank()) {
@@ -94,7 +98,7 @@ class LibraryAnalysis(
                                 failed++; done++
                                 onProgress?.invoke(Progress(total, done, skipped, failed))
                             }
-                            return@withPermit
+                            continue
                         }
                         val ok = runCatching {
                             val f = repository.audioFeatures(ne, url)
@@ -108,7 +112,7 @@ class LibraryAnalysis(
                         }
                     }
                 }
-            }.forEach { it.await() }
+            }.awaitAll()
         }
         return Progress(total, done, skipped, failed)
     }

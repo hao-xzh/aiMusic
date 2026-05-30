@@ -42,8 +42,6 @@ data class BehaviorSummary(
     val skipHotArtists: List<String>,
 )
 
-class BehaviorLogContext(val log: BehaviorLog)
-
 class BehaviorLog(context: Context) {
     /** 24h / 7d 内播放过的 neteaseId 集合，用于 ranker 的 recent play penalty */
     data class RecentPlay(val last24hTrackIds: Set<Long>, val last7dTrackIds: Set<Long>)

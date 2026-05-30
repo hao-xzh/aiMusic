@@ -48,10 +48,12 @@ object PipoMediaCache {
         )
     }
 
+    @Synchronized
     fun setMaxBytes(context: Context, bytes: Long) {
+        val maxBytes = bytes.coerceAtLeast(64L * 1024L * 1024L)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
-            .putLong(KEY_MAX_BYTES, bytes.coerceAtLeast(64L * 1024L * 1024L))
+            .putLong(KEY_MAX_BYTES, maxBytes)
             .apply()
     }
 

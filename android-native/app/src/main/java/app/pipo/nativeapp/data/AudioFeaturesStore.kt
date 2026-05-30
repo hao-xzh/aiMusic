@@ -54,7 +54,7 @@ class AudioFeaturesStore(context: Context) {
             val out = mutableMapOf<String, AudioFeatures>()
             obj.keys().forEach { k ->
                 val o = obj.optJSONObject(k) ?: return@forEach
-                decode(k, o)?.let { out[k] = it }
+                decode(o)?.let { out[k] = it }
             }
             out
         } catch (_: Exception) {
@@ -77,7 +77,7 @@ class AudioFeaturesStore(context: Context) {
         put("tailSilenceS", f.tailSilenceS)
     }
 
-    private fun decode(@Suppress("UNUSED_PARAMETER") key: String, o: JSONObject): AudioFeatures? = try {
+    private fun decode(o: JSONObject): AudioFeatures? = try {
         AudioFeatures(
             trackId = o.optLong("trackId"),
             durationS = o.optDouble("durationS"),

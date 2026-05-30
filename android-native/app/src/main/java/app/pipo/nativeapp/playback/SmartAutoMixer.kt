@@ -1,15 +1,12 @@
 package app.pipo.nativeapp.playback
 
-import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.AudioFeatures
@@ -30,10 +27,7 @@ import kotlin.math.roundToLong
  */
 @UnstableApi
 internal class SmartAutoMixer(
-    @Suppress("UNUSED_PARAMETER") context: Context,
     private val mainPlayer: ExoPlayer,
-    @Suppress("UNUSED_PARAMETER") dataSourceFactory: CacheDataSource.Factory,
-    @Suppress("UNUSED_PARAMETER") audioAttributes: AudioAttributes,
     private val featuresStore: AudioFeaturesStore,
 ) {
     private val handler = Handler(Looper.getMainLooper())

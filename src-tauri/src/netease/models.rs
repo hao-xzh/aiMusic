@@ -34,8 +34,6 @@ pub struct QrCheckResp {
     pub code: i32,
     #[serde(default)]
     pub message: Option<String>,
-    #[serde(default)]
-    pub cookie: Option<String>,
     /// 803 时可能带昵称
     #[serde(default, rename = "nickname")]
     pub nickname: Option<String>,
@@ -641,8 +639,6 @@ pub struct LyricData {
 pub struct CloudSearchResult {
     #[serde(default)]
     pub songs: Vec<TrackInfo>,
-    #[serde(default, rename = "songCount")]
-    pub song_count: i64,
 }
 
 #[derive(Debug, Deserialize)]

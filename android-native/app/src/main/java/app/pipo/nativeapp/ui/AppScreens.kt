@@ -346,16 +346,6 @@ private fun DistillLibrary(
         }
     }
 
-    val refreshInfiniteTransition = rememberInfiniteTransition(label = "refreshSpinner")
-    val refreshRotation by refreshInfiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1400, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "rotation"
-    )
     val refreshGapPx by animateFloatAsState(
         targetValue = when {
             pullOffset > 0f -> (pullOffset * 0.62f).coerceAtMost(refreshMaxGapPx)
@@ -892,6 +882,21 @@ private fun DistillLibrary(
 	                            item(key = "__pull_refresh__") {
 	                                val refreshGapDp = with(localDensity) { refreshGapPx.toDp() }
 	                                val pullProgress = (pullOffset / refreshThresholdPx).coerceIn(0f, 1f)
+	                                val refreshRotation = if (isRefreshing) {
+	                                    val refreshInfiniteTransition = rememberInfiniteTransition(label = "refreshSpinner")
+	                                    val rotation by refreshInfiniteTransition.animateFloat(
+	                                        initialValue = 0f,
+	                                        targetValue = 360f,
+	                                        animationSpec = infiniteRepeatable(
+	                                            animation = tween(1400, easing = LinearEasing),
+	                                            repeatMode = RepeatMode.Restart
+	                                        ),
+	                                        label = "rotation"
+	                                    )
+	                                    rotation
+	                                } else {
+	                                    0f
+	                                }
 	                                val sweepAngle = if (isRefreshing) 260f else (pullProgress * 280f)
 	                                val rotation = if (isRefreshing) refreshRotation else (-90f + pullProgress * 150f)
 	                                val indicatorAlpha = if (isRefreshing) 0.92f else (0.24f + pullProgress * 0.68f)

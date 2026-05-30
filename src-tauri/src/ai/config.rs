@@ -29,8 +29,6 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Deepseek, Provider::Openai, Provider::XiaomiMimo];
-
     pub fn as_key(self) -> &'static str {
         match self {
             Provider::Deepseek => "deepseek",

@@ -1496,8 +1496,6 @@ class PlayerViewModel(
                 }
             }
         }
-        // 单曲首次出场时触发语义标注（fire-and-forget；LLM 失败也不影响播放）
-        maybeTriggerSemantic(track)
         state = state.copy(
             currentIndex = index,
             title = player.mediaMetadata.title?.toString() ?: track?.title.orEmpty(),
@@ -1932,15 +1930,6 @@ class PlayerViewModel(
 
     /** 已经分析过的 Symphonia 特征—— 全局 AudioFeaturesStore（跨 session 持久 + 蒸馏复用） */
     private val featuresStore by lazy { PipoGraph.audioFeaturesStore }
-
-    /**
-     * 语义档案 + embedding 索引以前在每曲首播时叫一次 LLM —— 一首歌额外两次 AI 请求，
-     * 用户反馈"太频繁"。改成只在 Distill 批量跑（蒸馏是显式 opt-in 的"昂贵分析"事件）。
-     * 这里留空保持 syncFrom 调用点干净；想恢复就把这两行加回来。
-     */
-    private fun maybeTriggerSemantic(@Suppress("UNUSED_PARAMETER") track: app.pipo.nativeapp.data.NativeTrack?) {
-        // 故意空：单曲索引集中到 Distill batch，每首歌减少 2 次 AI 调用
-    }
 
     private suspend fun fetchPlayableUrl(id: Long): String? = urlResolver.fetchPlayableUrl(id)
 

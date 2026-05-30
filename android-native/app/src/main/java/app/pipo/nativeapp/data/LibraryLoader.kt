@@ -3,6 +3,8 @@ package app.pipo.nativeapp.data
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 /**
  * 用户库聚合 —— 把所有歌单的 tracks 合并成一个 library，用于本地召回管线。
@@ -16,6 +18,7 @@ class LibraryLoader(private val repository: PipoRepository) {
 
     @Volatile
     private var cached: List<NativeTrack>? = null
+    private val playlistLoadSemaphore = Semaphore(TRACKS_LOAD_CONCURRENCY)
 
     suspend fun library(forceRefresh: Boolean = false): List<NativeTrack> {
         if (!forceRefresh) cached?.let { return it }
@@ -31,7 +34,9 @@ class LibraryLoader(private val repository: PipoRepository) {
         val tracks = coroutineScope {
             val deferred = playlists.map { p ->
                 async {
-                    runCatching { repository.tracksForPlaylist(p.id) }.getOrDefault(emptyList())
+                    playlistLoadSemaphore.withPermit {
+                        runCatching { repository.tracksForPlaylist(p.id) }.getOrDefault(emptyList())
+                    }
                 }
             }
             val seen = HashSet<String>()
@@ -50,4 +55,8 @@ class LibraryLoader(private val repository: PipoRepository) {
     }
 
     fun invalidate() { cached = null }
+
+    companion object {
+        private const val TRACKS_LOAD_CONCURRENCY = 4
+    }
 }

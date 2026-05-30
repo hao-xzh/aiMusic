@@ -261,33 +261,6 @@ private val LocateCurrentIconVector: ImageVector by lazy {
     }
 }
 
-private val RepeatModeIconVector: ImageVector by lazy {
-    iconVector {
-        path(
-            stroke = SolidColor(Color.White),
-            strokeLineWidth = 2.0f,
-            strokeLineCap = StrokeCap.Round,
-            strokeLineJoin = StrokeJoin.Round,
-        ) {
-            moveTo(7f, 7.5f)
-            horizontalLineToRelative(8.6f)
-            arcToRelative(3.4f, 3.4f, 0f, false, true, 3.4f, 3.4f)
-            verticalLineToRelative(0.9f)
-            moveTo(16.1f, 4.6f)
-            lineTo(19f, 7.5f)
-            lineToRelative(-2.9f, 2.9f)
-
-            moveTo(17f, 16.5f)
-            horizontalLineToRelative(-8.6f)
-            arcToRelative(3.4f, 3.4f, 0f, false, true, -3.4f, -3.4f)
-            verticalLineToRelative(-0.9f)
-            moveTo(7.9f, 19.4f)
-            lineTo(5f, 16.5f)
-            lineToRelative(2.9f, -2.9f)
-        }
-    }
-}
-
 private val OrderModeIconVector: ImageVector by lazy {
     iconVector {
         path(
@@ -536,14 +509,6 @@ fun LocateCurrentIcon(
     modifier: Modifier = Modifier.size(20.dp),
 ) {
     Icon(imageVector = LocateCurrentIconVector, contentDescription = null, tint = color, modifier = modifier)
-}
-
-@Composable
-fun RepeatModeIcon(
-    color: Color = Color(0xD1F5F7FF),
-    modifier: Modifier = Modifier.size(20.dp),
-) {
-    Icon(imageVector = RepeatModeIconVector, contentDescription = null, tint = color, modifier = modifier)
 }
 
 @Composable

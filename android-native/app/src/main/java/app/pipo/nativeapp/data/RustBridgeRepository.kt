@@ -8,7 +8,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CancellationException
-import kotlin.math.max
 
 /**
  * Repository implementation target for the full native build.
@@ -427,14 +426,15 @@ class RustBridgeRepository(
             AudioCacheStats(
                 totalBytes = bridgeStats.totalBytes + mediaStats.totalBytes,
                 count = bridgeStats.count + mediaStats.count,
-                maxBytes = max(bridgeStats.maxBytes, mediaStats.maxBytes),
+                maxBytes = bridgeStats.maxBytes + mediaStats.maxBytes,
             )
         }
     }
 
     override suspend fun setCacheMaxMb(mb: Long) {
-        appContext?.let { PipoMediaCache.setMaxBytes(it, mb * 1024L * 1024L) }
-        safe({ bridge.audioCacheSetMaxMb(mb) }, { Unit })
+        val perCacheMb = (mb / 2L).coerceAtLeast(64L)
+        appContext?.let { PipoMediaCache.setMaxBytes(it, perCacheMb * 1024L * 1024L) }
+        safe({ bridge.audioCacheSetMaxMb(perCacheMb) }, { Unit })
         refreshAudioCacheStats()
     }
 
@@ -445,7 +445,7 @@ class RustBridgeRepository(
     }
 
     override suspend fun audioFeatures(trackId: Long, url: String, cacheBytes: Boolean): AudioFeatures {
-        return safe({ bridge.audioGetFeatures(trackId, url, cacheBytes) }, { fallback.audioFeatures(trackId, url, cacheBytes) })
+        return bridge.audioGetFeatures(trackId, url, cacheBytes)
     }
 
     override suspend fun setAiProvider(providerId: String) {

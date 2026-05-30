@@ -238,16 +238,6 @@ impl NeteaseClient {
         found
     }
 
-    /// 导出所有 music.163.com 下的 cookie，给前端做登录状态判定 / 将来持久化。
-    pub fn dump_cookies(&self) -> Vec<(String, String)> {
-        let Ok(store) = self.cookies.lock() else {
-            return vec![];
-        };
-        store
-            .iter_any()
-            .map(|c| (c.name().to_string(), c.value().to_string()))
-            .collect()
-    }
 }
 
 fn seed_identity_cookies(store: &mut cookie_store::CookieStore) -> Result<()> {

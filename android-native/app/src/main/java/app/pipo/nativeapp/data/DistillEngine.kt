@@ -2,6 +2,8 @@ package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlin.math.max
 import kotlin.math.round
 import kotlin.random.Random
@@ -40,6 +42,8 @@ class DistillEngine(
     private val featuresStore: AudioFeaturesStore,
     private val behaviorLog: BehaviorLog,
 ) {
+    private val playlistLoadSemaphore = Semaphore(PLAYLIST_TRACK_LOAD_CONCURRENCY)
+
     suspend fun distill(
         playlists: List<PipoPlaylist>,
         sampleSize: Int = 200,
@@ -52,10 +56,12 @@ class DistillEngine(
         val details = coroutineScope {
             val deferred = playlists.mapIndexed { i, p ->
                 async {
-                    onProgress(DistillProgress.LoadingTracks(i, playlists.size))
-                    val tracks = runCatching { repository.tracksForPlaylist(p.id) }
-                        .getOrDefault(emptyList())
-                    Triple(p.id, p.name, tracks)
+                    playlistLoadSemaphore.withPermit {
+                        onProgress(DistillProgress.LoadingTracks(i, playlists.size))
+                        val tracks = runCatching { repository.tracksForPlaylist(p.id) }
+                            .getOrDefault(emptyList())
+                        Triple(p.id, p.name, tracks)
+                    }
                 }
             }
             deferred.map { it.await() }
@@ -179,6 +185,10 @@ class DistillEngine(
 
         onProgress(DistillProgress.Done)
         return profile
+    }
+
+    companion object {
+        private const val PLAYLIST_TRACK_LOAD_CONCURRENCY = 4
     }
 }
 

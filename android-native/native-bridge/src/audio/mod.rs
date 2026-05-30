@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 #[path = "../../../../src-tauri/src/audio/analysis.rs"]
 mod analysis;
@@ -16,12 +17,18 @@ pub struct NativeAudioStore {
     audio_dir: PathBuf,
     feature_dir: PathBuf,
     config_path: PathBuf,
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AudioConfig {
     max_bytes: i64,
+}
+
+struct AudioFile {
+    path: PathBuf,
+    temporary: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,11 +48,17 @@ impl NativeAudioStore {
             .with_context(|| format!("create audio cache dir {}", audio_dir.display()))?;
         std::fs::create_dir_all(&feature_dir)
             .with_context(|| format!("create audio feature dir {}", feature_dir.display()))?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(45))
+            .build()
+            .context("build audio http client")?;
         Ok(Self {
             config_path: root.join("audio-config.json"),
             root,
             audio_dir,
             feature_dir,
+            client,
         })
     }
 
@@ -99,9 +112,13 @@ impl NativeAudioStore {
             return Ok(serde_json::to_value(features)?);
         }
 
-        let path = self.ensure_audio_file(track_id, &url, cache_bytes).await?;
-        let features = analysis::analyze_file(track_id, &path)
-            .with_context(|| format!("analyze audio features for track {track_id}"))?;
+        let audio_file = self.ensure_audio_file(track_id, &url, cache_bytes).await?;
+        let features_result = analysis::analyze_file(track_id, &audio_file.path)
+            .with_context(|| format!("analyze audio features for track {track_id}"));
+        if audio_file.temporary {
+            let _ = std::fs::remove_file(&audio_file.path);
+        }
+        let features = features_result?;
         self.write_features(track_id, &features)?;
         Ok(serde_json::to_value(features)?)
     }
@@ -128,19 +145,19 @@ impl NativeAudioStore {
         track_id: i64,
         url: &str,
         cache_bytes: bool,
-    ) -> Result<PathBuf> {
+    ) -> Result<AudioFile> {
         if let Some(path) = self.cached_audio_path(track_id)? {
-            return Ok(path);
+            return Ok(AudioFile {
+                path,
+                temporary: false,
+            });
         }
         if url.trim().is_empty() {
             return Err(anyhow!("missing audio url for track {track_id}"));
         }
 
-        let response = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(45))
-            .build()
-            .context("build audio http client")?
+        let response = self
+            .client
             .get(url)
             .send()
             .await
@@ -152,10 +169,6 @@ impl NativeAudioStore {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let bytes = response
-            .bytes()
-            .await
-            .context("read audio response bytes")?;
         let ext = infer_ext_from_url(url)
             .or_else(|| content_type.as_deref().and_then(ext_from_content_type))
             .unwrap_or_else(|| "bin".to_string());
@@ -163,19 +176,24 @@ impl NativeAudioStore {
 
         if cache_bytes {
             let tmp = path.with_extension(format!("{ext}.tmp"));
-            std::fs::write(&tmp, &bytes)
-                .with_context(|| format!("write audio cache tmp {}", tmp.display()))?;
-            std::fs::rename(&tmp, &path)
+            write_response_to_file(response, &tmp).await?;
+            tokio::fs::rename(&tmp, &path)
+                .await
                 .with_context(|| format!("rename audio cache {}", path.display()))?;
             self.evict_to_fit()?;
-            Ok(path)
+            Ok(AudioFile {
+                path,
+                temporary: false,
+            })
         } else {
             let tmp = self
                 .audio_dir
                 .join(format!("{track_id}.analysis.{ext}.tmp"));
-            std::fs::write(&tmp, &bytes)
-                .with_context(|| format!("write temp analysis audio {}", tmp.display()))?;
-            Ok(tmp)
+            write_response_to_file(response, &tmp).await?;
+            Ok(AudioFile {
+                path: tmp,
+                temporary: true,
+            })
         }
     }
 
@@ -242,21 +260,23 @@ impl NativeAudioStore {
     }
 }
 
-pub fn zero_features(track_id: i64) -> Value {
-    json!({
-        "trackId": track_id,
-        "durationS": 0.0,
-        "bpm": null,
-        "bpmConfidence": 0.0,
-        "rmsDb": 0.0,
-        "peakDb": 0.0,
-        "dynamicRangeDb": 0.0,
-        "introEnergy": 0.0,
-        "outroEnergy": 0.0,
-        "spectralCentroidHz": 0.0,
-        "headSilenceS": 0.0,
-        "tailSilenceS": 0.0
-    })
+async fn write_response_to_file(mut response: reqwest::Response, path: &PathBuf) -> Result<()> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .with_context(|| format!("create audio file {}", path.display()))?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("read audio response chunk")?
+    {
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("write audio file {}", path.display()))?;
+    }
+    file.flush()
+        .await
+        .with_context(|| format!("flush audio file {}", path.display()))?;
+    Ok(())
 }
 
 fn infer_ext_from_url(url: &str) -> Option<String> {
