@@ -1358,37 +1358,44 @@ private fun PlayingWaveIndicator(
     color: Color,
     modifier: Modifier = Modifier,
 ) {
-    val transition = rememberInfiniteTransition(label = "playlistWave")
-
-    @Composable
-    fun barHeight(index: Int, idle: Float): Float {
-        val value by transition.animateFloat(
-            initialValue = 0.35f + index * 0.14f,
-            targetValue = 1f - index * 0.10f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 520, delayMillis = index * 110),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "bar$index",
-        )
-        return if (isPlaying) value.coerceIn(0.25f, 1f) else idle
-    }
-
+    val idles = listOf(0.45f, 0.72f, 0.55f)
     Row(
         modifier = modifier.size(width = 18.dp, height = 18.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        listOf(0.45f, 0.72f, 0.55f).forEachIndexed { idx, idle ->
-            Box(
-                modifier = Modifier
-                    .width(3.dp)
-                    .height((16f * barHeight(idx, idle)).dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(color),
-            )
+        if (isPlaying) {
+            // 仅在播放时建立无限动画。暂停态原本也只显示静止 idle 高度,这里直接走 else 分支,
+            // 不再让 infiniteTransition 在暂停时空转(旧实现里 transition 一直跑、3 个 animateFloat
+            // 每帧重组该指示器,结果却被 if(isPlaying) 丢弃)。可见效果(播放=律动,暂停=静止)不变。
+            val transition = rememberInfiniteTransition(label = "playlistWave")
+            idles.forEachIndexed { index, _ ->
+                val value by transition.animateFloat(
+                    initialValue = 0.35f + index * 0.14f,
+                    targetValue = 1f - index * 0.10f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 520, delayMillis = index * 110),
+                        repeatMode = RepeatMode.Reverse,
+                    ),
+                    label = "bar$index",
+                )
+                WaveBar(color = color, heightFraction = value.coerceIn(0.25f, 1f))
+            }
+        } else {
+            idles.forEach { idle -> WaveBar(color = color, heightFraction = idle) }
         }
     }
+}
+
+@Composable
+private fun WaveBar(color: Color, heightFraction: Float) {
+    Box(
+        modifier = Modifier
+            .width(3.dp)
+            .height((16f * heightFraction).dp)
+            .clip(RoundedCornerShape(50))
+            .background(color),
+    )
 }
 
 private fun stageLabel(p: app.pipo.nativeapp.data.DistillProgress): String = when (p) {

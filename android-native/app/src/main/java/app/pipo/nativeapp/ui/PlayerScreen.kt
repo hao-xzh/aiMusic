@@ -107,9 +107,12 @@ fun PlayerScreen(
         }
     }
 
-    val progress = if (state.durationMs > 0) {
-        (state.positionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
-    } else 0f
+    // 进度 / 位置改为在叶子(进度条、时间标签、歌词时钟)里惰性读取 viewModel.positionMs,
+    // 避免高频进度让 PlayerScreen / PortraitPlayerContent 整屏 30Hz 重组。durationMs 是低频元数据。
+    val durationMs = state.durationMs
+    val progressProvider: () -> Float = {
+        if (durationMs > 0) (viewModel.positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+    }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
         configuration.screenWidthDp > configuration.screenHeightDp
@@ -141,8 +144,9 @@ fun PlayerScreen(
         label = "playerOrientation",
     ) { landscape ->
         if (landscape) {
+            // 横屏歌词逐帧驱动,直接读 viewModel.positionMs —— 该分支随之 30Hz,本就如此。
             val lyricClock = LyricTiming.resolve(
-                positionMs = state.positionMs,
+                positionMs = viewModel.positionMs,
                 lines = state.lyrics,
             )
             LandscapePlayerLyricsScreen(
@@ -155,7 +159,7 @@ fun PlayerScreen(
                 activeLyricIndex = lyricClock.activeIndex,
                 positionMs = lyricClock.positionMs,
                 durationMs = state.durationMs,
-                progress = progress,
+                progress = progressProvider(),
                 isPlaying = state.isPlaying,
                 isLoading = state.isLoading,
                 controlsEnabled = state.queue.isNotEmpty(),
@@ -177,9 +181,9 @@ fun PlayerScreen(
                 lyricsReady = state.lyrics.isNotEmpty(),
                 queueReady = state.queue.isNotEmpty(),
                 isLoading = state.isLoading,
-                positionMs = state.positionMs,
+                positionProvider = { viewModel.positionMs },
                 durationMs = state.durationMs,
-                progress = progress,
+                progressProvider = progressProvider,
                 hideAlpha = hideAlpha,
                 hideCover = immersiveActive,
                 hideDotPattern = settings.hideDotPattern,
@@ -205,9 +209,9 @@ private fun PortraitPlayerContent(
     lyricsReady: Boolean,
     queueReady: Boolean,
     isLoading: Boolean,
-    positionMs: Long,
+    positionProvider: () -> Long,
     durationMs: Long,
-    progress: Float,
+    progressProvider: () -> Float,
     hideAlpha: Float,
     hideCover: Boolean,
     hideDotPattern: Boolean,
@@ -306,7 +310,7 @@ private fun PortraitPlayerContent(
 
                     Spacer(modifier = Modifier.height(titleGap))
                     PipoProgressBar(
-                        progress = progress,
+                        progress = progressProvider,
                         onSeek = onSeek,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -314,9 +318,9 @@ private fun PortraitPlayerContent(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        MonoTime(positionMs, color = Color(0xB8E9EFFF))
+                        MonoTime(positionProvider, color = Color(0xB8E9EFFF))
                         MonoTime(
-                            (durationMs - positionMs).coerceAtLeast(0L),
+                            { (durationMs - positionProvider()).coerceAtLeast(0L) },
                             color = Color(0x6BE9EFFF),
                             prefix = "-",
                         )
@@ -469,14 +473,15 @@ private fun CompactCover(coverUrl: String?, isPlaying: Boolean, hidden: Boolean)
  */
 @Composable
 internal fun PipoProgressBar(
-    progress: Float,
+    progress: () -> Float,
     onSeek: (Float) -> Unit,
     modifier: Modifier = Modifier,
     trackColor: Color = Color(0x1FE9EFFF),
     fillColor: Color = Color(0xEBF5F7FF),
 ) {
     var draggingProgress by remember { mutableStateOf<Float?>(null) }
-    val displayProgress = (draggingProgress ?: progress).coerceIn(0f, 1f)
+    // progress() 在此惰性读取 viewModel.positionMs —— 仅本进度条随进度 30Hz 重组,父级不受影响。
+    val displayProgress = (draggingProgress ?: progress()).coerceIn(0f, 1f)
     val animated by animateFloatAsState(
         targetValue = displayProgress,
         animationSpec = tween(durationMillis = if (draggingProgress == null) 120 else 0),
@@ -545,8 +550,8 @@ internal fun LoadingRing(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun MonoTime(ms: Long, color: Color, prefix: String = "") {
-    val total = (ms / 1000).coerceAtLeast(0)
+private fun MonoTime(ms: () -> Long, color: Color, prefix: String = "") {
+    val total = (ms() / 1000).coerceAtLeast(0)
     val m = total / 60
     val s = total % 60
     Text(

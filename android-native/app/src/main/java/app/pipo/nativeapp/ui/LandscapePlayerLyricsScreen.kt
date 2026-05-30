@@ -356,7 +356,7 @@ private fun LandscapeBottomControls(
     ) {
         LandscapeTimeText(positionMs, fgDim)
         PipoProgressBar(
-            progress = progress,
+            progress = { progress },
             onSeek = onSeek,
             trackColor = fg.copy(alpha = 0.18f),
             fillColor = fg,

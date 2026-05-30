@@ -183,7 +183,7 @@ fun PipoNativeApp() {
             if ((immersive && !isLandscape) || route != Route.Player) coverAnchor.releaseCoverRect()
             if (immersive && route == Route.Player && !isLandscape) {
                 val lyricClock = LyricTiming.resolve(
-                    positionMs = playerState.positionMs,
+                    positionMs = viewModel.positionMs,
                     lines = playerState.lyrics,
                 )
                 val activeLine = playerState.lyrics.getOrNull(lyricClock.activeIndex)
@@ -298,7 +298,7 @@ fun PipoNativeApp() {
                         // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
                         // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
                         val lyricClock = LyricTiming.resolve(
-                            positionMs = viewModel.state.positionMs,
+                            positionMs = viewModel.positionMs,
                             lines = viewModel.state.lyrics,
                         )
                         ImmersiveLyricsOverlay(

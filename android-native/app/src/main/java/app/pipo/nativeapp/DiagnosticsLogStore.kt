@@ -7,6 +7,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 object DiagnosticsLogStore {
     private const val DIR_NAME = "diagnostics"
@@ -18,14 +21,25 @@ object DiagnosticsLogStore {
     private val MUTED_AREAS = setOf("lyrics_speed", "amll_lyric")
     private val lock = Any()
 
+    // 日志写盘挪到单线程后台 —— 之前 record() 在调用线程同步 appendText + mkdirs + 文件大小
+    // 检查;而 record 大量从 Player.Listener 等主线程回调触发,切歌 / 暂停时会出现主线程磁盘
+    // IO 卡顿甚至 ANR 隐患。单线程 executor 保持 FIFO,落盘顺序与提交顺序一致(等价旧的锁到达序)。
+    private val ioExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pipo-diagnostics").apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }
+    }
+
     @Volatile
     private var appContext: Context? = null
 
     fun install(context: Context) {
         val app = context.applicationContext
         appContext = app
-        synchronized(lock) {
-            resetEventLogs(app)
+        // 清理 + start 事件都走后台队列;FIFO 保证 reset 先于 start 落盘,且不阻塞冷启动主线程。
+        ioExecutor.execute {
+            synchronized(lock) { resetEventLogs(app) }
         }
         runCatching {
             record(
@@ -43,22 +57,41 @@ object DiagnosticsLogStore {
     fun record(area: String, event: String, fields: Map<String, Any?> = emptyMap()) {
         if (area in MUTED_AREAS) return
         val context = appContext ?: return
-        synchronized(lock) {
-            val dir = diagnosticsDir(context).apply { mkdirs() }
-            rotateIfNeeded(dir)
-            val json = JSONObject()
-                .put("ts", timestamp())
-                .put("area", area.take(40))
-                .put("event", event.take(80))
-            for ((key, value) in fields) {
-                json.put(key.take(48), sanitizeValue(key, value))
+        // 时间戳在调用时刻取(保证事件按发生时间排序,即便落盘稍晚);fields 在调用线程快照一份,
+        // 之后的 JSON 组装 + 写盘全部在后台单线程做,调用方零磁盘 IO。
+        val ts = timestamp()
+        val snapshot = if (fields.isEmpty()) emptyMap() else HashMap(fields)
+        runCatching {
+            ioExecutor.execute {
+                runCatching {
+                    synchronized(lock) {
+                        val dir = diagnosticsDir(context).apply { mkdirs() }
+                        rotateIfNeeded(dir)
+                        val json = JSONObject()
+                            .put("ts", ts)
+                            .put("area", area.take(40))
+                            .put("event", event.take(80))
+                        for ((key, value) in snapshot) {
+                            json.put(key.take(48), sanitizeValue(key, value))
+                        }
+                        currentFile(dir).appendText(json.toString() + "\n")
+                    }
+                }
             }
-            currentFile(dir).appendText(json.toString() + "\n")
         }
+    }
+
+    /** 等待后台队列里已提交的写入落盘 —— 分享 / 导出诊断前调用,保证快照包含最新事件。 */
+    private fun flushPending() {
+        val latch = CountDownLatch(1)
+        val submitted = runCatching { ioExecutor.execute { latch.countDown() } }.isSuccess
+        if (!submitted) return
+        runCatching { latch.await(2, TimeUnit.SECONDS) }
     }
 
     fun snapshotText(context: Context, maxBytes: Int = DEFAULT_SNAPSHOT_BYTES): String {
         val app = context.applicationContext
+        flushPending()
         return synchronized(lock) {
             val dir = diagnosticsDir(app).apply { mkdirs() }
             rotateIfNeeded(dir)

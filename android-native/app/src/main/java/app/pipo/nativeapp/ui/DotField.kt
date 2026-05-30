@@ -45,10 +45,13 @@ fun DotField(
     // 粒子数组：尺寸首次 > 0 时初始化，之后即使 resize 也不重生成（粒子会自然漂到新区域）
     val particles = remember { ParticleSet(count) }
 
-    // 帧驱动状态
+    // 帧驱动状态：visAlpha / smoothAmp 在 Canvas 的 draw 阶段被读取,必须是 snapshot state。
     var visAlpha by remember { mutableStateOf(0f) }
     var smoothAmp by remember { mutableStateOf(0f) }
-    var t by remember { mutableStateOf(0f) }
+    // t（flow field 时间）只在帧循环里读写、不参与组合,用普通 remember 持有即可:跨
+    // LaunchedEffect 重启仍保持连续(等同旧 mutableStateOf 的可见行为),但不再每帧产生
+    // 一次无人订阅的快照写。
+    val tHolder = remember { FloatArray(1) }
 
     LaunchedEffect(canvasSize, playing) {
         if (canvasSize == IntSize.Zero) return@LaunchedEffect
@@ -59,7 +62,7 @@ fun DotField(
             withFrameNanos { ns ->
                 val dt = if (lastNs == 0L) 0.016f else min(0.05f, (ns - lastNs) / 1_000_000_000f)
                 lastNs = ns
-                t += dt
+                tHolder[0] += dt
 
                 val target = if (playing) 1f else 0f
                 visAlpha += (target - visAlpha) * min(1f, dt * 4f)
@@ -70,7 +73,7 @@ fun DotField(
                 if (visAlpha >= 0.005f && canvasSize.width > 0 && canvasSize.height > 0) {
                     particles.tick(
                         dt = dt,
-                        t = t,
+                        t = tHolder[0],
                         amp = smoothAmp,
                         width = canvasSize.width.toFloat(),
                         height = canvasSize.height.toFloat(),

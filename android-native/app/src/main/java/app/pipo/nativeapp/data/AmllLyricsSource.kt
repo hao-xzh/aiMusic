@@ -5,9 +5,9 @@ import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
+import okhttp3.Request
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.concurrent.TimeUnit
 
 /**
  * 从 AMLL TTML 数据库（amll-dev/amll-ttml-db）拉网易云逐字歌词，按需缓存到本地。
@@ -28,6 +28,14 @@ class AmllLyricsSource(private val context: Context) {
 
     private val cacheDir: File by lazy {
         File(context.cacheDir, CACHE_SUBDIR).apply { mkdirs() }
+    }
+
+    // 复用全 app 共享连接池,叠加本数据源自己的超时(连接 4s / 读 6s,与旧值一致)。
+    private val http by lazy {
+        PipoHttp.client.newBuilder()
+            .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(READ_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+            .build()
     }
 
     /**
@@ -112,32 +120,29 @@ class AmllLyricsSource(private val context: Context) {
     }
 
     private suspend fun fetchOnce(trackId: String): FetchResult? = withContext(Dispatchers.IO) {
-        val url = URL("$BASE_URL$trackId$TTML_SUFFIX")
-        var conn: HttpURLConnection? = null
+        val request = Request.Builder()
+            .url("$BASE_URL$trackId$TTML_SUFFIX")
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "application/ttml+xml,application/xml,text/xml,*/*")
+            .get()
+            .build()
         try {
-            conn = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = READ_TIMEOUT_MS
-                instanceFollowRedirects = true
-                requestMethod = "GET"
-                setRequestProperty("User-Agent", USER_AGENT)
-                setRequestProperty("Accept", "application/ttml+xml,application/xml,text/xml,*/*")
-            }
-            val code = conn.responseCode
-            when {
-                code == HttpURLConnection.HTTP_OK -> {
-                    val body = conn.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
-                    if (body.isBlank()) null else FetchResult.Ok(body)
+            // response.use{} 无论 2xx / 404 / 其他都会正确关闭 body 并把连接归还连接池(或关闭),
+            // 不像旧 disconnect() 那样强关 socket —— 重复抓歌词时复用 keep-alive 连接。
+            http.newCall(request).execute().use { resp ->
+                when {
+                    resp.isSuccessful -> {
+                        val body = resp.body?.string()
+                        if (body.isNullOrBlank()) null else FetchResult.Ok(body)
+                    }
+                    resp.code == 404 -> FetchResult.NotFound
+                    else -> null
                 }
-                code == HttpURLConnection.HTTP_NOT_FOUND -> FetchResult.NotFound
-                else -> null
             }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {
             null
-        } finally {
-            conn?.disconnect()
         }
     }
 

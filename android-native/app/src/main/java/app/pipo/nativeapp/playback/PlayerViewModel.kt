@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.os.SystemClock
 import android.util.Base64
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
@@ -48,16 +49,12 @@ data class PlayerUiState(
     val currentTrackId: String? = null,
     val artworkUrl: String? = null,
     val isPlaying: Boolean = false,
-    val positionMs: Long = 0L,
     val durationMs: Long = 0L,
     val lyrics: List<PipoLyricLine> = emptyList(),
     val isReady: Boolean = false,
     val isLoading: Boolean = false,
     val playbackMode: PlaybackQueueMode = PlaybackQueueMode.ShufflePlay,
-) {
-    val activeLyricIndex: Int
-        get() = LyricTiming.resolve(positionMs, lyrics).activeIndex.coerceAtLeast(0)
-}
+)
 
 enum class PlaybackQueueMode {
     ShufflePlay,
@@ -145,7 +142,6 @@ class PlayerViewModel(
     var state by mutableStateOf(
         savedSnapshot?.let { snap ->
             val cur = snap.queue.getOrNull(snap.currentIndex)
-            val resumePos = safeResumePosition(snap.positionMs, cur?.durationMs ?: 0L)
             PlayerUiState(
                 queue = snap.queue,
                 currentIndex = snap.currentIndex,
@@ -154,11 +150,25 @@ class PlayerViewModel(
                 album = cur?.album.orEmpty(),
                 artworkUrl = cur?.artworkUrl,
                 isPlaying = false,
-                positionMs = resumePos,
                 durationMs = cur?.durationMs ?: 0L,
                 isReady = false,
             )
         } ?: PlayerUiState(),
+    )
+        private set
+
+    /**
+     * 播放进度(毫秒)—— 从 [state] 拆出来的高频状态。
+     *
+     * 30Hz 的 refreshPosition 只更新这一个 Long,不再每帧重建整个 PlayerUiState。这样只有真正
+     * 用到进度的叶子(进度条 / 时间标签 / 歌词时钟)才随之重组;顶层 shell 与播放页其余部分
+     * 只在元数据(标题、封面、播放态…)真正变化时才重组,告别 30Hz 全树 churn。
+     */
+    var positionMs by mutableLongStateOf(
+        savedSnapshot?.let { snap ->
+            val cur = snap.queue.getOrNull(snap.currentIndex)
+            safeResumePosition(snap.positionMs, cur?.durationMs ?: 0L)
+        } ?: 0L,
     )
         private set
 
@@ -266,7 +276,7 @@ class PlayerViewModel(
             event = "player_error",
             fields = currentTrackFields() + mapOf(
                 "code" to error.errorCodeName,
-                "positionMs" to state.positionMs,
+                "positionMs" to positionMs,
                 "durationMs" to state.durationMs,
                 "message" to error.message,
             ),
@@ -307,7 +317,7 @@ class PlayerViewModel(
             return
         }
         val attempt = transientRetryCount
-        val resumePosMs = maxOf(player.currentPosition, state.positionMs).coerceAtLeast(0L)
+        val resumePosMs = maxOf(player.currentPosition, positionMs).coerceAtLeast(0L)
         val targetTrackId = track.id
         transientRetryJob?.cancel()
         setResolvingPlayback(true)
@@ -383,10 +393,10 @@ class PlayerViewModel(
                 "force" to force,
             ),
         )
-        // 错误时 player 在 IDLE，currentPosition 可能已重置。state.positionMs 由 syncFrom
+        // 错误时 player 在 IDLE，currentPosition 可能已重置。positionMs 由 syncFrom
         // 持续更新，是更可靠的"上一刻播到哪儿"。
         val resumePosMs = resumePositionMs
-            ?: maxOf(player.currentPosition, state.positionMs).coerceAtLeast(0L)
+            ?: maxOf(player.currentPosition, positionMs).coerceAtLeast(0L)
         val targetTrackId = track.id
         setResolvingPlayback(true)
         viewModelScope.launch {
@@ -669,7 +679,7 @@ class PlayerViewModel(
         DiagnosticsLogStore.record(
             area = "playback",
             event = if (player.isPlaying) "pause_tap" else "play_tap",
-            fields = currentTrackFields() + mapOf("positionMs" to state.positionMs),
+            fields = currentTrackFields() + mapOf("positionMs" to positionMs),
         )
         if (player.isPlaying) {
             userPausedPlayback = true
@@ -719,9 +729,9 @@ class PlayerViewModel(
             player.duration.takeIf { it > 0 } ?: state.durationMs
         }
         val positionMs = if (targetMismatch) {
-            state.positionMs.coerceAtLeast(0L)
+            positionMs.coerceAtLeast(0L)
         } else {
-            maxOf(player.currentPosition, state.positionMs)
+            maxOf(player.currentPosition, positionMs)
         }
         val atEnd = durationMs > 0L && positionMs >= durationMs - END_POSITION_TOLERANCE_MS
         refreshTrackUrlAndResume(
@@ -1298,7 +1308,7 @@ class PlayerViewModel(
             area = "lyrics",
             event = "line_seek",
             fields = currentTrackFields() + mapOf(
-                "fromMs" to state.positionMs,
+                "fromMs" to positionMs,
                 "toMs" to targetMs,
             ),
         )
@@ -1496,31 +1506,55 @@ class PlayerViewModel(
                 }
             }
         }
-        state = state.copy(
-            currentIndex = index,
-            title = player.mediaMetadata.title?.toString() ?: track?.title.orEmpty(),
-            artist = player.mediaMetadata.artist?.toString() ?: track?.artist.orEmpty(),
-            album = player.mediaMetadata.albumTitle?.toString() ?: track?.album.orEmpty(),
-            currentTrackId = authoritativeTrackId,
-            artworkUrl = player.mediaMetadata.artworkUri?.toString()
-                ?: track?.artworkUrl
-                ?: embeddedArtworkDataUri(authoritativeTrackId, player.mediaMetadata.artworkData),
-            isPlaying = player.isPlaying,
-            positionMs = player.currentPosition.coerceAtLeast(0L),
-            durationMs = player.duration.takeIf { it > 0 } ?: track?.durationMs ?: 0L,
-            isReady = true,
-            isLoading = resolvingPlayback || (
-                player.playbackState == Player.STATE_BUFFERING &&
-                    player.playWhenReady &&
-                    player.mediaItemCount > 0
-            ),
+        // 进度是高频字段 —— 每帧只写独立的 positionMs holder,不进 state。
+        positionMs = player.currentPosition.coerceAtLeast(0L)
+
+        val newTitle = player.mediaMetadata.title?.toString() ?: track?.title.orEmpty()
+        val newArtist = player.mediaMetadata.artist?.toString() ?: track?.artist.orEmpty()
+        val newAlbum = player.mediaMetadata.albumTitle?.toString() ?: track?.album.orEmpty()
+        val newArtworkUrl = player.mediaMetadata.artworkUri?.toString()
+            ?: track?.artworkUrl
+            ?: embeddedArtworkDataUri(authoritativeTrackId, player.mediaMetadata.artworkData)
+        val newIsPlaying = player.isPlaying
+        val newDurationMs = player.duration.takeIf { it > 0 } ?: track?.durationMs ?: 0L
+        val newIsLoading = resolvingPlayback || (
+            player.playbackState == Player.STATE_BUFFERING &&
+                player.playWhenReady &&
+                player.mediaItemCount > 0
         )
+        // 仅当元数据真正变化时才替换 state —— 避免 30Hz 进度推进每帧重建 PlayerUiState、
+        // 触发顶层 shell 与播放页全树重组。这里只比标量 / 字符串(不碰 queue / lyrics 大列表)。
+        if (
+            state.currentIndex != index ||
+            state.title != newTitle ||
+            state.artist != newArtist ||
+            state.album != newAlbum ||
+            state.currentTrackId != authoritativeTrackId ||
+            state.artworkUrl != newArtworkUrl ||
+            state.isPlaying != newIsPlaying ||
+            state.durationMs != newDurationMs ||
+            !state.isReady ||
+            state.isLoading != newIsLoading
+        ) {
+            state = state.copy(
+                currentIndex = index,
+                title = newTitle,
+                artist = newArtist,
+                album = newAlbum,
+                currentTrackId = authoritativeTrackId,
+                artworkUrl = newArtworkUrl,
+                isPlaying = newIsPlaying,
+                durationMs = newDurationMs,
+                isReady = true,
+                isLoading = newIsLoading,
+            )
+        }
         // 续杯：current 后剩 < 阈值时调一次 fetchMore
         maybeExtendQueue()
         maybePrewarmNextTrack(player)
         // 节流持久化：杀掉冷启动黑屏 + 跳到 playlist[0] 的尴尬
         if (queue.isNotEmpty()) {
-            lastPlaybackStore.saveThrottled(queue, index, state.positionMs)
+            lastPlaybackStore.saveThrottled(queue, index, positionMs)
         }
     }
 
@@ -1596,7 +1630,7 @@ class PlayerViewModel(
         if (!player.isPlaying) return
         val durationMs = player.duration.takeIf { it > 0 } ?: state.durationMs
         if (durationMs <= 0L) return
-        val positionMs = player.currentPosition.coerceAtLeast(state.positionMs)
+        val positionMs = player.currentPosition.coerceAtLeast(positionMs)
         val remainingMs = (durationMs - positionMs).coerceAtLeast(0L)
         val shouldPrewarm = positionMs >= (durationMs * PREWARM_AFTER_PROGRESS).toLong() ||
             remainingMs <= PREWARM_WHEN_REMAINING_MS

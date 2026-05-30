@@ -61,6 +61,11 @@ class PipoPlaybackService : MediaLibraryService() {
     private var badSourceSkipToken: Long = 0L
     private var badSourceRecoveryMediaId: String? = null
     private var badSourceRecoveryUntilMs: Long = 0L
+    // —— 静默缓冲卡顿兜底（后台 doze / 弱网下 BUFFERING 卡死又不报错时主动重踢）的状态 ——
+    private var bufferStallToken: Long = 0L
+    private var bufferStallScheduledForMediaId: String? = null
+    private var bufferStallAttemptMediaId: String? = null
+    private var bufferStallAttempts: Int = 0
     private var badSourceRefreshJob: Job? = null
     private var audioFocusResumeJob: Job? = null
     private var resumeAfterAudioFocusLoss = false
@@ -324,6 +329,9 @@ class PipoPlaybackService : MediaLibraryService() {
                         )
                         badSourceSkipToken += 1L
                         clearBadSourceRecovery()
+                        // 换曲 = 旧的卡顿观察作废,新曲重置重踢预算
+                        cancelBufferStallCheck()
+                        resetBufferStallAttempts()
                         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
                             serviceUrlRefreshTried.clear()
                         } else {
@@ -365,7 +373,11 @@ class PipoPlaybackService : MediaLibraryService() {
                         )
                         smartAutoMixer?.onMainPlayerEvent()
                         when (playbackState) {
-                            Player.STATE_IDLE -> keepMediaNotificationAlive(this@apply, "idle")
+                            Player.STATE_IDLE -> {
+                                cancelBufferStallCheck()
+                                keepMediaNotificationAlive(this@apply, "idle")
+                            }
+                            Player.STATE_ENDED -> cancelBufferStallCheck()
                             Player.STATE_BUFFERING,
                             Player.STATE_READY -> {
                                 if (playWhenReady && mediaItemCount > 0) {
@@ -373,6 +385,14 @@ class PipoPlaybackService : MediaLibraryService() {
                                     mediaSession?.let { session ->
                                         updateNotificationSafely(session, true, "state-$playbackState")
                                     }
+                                }
+                                if (playbackState == Player.STATE_READY) {
+                                    // 到 READY = 这一刻加载是通的:撤掉待检查、重置该首的重踢预算。
+                                    cancelBufferStallCheck()
+                                    resetBufferStallAttempts()
+                                } else if (playWhenReady && mediaItemCount > 0) {
+                                    // 进入 BUFFERING 且想播 —— 排一个延时检查,后台静默卡死时兜底重踢。
+                                    scheduleBufferStallCheck(this@apply)
                                 }
                             }
                         }
@@ -969,6 +989,103 @@ class PipoPlaybackService : MediaLibraryService() {
         )
     }
 
+    // —— 静默缓冲卡顿兜底 ——
+    // 既有的播放恢复要么靠 onPlayerError（后台有效），要么靠 UI 30Hz 轮询的 monitorPlaybackProgress
+    // （只前台、且只救 READY 冻结）。后台一旦发生「BUFFERING 卡死又不报错」（doze / MIUI 掐网、socket
+    // 没断但数据不来），没人来救 —— UI 一直显示加载中，直到回前台、设备解除限制那笔挂起缓冲才补上。
+    // Service 常驻，这里在它自己的 BUFFERING 事件上挂一个延时检查，后台也能主动重踢把它救活。
+    private fun scheduleBufferStallCheck(player: Player) {
+        val mediaId = player.currentMediaItem?.mediaId ?: return
+        if (bufferStallScheduledForMediaId == mediaId) return // 同一首已排队,别重复堆 postDelayed
+        bufferStallScheduledForMediaId = mediaId
+        val token = ++bufferStallToken
+        val bufferedAtSchedule = player.bufferedPosition
+        val positionAtSchedule = player.currentPosition
+        mainHandler.postDelayed({
+            if (bufferStallScheduledForMediaId == mediaId) bufferStallScheduledForMediaId = null
+            if (token != bufferStallToken) return@postDelayed
+            evaluateBufferStall(player, mediaId, bufferedAtSchedule, positionAtSchedule)
+        }, BUFFER_STALL_CHECK_DELAY_MS)
+    }
+
+    private fun cancelBufferStallCheck() {
+        bufferStallToken += 1L // 令所有已排队的检查回调失效
+        bufferStallScheduledForMediaId = null
+    }
+
+    private fun resetBufferStallAttempts() {
+        bufferStallAttemptMediaId = null
+        bufferStallAttempts = 0
+    }
+
+    private fun evaluateBufferStall(
+        player: Player,
+        mediaId: String,
+        bufferedAtScheduleMs: Long,
+        positionAtScheduleMs: Long,
+    ) {
+        // 任一前提不再成立 = 不是我们要救的场景（已恢复 / 暂停 / 换曲 / 队列空）
+        if (player.playbackState != Player.STATE_BUFFERING) return
+        if (!player.playWhenReady || player.mediaItemCount == 0) return
+        if (player.currentMediaItem?.mediaId != mediaId) return
+        val now = SystemClock.elapsedRealtime()
+        if (isWaitingForBadSourceController(player, now)) return // 坏源恢复在跑,让它先走
+
+        val bufferedNow = player.bufferedPosition
+        val positionNow = player.currentPosition
+        val advancing = bufferedNow > bufferedAtScheduleMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS ||
+            positionNow > positionAtScheduleMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS
+        if (advancing) {
+            // 还在补数据 / 还在前进,只是慢 —— 不打断,再观察一轮
+            scheduleBufferStallCheck(player)
+            return
+        }
+
+        if (bufferStallAttemptMediaId != mediaId) {
+            bufferStallAttemptMediaId = mediaId
+            bufferStallAttempts = 0
+        }
+        if (bufferStallAttempts >= BUFFER_STALL_MAX_ATTEMPTS) {
+            // 连踢几次都没活 —— 八成网络真没了,停手,交给报错恢复 / 网络回来(READY)/ 回前台,别 prepare 风暴
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "buffer_stall_give_up",
+                fields = playerFields(player) + mapOf(
+                    "attempts" to bufferStallAttempts,
+                    "bufferedMs" to bufferedNow,
+                ),
+            )
+            return
+        }
+        bufferStallAttempts += 1
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "buffer_stall_rekick",
+            fields = playerFields(player) + mapOf(
+                "attempt" to bufferStallAttempts,
+                "positionMs" to positionNow,
+                "bufferedMs" to bufferedNow,
+            ),
+        )
+        runCatching {
+            // 与 monitorPlaybackProgress 的自愈一致:seek 回原位 + prepare,逼它重新拉流。
+            // 若网络真没了,这一步会转成 ERROR_CODE_IO_NETWORK_* → 走既有报错恢复,也强过静默卡死。
+            player.seekTo(positionNow.coerceAtLeast(0L))
+            player.prepare()
+        }.onFailure { err ->
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "buffer_stall_rekick_failed",
+                fields = playerFields(player) + mapOf(
+                    "errorType" to err::class.java.simpleName,
+                    "message" to err.message,
+                ),
+            )
+        }
+        // 再排一轮,看这次重踢有没有救活(没救活会累加 attempts 直到上限后停手）
+        scheduleBufferStallCheck(player)
+    }
+
     private fun updateNotificationSafely(
         session: MediaSession,
         startInForegroundRequired: Boolean,
@@ -1054,6 +1171,7 @@ class PipoPlaybackService : MediaLibraryService() {
         }
         smartAutoMixer?.release()
         smartAutoMixer = null
+        cancelBufferStallCheck()
         badSourceRefreshJob?.cancel()
         audioFocusResumeJob?.cancel()
         unregisterPlaybackCallback()
@@ -1073,6 +1191,12 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val STREAM_URL_TIMEOUT_MS = 15_000L
         private const val BAD_SOURCE_SERVICE_REFRESH_GRACE_MS = STREAM_URL_TIMEOUT_MS + 2_000L
         private const val BAD_SOURCE_CONTROLLER_GRACE_MS = 5_000L
+        // 静默缓冲卡顿:进入 BUFFERING 后等这么久,若缓冲 / 进度都没推进就判定卡死并重踢
+        private const val BUFFER_STALL_CHECK_DELAY_MS = 12_000L
+        // 缓冲 / 进度推进的容差(ms)—— 超过才算"在前进",避免把慢速加载误判成卡死
+        private const val BUFFER_STALL_PROGRESS_TOLERANCE_MS = 250L
+        // 同一首最多重踢几次,防止网络真没了时 prepare 风暴
+        private const val BUFFER_STALL_MAX_ATTEMPTS = 4
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
         private const val LIBRARY_ROOT_ID = "pipo:root"
         private const val CURRENT_QUEUE_ID = "pipo:current-queue"

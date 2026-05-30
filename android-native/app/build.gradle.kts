@@ -89,6 +89,8 @@ dependencies {
     implementation("androidx.media3:media3-datasource:1.5.1")
     implementation("androidx.media3:media3-session:1.5.1")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    // 与 Coil 2.7.0 内部使用的 OkHttp 版本对齐 —— 全 app 共享一份连接池(封面 / 歌词 / 天气)。
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.guava:guava:33.3.1-android")
     implementation("com.google.zxing:core:3.5.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")

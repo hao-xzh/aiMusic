@@ -41,6 +41,9 @@ class PipoApplication : Application(), ImageLoaderFactory {
     // 在 in-app UI 永远是空的（系统状态栏走 MediaSession 不受影响）。
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
+            // 复用全 app 共享的 OkHttp（连接池 / DNS 与歌词、天气共用）。Coil 自己的内存 /
+            // 磁盘图片缓存是独立的一层，不受这里影响，封面缓存行为不变。
+            .okHttpClient(app.pipo.nativeapp.data.PipoHttp.client)
             .components { add(Base64UriFetcher.Factory()) }
             .build()
 

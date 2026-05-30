@@ -1,9 +1,9 @@
 package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Request
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.concurrent.TimeUnit
 
 /**
  * 轻量天气 —— wttr.in 免 key、根据 IP 自动定位。镜像 src/lib/weather.ts。
@@ -15,6 +15,14 @@ object Weather {
 
     @Volatile private var cached: Pair<Long, Snapshot?>? = null
     private const val MEMO_TTL_MS = 60L * 60 * 1000
+
+    // 复用全 app 共享连接池,超时与旧值一致(连接 3s / 读 3s)。
+    private val http by lazy {
+        PipoHttp.client.newBuilder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .build()
+    }
 
     suspend fun get(): Snapshot? {
         val now = System.currentTimeMillis()
@@ -29,15 +37,13 @@ object Weather {
     }
 
     private fun fetchOnce(): Snapshot? {
-        val url = URL("https://wttr.in/?format=j1&lang=zh-cn")
-        val conn = (url.openConnection() as HttpURLConnection).apply {
-            connectTimeout = 3000
-            readTimeout = 3000
-            requestMethod = "GET"
-        }
-        try {
-            if (conn.responseCode !in 200..299) return null
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
+        val request = Request.Builder()
+            .url("https://wttr.in/?format=j1&lang=zh-cn")
+            .get()
+            .build()
+        http.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string() ?: return null
             val json = JSONObject(body)
             val arr = json.optJSONArray("current_condition") ?: return null
             val cur = arr.optJSONObject(0) ?: return null
@@ -48,8 +54,6 @@ object Weather {
                 ?: "未知"
             val tempC = cur.optString("temp_C").toIntOrNull() ?: return null
             return Snapshot(summary, tempC)
-        } finally {
-            conn.disconnect()
         }
     }
 }
