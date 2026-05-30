@@ -60,6 +60,8 @@ import androidx.core.content.FileProvider
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.AudioCacheStats
 import app.pipo.nativeapp.data.AiConfigView
+import app.pipo.nativeapp.data.AiProviderView
+import app.pipo.nativeapp.data.ModelOption
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoGraph
@@ -83,6 +85,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
     var qrJob by remember { mutableStateOf<Job?>(null) }
     var apiKeyDraft by remember { mutableStateOf("") }
     var aiReply by remember { mutableStateOf<String?>(null) }
+    var modelOptionsByProvider by remember { mutableStateOf<Map<String, List<ModelOption>>>(emptyMap()) }
 
     DisposableEffect(Unit) {
         onDispose { qrJob?.cancel() }
@@ -220,35 +223,67 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
         // AI Provider 配置
         val activeProvider = aiConfig.providers.firstOrNull { it.id == aiConfig.activeProvider }
         val anyHasKey = aiConfig.providers.any { it.hasKey }
-        
-        PipoRow(
-            title = "服务商",
-            subtitle = activeProvider?.let { "${it.label} · ${it.model}" } ?: "DeepSeek / OpenAI / MiMo"
-        )
-        if (!anyHasKey) {
-            PipoRow(title = "提示", subtitle = "填入任一 key 后启用 AI")
+
+        LaunchedEffect(activeProvider?.id) {
+            val providerId = activeProvider?.id ?: return@LaunchedEffect
+            if (modelOptionsByProvider[providerId] == null) {
+                val models = runCatching { repository.aiListModels(providerId) }
+                    .getOrElse { emptyList() }
+                modelOptionsByProvider = modelOptionsByProvider + (providerId to models)
+            }
         }
 
-        aiConfig.providers.forEach { provider ->
-            val isActive = provider.id == aiConfig.activeProvider
-            PipoRow(
-                title = provider.label,
-                subtitle = if (provider.hasKey) "key ${provider.keyPreview ?: "已存"}" else "未填 key",
-                showDivider = provider != aiConfig.providers.lastOrNull()
-            ) {
-                if (isActive) {
-                    Text(
-                        text = "当前",
-                        color = PipoColors.Ink,
-                        style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                    )
-                } else {
-                    PipoButton(
-                        text = "切换",
-                        onClick = { scope.launch { repository.setAiProvider(provider.id) } }
-                    )
-                }
+        PipoRow(
+            title = "服务商",
+            subtitle = activeProvider?.let(::providerStatusText) ?: "DeepSeek / OpenAI / MiMo"
+        ) {
+            if (aiConfig.providers.isNotEmpty()) {
+                PipoDropdown(
+                    currentLabel = activeProvider?.label ?: "选择",
+                    selectedId = aiConfig.activeProvider,
+                    options = aiConfig.providers.map { provider ->
+                        PipoDropdownOption(
+                            id = provider.id,
+                            label = provider.label,
+                            description = providerStatusText(provider),
+                        )
+                    },
+                    onSelect = { option ->
+                        aiReply = null
+                        scope.launch { repository.setAiProvider(option.id) }
+                    },
+                    modifier = Modifier.width(190.dp),
+                    fillTriggerWidth = true,
+                )
             }
+        }
+        activeProvider?.let { provider ->
+            val modelOptions = mergedModelOptions(
+                activeModel = provider.model,
+                options = modelOptionsByProvider[provider.id].orEmpty(),
+            )
+            PipoRow(
+                title = "模型",
+                subtitle = "当前服务商：${provider.label}",
+            ) {
+                PipoDropdown(
+                    currentLabel = provider.model,
+                    selectedId = provider.model,
+                    options = modelOptions,
+                    onSelect = { option ->
+                        aiReply = null
+                        scope.launch {
+                            repository.aiSetModel(provider.id, option.id)
+                            repository.refreshAiConfig()
+                        }
+                    },
+                    modifier = Modifier.width(220.dp),
+                    fillTriggerWidth = true,
+                )
+            }
+        }
+        if (!anyHasKey) {
+            PipoRow(title = "提示", subtitle = "填入任一 key 后启用 AI")
         }
 
         Spacer(modifier = Modifier.height(14.dp))
@@ -642,17 +677,58 @@ private fun PipoButton(
     }
 }
 
+private data class PipoDropdownOption(
+    val id: String,
+    val label: String,
+    val description: String? = null,
+)
+
+private fun providerStatusText(provider: AiProviderView): String {
+    val keyStatus = if (provider.hasKey) {
+        "key ${provider.keyPreview ?: "已存"}"
+    } else {
+        "未填 key"
+    }
+    return "$keyStatus · ${provider.model}"
+}
+
+private fun mergedModelOptions(
+    activeModel: String,
+    options: List<ModelOption>,
+): List<PipoDropdownOption> {
+    val knownOptions = options.map { option ->
+        PipoDropdownOption(
+            id = option.id,
+            label = option.label,
+            description = option.id,
+        )
+    }
+    if (activeModel.isBlank() || knownOptions.any { it.id == activeModel }) {
+        return knownOptions
+    }
+    return listOf(
+        PipoDropdownOption(
+            id = activeModel,
+            label = activeModel,
+            description = "当前自定义模型",
+        )
+    ) + knownOptions
+}
+
 /**
  * 单选下拉，复用 PipoButton 的视觉（透明底 + GlassStroke 边框 + Ink/SemiBold/12sp/letter-spacing 1）。
- * trigger 显示当前 [PetPersona.label]，点开 Popup 在 trigger 正下方对齐右边线弹出选项面板，
+ * trigger 显示当前项，点开 Popup 在 trigger 正下方对齐右边线弹出选项面板，
  * 选项内 (当前) 项 mint 高亮 + "当前" 角标。Popup 用 PopupPositionProvider 精确对齐，
  * 避免默认 alignment 把弹层贴到右侧外面。
  */
 @Composable
-private fun PipoPersonaDropdown(
-    current: PetPersona,
-    onSelect: (PetPersona) -> Unit,
+private fun PipoDropdown(
+    currentLabel: String,
+    selectedId: String,
+    options: List<PipoDropdownOption>,
+    onSelect: (PipoDropdownOption) -> Unit,
     modifier: Modifier = Modifier,
+    fillTriggerWidth: Boolean = false,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val positionProvider = remember {
@@ -670,23 +746,30 @@ private fun PipoPersonaDropdown(
             }
         }
     }
-    Box(modifier = modifier) {
+    Box(modifier = modifier, contentAlignment = Alignment.CenterEnd) {
         // trigger：跟 PipoButton 同款 chip
         Box(
-            modifier = Modifier
+            modifier = (if (fillTriggerWidth) Modifier.fillMaxWidth() else Modifier)
                 .border(1.dp, PipoColors.GlassStroke, RectangleShape)
                 .clickable { expanded = !expanded }
                 .padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = if (fillTriggerWidth) Modifier.fillMaxWidth() else Modifier,
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = if (fillTriggerWidth) Arrangement.SpaceBetween else Arrangement.Start,
+            ) {
                 Text(
-                    text = current.label,
+                    text = currentLabel,
                     color = PipoColors.Ink,
                     style = TextStyle(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         letterSpacing = 1.sp,
                     ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = if (fillTriggerWidth) Modifier.weight(1f) else Modifier.widthIn(max = 180.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
@@ -709,13 +792,15 @@ private fun PipoPersonaDropdown(
                         .border(1.dp, PipoColors.GlassStroke, RectangleShape)
                         .padding(vertical = 4.dp),
                 ) {
-                    PetPersona.entries.forEach { persona ->
-                        val isCurrent = persona.id == current.id
+                    options.forEach { option ->
+                        val isCurrent = option.id == selectedId
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable {
-                                    onSelect(persona)
+                                    if (!isCurrent) {
+                                        onSelect(option)
+                                    }
                                     expanded = false
                                 }
                                 .padding(horizontal = 14.dp, vertical = 10.dp),
@@ -723,12 +808,14 @@ private fun PipoPersonaDropdown(
                             Column {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = persona.label,
+                                        text = option.label,
                                         color = if (isCurrent) PipoColors.Mint else PipoColors.Ink,
                                         style = TextStyle(
                                             fontSize = 13.sp,
                                             fontWeight = FontWeight.Medium,
                                         ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.weight(1f),
                                     )
                                     if (isCurrent) {
@@ -743,12 +830,14 @@ private fun PipoPersonaDropdown(
                                         )
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = persona.description,
-                                    color = PipoColors.TextDim,
-                                    style = TextStyle(fontSize = 11.sp, lineHeight = 14.sp),
-                                )
+                                option.description?.takeIf { it.isNotBlank() }?.let { description ->
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = description,
+                                        color = PipoColors.TextDim,
+                                        style = TextStyle(fontSize = 11.sp, lineHeight = 14.sp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -756,6 +845,29 @@ private fun PipoPersonaDropdown(
             }
         }
     }
+}
+
+@Composable
+private fun PipoPersonaDropdown(
+    current: PetPersona,
+    onSelect: (PetPersona) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    PipoDropdown(
+        currentLabel = current.label,
+        selectedId = current.id,
+        options = PetPersona.entries.map { persona ->
+            PipoDropdownOption(
+                id = persona.id,
+                label = persona.label,
+                description = persona.description,
+            )
+        },
+        onSelect = { option ->
+            PetPersona.entries.firstOrNull { it.id == option.id }?.let(onSelect)
+        },
+        modifier = modifier,
+    )
 }
 
 @Composable

@@ -101,11 +101,10 @@ pub fn default_base_url(provider: Provider) -> &'static str {
 }
 
 /// 各家 provider 的「兜底默认模型」—— 当用户没选时用这个。
-/// 选的是性价比 / 速度均衡的中档款，不是最贵的旗舰，避免一上手就烧钱。
 pub fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::Deepseek => "deepseek-v4-flash",
-        Provider::Openai => "gpt-5.4-mini",
+        Provider::Openai => "gpt-5.5",
         Provider::XiaomiMimo => "mimo-v2-flash",
     }
 }
@@ -133,12 +132,9 @@ pub fn known_models(provider: Provider) -> &'static [(&'static str, &'static str
             ("deepseek-v4-flash", "V4 Flash · 性价比"),
         ],
         Provider::Openai => &[
-            ("gpt-5.5-pro", "GPT-5.5 Pro · 旗舰"),
-            ("gpt-5.5", "GPT-5.5 · 旗舰"),
-            ("gpt-5.4-pro", "GPT-5.4 Pro"),
-            ("gpt-5.4", "GPT-5.4"),
-            ("gpt-5.4-mini", "GPT-5.4 Mini · 性价比"),
-            ("gpt-5.4-nano", "GPT-5.4 Nano · 速度优先"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.5-mini", "GPT-5.5 Mini"),
+            ("gpt-5.5-nano", "GPT-5.5 Nano"),
         ],
         Provider::XiaomiMimo => &[
             ("mimo-v2-pro", "MiMo V2 Pro · 旗舰 · 1M 上下文"),

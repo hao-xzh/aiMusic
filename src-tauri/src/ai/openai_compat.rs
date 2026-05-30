@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
@@ -24,8 +25,14 @@ pub struct ChatMessage {
 struct ChatReq<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
-    temperature: f32,
-    max_tokens: u32,
+    // OpenAI GPT-5 / o 系只认 max_completion_tokens 且拒绝自定义 temperature；
+    // DeepSeek / MiMo / 老款 GPT 用 max_tokens + temperature。按模型族二选一，None 不发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingReq>,
@@ -54,6 +61,16 @@ struct ChatMessageResp {
     content: String,
 }
 
+/// OpenAI 的 GPT-5 系与 o 系推理模型有两条与 DeepSeek 不同的硬约束：
+///   - 不收 `max_tokens`，必须用 `max_completion_tokens`
+///   - 不收自定义 `temperature`，只接受默认值（必须整个不发，发了 0.x 直接 400）
+/// DeepSeek / MiMo / 老款 GPT 不受此限。靠模型名前缀判定即可——DeepSeek=deepseek-*、
+/// MiMo=mimo-* 都不会误命中 gpt-5 / o1 / o3 / o4。
+fn is_openai_restricted(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+}
+
 pub async fn chat(
     api_key: &str,
     base_url: &str,
@@ -74,11 +91,13 @@ pub async fn chat(
         .build()
         .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
 
+    let restricted = is_openai_restricted(model);
     let body = ChatReq {
         model,
         messages,
-        temperature,
-        max_tokens,
+        temperature: if restricted { None } else { Some(temperature) },
+        max_tokens: if restricted { None } else { Some(max_tokens) },
+        max_completion_tokens: if restricted { Some(max_tokens) } else { None },
         stream: false,
         thinking: if base_url.trim_end_matches('/') == "https://api.deepseek.com" {
             Some(ThinkingReq { kind: "disabled" })
@@ -116,6 +135,96 @@ pub async fn chat(
         .map(|c| c.message.content)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("AI 返回了 0 条内容"))
+}
+
+// ---------------- tool calling ----------------
+
+/// 原生 function-calling 版的 chat。和 [`chat`] 共用 `/chat/completions` 端点，
+/// 但 body 带 `tools` + `tool_choice:"auto"`，并把 `choices[0].message` **原样**回传
+/// （含 `content` + `tool_calls`），让调用方在 Kotlin 侧驱动多轮工具循环。
+///
+/// `messages` / `tools` 由调用方以原始 JSON（数组）传入——schema 归调用方所有，
+/// 这里只做透传，避免在 Rust 端重复建模每个工具字段。
+///
+/// 注意：assistant 决定调用工具时 `content` 可能为空但 `tool_calls` 非空，这是**合法**
+/// 状态，所以这里不像 [`chat`] 那样过滤空 content；只要存在 `choices[0].message` 就返回。
+///
+/// 为什么和 [`chat`] 分开而不是加可选参数：`chat` 是 Android + 桌面 Tauri 共享调用，
+/// 签名稳定优先；新增独立函数对老调用方零影响。
+pub async fn chat_tools(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    messages: Value,
+    tools: Value,
+    temperature: f32,
+    max_tokens: u32,
+) -> Result<Value> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("还没填 API key，请在设置里填上"));
+    }
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
+
+    let restricted = is_openai_restricted(model);
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+    });
+    if let Some(obj) = body.as_object_mut() {
+        // GPT-5 / o 系只认 max_completion_tokens 且拒绝 temperature；其余用 max_tokens + temperature。
+        if restricted {
+            obj.insert("max_completion_tokens".to_string(), json!(max_tokens));
+        } else {
+            obj.insert("max_tokens".to_string(), json!(max_tokens));
+            obj.insert("temperature".to_string(), json!(temperature));
+        }
+        // tools 为空数组 / null 时不带，等价于普通 chat（让最后一轮"纯文本收尾"也能走这条）
+        let has_tools = tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+        if has_tools {
+            obj.insert("tools".to_string(), tools);
+            obj.insert("tool_choice".to_string(), json!("auto"));
+        }
+        // 对齐 chat()：DeepSeek 关掉 reasoning，省 latency / token
+        if base_url.trim_end_matches('/') == "https://api.deepseek.com" {
+            obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
+        }
+    }
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("请求失败：{e}"))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("读取响应体失败：{e}"))?;
+
+    if !status.is_success() {
+        return Err(anyhow!("{status}：{text}"));
+    }
+
+    let parsed: Value =
+        serde_json::from_str(&text).map_err(|e| anyhow!("响应解析失败：{e} / body={text}"))?;
+
+    parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .ok_or_else(|| anyhow!("AI 返回里没有 choices[0].message / body={text}"))
 }
 
 // ---------------- embeddings ----------------

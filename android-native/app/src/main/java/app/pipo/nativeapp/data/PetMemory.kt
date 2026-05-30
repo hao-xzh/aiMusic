@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -27,12 +28,27 @@ class PetMemory(context: Context) {
     data class Memory(
         val version: Int,
         val utterances: MutableList<Utterance>,
+        val conversation: MutableList<ConversationTurn>,
+        val musicReferences: MutableList<MusicReference>,
         var firstSeenAt: Long,
         var lastSeenAt: Long,
         var userFacts: String,
+        var conversationSummary: String,
     )
 
     data class Utterance(val tsSec: Long, val text: String)
+    data class ConversationTurn(val role: String, val text: String, val tsSec: Long)
+    data class MusicReference(
+        val title: String,
+        val artist: String = "",
+        val reason: String = "",
+        val tsSec: Long = 0L,
+    )
+    data class ConversationContext(
+        val summary: String = "",
+        val turns: List<ConversationTurn> = emptyList(),
+        val musicReferences: List<MusicReference> = emptyList(),
+    )
 
     @Volatile
     private var memo: Memory? = null
@@ -51,21 +67,52 @@ class PetMemory(context: Context) {
                     utt.add(Utterance(o.optLong("ts"), o.optString("text")))
                 }
             }
+            val conv = mutableListOf<ConversationTurn>()
+            val convArr = parsed.optJSONArray("conversation")
+            if (convArr != null) {
+                for (i in 0 until convArr.length()) {
+                    val o = convArr.optJSONObject(i) ?: continue
+                    val role = normalizeRole(o.optString("role"))
+                    val text = cleanConversationText(o.optString("text"))
+                    if (role != null && text.isNotBlank()) {
+                        conv.add(ConversationTurn(role, text, o.optLong("ts")))
+                    }
+                }
+            }
+            val refs = mutableListOf<MusicReference>()
+            val refArr = parsed.optJSONArray("musicReferences")
+            if (refArr != null) {
+                for (i in 0 until refArr.length()) {
+                    val o = refArr.optJSONObject(i) ?: continue
+                    cleanMusicReference(
+                        title = o.optString("title"),
+                        artist = o.optString("artist"),
+                        reason = o.optString("reason"),
+                        tsSec = o.optLong("ts"),
+                    )?.let { refs.add(it) }
+                }
+            }
             memo = Memory(
                 version = VERSION,
                 utterances = utt,
+                conversation = conv.takeLast(MAX_RAW_CONVERSATION_TURNS).toMutableList(),
+                musicReferences = refs.takeLast(MAX_MUSIC_REFERENCES).toMutableList(),
                 firstSeenAt = parsed.optLong("firstSeenAt"),
                 lastSeenAt = parsed.optLong("lastSeenAt"),
                 userFacts = parsed.optString("userFacts"),
+                conversationSummary = parsed.optString("conversationSummary").take(MAX_SUMMARY_CHARS),
             )
         } else {
             val now = System.currentTimeMillis() / 1000
             memo = Memory(
                 version = VERSION,
                 utterances = mutableListOf(),
+                conversation = mutableListOf(),
+                musicReferences = mutableListOf(),
                 firstSeenAt = now,
                 lastSeenAt = now,
                 userFacts = "",
+                conversationSummary = "",
             )
         }
         return memo!!
@@ -78,12 +125,32 @@ class PetMemory(context: Context) {
         m.utterances.forEach {
             arr.put(JSONObject().apply { put("ts", it.tsSec); put("text", it.text) })
         }
+        val convArr = JSONArray()
+        m.conversation.forEach {
+            convArr.put(JSONObject().apply {
+                put("role", it.role)
+                put("text", it.text)
+                put("ts", it.tsSec)
+            })
+        }
+        val refArr = JSONArray()
+        m.musicReferences.forEach {
+            refArr.put(JSONObject().apply {
+                put("title", it.title)
+                put("artist", it.artist)
+                put("reason", it.reason)
+                put("ts", it.tsSec)
+            })
+        }
         val obj = JSONObject().apply {
             put("version", m.version)
             put("utterances", arr)
+            put("conversation", convArr)
+            put("musicReferences", refArr)
             put("firstSeenAt", m.firstSeenAt)
             put("lastSeenAt", m.lastSeenAt)
             put("userFacts", m.userFacts)
+            put("conversationSummary", m.conversationSummary)
         }
         prefs.edit().putString(KEY, obj.toString()).apply()
     }
@@ -114,6 +181,71 @@ class PetMemory(context: Context) {
     /** 最后一句有意义的话 + 上次时间标签 */
     fun lastUtterance(): Utterance? = load().utterances.lastOrNull()
 
+    fun conversationContext(): ConversationContext {
+        val m = load()
+        return ConversationContext(
+            summary = m.conversationSummary,
+            turns = m.conversation.toList(),
+            musicReferences = m.musicReferences.toList(),
+        )
+    }
+
+    suspend fun recordConversationTurn(role: String, text: String) {
+        withContext(Dispatchers.IO) {
+            recordConversationTurnBlocking(role, text)
+        }
+    }
+
+    @Synchronized
+    private fun recordConversationTurnBlocking(role: String, text: String) {
+        val normalizedRole = normalizeRole(role) ?: return
+        val cleaned = cleanConversationText(text)
+        if (cleaned.isBlank()) return
+        val m = load()
+        val now = System.currentTimeMillis() / 1000
+        m.conversation.add(ConversationTurn(normalizedRole, cleaned, now))
+        trimConversation(m)
+        m.lastSeenAt = now
+        save()
+    }
+
+    suspend fun recordMusicReferences(references: List<MusicReference>) {
+        if (references.isEmpty()) return
+        withContext(Dispatchers.IO) {
+            recordMusicReferencesBlocking(references)
+        }
+    }
+
+    @Synchronized
+    private fun recordMusicReferencesBlocking(references: List<MusicReference>) {
+        val cleaned = references.mapNotNull {
+            cleanMusicReference(it.title, it.artist, it.reason, it.tsSec)
+        }
+        if (cleaned.isEmpty()) return
+        val m = load()
+        val now = System.currentTimeMillis() / 1000
+        val byKey = LinkedHashMap<String, MusicReference>()
+        for (old in m.musicReferences) {
+            val key = musicReferenceKey(old)
+            if (key.isNotBlank()) byKey[key] = old
+        }
+        for (ref in cleaned) {
+            val stamped = ref.copy(tsSec = if (ref.tsSec > 0L) ref.tsSec else now)
+            val key = musicReferenceKey(stamped)
+            if (key.isBlank()) continue
+            byKey.remove(key)
+            byKey[key] = stamped
+        }
+        val cutoff = now - MUSIC_REFERENCE_TTL_DAYS * 86400L
+        val fresh = byKey.values
+            .filter { it.tsSec >= cutoff }
+            .takeLast(MAX_MUSIC_REFERENCES)
+        m.musicReferences.clear()
+        m.musicReferences.addAll(fresh)
+        m.lastSeenAt = now
+        save()
+    }
+
     fun firstSeenAt(): Long = load().firstSeenAt
 
     fun userFacts(): String = load().userFacts
@@ -126,7 +258,7 @@ class PetMemory(context: Context) {
 
     fun clear() {
         val now = System.currentTimeMillis() / 1000
-        memo = Memory(VERSION, mutableListOf(), now, now, "")
+        memo = Memory(VERSION, mutableListOf(), mutableListOf(), mutableListOf(), now, now, "", "")
         save()
     }
 
@@ -154,11 +286,98 @@ class PetMemory(context: Context) {
         return parts.joinToString(" · ")
     }
 
+    private fun trimConversation(m: Memory) {
+        if (m.conversation.size <= MAX_RAW_CONVERSATION_TURNS) return
+        val moveCount = (m.conversation.size - RAW_CONVERSATION_KEEP_TURNS)
+            .coerceAtLeast(1)
+            .coerceAtMost(m.conversation.size)
+        val moved = m.conversation.take(moveCount)
+        val remaining = m.conversation.drop(moveCount)
+        val addition = summarizeConversationTurns(moved)
+        m.conversationSummary = compactSummary(m.conversationSummary, addition)
+        m.conversation.clear()
+        m.conversation.addAll(remaining)
+    }
+
+    private fun summarizeConversationTurns(turns: List<ConversationTurn>): String {
+        val lines = mutableListOf<String>()
+        var pendingUser: String? = null
+        for (turn in turns) {
+            when (turn.role) {
+                ROLE_USER -> pendingUser = turn.text
+                ROLE_ASSISTANT -> {
+                    val u = pendingUser
+                    if (!u.isNullOrBlank()) {
+                        lines.add("用户:${u.take(54)} / Claudio:${turn.text.take(54)}")
+                        pendingUser = null
+                    } else {
+                        lines.add("Claudio:${turn.text.take(70)}")
+                    }
+                }
+            }
+        }
+        if (!pendingUser.isNullOrBlank()) lines.add("用户:${pendingUser.take(70)}")
+        return lines.joinToString("\n")
+    }
+
+    private fun compactSummary(existing: String, addition: String): String {
+        val combined = listOf(existing.trim(), addition.trim())
+            .filter { it.isNotBlank() }
+            .joinToString("\n")
+        if (combined.length <= MAX_SUMMARY_CHARS) return combined
+        return combined
+            .lines()
+            .filter { it.isNotBlank() }
+            .takeLast(MAX_SUMMARY_LINES)
+            .joinToString("\n")
+            .takeLast(MAX_SUMMARY_CHARS)
+            .trim()
+    }
+
+    private fun cleanConversationText(text: String): String =
+        text.replace('\n', ' ')
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(MAX_CONVERSATION_TEXT_CHARS)
+
+    private fun cleanMusicReference(
+        title: String,
+        artist: String,
+        reason: String,
+        tsSec: Long,
+    ): MusicReference? {
+        val t = cleanConversationText(title).take(80)
+        if (t.isBlank() || t == "null") return null
+        val a = cleanConversationText(artist).take(80).takeUnless { it == "null" }.orEmpty()
+        val r = cleanConversationText(reason).take(80).takeUnless { it == "null" }.orEmpty()
+        return MusicReference(title = t, artist = a, reason = r, tsSec = tsSec)
+    }
+
+    private fun musicReferenceKey(ref: MusicReference): String =
+        (ref.title + "|" + ref.artist).lowercase()
+            .replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？()（）\\[\\]【】《》<>&/]+"), "")
+
+    private fun normalizeRole(role: String): String? =
+        when (role.trim().lowercase()) {
+            ROLE_USER -> ROLE_USER
+            ROLE_ASSISTANT -> ROLE_ASSISTANT
+            else -> null
+        }
+
     companion object {
+        const val ROLE_USER = "user"
+        const val ROLE_ASSISTANT = "assistant"
         private const val PREFS_NAME = "claudio_pet_memory"
         private const val KEY = "v1"
         private const val VERSION = 1
         private const val MAX_UTTERANCES = 30
         private const val UTTERANCE_TTL_DAYS = 30
+        private const val MAX_RAW_CONVERSATION_TURNS = 18
+        private const val RAW_CONVERSATION_KEEP_TURNS = 12
+        private const val MAX_CONVERSATION_TEXT_CHARS = 220
+        private const val MAX_SUMMARY_CHARS = 900
+        private const val MAX_SUMMARY_LINES = 12
+        private const val MAX_MUSIC_REFERENCES = 16
+        private const val MUSIC_REFERENCE_TTL_DAYS = 7
     }
 }

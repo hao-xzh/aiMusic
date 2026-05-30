@@ -31,7 +31,7 @@ class EmptyPipoRepository : PipoRepository {
             activeProvider = "deepseek",
             providers = listOf(
                 AiProviderView("deepseek", "DeepSeek", false, null, "deepseek-chat", "https://api.deepseek.com"),
-                AiProviderView("openai", "OpenAI", false, null, "gpt-4.1-mini", "https://api.openai.com/v1"),
+                AiProviderView("openai", "OpenAI", false, null, "gpt-5.5", "https://api.openai.com/v1"),
                 AiProviderView("xiaomi-mimo", "MiMo", false, null, "mimo-vl", "https://api.xiaomi.com"),
             ),
         )
@@ -143,6 +143,12 @@ class EmptyPipoRepository : PipoRepository {
     override suspend fun aiChat(
         system: String?,
         user: String,
+        temperature: Float?,
+        maxTokens: Int?,
+    ): String = ""
+    override suspend fun aiChatTools(
+        messagesJson: String,
+        toolsJson: String,
         temperature: Float?,
         maxTokens: Int?,
     ): String = ""

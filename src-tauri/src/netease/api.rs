@@ -9,7 +9,7 @@
 //!        802 = 已扫码，等手机上点"确认登录"
 //!        803 = 确认完成，此时 reqwest 的 cookie jar 里已经自动装上 MUSIC_U + __csrf 等
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use serde_json::json;
@@ -379,7 +379,63 @@ impl NeteaseClient {
             }
             offset += limit;
         }
+        self.hydrate_cloud_artwork(&mut out).await;
         Ok(out)
+    }
+
+    /// `v1/cloud/get` 的 `simpleSong` 不带 `al.picUrl`，纯用户上传更是连 `al` 都没有，
+    /// 所以云盘列表里 tracks 的封面恒为空（cover-flow 那张磁贴拿不到图）。这里对匹配到
+    /// 官方库的曲目用 `song/detail` 批量补 album（含 picUrl）——和歌单 hydration 复用同一
+    /// 条 best-effort 路径。补不到的（真·纯上传，库里无匹配）维持无封面，播放时仍可由
+    /// 文件内嵌封面兜底，不受影响。
+    async fn hydrate_cloud_artwork(&self, tracks: &mut [TrackInfo]) {
+        let missing_ids = tracks
+            .iter()
+            .filter(|t| {
+                t.album
+                    .as_ref()
+                    .and_then(|a| a.pic_url.as_deref())
+                    .map_or(true, str::is_empty)
+            })
+            .map(|t| t.id)
+            .filter(|id| *id != 0)
+            .collect::<Vec<_>>();
+        if missing_ids.is_empty() {
+            return;
+        }
+        let detail_albums = self
+            .song_detail_best_effort(&missing_ids)
+            .await
+            .into_iter()
+            .filter_map(|t| {
+                let id = t.id;
+                t.album
+                    .filter(|a| a.pic_url.as_deref().map_or(false, |u| !u.is_empty()))
+                    .map(|a| (id, a))
+            })
+            .collect::<HashMap<i64, AlbumShort>>();
+        if detail_albums.is_empty() {
+            return;
+        }
+        let mut hydrated = 0usize;
+        for track in tracks.iter_mut() {
+            let has_art = track
+                .album
+                .as_ref()
+                .and_then(|a| a.pic_url.as_deref())
+                .map_or(false, |u| !u.is_empty());
+            if has_art {
+                continue;
+            }
+            if let Some(album) = detail_albums.get(&track.id) {
+                track.album = Some(album.clone());
+                hydrated += 1;
+            }
+        }
+        eprintln!(
+            "[netease] cloud artwork hydrated {hydrated}/{} via song_detail",
+            missing_ids.len()
+        );
     }
 
     async fn user_cloud_tracks_page(&self, limit: i64, offset: i64) -> Result<UserCloudResp> {

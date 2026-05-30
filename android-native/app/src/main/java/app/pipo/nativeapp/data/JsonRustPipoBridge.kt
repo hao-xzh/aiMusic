@@ -310,6 +310,22 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         return parseJsonString(callRaw("ai_chat", args))
     }
 
+    override suspend fun aiChatTools(
+        messagesJson: String,
+        toolsJson: String,
+        temperature: Float?,
+        maxTokens: Int?,
+    ): String {
+        val args = JSONObject()
+            .put("messages", JSONArray(messagesJson))
+            .put("tools", JSONArray(toolsJson))
+            .put("temperature", temperature)
+            .put("maxTokens", maxTokens)
+        // 成功时 bridge 原样回传 assistant message JSON 对象（含 tool_calls）。
+        // callRaw 只在出现顶层 "error" 字段时抛错；普通 message 不含该字段，原样返回。
+        return callRaw("ai_chat_tools", args)
+    }
+
     override suspend fun aiEmbed(inputs: List<String>): List<FloatArray> {
         if (inputs.isEmpty()) return emptyList()
         val args = JSONObject().put("inputs", JSONArray(inputs))

@@ -3,6 +3,8 @@ package app.pipo.nativeapp.data
 import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.first
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -29,138 +31,456 @@ class PetAgent(
     private val library: LibraryLoader = PipoGraph.library,
     private val embeddingStore: EmbeddingStore = PipoGraph.embeddingStore,
     private val embeddingIndexer: EmbeddingIndexer = PipoGraph.embeddingIndexer,
+    private val preferenceEngine: BehaviorPreferenceEngine = PipoGraph.behaviorPreference,
 ) {
 
-    enum class Action {
-        Chat,
-        /** 替换整个队列（"听陈奕迅"、"放点振奋的"、"想听 X 从 Y 开始"） */
-        Play,
-        /** 插队到当前队列下一首（"放浮夸"、"来一首XX"——只想听这一首，别毁掉当前列表） */
-        Insert,
-        /** 跳过当前歌（"下一首""跳过""换"）—— 不走召回 */
-        Skip,
-        /** 解释当前歌 / 推荐理由（"这首啥意思""为啥推这首"）—— reply 字段放宽到 ≤120 字，不走召回 */
-        Explain,
-        /** 基于当前曲找类似（"再来几首类似的""类似但更慢"）—— 走 Play 召回路径但 action 保留 Similar */
-        Similar,
-        /** 收藏当前曲到"我喜欢的音乐"红心歌单 */
-        Like,
-        /** 取消收藏 */
-        Unlike,
-        /** 加到指定歌单 —— trackOp.playlistName 给名字（UI 端模糊匹配 playlist id） */
-        AddToPlaylist,
-        /** 从指定歌单移除 */
-        RemoveFromPlaylist,
-    }
-
     /**
-     * 写动作的参数。like/unlike 不需要 playlistName，
-     * add_to_playlist / remove_from_playlist 必须有。
+     * agent 一轮对话产出的**有序动作列表** —— 一次发话可链式落多个写动作
+     * （"收藏这首再放点类似的" → [Like, Play]）。reply 是人格化那句话。
+     * 纯聊天 / explain 时 actions 为空，只有 reply。
      */
-    data class TrackOpRequest(
-        val kind: String,
-        val playlistName: String? = null,
-    )
-
     data class AgentResponse(
         val reply: String,
-        val action: Action,
-        val initialBatch: List<NativeTrack>,
-        val continuous: ContinuousQueueSource?,
-        /** Like/Unlike/AddToPlaylist/RemoveFromPlaylist 时 UI 端用来执行写操作 */
-        val trackOp: TrackOpRequest? = null,
-    )
+        val actions: List<AgentAction>,
+        val musicReferences: List<PetMemory.MusicReference> = emptyList(),
+    ) {
+        /** UI / 自动纠偏链路常用：取第一个放歌动作。 */
+        fun firstPlay(): AgentAction.Play? = actions.filterIsInstance<AgentAction.Play>().firstOrNull()
+    }
+
+    /** 可被 UI 按序执行的写动作。读工具（查历史/搜索/查歌单）不在此列——它们只喂给模型。 */
+    sealed class AgentAction {
+        /**
+         * 放歌。[insert]=true 表示插一首到下一首（不毁队列）；false 表示替换整列。
+         * [similar]=true 仅作 UI 提示（"配同款"），召回路径和普通 Play 相同。
+         */
+        data class Play(
+            val initialBatch: List<NativeTrack>,
+            val continuous: ContinuousQueueSource?,
+            val insert: Boolean = false,
+            val similar: Boolean = false,
+        ) : AgentAction()
+        /** 跳过当前歌。 */
+        object Skip : AgentAction()
+        /** 收藏 / 取消收藏当前歌（[like]=false 即取消）。 */
+        data class Like(val like: Boolean) : AgentAction()
+        /** 把当前歌加入 / 移出指定歌单（[add]=false 即移出）。[name] 原样回传，UI 端模糊匹配。 */
+        data class Playlist(val add: Boolean, val name: String) : AgentAction()
+    }
 
     suspend fun chat(
         userText: String,
-        history: List<Pair<Boolean, String>>,
+        history: List<PetMemory.ConversationTurn>,
+        historySummary: String = "",
+        musicReferences: List<PetMemory.MusicReference> = emptyList(),
         currentTrack: NativeTrack?,
         userFacts: String,
         persona: PetPersona = PetPersona.DEFAULT,
     ): AgentResponse {
+        val providerId = activeProviderId()
+        val toolsSupported = providerId == "deepseek" || providerId == "openai"
+        val toolsJson = if (toolsSupported) AGENT_TOOLS else "[]"
         DiagnosticsLogStore.record(
             area = "ai_agent",
             event = "chat_start",
             fields = mapOf(
                 "inputLen" to userText.length,
                 "historyCount" to history.size,
+                "historySummaryLen" to historySummary.length,
                 "hasCurrentTrack" to (currentTrack != null),
                 "userFactsLen" to userFacts.length,
                 "persona" to persona.id,
+                "provider" to providerId,
+                "toolsSupported" to toolsSupported,
+                "toolCount" to if (toolsSupported) AGENT_TOOL_COUNT else 0,
             ),
         )
-        val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
-        val aiResult = runCatching {
-            repository.aiChat(
-                system = persona.chatSystemPrompt,
-                user = buildUserMessage(userText, history, currentTrack, userFacts, behaviorEvents),
-                temperature = 0.75f,
-                maxTokens = 4000,
-            )
-        }
-        aiResult.onFailure { error ->
-            DiagnosticsLogStore.record(
-                area = "ai_agent",
-                event = "ai_chat_failed",
-                fields = errorFields(error) + mapOf("inputLen" to userText.length),
-            )
-        }
-        val raw = aiResult.getOrNull().orEmpty()
 
-        val parsed = parseIntent(raw)
-            ?: run {
+        val behaviorEvents = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
+        val behaviorPreference = runCatching { preferenceEngine.current() }
+            .getOrDefault(BehaviorPreferenceSnapshot.Empty)
+        val messages = JSONArray()
+        messages.put(chatMsg("system", persona.toolChatSystemPrompt))
+        if (historySummary.isNotBlank()) {
+            messages.put(chatMsg("system", "早前对话摘要（只作上下文，不要逐字引用）：\n${historySummary.take(900)}"))
+        }
+        appendHistoryMessages(messages, history)
+        messages.put(chatMsg("user", buildUserMessage(
+            userText = userText,
+            currentTrack = currentTrack,
+            userFacts = userFacts,
+            behaviorEvents = behaviorEvents,
+            behaviorPreference = behaviorPreference,
+            musicReferences = musicReferences,
+        )))
+
+        val actions = mutableListOf<AgentAction>()
+        val replyParts = LinkedHashSet<String>()
+        val newMusicReferences = mutableListOf<PetMemory.MusicReference>()
+
+        for (round in 0 until MAX_STEPS) {
+            val raw = try {
+                repository.aiChatTools(messages.toString(), toolsJson, 0.7f, 2000)
+            } catch (e: Exception) {
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
-                    event = if (raw.isBlank()) "intent_empty" else "intent_parse_failed",
-                    fields = mapOf(
-                        "rawChars" to raw.length,
-                        "inputLen" to userText.length,
-                    ),
+                    event = "agent_call_failed",
+                    fields = errorFields(e) + mapOf("round" to round),
                 )
-                return AgentResponse(
-                    reply = if (raw.isBlank()) "断线了。" else raw.take(60),
-                    action = Action.Chat,
-                    initialBatch = emptyList(),
-                    continuous = null,
+                return finalizeAgent(replyParts, actions, fallback = "我这边刚刚断了一下，再说一次。", musicReferences = newMusicReferences)
+            }
+            if (raw.isBlank()) return finalizeAgent(replyParts, actions, fallback = "断线了。", musicReferences = newMusicReferences)
+            val assistant = runCatching { JSONObject(raw) }.getOrNull()
+                ?: return finalizeAgent(replyParts, actions, fallback = raw.take(60), musicReferences = newMusicReferences)
+            // 把 assistant 消息原样回灌 —— 下一轮带工具结果再发时，协议要求保留 tool_calls。
+            messages.put(assistant)
+
+            val content = assistantContent(assistant)
+            val toolCalls = assistant.optJSONArray("tool_calls")
+            val calls = if (toolCalls == null) emptyList()
+                else (0 until toolCalls.length()).mapNotNull { parseToolCall(toolCalls.optJSONObject(it)) }
+
+            if (calls.isEmpty()) {
+                // 纯文本 —— 收尾（纯聊天 / explain / MiMo 降级都走这）。
+                if (content.isNotBlank()) replyParts.add(content)
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "agent_finish",
+                    fields = mapOf("round" to round, "reason" to "text", "actionCount" to actions.size),
                 )
+                return finalizeAgent(replyParts, actions, fallback = "嗯。", musicReferences = newMusicReferences)
             }
 
-        if (parsed.action != Action.Play && parsed.action != Action.Similar) {
-            // 非召回类 action —— 直接返回带 reply（可能附 trackOp）。
-            // NativeAiPet 按 action 决定后续：
-            //   Skip → viewModel.next()
-            //   Explain / Chat → 只展示 reply
-            //   Like / Unlike → repository.likeSong
-            //   AddToPlaylist / RemoveFromPlaylist → repository.playlistModifyTracks（含模糊匹配 playlist）
-            val trackOp = when (parsed.action) {
-                Action.Like -> TrackOpRequest(kind = "like")
-                Action.Unlike -> TrackOpRequest(kind = "unlike")
-                Action.AddToPlaylist -> TrackOpRequest(kind = "add_to_playlist", playlistName = parsed.playlistName)
-                Action.RemoveFromPlaylist -> TrackOpRequest(kind = "remove_from_playlist", playlistName = parsed.playlistName)
-                else -> null
+            val hasReadTool = calls.any { it.name in READ_TOOLS }
+            if (!hasReadTool) {
+                // 仅动作工具 —— 就地结算并收尾，不再发请求（也就无需回传 tool 结果）。常见请求 1 个往返。
+                for (c in calls) {
+                    newMusicReferences.addAll(musicReferencesFromArgs(c.args))
+                    val (action, reply) = executeActionTool(
+                        call = c,
+                        currentTrack = currentTrack,
+                        behaviorEvents = behaviorEvents,
+                        behaviorPreference = behaviorPreference,
+                    )
+                    if (action != null) actions.add(action)
+                    if (reply.isNotBlank()) replyParts.add(reply)
+                    DiagnosticsLogStore.record(
+                        area = "ai_agent",
+                        event = "agent_tool_call",
+                        fields = mapOf("round" to round, "tool" to c.name, "kind" to "action"),
+                    )
+                }
+                if (content.isNotBlank()) replyParts.add(content)
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "agent_finish",
+                    fields = mapOf("round" to round, "reason" to "action", "actionCount" to actions.size),
+                )
+                return finalizeAgent(replyParts, actions, fallback = "嗯。", musicReferences = newMusicReferences)
             }
-            DiagnosticsLogStore.record(
-                area = "ai_agent",
-                event = "intent_${parsed.action.name.lowercase()}",
-                fields = mapOf(
-                    "replyLen" to parsed.reply.length,
-                    "rawAction" to parsed.action.name,
-                    "playlistName" to (parsed.playlistName ?: ""),
-                ),
-            )
-            return AgentResponse(
-                reply = parsed.reply,
-                action = parsed.action,
-                initialBatch = emptyList(),
-                continuous = null,
-                trackOp = trackOp,
-            )
+
+            // 含读工具 —— 协议要求**每个** tool_call 都回一条 tool 结果，然后继续下一轮。
+            // 动作工具若混在同轮：就地结算 + 回乐观 ack（模型看到 ack 不会重复下手）。
+            for (c in calls) {
+                newMusicReferences.addAll(musicReferencesFromArgs(c.args))
+                val resultText = if (c.name in READ_TOOLS) {
+                    executeReadTool(c, behaviorEvents)
+                } else {
+                    val (action, reply) = executeActionTool(
+                        call = c,
+                        currentTrack = currentTrack,
+                        behaviorEvents = behaviorEvents,
+                        behaviorPreference = behaviorPreference,
+                    )
+                    if (action != null) actions.add(action)
+                    if (reply.isNotBlank()) replyParts.add(reply)
+                    "ok"
+                }
+                messages.put(toolResultMsg(c.id, resultText))
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "agent_tool_call",
+                    fields = mapOf("round" to round, "tool" to c.name, "kind" to if (c.name in READ_TOOLS) "read" else "action"),
+                )
+            }
         }
 
-        val intent = parsed.intent
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "agent_finish",
+            fields = mapOf("reason" to "max_steps", "actionCount" to actions.size),
+        )
+        return finalizeAgent(replyParts, actions, fallback = "想太久了，再说一次？", musicReferences = newMusicReferences)
+    }
+
+    private fun finalizeAgent(
+        replyParts: Set<String>,
+        actions: List<AgentAction>,
+        fallback: String,
+        musicReferences: List<PetMemory.MusicReference> = emptyList(),
+    ): AgentResponse {
+        val reply = replyParts.joinToString(" ").trim().ifBlank { fallback }
+        return AgentResponse(
+            reply = reply.take(160),
+            actions = actions.toList(),
+            musicReferences = musicReferences.distinctBy { referenceKey(it) }.takeLast(8),
+        )
+    }
+
+    private suspend fun activeProviderId(): String {
+        var providerId = runCatching { repository.aiConfig.first().activeProvider }
+            .getOrDefault("")
+            .trim()
+        if (providerId.isBlank()) {
+            runCatching { repository.refreshAiConfig() }
+            providerId = runCatching { repository.aiConfig.first().activeProvider }
+                .getOrDefault("")
+                .trim()
+        }
+        return providerId.ifBlank { "deepseek" }
+    }
+
+    private fun appendHistoryMessages(messages: JSONArray, history: List<PetMemory.ConversationTurn>) {
+        history.takeLast(MAX_HISTORY_MESSAGES).forEach { turn ->
+            val role = when (turn.role) {
+                PetMemory.ROLE_USER -> "user"
+                PetMemory.ROLE_ASSISTANT -> "assistant"
+                else -> return@forEach
+            }
+            val text = cleanHistoryText(turn.text)
+            if (text.isNotBlank()) messages.put(chatMsg(role, text))
+        }
+    }
+
+    private fun cleanHistoryText(text: String): String =
+        text.replace('\n', ' ')
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(MAX_HISTORY_TEXT_CHARS)
+
+    // ---------- 工具调用解析 / 执行 ----------
+
+    private data class ToolCall(val id: String, val name: String, val args: JSONObject)
+
+    private fun parseToolCall(obj: JSONObject?): ToolCall? {
+        if (obj == null) return null
+        val fn = obj.optJSONObject("function") ?: return null
+        val name = fn.optString("name").trim()
+        if (name.isEmpty()) return null
+        val args = runCatching { JSONObject(fn.optString("arguments").ifBlank { "{}" }) }
+            .getOrDefault(JSONObject())
+        return ToolCall(id = obj.optString("id"), name = name, args = args)
+    }
+
+    private fun assistantContent(message: JSONObject): String =
+        jsonString(message, "content")
+
+    private fun jsonString(obj: JSONObject, key: String): String {
+        if (!obj.has(key) || obj.isNull(key)) return ""
+        return obj.optString(key).trim().takeUnless { it == "null" }.orEmpty()
+    }
+
+    private fun chatMsg(role: String, content: String): JSONObject =
+        JSONObject().put("role", role).put("content", content)
+
+    private fun toolResultMsg(toolCallId: String, content: String): JSONObject =
+        JSONObject().put("role", "tool").put("tool_call_id", toolCallId).put("content", content)
+
+    /** 读工具：返回喂回给模型的文本，不产生任何副作用。 */
+    private suspend fun executeReadTool(call: ToolCall, behaviorEvents: List<BehaviorEvent>): String =
+        runCatching {
+            when (call.name) {
+                "search_catalog" -> {
+                    val q = call.args.optString("query").trim()
+                    if (q.isBlank()) return@runCatching "需要 query"
+                    val limit = call.args.optInt("limit", 8).coerceIn(1, 20)
+                    val hits = repository.searchTracks(q, limit)
+                    if (hits.isEmpty()) "没搜到「$q」"
+                    else hits.joinToString("\n") { "${it.title} — ${it.artist}" }
+                }
+                "get_play_history" -> summarizeHistory(behaviorEvents)
+                "list_playlists" -> {
+                    val pls = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                    if (pls.isEmpty()) "（没有歌单）"
+                    else pls.joinToString("\n") { "${it.name}（${it.trackCount} 首）" }
+                }
+                "get_playlist_tracks" -> {
+                    val name = call.args.optString("name").trim()
+                    val pls = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                    val target = matchPlaylistByName(pls, name)
+                        ?: return@runCatching "没找到歌单「$name」"
+                    val limit = call.args.optInt("limit", 20).coerceIn(1, 50)
+                    val tracks = runCatching { repository.tracksForPlaylist(target.id) }.getOrDefault(emptyList())
+                    if (tracks.isEmpty()) "「${target.name}」是空的"
+                    else "「${target.name}」：\n" + tracks.take(limit).joinToString("\n") { "${it.title} — ${it.artist}" }
+                }
+                "get_taste_profile" -> summarizeTaste()
+                else -> "未知读工具：${call.name}"
+            }
+        }.getOrElse { "（${call.name} 出错：${it.message ?: it::class.java.simpleName}）" }
+
+    /** 动作工具：累积成 AgentAction（UI 后续按序执行），返回 (action?, 人格 reply)。 */
+    private suspend fun executeActionTool(
+        call: ToolCall,
+        currentTrack: NativeTrack?,
+        behaviorEvents: List<BehaviorEvent>,
+        behaviorPreference: BehaviorPreferenceSnapshot,
+    ): Pair<AgentAction?, String> {
+        val reply = jsonString(call.args, "reply")
+        return when (call.name) {
+            "play_queue", "play_similar" -> {
+                val similar = call.name == "play_similar"
+                val intentObj = call.args.optJSONObject("intent") ?: JSONObject()
+                val intent = parseIntentFromArgs(intentObj, fallbackQuery = reply)
+                // 指代承接("听这个/那首")完全交给模型:它从对话 + music_references 里认出具体
+                // 歌名填进 intent,并自行决定 queue_action(单首→insert)。不再用关键词正则兜底。
+                val rawQueueAction = call.args.optString("queue_action").trim().lowercase()
+                    .ifBlank { intentObj.optJSONObject("queueIntent")?.optString("action")?.lowercase().orEmpty() }
+                val queueAction = if (rawQueueAction == "insert") "insert" else "replace"
+                when (val outcome = buildPlayOutcome(intent, queueAction, currentTrack, behaviorEvents, behaviorPreference)) {
+                    is PlayOutcome.Replace ->
+                        AgentAction.Play(outcome.initialBatch, outcome.continuous, insert = false, similar = similar) to reply
+                    is PlayOutcome.Insert ->
+                        AgentAction.Play(listOf(outcome.track), null, insert = true, similar = false) to reply
+                    is PlayOutcome.Empty ->
+                        null to (if (reply.isBlank()) outcome.note else "$reply（${outcome.note}）")
+                }
+            }
+            "play_playlist" -> {
+                val name = call.args.optString("name").trim()
+                val limit = call.args.optInt("limit", 80).coerceIn(1, 160)
+                if (name.isBlank()) return null to "说个歌单名。"
+                val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                val target = matchPlaylistByName(playlists, name)
+                    ?: return null to "没找到歌单「$name」。"
+                val tracks = runCatching { repository.tracksForPlaylist(target.id) }.getOrDefault(emptyList())
+                    .filter { it.streamUrl.isNotBlank() || it.neteaseId != null }
+                    .take(limit)
+                if (tracks.isEmpty()) {
+                    null to "「${target.name}」是空的。"
+                } else {
+                    DiagnosticsLogStore.record(
+                        area = "ai_agent",
+                        event = "playlist_ready",
+                        fields = mapOf(
+                            "playlistId" to target.id,
+                            "playlistName" to target.name,
+                            "trackCount" to tracks.size,
+                        ),
+                    )
+                    AgentAction.Play(tracks, continuous = null, insert = false, similar = false) to reply
+                }
+            }
+            "skip" -> AgentAction.Skip to reply
+            "like" -> AgentAction.Like(like = true) to reply
+            "unlike" -> AgentAction.Like(like = false) to reply
+            "add_to_playlist" -> {
+                val name = call.args.optString("playlist_name").trim()
+                (if (name.isNotEmpty()) AgentAction.Playlist(add = true, name = name) else null) to reply
+            }
+            "remove_from_playlist" -> {
+                val name = call.args.optString("playlist_name").trim()
+                (if (name.isNotEmpty()) AgentAction.Playlist(add = false, name = name) else null) to reply
+            }
+            "say" -> null to reply
+            else -> null to reply
+        }
+    }
+
+    private fun musicReferencesFromArgs(args: JSONObject): List<PetMemory.MusicReference> {
+        val arr = args.optJSONArray("music_references") ?: return emptyList()
+        val out = ArrayList<PetMemory.MusicReference>()
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            val title = jsonString(item, "title")
+            if (title.isBlank()) continue
+            out.add(
+                PetMemory.MusicReference(
+                    title = title,
+                    artist = jsonString(item, "artist"),
+                    reason = jsonString(item, "reason"),
+                )
+            )
+        }
+        return out
+    }
+
+    private fun referenceKey(ref: PetMemory.MusicReference): String =
+        normalizeForMatch("${ref.title}|${ref.artist}")
+
+    private fun matchPlaylistByName(playlists: List<PipoPlaylist>, name: String): PipoPlaylist? {
+        val key = normalizeForMatch(name)
+        if (key.isEmpty()) return null
+        return playlists.firstOrNull { normalizeForMatch(it.name) == key }
+            ?: playlists.firstOrNull {
+                val n = normalizeForMatch(it.name)
+                n.isNotEmpty() && (key in n || n in key)
+            }
+    }
+
+    private fun summarizeHistory(events: List<BehaviorEvent>): String {
+        val played = events
+            .filter { it.type == BehaviorType.PlayStarted || it.type == BehaviorType.Completed }
+            .sortedByDescending { it.tsMs }
+            .distinctBy { "${it.title}|${it.artist}" }
+            .take(10)
+        val skipped = events
+            .filter { it.type == BehaviorType.Skipped || (it.type == BehaviorType.ManualCut && it.completionPct < 0.6f) }
+            .sortedByDescending { it.tsMs }
+            .distinctBy { "${it.title}|${it.artist}" }
+            .take(5)
+        val sb = StringBuilder()
+        if (played.isNotEmpty()) {
+            sb.append("最近听过：\n")
+            sb.append(played.joinToString("\n") { "${it.title} — ${it.artist}" })
+        } else {
+            sb.append("还没听歌记录")
+        }
+        if (skipped.isNotEmpty()) {
+            sb.append("\n最近跳过（负反馈）：\n")
+            sb.append(skipped.joinToString("\n") { "${it.title} — ${it.artist}" })
+        }
+        return sb.toString()
+    }
+
+    private fun summarizeTaste(): String {
+        val tp = tasteProfileStore.flow.value ?: return "还没有口味画像（可以让 TA 去蒸馏歌单）"
+        val genres = tp.genres.take(6).joinToString("、") { it.tag }
+        val artists = tp.topArtists.take(8).joinToString("、") { it.name }
+        return buildString {
+            if (tp.summary.isNotBlank()) appendLine(tp.summary)
+            if (genres.isNotBlank()) appendLine("常听风格：$genres")
+            if (artists.isNotBlank()) append("常听艺人：$artists")
+        }.trim()
+    }
+
+    // ---------- 放歌召回 pipeline（被 play_queue / play_similar 复用）----------
+
+    private sealed class PlayOutcome {
+        /** 替换整列。 */
+        data class Replace(val initialBatch: List<NativeTrack>, val continuous: ContinuousQueueSource?) : PlayOutcome()
+        /** 插一首。 */
+        data class Insert(val track: NativeTrack) : PlayOutcome()
+        /** 没找到任何曲目；[note] 给模型/用户的一句解释。 */
+        data class Empty(val note: String) : PlayOutcome()
+    }
+
+    private suspend fun buildPlayOutcome(
+        intent: PetIntent,
+        queueAction: String,
+        currentTrack: NativeTrack?,
+        behaviorEvents: List<BehaviorEvent>,
+        behaviorPreference: BehaviorPreferenceSnapshot,
+    ): PlayOutcome {
         val desired = intent.desiredCount.coerceIn(8, 60)
         val requestedArtistKeys = requestedArtistKeys(intent)
-        val artistSearchQueries = artistFirstSearchQueries(intent, userText)
+        val artistSearchQueries = artistFirstSearchQueries(intent, intent.queryText)
+        val behaviorSearchQueries = if (requestedArtistKeys.isEmpty()) behaviorPreference.onlineSeeds(maxItems = 4) else emptyList()
+        val onlineSeedQueries = if (requestedArtistKeys.isEmpty() && !hasSpecificSearchIntent(intent)) {
+            mergeSearchQueries(behaviorSearchQueries, artistSearchQueries, maxItems = 10)
+        } else {
+            mergeSearchQueries(artistSearchQueries, behaviorSearchQueries, maxItems = 10)
+        }
 
         // 1) 本地库 → 多路召回 → 排序
         val localTracks = runCatching { library.library() }.getOrDefault(emptyList())
@@ -169,11 +489,13 @@ class PetAgent(
             event = "intent_play",
             fields = mapOf(
                 "desired" to desired,
-                "queueAction" to parsed.queueAction,
+                "queueAction" to queueAction,
                 "libraryCount" to localTracks.size,
                 "hardTrackCount" to intent.hardTracks.size,
                 "hardArtistCount" to intent.hardArtists.size,
                 "promptArtistCount" to requestedArtistKeys.size,
+                "behaviorPreferenceConfidence" to behaviorPreference.confidence,
+                "behaviorSeedCount" to behaviorSearchQueries.size,
             ),
         )
 
@@ -186,7 +508,7 @@ class PetAgent(
         // 1b) Insert 模式 —— 用户只想插一首（"放浮夸"、"来一首XX"），不毁掉当前队列。
         //     不跑后续召回，只解析命名歌；命中就走 Insert action 让上层 insertNext。
         //     如果命名歌完全找不到（本地没有 + 在线也搜不到），走 chat 礼貌拒绝。
-        if (parsed.queueAction == "insert") {
+        if (queueAction == "insert") {
             val pinnedOnlineOnly = resolvePinnedFromOnline(intent, pinnedNamed)
             val toInsert = mergeUnique(pinnedNamed, pinnedOnlineOnly).take(1)
             if (toInsert.isEmpty()) {
@@ -198,12 +520,7 @@ class PetAgent(
                         "trackHintCount" to (intent.hardTracks.size + intent.textTracks.size),
                     ),
                 )
-                return AgentResponse(
-                    reply = "${parsed.reply}（这首我没找到，换个名字？）",
-                    action = Action.Chat,
-                    initialBatch = emptyList(),
-                    continuous = null,
-                )
+                return PlayOutcome.Empty("这首我没找到，换个名字？")
             }
             runCatching {
                 recommendationLog.logTracks(toInsert, RecommendationLog.Source.Pet)
@@ -216,12 +533,7 @@ class PetAgent(
                     "neteaseId" to toInsert.firstOrNull()?.neteaseId,
                 ),
             )
-            return AgentResponse(
-                reply = parsed.reply,
-                action = Action.Insert,
-                initialBatch = toInsert,
-                continuous = null,
-            )
+            return PlayOutcome.Insert(toInsert.first())
         }
         val recentPlay = runCatching { behaviorLog.recentPlay() }.getOrDefault(BehaviorLog.RecentPlay(emptySet(), emptySet()))
         val recentRec = runCatching { recommendationLog.recentContext() }.getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
@@ -233,7 +545,7 @@ class PetAgent(
         val localRanked: List<NativeTrack> = if (localTracks.isNotEmpty()) {
             // 用户原话向量化（OpenAI 才支持；DeepSeek/MiMo 失败时返回 null，自动 fallback lexical）
             val queryVector = if (embeddingStore.count() > 0) {
-                runCatching { embeddingIndexer.embedQuery(userText) }.getOrNull()
+                runCatching { embeddingIndexer.embedQuery(intent.queryText) }.getOrNull()
             } else null
 
             val candidates = CandidateRecall.recall(
@@ -244,6 +556,7 @@ class PetAgent(
                 indexer = indexer,
                 tasteProfile = tasteProfile,
                 behaviorEvents = behaviorEvents,
+                behaviorPreference = behaviorPreference,
                 currentTrack = currentTrack,
                 limit = 200,
                 queryVector = queryVector,
@@ -256,6 +569,7 @@ class PetAgent(
                     topN = desired * 3,
                     recentPlay = recentPlay,
                     recentRecommendation = recentRec,
+                    behaviorPreference = behaviorPreference,
                 ),
             )
             localRankedRecord = ranked
@@ -297,7 +611,7 @@ class PetAgent(
         val recallMerged = if (localRanked.size >= 6 && !needsArtistBackfill) {
             localRanked
         } else {
-            val queries = artistSearchQueries
+            val queries = onlineSeedQueries
             val onlineRaw = neteaseSearch(
                 queries = queries,
                 limitPerQuery = if (requestedArtistKeys.isNotEmpty()) 12 else 4,
@@ -316,6 +630,7 @@ class PetAgent(
                     "localArtistCount" to localArtistCount,
                     "onlineCount" to online.size,
                     "promptArtistCount" to requestedArtistKeys.size,
+                    "behaviorSeedCount" to behaviorSearchQueries.size,
                 ),
             )
             // 合并：本地优先 + 在线兜底
@@ -353,12 +668,7 @@ class PetAgent(
                     "pinnedCount" to pinnedAll.size,
                 ),
             )
-            return AgentResponse(
-                reply = "${parsed.reply}（这次库里真没贴的，换个说法？）",
-                action = Action.Chat,
-                initialBatch = emptyList(),
-                continuous = null,
-            )
+            return PlayOutcome.Empty("这次库里真没贴的，换个说法？")
         }
 
         // 4) 拆 initialBatch + reservoir
@@ -389,21 +699,21 @@ class PetAgent(
                 "pinnedCount" to pinnedAll.size,
                 "promptArtistCount" to requestedArtistKeys.size,
                 "finalArtistCount" to final.count { matchesRequestedArtist(it, requestedArtistKeys) },
+                "behaviorPreferenceConfidence" to behaviorPreference.confidence,
                 "desired" to desired,
             ),
         )
 
-        return AgentResponse(
-            reply = parsed.reply,
-            action = parsed.action,  // Play 或 Similar —— Similar 走同样召回但 UI 可区分提示
+        return PlayOutcome.Replace(
             initialBatch = initialBatch,
             continuous = makeContinuousSource(
                 reservoir = reservoir,
-                seedQueries = artistSearchQueries,
+                seedQueries = onlineSeedQueries,
                 requestedArtistKeys = requestedArtistKeys,
                 intent = intent,
                 recentPlay = recentPlay,
                 recentRec = recentRec,
+                behaviorPreference = behaviorPreference,
             ),
         )
     }
@@ -605,6 +915,7 @@ class PetAgent(
         intent: PetIntent,
         recentPlay: BehaviorLog.RecentPlay,
         recentRec: RecommendationLog.RecentContext,
+        behaviorPreference: BehaviorPreferenceSnapshot,
     ): ContinuousQueueSource {
         val pool = reservoir.toMutableList()
         val consumed = mutableSetOf<Long>()
@@ -711,6 +1022,7 @@ class PetAgent(
                 intent = intent,
                 recentPlay = recentPlay,
                 recentRec = recentRec,
+                behaviorPreference = behaviorPreference,
                 target = 8,
             )
             if (refill.isEmpty()) {
@@ -821,6 +1133,7 @@ class PetAgent(
         intent: PetIntent,
         recentPlay: BehaviorLog.RecentPlay,
         recentRec: RecommendationLog.RecentContext,
+        behaviorPreference: BehaviorPreferenceSnapshot,
         target: Int,
     ): List<NativeTrack> {
         if (tracks.isEmpty()) return emptyList()
@@ -844,6 +1157,7 @@ class PetAgent(
                 topN = target * 2,
                 recentPlay = recentPlay,
                 recentRecommendation = recentRec,
+                behaviorPreference = behaviorPreference,
             ),
         )
         return ranked.map { it.candidate.track }.take(target)
@@ -887,6 +1201,31 @@ class PetAgent(
         }
         return queries.toList().take(10)
     }
+
+    private fun mergeSearchQueries(
+        primary: List<String>,
+        preference: List<String>,
+        maxItems: Int,
+    ): List<String> {
+        val out = LinkedHashSet<String>()
+        (primary + preference).forEach { query ->
+            val q = query.trim()
+            if (q.isNotBlank()) out.add(q)
+        }
+        return out.toList().take(maxItems)
+    }
+
+    private fun hasSpecificSearchIntent(intent: PetIntent): Boolean =
+        intent.hardTracks.isNotEmpty() ||
+            intent.textTracks.isNotEmpty() ||
+            intent.hardGenres.isNotEmpty() ||
+            intent.hardLanguages.isNotEmpty() ||
+            intent.hardRegions.isNotEmpty() ||
+            intent.softMoods.isNotEmpty() ||
+            intent.softScenes.isNotEmpty() ||
+            intent.musicHintsMoods.isNotEmpty() ||
+            intent.musicHintsGenres.isNotEmpty() ||
+            intent.orderStyle != "smooth"
 
     private fun prioritizeRequestedArtists(
         tracks: List<NativeTrack>,
@@ -972,15 +1311,18 @@ class PetAgent(
 
     private suspend fun buildUserMessage(
         userText: String,
-        history: List<Pair<Boolean, String>>,
         currentTrack: NativeTrack?,
         userFacts: String,
         behaviorEvents: List<BehaviorEvent>,
+        behaviorPreference: BehaviorPreferenceSnapshot,
+        musicReferences: List<PetMemory.MusicReference>,
     ): String {
         val ctxLines = mutableListOf<String>()
         val weather = runCatching { Weather.get() }.getOrNull()
         ctxLines.add("时段：${AppContext.describe(weather)}")
         AppContext.memoryDigest(userFacts)?.let { ctxLines.add("TA 的人:$it") }
+        behaviorPreference.brief(maxItems = 4)?.let { ctxLines.add("近期口味变化：$it") }
+        formatMusicReferences(musicReferences)?.let { ctxLines.add(it) }
         
         currentTrack?.let { track ->
             val feat = featuresStore.get(track.id)
@@ -1034,99 +1376,75 @@ class PetAgent(
             ctxLines.add("最近播放历史：\n$playedBlock")
         }
 
-        val tail = history.takeLast(4)
-        if (tail.isNotEmpty()) {
-            val block = tail.joinToString("\n") { (fromUser, text) ->
-                "${if (fromUser) "U" else "C"}：$text"
-            }
-            ctxLines.add("最近对话：\n$block")
-        }
         val prefix = if (ctxLines.isNotEmpty()) ctxLines.joinToString("\n") + "\n\n" else ""
         return prefix + "用户：$userText"
     }
 
+    private fun formatMusicReferences(references: List<PetMemory.MusicReference>): String? {
+        val recent = references
+            .filter { it.title.isNotBlank() }
+            .takeLast(5)
+        if (recent.isEmpty()) return null
+        return "可执行音乐指代（用户说 那首/它/刚才说的 时优先承接）：\n" +
+            recent.joinToString("\n") { ref ->
+                val artist = ref.artist.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
+                val reason = ref.reason.takeIf { it.isNotBlank() }?.let { "（$it）" }.orEmpty()
+                "- ${ref.title}$artist$reason"
+            }
+    }
+
     // ---------- 解析 ----------
 
-    private data class Parsed(
-        val reply: String,
-        val action: Action,
-        val intent: PetIntent,
-        /** 来自 LLM queueIntent.action："insert" / "replace"，缺省 "replace" */
-        val queueAction: String,
-        /** AddToPlaylist/RemoveFromPlaylist 时 AI 给的歌单名（原样回传，UI 端做模糊匹配） */
-        val playlistName: String? = null,
-    )
-
-    private fun parseIntent(raw: String): Parsed? {
-        if (raw.isBlank()) return null
-        val cleaned = raw.let { s ->
-            val a = s.indexOf('{'); val b = s.lastIndexOf('}')
-            if (a >= 0 && b > a) s.substring(a, b + 1) else s
-        }
-        return try {
-            val obj = JSONObject(cleaned)
-            val reply = obj.optString("reply").trim().ifBlank { "嗯。" }
-            val actionStr = obj.optString("action").lowercase()
-            val action = when (actionStr) {
-                "play", "recommend", "continue", "adjust_queue" -> Action.Play
-                "skip", "next" -> Action.Skip
-                "explain", "info", "about", "why" -> Action.Explain
-                "similar", "more_like_this", "more" -> Action.Similar
-                "like", "favorite" -> Action.Like
-                "unlike", "dislike", "unfavorite" -> Action.Unlike
-                "add_to_playlist", "add" -> Action.AddToPlaylist
-                "remove_from_playlist", "remove" -> Action.RemoveFromPlaylist
-                else -> Action.Chat
-            }
-            val hard = obj.optJSONObject("hardConstraints")
-            val text = obj.optJSONObject("textHints")
-            val music = obj.optJSONObject("musicHints")
-            val soft = obj.optJSONObject("softPreferences")
-            val refs = obj.optJSONObject("references")
-            val emo = obj.optJSONObject("emotionalGoal")
-            val queue = obj.optJSONObject("queueIntent")
-
-            val intent = PetIntent(
-                queryText = obj.optString("queryText").ifBlank { "" },
-                hardArtists = jsonStringList(hard, "artists"),
-                hardTracks = jsonStringList(hard, "tracks"),
-                hardGenres = jsonStringList(hard, "genres"),
-                hardSubGenres = jsonStringList(hard, "subGenres"),
-                hardLanguages = jsonStringList(hard, "languages"),
-                hardRegions = jsonStringList(hard, "regions"),
-                hardVocalTypes = jsonStringList(hard, "vocalTypes"),
-                excludeLanguages = jsonStringList(hard, "excludeLanguages"),
-                excludeRegions = jsonStringList(hard, "excludeRegions"),
-                excludeGenres = jsonStringList(hard, "excludeGenres"),
-                excludeVocalTypes = jsonStringList(hard, "excludeVocalTypes"),
-                excludeTags = jsonStringList(hard, "excludeTags"),
-                excludeArtists = jsonStringList(hard, "excludeArtists"),
-                avoidWords = jsonStringList(music, "avoid"),
-                textArtists = jsonStringList(text, "artists"),
-                textTracks = jsonStringList(text, "tracks"),
-                textAlbums = jsonStringList(text, "albums"),
-                softMoods = jsonStringList(soft, "moods"),
-                softScenes = jsonStringList(soft, "scenes"),
-                softTextures = jsonStringList(soft, "textures"),
-                softQualityWords = jsonStringList(soft, "qualityWords"),
-                softEnergy = soft?.optString("energy")?.takeIf { it.isNotBlank() } ?: "any",
-                softTempoFeel = soft?.optString("tempoFeel")?.takeIf { it.isNotBlank() } ?: "any",
-                musicHintsMoods = jsonStringList(music, "moods"),
-                musicHintsScenes = jsonStringList(music, "scenes"),
-                musicHintsGenres = jsonStringList(music, "genres"),
-                musicHintsEnergy = music?.optString("energy")?.takeIf { it.isNotBlank() } ?: "any",
-                musicHintsTransitionStyle = music?.optString("transitionStyle")?.takeIf { it.isNotBlank() } ?: "soft",
-                refStyles = jsonStringList(refs, "styles"),
-                refArtists = jsonStringList(refs, "artists"),
-                emotionalDirection = emo?.optString("direction")?.takeIf { it.isNotBlank() },
-                orderStyle = queue?.optString("orderStyle")?.takeIf { it.isNotBlank() } ?: "smooth",
-                desiredCount = obj.optInt("desiredCount", 30).coerceIn(1, 60),
-            )
-            val queueAction = queue?.optString("action")?.lowercase()?.trim().orEmpty()
-                .let { if (it == "insert") "insert" else "replace" }
-            val playlistName = obj.optString("playlistName").trim().ifBlank { null }
-            Parsed(reply, action, intent, queueAction, playlistName)
-        } catch (_: Exception) { null }
+    /**
+     * 从 play_queue / play_similar 工具的 `intent` 参数对象构造 PetIntent。
+     * 字段结构沿用旧 JSON 协议（hardConstraints / textHints / musicHints /
+     * softPreferences / references / emotionalGoal / queueIntent），读取逻辑与早先
+     * 的 parseIntent 一致；差别只是数据来自工具参数对象而非裸 JSON 文本。
+     */
+    private fun parseIntentFromArgs(obj: JSONObject, fallbackQuery: String): PetIntent {
+        val hard = obj.optJSONObject("hardConstraints")
+        val text = obj.optJSONObject("textHints")
+        val music = obj.optJSONObject("musicHints")
+        val soft = obj.optJSONObject("softPreferences")
+        val refs = obj.optJSONObject("references")
+        val emo = obj.optJSONObject("emotionalGoal")
+        val queue = obj.optJSONObject("queueIntent")
+        return PetIntent(
+            queryText = obj.optString("queryText").ifBlank { fallbackQuery },
+            hardArtists = jsonStringList(hard, "artists"),
+            hardTracks = jsonStringList(hard, "tracks"),
+            hardGenres = jsonStringList(hard, "genres"),
+            hardSubGenres = jsonStringList(hard, "subGenres"),
+            hardLanguages = jsonStringList(hard, "languages"),
+            hardRegions = jsonStringList(hard, "regions"),
+            hardVocalTypes = jsonStringList(hard, "vocalTypes"),
+            excludeLanguages = jsonStringList(hard, "excludeLanguages"),
+            excludeRegions = jsonStringList(hard, "excludeRegions"),
+            excludeGenres = jsonStringList(hard, "excludeGenres"),
+            excludeVocalTypes = jsonStringList(hard, "excludeVocalTypes"),
+            excludeTags = jsonStringList(hard, "excludeTags"),
+            excludeArtists = jsonStringList(hard, "excludeArtists"),
+            avoidWords = jsonStringList(music, "avoid"),
+            textArtists = jsonStringList(text, "artists"),
+            textTracks = jsonStringList(text, "tracks"),
+            textAlbums = jsonStringList(text, "albums"),
+            softMoods = jsonStringList(soft, "moods"),
+            softScenes = jsonStringList(soft, "scenes"),
+            softTextures = jsonStringList(soft, "textures"),
+            softQualityWords = jsonStringList(soft, "qualityWords"),
+            softEnergy = soft?.optString("energy")?.takeIf { it.isNotBlank() } ?: "any",
+            softTempoFeel = soft?.optString("tempoFeel")?.takeIf { it.isNotBlank() } ?: "any",
+            musicHintsMoods = jsonStringList(music, "moods"),
+            musicHintsScenes = jsonStringList(music, "scenes"),
+            musicHintsGenres = jsonStringList(music, "genres"),
+            musicHintsEnergy = music?.optString("energy")?.takeIf { it.isNotBlank() } ?: "any",
+            musicHintsTransitionStyle = music?.optString("transitionStyle")?.takeIf { it.isNotBlank() } ?: "soft",
+            refStyles = jsonStringList(refs, "styles"),
+            refArtists = jsonStringList(refs, "artists"),
+            emotionalDirection = emo?.optString("direction")?.takeIf { it.isNotBlank() },
+            orderStyle = queue?.optString("orderStyle")?.takeIf { it.isNotBlank() } ?: "smooth",
+            desiredCount = obj.optInt("desiredCount", 30).coerceIn(1, 60),
+        )
     }
 
     private fun jsonStringList(obj: JSONObject?, key: String): List<String> {
@@ -1138,6 +1456,78 @@ class PetAgent(
             if (s.isNotEmpty()) out.add(s)
         }
         return out
+    }
+
+    companion object {
+        /** agent 循环最多轮数（含读工具往返）。动作请求通常 1 轮收尾，多步组合 2–3 轮。 */
+        private const val MAX_STEPS = 5
+        private const val MAX_HISTORY_MESSAGES = 16
+        private const val MAX_HISTORY_TEXT_CHARS = 260
+
+        /** 读工具名集合：执行后把结果喂回模型、继续循环；其余视为动作工具（结算成 AgentAction）。 */
+        private val READ_TOOLS = setOf(
+            "search_catalog",
+            "get_play_history",
+            "list_playlists",
+            "get_playlist_tracks",
+            "get_taste_profile",
+        )
+
+        /**
+         * function-calling 工具定义（OpenAI 兼容）。system prompt + 这份 schema 跨请求
+         * 保持稳定 —— 利于 DeepSeek 前缀缓存命中。注意：本串内不要出现 `$`（Kotlin
+         * 三引号字符串模板）和三连双引号。
+         */
+        private val AGENT_TOOLS: String = """
+[
+  {"type":"function","function":{
+    "name":"play_queue",
+    "description":"放歌：把队列换成新的一组，或插一首。用户表达任何想听歌的信号（说情绪/累/烦/开心、点名艺人或歌、描述场景、催促放歌）都用它。reply 用当前人格语气说一句。",
+    "parameters":{"type":"object","properties":{
+      "reply":{"type":"string","description":"你以当前人格说出来的那句话，短、口语、符合人格调性。"},
+      "queue_action":{"type":"string","enum":["replace","insert"],"description":"replace=换整列（指定艺人/情绪/场景探索，默认）；insert=只插一首（用户只点名一首歌、不想毁掉当前队列）。不确定就 replace。"},
+      "intent":{"type":"object","description":"放歌意图，只填用得上的字段。","properties":{
+        "queryText":{"type":"string","description":"用户原句"},
+        "hardConstraints":{"type":"object","description":"用户明确说死的硬约束","properties":{"artists":{"type":"array","items":{"type":"string"}},"tracks":{"type":"array","items":{"type":"string"}},"genres":{"type":"array","items":{"type":"string"}},"languages":{"type":"array","items":{"type":"string"}},"regions":{"type":"array","items":{"type":"string"}},"excludeArtists":{"type":"array","items":{"type":"string"}},"excludeGenres":{"type":"array","items":{"type":"string"}},"excludeTags":{"type":"array","items":{"type":"string"}}}},
+        "textHints":{"type":"object","description":"句子里直接点名的，或从可执行音乐指代承接来的那首歌；用户说 那首/它/刚才说的 时，把指代里的 title 放进 tracks、artist 放进 artists。","properties":{"artists":{"type":"array","items":{"type":"string"}},"tracks":{"type":"array","items":{"type":"string"}},"albums":{"type":"array","items":{"type":"string"}}}},
+        "musicHints":{"type":"object","properties":{"moods":{"type":"array","items":{"type":"string"}},"scenes":{"type":"array","items":{"type":"string"}},"genres":{"type":"array","items":{"type":"string"}},"energy":{"type":"string"},"transitionStyle":{"type":"string"},"avoid":{"type":"array","items":{"type":"string"}}}},
+        "softPreferences":{"type":"object","properties":{"moods":{"type":"array","items":{"type":"string"}},"scenes":{"type":"array","items":{"type":"string"}},"textures":{"type":"array","items":{"type":"string"}},"energy":{"type":"string"},"tempoFeel":{"type":"string"},"qualityWords":{"type":"array","items":{"type":"string"}}}},
+        "queueIntent":{"type":"object","properties":{"orderStyle":{"type":"string","description":"smooth 默认 / energy_up / party / sleep"}}},
+        "desiredCount":{"type":"integer","description":"想要几首，1-60，默认 30"}
+      }}
+    },"required":["reply","intent"]}
+  }},
+	  {"type":"function","function":{
+	    "name":"play_similar",
+	    "description":"基于当前在播曲找类似（用户说 再来几首类似的 / 跟这首一样的 / 类似但更慢）。可选 intent 微调方向（更慢、更燃）。",
+	    "parameters":{"type":"object","properties":{
+	      "reply":{"type":"string"},
+	      "intent":{"type":"object","description":"可选微调，字段同 play_queue 的 intent。"}
+	    },"required":["reply"]}
+	  }},
+	  {"type":"function","function":{
+	    "name":"play_playlist",
+	    "description":"播放用户已有歌单（用户说 放我的XX歌单 / 播XX歌单 / 来点收藏歌单里的歌）。如果歌单名不明确，先用 list_playlists。reply 用当前人格说一句。",
+	    "parameters":{"type":"object","properties":{
+	      "reply":{"type":"string","description":"你以当前人格说出来的那句话，短、口语。"},
+	      "name":{"type":"string","description":"用户说的歌单名，原样给，app 端模糊匹配。"},
+	      "limit":{"type":"integer","description":"最多装入多少首，默认80，1-160。"}
+	    },"required":["reply","name"]}
+	  }},
+	  {"type":"function","function":{"name":"skip","description":"跳过当前歌（用户说 下一首 / 跳过 / 换一首 / 不想听这个）。","parameters":{"type":"object","properties":{"reply":{"type":"string"}},"required":["reply"]}}},
+  {"type":"function","function":{"name":"like","description":"收藏当前歌到 我喜欢的音乐（用户说 收藏这首 / 加心 / 喜欢这首）。","parameters":{"type":"object","properties":{"reply":{"type":"string"}},"required":["reply"]}}},
+  {"type":"function","function":{"name":"unlike","description":"取消收藏当前歌（用户说 取消收藏 / 不喜欢这首）。","parameters":{"type":"object","properties":{"reply":{"type":"string"}},"required":["reply"]}}},
+  {"type":"function","function":{"name":"add_to_playlist","description":"把当前歌加到指定歌单（加到 XX 歌单 / 丢进 XX / 保存到 XX）。","parameters":{"type":"object","properties":{"reply":{"type":"string"},"playlist_name":{"type":"string","description":"用户说的歌单名，原样给，app 端模糊匹配。"}},"required":["reply","playlist_name"]}}},
+  {"type":"function","function":{"name":"remove_from_playlist","description":"把当前歌从指定歌单移除（从 XX 删了 / 把这首从 XX 拿出来）。","parameters":{"type":"object","properties":{"reply":{"type":"string"},"playlist_name":{"type":"string"}},"required":["reply","playlist_name"]}}},
+  {"type":"function","function":{"name":"say","description":"只说话不放歌：纯打招呼/问名字/感谢/闲聊，或回答关于当前歌/听歌历史/音乐知识的问题。回答某歌手成名曲/代表作/推荐某首具体歌时，必须把那首歌写进 music_references，方便用户下一句说 那首/它 时直接播放。","parameters":{"type":"object","properties":{"reply":{"type":"string"},"music_references":{"type":"array","description":"本轮回复里提到、后续可用 那首/它 执行播放的具体歌曲。闲聊没有就给空数组或省略。","items":{"type":"object","properties":{"title":{"type":"string"},"artist":{"type":"string"},"reason":{"type":"string","description":"为什么提到它，如 成名曲/代表作/推荐"}},"required":["title"]}}},"required":["reply"]}}},
+  {"type":"function","function":{"name":"search_catalog","description":"在线搜曲库找具体歌或艺人，确认是否存在或拿候选。用于 有没有 XX / 找一首歌词是 XX 的 这类需要先查的请求。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}},
+  {"type":"function","function":{"name":"get_play_history","description":"查用户最近听过和跳过的歌。回答 我刚才听啥 / 上一首 / 之前那首，或处理 像我最近常听的 这类要参考历史的请求前先调。","parameters":{"type":"object","properties":{}}}},
+  {"type":"function","function":{"name":"list_playlists","description":"列出用户的歌单（名字+数量）。需要按歌单操作或挑歌单前先调。","parameters":{"type":"object","properties":{}}}},
+  {"type":"function","function":{"name":"get_playlist_tracks","description":"看某个歌单里的歌，按名字模糊匹配。","parameters":{"type":"object","properties":{"name":{"type":"string"},"limit":{"type":"integer"}},"required":["name"]}}},
+  {"type":"function","function":{"name":"get_taste_profile","description":"读用户长期口味画像（常听风格/艺人/总结）。当用户说 你懂我 / 随便来点我爱听的 时可参考——这是参考不是硬过滤，别把它变成只推同几个艺人。","parameters":{"type":"object","properties":{}}}}
+	]
+	""".trim()
+        private val AGENT_TOOL_COUNT = runCatching { JSONArray(AGENT_TOOLS).length() }.getOrDefault(0)
     }
 
 }

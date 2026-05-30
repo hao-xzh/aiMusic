@@ -55,6 +55,9 @@ object PipoGraph {
     @Volatile
     private var recEngine: RecommendEngine? = null
 
+    @Volatile
+    private var behaviorPref: BehaviorPreferenceEngine? = null
+
     val repository: PipoRepository
         get() = overrideRepository ?: emptyRepository
 
@@ -104,6 +107,16 @@ object PipoGraph {
     val distillCoordinator: DistillCoordinator
         get() = distillCoord ?: DistillCoordinator(distillEngine).also { distillCoord = it }
 
+    /** 低成本本地偏好 delta：从 BehaviorLog 推导最近口味，不走 AI / 网络。 */
+    val behaviorPreference: BehaviorPreferenceEngine
+        get() = behaviorPref ?: BehaviorPreferenceEngine(
+            behaviorLog = behaviorLog,
+            library = library,
+            semanticStore = trackSemanticStore,
+            featuresStore = audioFeaturesStore,
+            indexer = semanticIndexer,
+        ).also { behaviorPref = it }
+
     /** 业界主流多路召回 + 排序 + 多样性 rerank 的推荐引擎。default 续杯走它。 */
     val recommendEngine: RecommendEngine
         get() = recEngine ?: RecommendEngine(
@@ -113,6 +126,7 @@ object PipoGraph {
             tasteProfileStore = tasteProfileStore,
             recommendationLog = recommendationLog,
             repository = repository,
+            behaviorPreference = behaviorPreference,
         ).also { recEngine = it }
 
     /** Bridge 还没装配前的空仓库——所有页面走 React 端的"空状态"分支。 */
@@ -126,6 +140,7 @@ object PipoGraph {
         libraryAnalysis = null
         embedIndexer = null
         recEngine = null
+        behaviorPref = null
     }
 
     fun installContext(context: Context) {

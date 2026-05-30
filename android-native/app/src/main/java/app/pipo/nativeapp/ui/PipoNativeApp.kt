@@ -12,6 +12,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Box
@@ -35,6 +36,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
@@ -45,6 +47,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.data.AiCaptionBus
 import app.pipo.nativeapp.data.AiPetCommandBus
 import app.pipo.nativeapp.data.BehaviorType
 import app.pipo.nativeapp.data.ContinuousQueueSource
@@ -243,69 +246,83 @@ fun PipoNativeApp() {
             },
         )
 
+        val aiOverlayOpen by AiPetCommandBus.isOpen.collectAsState()
+        val aiPlayerBlur by animateDpAsState(
+            targetValue = if (aiOverlayOpen) 6.dp else 0.dp,
+            animationSpec = tween(320, easing = PipoMotion.FlipEase),
+            label = "aiPlayerBlur",
+        )
+
         CompositionLocalProvider(LocalCoverAnchor provides coverAnchor) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // 主页：Player（compact 封面在过渡期间 alpha 0）
-                PlayerScreen(
-                    onOpenLyrics = {
-                        viewModel.refreshPosition()
-                        immersive = true
-                    },
-                    onOpenDistill = { route = Route.Distill },
-                    onOpenSettings = { route = Route.Settings },
-                    immersiveActive = coverInTransition,
-                    showTranslation = showLyricTranslation && hasLyricTranslation,
-                    hasTranslation = hasLyricTranslation,
-                    onToggleTranslation = toggleLyricTranslation,
-                    viewModel = viewModel,
-                )
-
-                AnimatedVisibility(
-                    visible = !isLandscape,
-                    enter = fadeIn(tween(240, easing = PipoMotion.FlipEase)),
-                    exit = fadeOut(tween(180, easing = PipoMotion.CloseEase)),
+                // 主页 + 独立封面 FLIP 层一起作为 AI 背景。
+                // TransitioningCover 不在 PlayerScreen 里面；所以 blur 必须包住这整个播放组，
+                // 否则 compact cover 会清晰地浮在 AI 覆盖层上方。
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .blur(aiPlayerBlur),
                 ) {
-                    Box(modifier = Modifier.fillMaxSize()) {
-                    // 沉浸式 backdrop（仅黑兜底 + 模糊封面 + 顶/底渐变压底，不含标题歌词）
-                    ImmersiveBackdrop(
-                        progress = coverProgress,
-                        coverUrl = viewModel.state.artworkUrl,
-                    )
-
-                    // 真 FLIP 封面 —— 在 backdrop 之上、标题歌词之下
-                    TransitioningCover(
-                        compactRect = coverAnchor.state.value.rect,
-                        coverUrl = viewModel.state.artworkUrl,
-                        progress = coverProgress,
-                    )
-
-                    // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
-                    // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
-                    val lyricClock = LyricTiming.resolve(
-                        positionMs = viewModel.state.positionMs,
-                        lines = viewModel.state.lyrics,
-                    )
-                    ImmersiveLyricsOverlay(
-                        progress = coverProgress,
-                        contentProgress = contentProgress,
-                        coverUrl = viewModel.state.artworkUrl,
-                        title = viewModel.state.title,
-                        artist = viewModel.state.artist,
-                        trackId = viewModel.state.currentTrackId,
-                        lyrics = viewModel.state.lyrics,
-                        activeLyricIndex = lyricClock.activeIndex,
-                        positionMs = lyricClock.positionMs,
-                        isPlaying = viewModel.state.isPlaying,
+                    PlayerScreen(
+                        onOpenLyrics = {
+                            viewModel.refreshPosition()
+                            immersive = true
+                        },
+                        onOpenDistill = { route = Route.Distill },
+                        onOpenSettings = { route = Route.Settings },
+                        immersiveActive = coverInTransition,
                         showTranslation = showLyricTranslation && hasLyricTranslation,
                         hasTranslation = hasLyricTranslation,
-                        onClose = { immersive = false },
-                        onToggle = viewModel::toggle,
-                        onNext = viewModel::next,
                         onToggleTranslation = toggleLyricTranslation,
-                        onSeekToMs = { targetMs ->
-                            viewModel.seekToMs(targetMs)
-                        },
+                        viewModel = viewModel,
                     )
+                    AnimatedVisibility(
+                        visible = !isLandscape,
+                        enter = fadeIn(tween(240, easing = PipoMotion.FlipEase)),
+                        exit = fadeOut(tween(180, easing = PipoMotion.CloseEase)),
+                    ) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                        // 沉浸式 backdrop（仅黑兜底 + 模糊封面 + 顶/底渐变压底，不含标题歌词）
+                        ImmersiveBackdrop(
+                            progress = coverProgress,
+                            coverUrl = viewModel.state.artworkUrl,
+                        )
+
+                        // 真 FLIP 封面 —— 在 backdrop 之上、标题歌词之下
+                        TransitioningCover(
+                            compactRect = coverAnchor.state.value.rect,
+                            coverUrl = viewModel.state.artworkUrl,
+                            progress = coverProgress,
+                        )
+
+                        // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
+                        // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
+                        val lyricClock = LyricTiming.resolve(
+                            positionMs = viewModel.state.positionMs,
+                            lines = viewModel.state.lyrics,
+                        )
+                        ImmersiveLyricsOverlay(
+                            progress = coverProgress,
+                            contentProgress = contentProgress,
+                            coverUrl = viewModel.state.artworkUrl,
+                            title = viewModel.state.title,
+                            artist = viewModel.state.artist,
+                            trackId = viewModel.state.currentTrackId,
+                            lyrics = viewModel.state.lyrics,
+                            activeLyricIndex = lyricClock.activeIndex,
+                            positionMs = lyricClock.positionMs,
+                            isPlaying = viewModel.state.isPlaying,
+                            showTranslation = showLyricTranslation && hasLyricTranslation,
+                            hasTranslation = hasLyricTranslation,
+                            onClose = { immersive = false },
+                            onToggle = viewModel::toggle,
+                            onNext = viewModel::next,
+                            onToggleTranslation = toggleLyricTranslation,
+                            onSeekToMs = { targetMs ->
+                                viewModel.seekToMs(targetMs)
+                            },
+                        )
+                        }
                     }
                 }
 
@@ -456,12 +473,14 @@ private fun SkipCorrectionEffect(
             )
 
             val response = try {
-                PetAgent(PipoGraph.repository).chat(
-                    userText = hintLine,
-                    history = emptyList(),
-                    currentTrack = null,
-                    userFacts = settings.userFacts,
-                    persona = PetPersona.fromId(settings.personaId),
+	                PetAgent(PipoGraph.repository).chat(
+		                    userText = hintLine,
+		                    history = emptyList(),
+		                    historySummary = "",
+		                    musicReferences = emptyList(),
+		                    currentTrack = null,
+	                    userFacts = settings.userFacts,
+	                    persona = PetPersona.fromId(settings.personaId),
                 )
             } catch (e: CancellationException) {
                 throw e
@@ -477,14 +496,16 @@ private fun SkipCorrectionEffect(
                 null
             } ?: continue
 
-            if (response.action == PetAgent.Action.Play && response.initialBatch.isNotEmpty()) {
-                DiagnosticsLogStore.record(
-                    area = "skip_correction",
-                    event = "applied",
-                    fields = mapOf("trackCount" to response.initialBatch.size),
-                )
-                onReady(response.initialBatch, response.continuous)
-            }
-        }
+            val play = response.firstPlay()
+	            if (play != null && play.initialBatch.isNotEmpty()) {
+	                DiagnosticsLogStore.record(
+	                    area = "skip_correction",
+	                    event = "applied",
+	                    fields = mapOf("trackCount" to play.initialBatch.size),
+	                )
+	                AiCaptionBus.show(response.reply.ifBlank { "这队不对，我换一组。" })
+	                onReady(play.initialBatch, play.continuous)
+	            }
+	        }
     }
 }

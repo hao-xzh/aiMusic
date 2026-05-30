@@ -422,6 +422,36 @@ fn dispatch(command: &str, args: Value) -> String {
                 Ok(json!(reply))
             })
         }
+        "ai_chat_tools" => {
+            // 原生 tool-calling 传输：Kotlin 侧驱动多轮循环，这里只发一轮。
+            // 入参 messages / tools 是原始 JSON 数组（schema 归 Kotlin 所有），
+            // 出参把 choices[0].message 原样回传（content + tool_calls）。
+            let messages = args.get("messages").cloned().unwrap_or_else(|| json!([]));
+            let tools = args.get("tools").cloned().unwrap_or_else(|| json!([]));
+            let temperature = args
+                .get("temperature")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.7) as f32;
+            let max_tokens = args
+                .get("maxTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(1024) as u32;
+            run_json(async move {
+                let (key, base_url, model) = ai_store().active();
+                let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
+                let message = ai::openai_compat::chat_tools(
+                    &key,
+                    base_url,
+                    &model,
+                    messages,
+                    tools,
+                    temperature,
+                    max_tokens,
+                )
+                .await?;
+                Ok(message)
+            })
+        }
         "ai_embed" => {
             // 输入：{ "inputs": [..字符串..] }
             // 输出：[[f32..], [f32..], ...]，按输入顺序对齐

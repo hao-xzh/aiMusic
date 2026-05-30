@@ -19,6 +19,7 @@ object CandidateRanker {
         val topN: Int = 100,
         val recentPlay: BehaviorLog.RecentPlay? = null,
         val recentRecommendation: RecommendationLog.RecentContext? = null,
+        val behaviorPreference: BehaviorPreferenceSnapshot = BehaviorPreferenceSnapshot.Empty,
     )
 
     // 权重 v2(2026-05) —— 跟 Web 端 candidate-ranker.ts 对齐。
@@ -70,6 +71,15 @@ object CandidateRanker {
                 ),
             ))
             val behaviorScore = clamp01((c.sourceScores[CandidateRecall.Source.Behavior] ?: 0.0) / 1.5)
+            val sourcePreferenceDelta = (c.sourceScores[CandidateRecall.Source.PreferenceDelta] ?: 0.0) / 1.4
+            val scoredPreferenceDelta = options.behaviorPreference.scoreTrack(c.track, c.semanticProfile, c.features)
+            val rawPreferenceDelta = if (sourcePreferenceDelta > 0.0) {
+                maxOf(sourcePreferenceDelta, scoredPreferenceDelta)
+            } else {
+                scoredPreferenceDelta
+            }
+            val preferenceDeltaScore = rawPreferenceDelta.coerceIn(-1.0, 1.0)
+            val behaviorAffinityScore = clamp01(maxOf(behaviorScore, preferenceDeltaScore))
             val transitionScore = clamp01(c.sourceScores[CandidateRecall.Source.Transition] ?: 0.0)
             val freshnessScore = clamp01(
                 (c.sourceScores[CandidateRecall.Source.Explore] ?: 0.0) -
@@ -80,7 +90,7 @@ object CandidateRanker {
             // 扰动 0.025 → 0.08(跟 Web 对齐),配合 bucket 洗牌共破"同 query 总同结果"
             val baseScore = intentScore * W_INTENT +
                 tagScore * w.tag + semanticScore * w.semantic +
-                tasteScore * w.taste + behaviorScore * w.behavior +
+                tasteScore * w.taste + behaviorAffinityScore * w.behavior +
                 transitionScore * W_TRANSITION + freshnessScore * W_FRESHNESS +
                 rnd.nextDouble() * 0.08
 
@@ -93,7 +103,13 @@ object CandidateRanker {
             val artistFatiguePenalty = if (explicitlyMentioned) 0.0
                 else computeArtistFatigue(c.track, options.recentRecommendation)
 
-            val finalScore = baseScore - recentPlayPenalty - recentRecPenalty - artistFatiguePenalty
+            val preferenceDeltaAdjust = if (explicitlyMentioned) {
+                maxOf(0.0, preferenceDeltaScore) * 0.06
+            } else {
+                preferenceDeltaScore * 0.16
+            }
+            val finalScore = baseScore + preferenceDeltaAdjust -
+                recentPlayPenalty - recentRecPenalty - artistFatiguePenalty
             if (finalScore <= 0) continue
             ranked.add(Ranked(c, finalScore))
         }

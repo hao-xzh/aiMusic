@@ -175,8 +175,12 @@ class RustBridgeRepository(
                         tracksMemoryCache.remove(p.id)
                     }
                 }
-                // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)
+                // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)。
+                // 网盘 sentinel(CLOUD_DISK_PLAYLIST_ID)不是真实歌单，永远不在 freshIds 里，
+                // 必须显式保留——否则每次 refresh 都连带把网盘 in-memory + 落盘 cache 误删，
+                // 进网盘页只能重新拉网（其它歌单 id 在 freshIds 里所以静默更新正常）。
                 val freshIds = fresh.mapTo(HashSet()) { it.id }
+                freshIds.add(CLOUD_DISK_PLAYLIST_ID)
                 tracksMemoryCache.keys.retainAll(freshIds)
                 HashMap(tracksMemoryCache)
             }
@@ -457,7 +461,7 @@ class RustBridgeRepository(
                     activeProvider = "deepseek",
                     providers = listOf(
                         AiProviderView("deepseek", "DeepSeek", false, null, "deepseek-chat", "https://api.deepseek.com"),
-                        AiProviderView("openai", "OpenAI", false, null, "gpt-4.1-mini", "https://api.openai.com/v1"),
+                        AiProviderView("openai", "OpenAI", false, null, "gpt-5.5", "https://api.openai.com/v1"),
                         AiProviderView("xiaomi-mimo", "MiMo", false, null, "mimo-vl", "https://platform.xiaomimimo.com"),
                     ),
                 )
@@ -494,6 +498,18 @@ class RustBridgeRepository(
         maxTokens: Int?,
     ): String {
         return safe({ bridge.aiChat(system, user, temperature, maxTokens) }, { fallback.aiChat(system, user, temperature, maxTokens) })
+    }
+
+    override suspend fun aiChatTools(
+        messagesJson: String,
+        toolsJson: String,
+        temperature: Float?,
+        maxTokens: Int?,
+    ): String {
+        return safe(
+            { bridge.aiChatTools(messagesJson, toolsJson, temperature, maxTokens) },
+            { fallback.aiChatTools(messagesJson, toolsJson, temperature, maxTokens) },
+        )
     }
 
     override suspend fun aiEmbed(inputs: List<String>): List<FloatArray> {
@@ -558,5 +574,6 @@ interface RustPipoBridge {
     suspend fun aiSetModel(providerId: String, model: String)
     suspend fun aiPing(): String
     suspend fun aiChat(system: String?, user: String, temperature: Float?, maxTokens: Int?): String
+    suspend fun aiChatTools(messagesJson: String, toolsJson: String, temperature: Float?, maxTokens: Int?): String
     suspend fun aiEmbed(inputs: List<String>): List<FloatArray>
 }

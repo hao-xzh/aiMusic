@@ -208,6 +208,12 @@ interface PipoRepository {
     suspend fun aiPing(): String
     suspend fun aiChat(system: String? = null, user: String, temperature: Float? = null, maxTokens: Int? = null): String
     /**
+     * 原生 tool-calling 版 chat。Kotlin 侧驱动多轮工具循环，本方法只发一轮。
+     * [messagesJson] / [toolsJson] 是 OpenAI 兼容格式的 JSON 数组文本（schema 归调用方所有）。
+     * 返回 assistant message 的原始 JSON 文本（含 content + tool_calls，可能 content 为 null）。
+     */
+    suspend fun aiChatTools(messagesJson: String, toolsJson: String, temperature: Float? = null, maxTokens: Int? = null): String
+    /**
      * 拿一组字符串的 embedding 向量。
      * provider 必须支持 embedding（当前 OpenAI text-embedding-3-small 走这条路），
      * 不支持时抛错；调用方应该预先 try/fallback 到 lexical。

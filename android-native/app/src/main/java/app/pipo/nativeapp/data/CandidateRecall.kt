@@ -19,7 +19,20 @@ import kotlin.math.min
  */
 object CandidateRecall {
 
-    enum class Source { Text, Tag, Semantic, SemanticBroad, Profile, ProfileTags, Acoustic, Audio, Behavior, Transition, Explore }
+    enum class Source {
+        Text,
+        Tag,
+        Semantic,
+        SemanticBroad,
+        Profile,
+        ProfileTags,
+        Acoustic,
+        Audio,
+        Behavior,
+        PreferenceDelta,
+        Transition,
+        Explore,
+    }
 
     data class Candidate(
         val track: NativeTrack,
@@ -37,6 +50,7 @@ object CandidateRecall {
         indexer: SemanticIndexer,
         tasteProfile: TasteProfile?,
         behaviorEvents: List<BehaviorEvent>,
+        behaviorPreference: BehaviorPreferenceSnapshot = BehaviorPreferenceSnapshot.Empty,
         currentTrack: NativeTrack? = null,
         limit: Int = 200,
         queryVector: FloatArray? = null,
@@ -94,6 +108,10 @@ object CandidateRecall {
         for (h in recallByAudio(intent, library, featuresMap)) hit(h.track, Source.Audio, h.score)
         // 7) behavior
         for (h in recallByBehavior(library, behaviorEvents)) hit(h.track, Source.Behavior, h.score)
+        // 7.1) preference_delta —— 最近完成/跳过推导出的风格偏好，不等同于单曲重复播放
+        for (h in recallByPreferenceDelta(library, semanticMap, featuresMap, behaviorPreference)) {
+            hit(h.track, Source.PreferenceDelta, h.score)
+        }
         // 8) transition
         if (currentTrack != null) {
             for (h in recallByTransition(currentTrack, featuresMap[currentTrack.id], library, featuresMap)) {
@@ -320,6 +338,22 @@ object CandidateRecall {
         }
         out.sortByDescending { it.score }
         return out.take(80)
+    }
+
+    private fun recallByPreferenceDelta(
+        library: List<NativeTrack>,
+        semanticMap: Map<String, TrackSemanticProfile>,
+        features: Map<String, AudioFeatures?>,
+        behaviorPreference: BehaviorPreferenceSnapshot,
+    ): List<Hit> {
+        if (!behaviorPreference.hasSignal) return emptyList()
+        val out = ArrayList<Hit>()
+        for (t in library) {
+            val score = behaviorPreference.scoreTrack(t, semanticMap[t.id], features[t.id])
+            if (score > 0.18) out.add(Hit(t, min(1.4, score * 1.4)))
+        }
+        out.sortByDescending { it.score }
+        return out.take(120)
     }
 
     private fun recallByTransition(

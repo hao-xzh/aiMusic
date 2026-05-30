@@ -35,6 +35,7 @@ class RecommendEngine(
     private val tasteProfileStore: TasteProfileStore,
     private val recommendationLog: RecommendationLog,
     private val repository: PipoRepository,
+    private val behaviorPreference: BehaviorPreferenceEngine,
 ) {
 
     suspend fun fetchMore(
@@ -51,6 +52,8 @@ class RecommendEngine(
             .getOrDefault(BehaviorLog.RecentPlay(emptySet(), emptySet()))
         val recentRec = runCatching { recommendationLog.recentContext() }
             .getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
+        val behaviorDelta = runCatching { behaviorPreference.current() }
+            .getOrDefault(BehaviorPreferenceSnapshot.Empty)
 
         val anchorKey = anchor?.let { TrackDedupe.songKey(it) }
         val anchorArtistKey = anchor?.firstArtistKey()
@@ -71,12 +74,13 @@ class RecommendEngine(
         recallCoListen(anchor, lib, events, hardExclude).forEach { pool.merge(it) }
         recallTaste(taste, lib, hardExclude).forEach { pool.merge(it) }
         recallLove(events, lib, recentPlay, hardExclude).forEach { pool.merge(it) }
+        recallBehaviorDelta(behaviorDelta, lib, hardExclude).forEach { pool.merge(it) }
 
         if (pool.isEmpty()) {
             // 本地空 → 走 AI / 在线兜底,但**也要过多样性筛选**。之前直接 return online,
             // 冷启动用户(无听历)拿到的可能全是同一艺人的 hot songs("怎么推都是周杰伦")。
             // 多取一倍 wantCount,然后按"每艺人 ≤ 2 首"去重。
-            val online = fetchFromOnline(anchor, taste, excludeIds, wantCount * 2)
+            val online = fetchFromOnline(anchor, taste, behaviorDelta, excludeIds, wantCount * 2)
             val seenArtist = HashMap<String, Int>()
             val diverse = ArrayList<NativeTrack>(wantCount)
             for (t in online) {
@@ -108,6 +112,8 @@ class RecommendEngine(
             val co = c.coListenScore
             val taste0 = c.tasteScore
             val love = c.loveScore
+            val deltaScore = if (c.behaviorDeltaScore != 0.0) c.behaviorDeltaScore
+                else behaviorPreference.scoreTrack(behaviorDelta, c.track)
             val ne = c.track.neteaseId
             val recencyPen = when {
                 // recentRec.last24h 已经在 hardExclude 里硬筛掉，这里不再列
@@ -115,7 +121,9 @@ class RecommendEngine(
                 ne != null && ne in recentPlay.last7dTrackIds -> -0.10
                 else -> 0.0
             }
-            val score = 0.25 * rel + 0.25 * co + 0.25 * taste0 + 0.15 * love + recencyPen +
+            val behaviorDeltaBoost = if (deltaScore >= 0.0) deltaScore * 0.22 else deltaScore * 0.16
+            val score = 0.23 * rel + 0.23 * co + 0.22 * taste0 + 0.14 * love +
+                behaviorDeltaBoost + recencyPen +
                 // 微噪声 ±0.05 给重排提供 serendipity，避免每次永远同一组
                 (kotlin.random.Random.nextDouble(-0.05, 0.05))
             c.copy(finalScore = score)
@@ -130,7 +138,7 @@ class RecommendEngine(
 
         // ---- 在线兜底 ----
         val haveKeys = picks.mapTo(HashSet()) { TrackDedupe.songKey(it.track) }
-        val online = fetchFromOnline(anchor, taste, excludeIds, wantCount - picks.size)
+        val online = fetchFromOnline(anchor, taste, behaviorDelta, excludeIds, wantCount - picks.size)
             .filter { TrackDedupe.songKey(it) !in haveKeys && !hardExclude(it) }
         val final = picks.map { it.track } + online
         logRecommendations(picks)
@@ -277,6 +285,25 @@ class RecommendEngine(
         return out.take(10)
     }
 
+    /** ch5: 最近行为偏好 delta —— 本地完成/跳过形成的短中期信号。 */
+    private fun recallBehaviorDelta(
+        delta: BehaviorPreferenceSnapshot,
+        lib: List<NativeTrack>,
+        hardExclude: (NativeTrack) -> Boolean,
+    ): List<Candidate> {
+        if (!delta.hasSignal || lib.isEmpty()) return emptyList()
+        val out = ArrayList<Candidate>()
+        for (t in lib) {
+            if (hardExclude(t)) continue
+            val score = behaviorPreference.scoreTrack(delta, t)
+            if (score > 0.18) {
+                out.add(Candidate(track = t, behaviorDeltaScore = score, source = SOURCE_BEHAVIOR_DELTA))
+            }
+        }
+        out.sortByDescending { it.behaviorDeltaScore }
+        return out.take(45)
+    }
+
     // ============== 多样性 rerank ==============
 
     /**
@@ -322,11 +349,12 @@ class RecommendEngine(
     private suspend fun fetchFromOnline(
         anchor: NativeTrack?,
         taste: TasteProfile?,
+        behaviorDelta: BehaviorPreferenceSnapshot,
         excludeIds: Set<Long>,
         wantCount: Int,
     ): List<NativeTrack> {
         if (wantCount <= 0) return emptyList()
-        val seeds = buildOnlineSeeds(anchor, taste)
+        val seeds = buildOnlineSeeds(anchor, taste, behaviorDelta)
         if (seeds.isEmpty()) return emptyList()
         val out = LinkedHashMap<String, NativeTrack>()  // songKey -> track
         val anchorArtistKey = anchor?.firstArtistKey()
@@ -351,8 +379,14 @@ class RecommendEngine(
         return out.values.toList().take(wantCount)
     }
 
-    private fun buildOnlineSeeds(anchor: NativeTrack?, taste: TasteProfile?): List<String> {
+    private fun buildOnlineSeeds(
+        anchor: NativeTrack?,
+        taste: TasteProfile?,
+        behaviorDelta: BehaviorPreferenceSnapshot,
+    ): List<String> {
         val seeds = LinkedHashSet<String>()
+        // 先放最近行为 seed：这正是"越听越懂我"对库外搜索最直接的低成本入口。
+        behaviorDelta.onlineSeeds(maxItems = 4).forEach { seeds.add(it) }
         // 不能光放 anchor.artist —— 会回流同 artist 热曲。改成
         // "anchor.artist + mood" / "anchor.artist + genre" 这种组合 seed
         val anchorArtist = anchor?.artist?.split('/', '&', ',')?.firstOrNull()?.trim().orEmpty()
@@ -407,6 +441,7 @@ class RecommendEngine(
         val coListenScore: Double = 0.0,
         val tasteScore: Double = 0.0,
         val loveScore: Double = 0.0,
+        val behaviorDeltaScore: Double = 0.0,
         val source: Int = 0,
         val finalScore: Double = 0.0,
     )
@@ -423,6 +458,7 @@ class RecommendEngine(
                 coListenScore = maxOf(existing.coListenScore, c.coListenScore),
                 tasteScore = maxOf(existing.tasteScore, c.tasteScore),
                 loveScore = maxOf(existing.loveScore, c.loveScore),
+                behaviorDeltaScore = maxOf(existing.behaviorDeltaScore, c.behaviorDeltaScore),
                 source = existing.source or c.source,
             )
         }
@@ -467,5 +503,6 @@ class RecommendEngine(
         private const val SOURCE_COLISTEN = 2
         private const val SOURCE_TASTE = 4
         private const val SOURCE_LOVE = 8
+        private const val SOURCE_BEHAVIOR_DELTA = 16
     }
 }

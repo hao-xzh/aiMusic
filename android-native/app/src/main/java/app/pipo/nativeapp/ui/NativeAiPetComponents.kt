@@ -63,9 +63,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.R
+import coil.compose.AsyncImage
 
 internal data class PetPalette(
     val accent: Color,
@@ -107,7 +109,7 @@ internal fun rememberPetPalette(edges: EdgeColors): PetPalette {
 }
 
 private fun buildPetPalette(edges: EdgeColors): PetPalette {
-    val accent = normalizePetAccent(rgbToColor(pickPetAccent(edges), fallback = PipoColors.Mint))
+    val accent = normalizePetAccent(rgbToColor(pickPetAccent(edges), fallback = Color(0xFFC8C3BA)))
     val top = normalizePetAccent(rgbToColor(edges.top, fallback = accent))
     val faceBase = Color(0xFFE0D9C4)
     val liftedAccent = when {
@@ -150,8 +152,8 @@ private fun normalizePetAccent(color: Color): Color {
         else -> out
     }
     if (colorSaturation(out) < 0.08f) {
-        val rescue = if (relativeLuma(out) > 0.5f) PipoColors.Blue else PipoColors.Mint
-        out = mixColors(out, rescue, 0.48f)
+        // 灰 / 黑白封面:不注入薄荷绿,保持中性(略提亮成可用的暖中性色)
+        out = mixColors(out, Color(0xFFC8C3BA), 0.40f)
     }
     return out
 }
@@ -655,6 +657,9 @@ internal fun ChatHistoryPanel(
     pending: Boolean,
     palette: PetPalette,
     modifier: Modifier = Modifier,
+    maxHeight: Dp = 280.dp,
+    /** 全屏模式:透明背景(背后是真实播放页 + AiChatBackdrop + 实底气泡),不再套一层面板。 */
+    transparent: Boolean = false,
 ) {
     val listState = rememberLazyListState()
 
@@ -665,22 +670,31 @@ internal fun ChatHistoryPanel(
         }
     }
 
+    // 全屏模式(transparent)下不套面板:整屏就是消息容器,消息气泡浮在播放页背景上。
+    val framed = !transparent
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .heightIn(max = 280.dp)
-            .clip(RoundedCornerShape(20.dp))
-            .background(palette.panel)
-            .drawBehind {
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(palette.accent.copy(alpha = 0.18f), Color.Transparent),
-                        startY = 0f,
-                        endY = 32f,
-                    )
-                )
-            }
-            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .heightIn(max = maxHeight)
+            .then(
+                if (framed) {
+                    Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(palette.panel)
+                        .drawBehind {
+                            drawRect(
+                                brush = Brush.verticalGradient(
+                                    colors = listOf(palette.accent.copy(alpha = 0.18f), Color.Transparent),
+                                    startY = 0f,
+                                    endY = 32f,
+                                )
+                            )
+                        }
+                } else {
+                    Modifier
+                },
+            )
+            .padding(horizontal = if (framed) 12.dp else 2.dp, vertical = 10.dp)
     ) {
         LazyColumn(
             state = listState,
@@ -702,11 +716,30 @@ internal fun ChatHistoryPanel(
 
 @Composable
 internal fun MessageBubbleItem(msg: PetMessage, palette: PetPalette) {
+    // 结果卡片消息(放歌/收藏/加歌单等)—— 左对齐,助手侧。
+    msg.card?.let { card ->
+        Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
+            when (card) {
+                is PetResultCard.Play -> PlayResultCard(card, palette)
+                is PetResultCard.Action -> ActionChip(card, palette)
+            }
+        }
+        return
+    }
     val alignment = if (msg.fromUser) Alignment.End else Alignment.Start
     val bubbleColor = if (msg.fromUser) {
-        palette.accent.copy(alpha = 0.22f)
+        if (relativeLuma(palette.accent) > 0.56f) {
+            mixColors(palette.accent, Color(0xFF10141E), 0.22f).copy(alpha = 0.96f)
+        } else {
+            mixColors(palette.accent, Color(0xFFF5F7FF), 0.20f).copy(alpha = 0.96f)
+        }
     } else {
-        Color(0x1AFFFFFF)
+        Color(0xF20D111A)
+    }
+    val textColor = if (msg.fromUser) {
+        if (relativeLuma(bubbleColor) > 0.58f) Color(0xFF0A0D14) else Color(0xFFF5F7FF)
+    } else {
+        Color(0xFFF5F7FF)
     }
     val shape = if (msg.fromUser) {
         RoundedCornerShape(14.dp, 14.dp, 3.dp, 14.dp)
@@ -727,7 +760,7 @@ internal fun MessageBubbleItem(msg: PetMessage, palette: PetPalette) {
         ) {
             Text(
                 text = msg.text,
-                color = palette.panelText,
+                color = textColor,
                 style = TextStyle(
                     fontSize = 13.5.sp,
                     lineHeight = 18.sp,
@@ -748,10 +781,239 @@ internal fun ThinkingBubbleItem(palette: PetPalette) {
             modifier = Modifier
                 .widthIn(max = 260.dp)
                 .clip(RoundedCornerShape(14.dp, 14.dp, 14.dp, 3.dp))
-                .background(Color(0x1AFFFFFF))
+                .background(Color(0xF20D111A))
                 .padding(horizontal = 12.dp, vertical = 10.dp)
         ) {
             ThinkingDots(tint = palette.accent)
+        }
+    }
+}
+
+/**
+ * AI 全屏对话覆盖层：真实播放页仍在下面，只做轻量压暗和封面色环境光。
+ * 播放页 blur 在 PipoNativeApp 统一处理，避免这里再铺一张封面把页面盖掉。
+ */
+@Composable
+internal fun AiChatBackdrop(
+    coverUrl: String?,
+    palette: PetPalette,
+    intensity: Float,
+    modifier: Modifier = Modifier,
+) {
+    if (intensity <= 0.002f) return
+    val k = intensity.coerceIn(0f, 1f)
+    val hasCover = !coverUrl.isNullOrBlank()
+    Box(modifier = modifier.fillMaxSize()) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            drawRect(
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF05070B).copy(alpha = 0.12f * k),
+                        Color(0xFF05070B).copy(alpha = 0.22f * k),
+                        Color(0xFF05070B).copy(alpha = 0.38f * k),
+                    ),
+                    startY = 0f,
+                    endY = h,
+                ),
+                size = size,
+            )
+            drawRect(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        palette.accent.copy(alpha = (if (hasCover) 0.14f else 0.22f) * k),
+                        palette.accent.copy(alpha = (if (hasCover) 0.05f else 0.08f) * k),
+                        Color.Transparent,
+                    ),
+                    center = Offset(w * 0.48f, h * 0.76f),
+                    radius = maxOf(w, h) * 0.66f,
+                ),
+                size = size,
+            )
+            drawRect(
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        palette.accentTop.copy(alpha = 0.06f * k),
+                        Color.Transparent,
+                    ),
+                    startY = 0f,
+                    endY = h * 0.28f,
+                ),
+                size = Size(w, h * 0.28f),
+            )
+        }
+    }
+}
+
+/**
+ * 唤起 AI 时浮在播放界面之上的环境光层:封面色中心柔光 + 四周边缘微光 +
+ * 输入区极淡压暗(给文字兜底对比度,不是平涂遮罩)。[intensity] 0→1 驱动入场,
+ * [pulse] 接 haloPulse 做呼吸。封面色取自 palette(灰封面已被 normalizePetAccent 兜底成薄荷)。
+ */
+@Composable
+internal fun GlowBackdrop(
+    palette: PetPalette,
+    intensity: Float,
+    modifier: Modifier = Modifier,
+) {
+    if (intensity <= 0.002f) return
+    // 稳态:alpha 只随唤起强度淡入,绝不随节拍脉动 —— 全屏层一脉动就是"整屏闪"。
+    val k = intensity.coerceIn(0f, 1f)
+    Canvas(modifier = modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        // 底部柔和压暗:只给输入/消息区文字兜底对比度,从中部向下渐深、顶部全透(非平涂遮罩)
+        drawRect(
+            brush = Brush.verticalGradient(
+                colors = listOf(Color.Transparent, Color(0xFF05070B).copy(alpha = 0.34f * k)),
+                startY = h * 0.42f,
+                endY = h,
+            ),
+        )
+        // 一束封面色柔光,从底部(orb 升起处)绽放 —— 半径随 intensity 由小变大,形成"绽放"入场
+        val bloomR = maxOf(w, h) * (0.42f + 0.34f * k)
+        drawRect(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    palette.accent.copy(alpha = 0.20f * k),
+                    palette.accent.copy(alpha = 0.06f * k),
+                    Color.Transparent,
+                ),
+                center = Offset(w * 0.5f, h * 0.74f),
+                radius = bloomR,
+            ),
+            size = size,
+        )
+        // 顶部一抹更淡同色平衡画面(不做四边光,避免廉价/闪烁感)
+        drawRect(
+            brush = Brush.verticalGradient(
+                colors = listOf(palette.accentTop.copy(alpha = 0.08f * k), Color.Transparent),
+                startY = 0f,
+                endY = h * 0.3f,
+            ),
+            size = Size(w, h * 0.3f),
+        )
+    }
+}
+
+/** 放歌结果卡:▶ + 封面缩略条 + "开整 N 首" + 艺人。映射 AgentAction.Play。 */
+@Composable
+internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
+    val title = when {
+        card.insert -> "插一首"
+        card.similar -> "配同款 · ${card.count} 首"
+        else -> "开整 · ${card.count} 首"
+    }
+    Row(
+        modifier = Modifier
+            .widthIn(max = 300.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(palette.panel)
+            .drawBehind {
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(palette.accent.copy(alpha = 0.22f), Color.Transparent),
+                        startY = 0f, endY = 26f,
+                    ),
+                )
+            }
+            .padding(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(38.dp)
+                .clip(RoundedCornerShape(11.dp))
+                .background(palette.accent.copy(alpha = 0.9f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("▶", color = palette.actionText, style = TextStyle(fontSize = 15.sp))
+        }
+        val covers = card.covers.filterNotNull().take(3)
+        if (covers.isNotEmpty()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                covers.forEach { url ->
+                    AsyncImage(
+                        model = url,
+                        contentDescription = null,
+                        modifier = Modifier.size(34.dp).clip(RoundedCornerShape(7.dp)),
+                    )
+                }
+            }
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                title,
+                color = palette.panelText,
+                style = TextStyle(fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, lineHeight = 17.sp),
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+            if (card.artists.isNotBlank()) {
+                Text(
+                    card.artists,
+                    color = palette.panelTextDim,
+                    style = TextStyle(fontSize = 11.5.sp, lineHeight = 15.sp),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+/** 单行动作 chip:收藏 / 进出歌单 / 切歌。映射 AgentAction.Like / Playlist / Skip。 */
+@Composable
+internal fun ActionChip(card: PetResultCard.Action, palette: PetPalette) {
+    val bg = if (card.ok) palette.accent.copy(alpha = 0.18f) else Color(0x33FF6B6B)
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(bg)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(card.glyph, style = TextStyle(fontSize = 13.sp))
+        Text(
+            card.label,
+            color = palette.panelText,
+            style = TextStyle(fontSize = 12.5.sp, fontWeight = FontWeight.Medium, lineHeight = 16.sp),
+        )
+    }
+}
+
+/** 空态建议提示 chips(可点直接发送)。 */
+@Composable
+internal fun SuggestedChips(
+    hints: List<String>,
+    palette: PetPalette,
+    onPick: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier.fillMaxWidth().padding(horizontal = 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        hints.take(3).forEach { h ->
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(palette.panel.copy(alpha = 0.72f))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { onPick(h) },
+                    )
+                    .padding(horizontal = 13.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    h,
+                    color = palette.panelText,
+                    style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                    maxLines = 1,
+                )
+            }
         }
     }
 }
