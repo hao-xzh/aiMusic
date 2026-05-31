@@ -384,15 +384,6 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
         }
 
         PipoToggleRow(
-            title = "隐藏点阵叠加",
-            subtitle = "在界面上隐藏复古像素点阵滤镜效果",
-            checked = settings.hideDotPattern,
-            onCheckedChange = {
-                logSettingToggle("hideDotPattern", it)
-                scope.launch { repository.updateSettings(settings.copy(hideDotPattern = it)) }
-            }
-        )
-        PipoToggleRow(
             title = "隐藏 AI 圆球",
             subtitle = "在播放页隐藏 Claudio Pet 的物理实体悬浮球",
             checked = settings.hideAiPetOrb,
@@ -427,6 +418,18 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                 style = TextStyle(fontSize = 11.sp)
             )
         }
+
+        Spacer(modifier = Modifier.height(10.dp))
+        // 清空 AI 对话记忆：清对话流 + 摘要 + 最近原话 + 音乐指代，并清掉界面对话气泡。
+        // 保留 ABOUT YOU（上面那栏是用户显式填的画像，单独编辑/清空）。
+        PipoButton(
+            text = "清空 AI 对话记忆",
+            onClick = {
+                runCatching { PipoGraph.petMemory.clearConversation() }
+                PetChatStore.clear()
+                DiagnosticsLogStore.record("ai_pet", "clear_conversation")
+            }
+        )
 
         // 04 / SYSTEM
         SettingsSectionHeader("04", "SYSTEM")

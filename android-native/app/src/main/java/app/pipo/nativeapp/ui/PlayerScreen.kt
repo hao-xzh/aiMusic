@@ -37,7 +37,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,9 +85,6 @@ fun PlayerScreen(
     viewModel: PlayerViewModel = viewModel(),
 ) {
     val state = viewModel.state
-    // 读用户的"隐藏点阵"开关
-    val settings by app.pipo.nativeapp.data.PipoGraph.repository.settings
-        .collectAsState(initial = app.pipo.nativeapp.data.NativeSettings())
 
     LaunchedEffect(state.isPlaying) {
         // 不在播 → 单次 reset Amp,然后退出。之前 while(true) 在暂停态也每 420ms tick
@@ -186,7 +182,6 @@ fun PlayerScreen(
                 progressProvider = progressProvider,
                 hideAlpha = hideAlpha,
                 hideCover = immersiveActive,
-                hideDotPattern = settings.hideDotPattern,
                 onOpenLyrics = onOpenLyrics,
                 onOpenDistill = onOpenDistill,
                 onOpenSettings = onOpenSettings,
@@ -214,7 +209,6 @@ private fun PortraitPlayerContent(
     progressProvider: () -> Float,
     hideAlpha: Float,
     hideCover: Boolean,
-    hideDotPattern: Boolean,
     onOpenLyrics: () -> Unit,
     onOpenDistill: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -224,11 +218,9 @@ private fun PortraitPlayerContent(
     onSeek: (Float) -> Unit,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
-        // 全局背景（封面驱动 blur + DotField + 切歌 cross-fade）
+        // 全局背景（封面驱动 blur + 切歌 cross-fade，点阵已移除）
         AdaptiveDotField(
             coverUrl = artworkUrl,
-            isPlaying = isPlaying,
-            showDots = !hideDotPattern,
         )
 
         BoxWithConstraints(

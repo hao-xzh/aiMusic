@@ -142,7 +142,10 @@ class PetAgent(
 
             if (calls.isEmpty()) {
                 // 纯文本 —— 收尾（纯聊天 / explain / MiMo 降级都走这）。
-                if (content.isNotBlank()) replyParts.add(content)
+                // content 只在还没有任何工具 reply 时兜底：读工具轮(查历史/搜歌)不产出
+                // reply,这里 content 才是真正答案;但若前面动作工具已给过 reply,这段
+                // content 多半是同义旁白,再拼上去就成了重复回答。
+                if (replyParts.isEmpty() && content.isNotBlank()) replyParts.add(content)
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
                     event = "agent_finish",
@@ -170,7 +173,11 @@ class PetAgent(
                         fields = mapOf("round" to round, "tool" to c.name, "kind" to "action"),
                     )
                 }
-                if (content.isNotBlank()) replyParts.add(content)
+                // 动作工具的 reply 字段才是规范出口。模型经常把同一句话既填进 reply
+                // 又写进 content(义同形不同,LinkedHashSet 去不掉),拼起来就成了
+                // "深夜配点 R&B… 深夜安静下来配点…" 的重复。content 只在工具一个
+                // reply 都没给时兜底。
+                if (replyParts.isEmpty() && content.isNotBlank()) replyParts.add(content)
                 DiagnosticsLogStore.record(
                     area = "ai_agent",
                     event = "agent_finish",
@@ -221,7 +228,7 @@ class PetAgent(
     ): AgentResponse {
         val reply = replyParts.joinToString(" ").trim().ifBlank { fallback }
         return AgentResponse(
-            reply = reply.take(160),
+            reply = reply.take(MAX_REPLY_CHARS),
             actions = actions.toList(),
             musicReferences = musicReferences.distinctBy { referenceKey(it) }.takeLast(8),
         )
@@ -300,13 +307,13 @@ class PetAgent(
                 }
                 "get_play_history" -> summarizeHistory(behaviorEvents)
                 "list_playlists" -> {
-                    val pls = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                    val pls = playlistsForAgent()
                     if (pls.isEmpty()) "（没有歌单）"
                     else pls.joinToString("\n") { "${it.name}（${it.trackCount} 首）" }
                 }
                 "get_playlist_tracks" -> {
                     val name = call.args.optString("name").trim()
-                    val pls = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                    val pls = playlistsForAgent()
                     val target = matchPlaylistByName(pls, name)
                         ?: return@runCatching "没找到歌单「$name」"
                     val limit = call.args.optInt("limit", 20).coerceIn(1, 50)
@@ -343,14 +350,16 @@ class PetAgent(
                     is PlayOutcome.Insert ->
                         AgentAction.Play(listOf(outcome.track), null, insert = true, similar = false) to reply
                     is PlayOutcome.Empty ->
-                        null to (if (reply.isBlank()) outcome.note else "$reply（${outcome.note}）")
+                        // 没找到任何曲目 —— 模型的乐观回复（"好，来原版《September》"）已经不成立，
+                        // 不能再和"没找到"拼一起（就成了"来原版…（这首我没找到）"的自相矛盾）。只回 note。
+                        null to outcome.note
                 }
             }
             "play_playlist" -> {
                 val name = call.args.optString("name").trim()
                 val limit = call.args.optInt("limit", 80).coerceIn(1, 160)
                 if (name.isBlank()) return null to "说个歌单名。"
-                val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                val playlists = playlistsForAgent()
                 val target = matchPlaylistByName(playlists, name)
                     ?: return null to "没找到歌单「$name」。"
                 val tracks = runCatching { repository.tracksForPlaylist(target.id) }.getOrDefault(emptyList())
@@ -376,11 +385,19 @@ class PetAgent(
             "unlike" -> AgentAction.Like(like = false) to reply
             "add_to_playlist" -> {
                 val name = call.args.optString("playlist_name").trim()
-                (if (name.isNotEmpty()) AgentAction.Playlist(add = true, name = name) else null) to reply
+                when {
+                    name.isEmpty() -> null to reply
+                    isCloudDiskName(name) -> null to "「我的网盘」是网易云上传的歌，没法在这儿往里加歌哦。"
+                    else -> AgentAction.Playlist(add = true, name = name) to reply
+                }
             }
             "remove_from_playlist" -> {
                 val name = call.args.optString("playlist_name").trim()
-                (if (name.isNotEmpty()) AgentAction.Playlist(add = false, name = name) else null) to reply
+                when {
+                    name.isEmpty() -> null to reply
+                    isCloudDiskName(name) -> null to "「我的网盘」不是普通歌单，没法从这儿删歌。"
+                    else -> AgentAction.Playlist(add = false, name = name) to reply
+                }
             }
             "say" -> null to reply
             else -> null to reply
@@ -407,6 +424,28 @@ class PetAgent(
 
     private fun referenceKey(ref: PetMemory.MusicReference): String =
         normalizeForMatch("${ref.title}|${ref.artist}")
+
+    /**
+     * 给 AI 看的歌单列表 = 真实歌单 + "我的网盘"。网盘是 LibraryPage.CloudDisk 特殊页，
+     * 不在 repository.playlists 里（sentinel id），不补的话 AI 根本不知道它存在、也没法
+     * list / 播 / 看它。登录了或本地已缓存到网盘曲目时才补。tracksForPlaylist 已把 sentinel
+     * 路由到 cloudDiskTracks，所以 play_playlist / get_playlist_tracks 拿它和普通歌单一样。
+     */
+    private suspend fun playlistsForAgent(): List<PipoPlaylist> {
+        val real = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        val cloudCount = runCatching { repository.cloudTracks.first().size }.getOrDefault(0)
+        val loggedIn = runCatching { repository.account.first() != null }.getOrDefault(false)
+        if (!loggedIn && cloudCount == 0) return real
+        val cloud = PipoPlaylist(id = CLOUD_DISK_PLAYLIST_ID, name = "我的网盘", trackCount = cloudCount)
+        return listOf(cloud) + real
+    }
+
+    /** 网盘是网易云上传曲目，不是可增删的普通歌单。 */
+    private fun isCloudDiskName(name: String): Boolean {
+        val key = normalizeForMatch(name)
+        val cloud = normalizeForMatch("我的网盘")
+        return key.isNotEmpty() && (key == cloud || key in cloud || cloud in key)
+    }
 
     private fun matchPlaylistByName(playlists: List<PipoPlaylist>, name: String): PipoPlaylist? {
         val key = normalizeForMatch(name)
@@ -481,6 +520,18 @@ class PetAgent(
         } else {
             mergeSearchQueries(artistSearchQueries, behaviorSearchQueries, maxItems = 10)
         }
+        // 字面撞名防护：纯口味驱动（没点名艺人、没具体意图）时，种子词是画像拼出的通用短语
+        // （如 "pop night"）。网易云按歌名字面命中，会搜回一堆标题恰好==种子词的同名歌。
+        // 把这些"标题==整条种子词"的命中丢掉——它们是字面撞名，不是真的贴合口味。
+        // 仅在纯口味场景启用：用户点名要某首歌/某歌手时绝不动（那时本就该字面命中）。
+        val dropTitleKeys: Set<String> =
+            if (requestedArtistKeys.isEmpty() && !hasSpecificSearchIntent(intent)) {
+                behaviorSearchQueries.mapNotNull { q ->
+                    TrackDedupe.normalizeTitle(q).takeIf { it.isNotEmpty() }
+                }.toSet()
+            } else {
+                emptySet()
+            }
 
         // 1) 本地库 → 多路召回 → 排序
         val localTracks = runCatching { library.library() }.getOrDefault(emptyList())
@@ -615,6 +666,7 @@ class PetAgent(
             val onlineRaw = neteaseSearch(
                 queries = queries,
                 limitPerQuery = if (requestedArtistKeys.isNotEmpty()) 12 else 4,
+                dropTitleKeys = dropTitleKeys,
             )
             val online = prioritizeRequestedArtists(
                 tracks = onlineRaw,
@@ -651,11 +703,15 @@ class PetAgent(
         )
 
         // 4) 把 pinned 钉到队首，然后是 recall 结果（去重）
+        // capSameTitle：把"不同艺人撞同名"收敛到每个标题 1 首，避免《Pop Night》那种一列同名歌。
+        // 只作用在非 pinned 部分 —— 用户点名要的歌（pinned）哪怕同名也照常钉，不误伤。
         val final = if (pinnedAll.isEmpty()) {
-            promptScoped.take(desired)
+            TrackDedupe.capSameTitle(promptScoped).take(desired)
         } else {
             val pinnedKeys = pinnedAll.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-            val rest = promptScoped.filter { TrackDedupe.songKey(it) !in pinnedKeys }
+            val rest = TrackDedupe.capSameTitle(
+                promptScoped.filter { TrackDedupe.songKey(it) !in pinnedKeys },
+            )
             (pinnedAll + rest).take(desired)
         }
 
@@ -714,6 +770,7 @@ class PetAgent(
                 recentPlay = recentPlay,
                 recentRec = recentRec,
                 behaviorPreference = behaviorPreference,
+                dropTitleKeys = dropTitleKeys,
             ),
         )
     }
@@ -775,9 +832,9 @@ class PetAgent(
                 //   1) 标题精确 + 艺人命中
                 //   2) 艺人命中 + 标题包含/被包含（"七百年后" ↔ "七百年后 (Live)"）
                 // 同档内多版本时按 trackVariantWeight 排,优先 studio 版,避免选 Live/Remix。
-                fun artistOk(t: NativeTrack) = t.artist.split('/', '&', ',', '、').any { a ->
-                    normalizeForMatch(a) in artistKeys
-                }
+                // artist 命中判定走 matchesRequestedArtist —— 同理修「Earth, Wind & Fire」这类
+                // 用 & / , 连起来的乐队名被自己当分隔符拆碎、配不上整串 key 的问题（本地库同样会踩）。
+                fun artistOk(t: NativeTrack) = matchesRequestedArtist(t, artistKeys)
                 val exactWithArtist = library.filter { t ->
                     normalizeForMatch(t.title) == titleKey && artistOk(t)
                 }
@@ -835,12 +892,13 @@ class PetAgent(
                         .filter { hit ->
                             // 只接受标题 fuzzy 命中的，避免搜索引擎乱推不相干的
                             if (!titleMatchesRequest(hit.title, title)) return@filter false
-                            // 单 artist hint 时也校验 artist 命中（防搜索引擎乱推同名）
+                            // 单 artist hint 时也校验 artist 命中（防搜索引擎乱推同名）。
+                            // 必须用 matchesRequestedArtist：它把 hit 的 artist 按 / & , 、feat 拆段
+                            // 逐段比，并兜底「整串 artist 含 key」。否则像「Earth, Wind & Fire」这种
+                            // 用 & 和 , 连起来的乐队名，会被当成分隔符拆碎，永远配不上整串 hint，
+                            // 网易明明有 September 也被这层过滤掉 —— 这就是「搜不到」的真凶。
                             if (singleArtistHint.isNotEmpty()) {
-                                val artistKey = normalizeForMatch(singleArtistHint)
-                                hit.artist.split('/', '&', ',', '、').any {
-                                    normalizeForMatch(it) == artistKey
-                                }
+                                matchesRequestedArtist(hit, setOf(normalizeForMatch(singleArtistHint)))
                             } else true
                         }
                         .minByOrNull { hit -> trackVariantWeight(hit.title) }
@@ -876,8 +934,15 @@ class PetAgent(
         return out
     }
 
-    /** 用一组查询词跑并行 netease 搜索，去重后返回 */
-    private suspend fun neteaseSearch(queries: List<String>, limitPerQuery: Int = 4): List<NativeTrack> {
+    /**
+     * 用一组查询词跑并行 netease 搜索，去重后返回。
+     * [dropTitleKeys]：标题归一后命中其中之一的曲目直接丢弃 —— 防通用种子词字面撞名（见 buildPlayOutcome）。
+     */
+    private suspend fun neteaseSearch(
+        queries: List<String>,
+        limitPerQuery: Int = 4,
+        dropTitleKeys: Set<String> = emptySet(),
+    ): List<NativeTrack> {
         if (queries.isEmpty()) return emptyList()
         return coroutineScope {
             val deferred = queries.map { q ->
@@ -887,6 +952,7 @@ class PetAgent(
             deferred.forEach { d ->
                 d.await().forEach { t ->
                     val id = t.neteaseId ?: return@forEach
+                    if (dropTitleKeys.isNotEmpty() && TrackDedupe.normalizeTitle(t.title) in dropTitleKeys) return@forEach
                     if (!seen.containsKey(id)) seen[id] = t
                 }
             }
@@ -916,6 +982,7 @@ class PetAgent(
         recentPlay: BehaviorLog.RecentPlay,
         recentRec: RecommendationLog.RecentContext,
         behaviorPreference: BehaviorPreferenceSnapshot,
+        dropTitleKeys: Set<String> = emptySet(),
     ): ContinuousQueueSource {
         val pool = reservoir.toMutableList()
         val consumed = mutableSetOf<Long>()
@@ -989,6 +1056,9 @@ class PetAgent(
             }
 
             val collected = LinkedHashMap<String, NativeTrack>()
+            // 续杯同样要按标题封顶：通用种子词（如画像拼出的 "pop night"）在网易云按歌名字面
+            // 命中，会搜回一堆不同艺人的同名歌。每个标题只收 1 首，避免续杯灌出一串同名。
+            val collectedTitles = HashSet<String>()
             for (q in seedQueries) {
                 val hits = runCatching {
                     repository.searchTracks(q, limit = if (requestedArtistKeys.isNotEmpty()) 16 else 8)
@@ -999,6 +1069,9 @@ class PetAgent(
                     if (id in excludeIds || id in consumed) continue
                     val k = TrackDedupe.songKey(t)
                     if (k in consumedSongKeys || k in collected) continue
+                    val titleKey = TrackDedupe.normalizeTitle(t.title)
+                    if (titleKey.isNotEmpty() && titleKey in dropTitleKeys) continue  // 字面撞名：标题==通用种子词
+                    if (titleKey.isNotEmpty() && !collectedTitles.add(titleKey)) continue
                     collected[k] = t
                     if (collected.size >= 18) break  // 多收点给 ranker 选
                 }
@@ -1463,6 +1536,7 @@ class PetAgent(
         private const val MAX_STEPS = 5
         private const val MAX_HISTORY_MESSAGES = 16
         private const val MAX_HISTORY_TEXT_CHARS = 260
+        private const val MAX_REPLY_CHARS = 420
 
         /** 读工具名集合：执行后把结果喂回模型、继续循环；其余视为动作工具（结算成 AgentAction）。 */
         private val READ_TOOLS = setOf(
@@ -1482,9 +1556,9 @@ class PetAgent(
 [
   {"type":"function","function":{
     "name":"play_queue",
-    "description":"放歌：把队列换成新的一组，或插一首。用户表达任何想听歌的信号（说情绪/累/烦/开心、点名艺人或歌、描述场景、催促放歌）都用它。reply 用当前人格语气说一句。",
+	    "description":"放歌：把队列换成新的一组，或插一首。用户表达任何想听歌的信号（说情绪/累/烦/开心、点名艺人或歌、描述场景、催促放歌）都用它。reply 用当前人格自然说话，可以顺带讲一句为什么这样放。",
     "parameters":{"type":"object","properties":{
-      "reply":{"type":"string","description":"你以当前人格说出来的那句话，短、口语、符合人格调性。"},
+	      "reply":{"type":"string","description":"你以当前人格说出来的话。动作确认可短；如果用户表达情绪、场景或问为什么，可以 1-3 句讲清楚音乐选择。"},
       "queue_action":{"type":"string","enum":["replace","insert"],"description":"replace=换整列（指定艺人/情绪/场景探索，默认）；insert=只插一首（用户只点名一首歌、不想毁掉当前队列）。不确定就 replace。"},
       "intent":{"type":"object","description":"放歌意图，只填用得上的字段。","properties":{
         "queryText":{"type":"string","description":"用户原句"},
@@ -1499,17 +1573,17 @@ class PetAgent(
   }},
 	  {"type":"function","function":{
 	    "name":"play_similar",
-	    "description":"基于当前在播曲找类似（用户说 再来几首类似的 / 跟这首一样的 / 类似但更慢）。可选 intent 微调方向（更慢、更燃）。",
+		    "description":"基于当前在播曲找类似（用户说 再来几首类似的 / 跟这首一样的 / 类似但更慢）。可选 intent 微调方向（更慢、更燃）。reply 可以提到当前歌的某个听感锚点。",
 	    "parameters":{"type":"object","properties":{
-	      "reply":{"type":"string"},
+		      "reply":{"type":"string","description":"当前人格的自然回复。可以说明抓住了当前歌的什么感觉，如节奏、声线、氛围或能量。"},
 	      "intent":{"type":"object","description":"可选微调，字段同 play_queue 的 intent。"}
 	    },"required":["reply"]}
 	  }},
 	  {"type":"function","function":{
 	    "name":"play_playlist",
-	    "description":"播放用户已有歌单（用户说 放我的XX歌单 / 播XX歌单 / 来点收藏歌单里的歌）。如果歌单名不明确，先用 list_playlists。reply 用当前人格说一句。",
+		    "description":"播放用户已有歌单（用户说 放我的XX歌单 / 播XX歌单 / 来点收藏歌单里的歌）。如果歌单名不明确，先用 list_playlists。reply 用当前人格自然回应。",
 	    "parameters":{"type":"object","properties":{
-	      "reply":{"type":"string","description":"你以当前人格说出来的那句话，短、口语。"},
+		      "reply":{"type":"string","description":"你以当前人格说出来的话。可以短，也可以提一句这个歌单接下来会是什么气氛。"},
 	      "name":{"type":"string","description":"用户说的歌单名，原样给，app 端模糊匹配。"},
 	      "limit":{"type":"integer","description":"最多装入多少首，默认80，1-160。"}
 	    },"required":["reply","name"]}
@@ -1519,7 +1593,7 @@ class PetAgent(
   {"type":"function","function":{"name":"unlike","description":"取消收藏当前歌（用户说 取消收藏 / 不喜欢这首）。","parameters":{"type":"object","properties":{"reply":{"type":"string"}},"required":["reply"]}}},
   {"type":"function","function":{"name":"add_to_playlist","description":"把当前歌加到指定歌单（加到 XX 歌单 / 丢进 XX / 保存到 XX）。","parameters":{"type":"object","properties":{"reply":{"type":"string"},"playlist_name":{"type":"string","description":"用户说的歌单名，原样给，app 端模糊匹配。"}},"required":["reply","playlist_name"]}}},
   {"type":"function","function":{"name":"remove_from_playlist","description":"把当前歌从指定歌单移除（从 XX 删了 / 把这首从 XX 拿出来）。","parameters":{"type":"object","properties":{"reply":{"type":"string"},"playlist_name":{"type":"string"}},"required":["reply","playlist_name"]}}},
-  {"type":"function","function":{"name":"say","description":"只说话不放歌：纯打招呼/问名字/感谢/闲聊，或回答关于当前歌/听歌历史/音乐知识的问题。回答某歌手成名曲/代表作/推荐某首具体歌时，必须把那首歌写进 music_references，方便用户下一句说 那首/它 时直接播放。","parameters":{"type":"object","properties":{"reply":{"type":"string"},"music_references":{"type":"array","description":"本轮回复里提到、后续可用 那首/它 执行播放的具体歌曲。闲聊没有就给空数组或省略。","items":{"type":"object","properties":{"title":{"type":"string"},"artist":{"type":"string"},"reason":{"type":"string","description":"为什么提到它，如 成名曲/代表作/推荐"}},"required":["title"]}}},"required":["reply"]}}},
+	  {"type":"function","function":{"name":"say","description":"只说话不放歌：纯打招呼/问名字/感谢/闲聊，或回答关于当前歌/听歌历史/音乐知识的问题。这里不需要很短；要像懂音乐、懂用户语境的助手。回答某歌手成名曲/代表作/推荐某首具体歌时，必须把那首歌写进 music_references，方便用户下一句说 那首/它 时直接播放。","parameters":{"type":"object","properties":{"reply":{"type":"string","description":"当前人格的自然回复。聊天、解释、音乐问题可以 2-5 句；要具体、有听感、有承接，不要客服腔。"},"music_references":{"type":"array","description":"本轮回复里提到、后续可用 那首/它 执行播放的具体歌曲。闲聊没有就给空数组或省略。","items":{"type":"object","properties":{"title":{"type":"string"},"artist":{"type":"string"},"reason":{"type":"string","description":"为什么提到它，如 成名曲/代表作/推荐"}},"required":["title"]}}},"required":["reply"]}}},
   {"type":"function","function":{"name":"search_catalog","description":"在线搜曲库找具体歌或艺人，确认是否存在或拿候选。用于 有没有 XX / 找一首歌词是 XX 的 这类需要先查的请求。","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}},
   {"type":"function","function":{"name":"get_play_history","description":"查用户最近听过和跳过的歌。回答 我刚才听啥 / 上一首 / 之前那首，或处理 像我最近常听的 这类要参考历史的请求前先调。","parameters":{"type":"object","properties":{}}}},
   {"type":"function","function":{"name":"list_playlists","description":"列出用户的歌单（名字+数量）。需要按歌单操作或挑歌单前先调。","parameters":{"type":"object","properties":{}}}},

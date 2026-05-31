@@ -567,8 +567,26 @@ private fun DistillLibrary(
     // mode = "library" 是 cover-flow 视图；"select" 是多选 / 准备蒸馏
     var mode by remember { mutableStateOf("library") }
     val selectedIds = remember { mutableStateMapOf<Long, Boolean>() }
-    val selectedPlaylists = remember(selectedIds.size, playlists) {
-        playlists.filter { selectedIds[it.id] == true }
+    // 可蒸馏列表 = "我的网盘"（有曲目时）+ 真实歌单。网盘是 CloudDisk 特殊页、不在
+    // repository.playlists 里，这里合成一条 sentinel id 的 PipoPlaylist 让它能被勾选。
+    // tracksForPlaylist(sentinel) 已路由到 cloudDiskTracks，所以蒸馏拿它和普通歌单一样。
+    // 没勾就不进 selectedPlaylists → 自然不参与分析（符合"没选就不分析网盘"）。
+    val distillablePlaylists = remember(playlists, cloudDiskCount, cloudDiskCover) {
+        if (cloudDiskCount > 0) {
+            listOf(
+                PipoPlaylist(
+                    id = app.pipo.nativeapp.data.CLOUD_DISK_PLAYLIST_ID,
+                    name = "我的网盘",
+                    trackCount = cloudDiskCount,
+                    coverUrl = cloudDiskCover,
+                ),
+            ) + playlists
+        } else {
+            playlists
+        }
+    }
+    val selectedPlaylists = remember(selectedIds.size, distillablePlaylists) {
+        distillablePlaylists.filter { selectedIds[it.id] == true }
     }
     val selectedTrackEstimate = selectedPlaylists.sumOf { it.trackCount }
 
@@ -615,8 +633,6 @@ private fun DistillLibrary(
         Box(modifier = Modifier.fillMaxSize()) {
             AdaptiveDotField(
                 coverUrl = focused?.coverUrl,
-                isPlaying = false,
-                showDots = false,
             )
 
             Column(
@@ -690,7 +706,7 @@ private fun DistillLibrary(
                                 Text("全清", color = PipoColors.TextDim, style = TextStyle(fontSize = 12.sp))
                             }
                         } else {
-                            TextButton(onClick = { playlists.forEach { selectedIds[it.id] = true } }) {
+                            TextButton(onClick = { distillablePlaylists.forEach { selectedIds[it.id] = true } }) {
                                 Text("全选", color = PipoColors.TextDim, style = TextStyle(fontSize = 12.sp))
                             }
                         }
@@ -701,7 +717,7 @@ private fun DistillLibrary(
                             .weight(1f),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 88.dp),
                     ) {
-                        items(items = playlists, key = { it.id }) { p ->
+                        items(items = distillablePlaylists, key = { it.id }) { p ->
                             val checked = selectedIds[p.id] == true
                             Row(
                                 modifier = Modifier

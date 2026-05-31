@@ -144,7 +144,6 @@ data class DistillState(
 )
 
 data class NativeSettings(
-    val hideDotPattern: Boolean = false,
     val hideAiPetOrb: Boolean = true,
     val lyricTranslation: Boolean = false,
     val aiNarration: Boolean = false,

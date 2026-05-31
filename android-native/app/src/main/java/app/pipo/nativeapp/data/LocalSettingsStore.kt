@@ -19,7 +19,6 @@ class LocalSettingsStore(context: Context) {
         // 设置页改 toggle 是低频操作,commit 阻塞 ~10-30ms 用户感知不明显;
         // SuppressLint 是因为 Lint 默认劝用 apply,这里有意选 commit。
         prefs.edit()
-            .putBoolean(KEY_HIDE_DOTS, next.hideDotPattern)
             .putBoolean(KEY_HIDE_AI_PET_ORB, next.hideAiPetOrb)
             .putBoolean(KEY_LYRIC_TRANSLATION, next.lyricTranslation)
             .putBoolean(KEY_AI_NARRATION, next.aiNarration)
@@ -32,7 +31,6 @@ class LocalSettingsStore(context: Context) {
 
     private fun read(): NativeSettings {
         return NativeSettings(
-            hideDotPattern = prefs.getBoolean(KEY_HIDE_DOTS, false),
             hideAiPetOrb = prefs.getBoolean(KEY_HIDE_AI_PET_ORB, true),
             lyricTranslation = prefs.getBoolean(KEY_LYRIC_TRANSLATION, false),
             aiNarration = prefs.getBoolean(KEY_AI_NARRATION, false),
@@ -45,7 +43,6 @@ class LocalSettingsStore(context: Context) {
     }
 
     private companion object {
-        const val KEY_HIDE_DOTS = "hide-dot-pattern"
         const val KEY_HIDE_AI_PET_ORB = "hide-ai-pet-orb"
         const val KEY_LYRIC_TRANSLATION = "lyric-translation"
         const val KEY_AI_NARRATION = "ai-narration"

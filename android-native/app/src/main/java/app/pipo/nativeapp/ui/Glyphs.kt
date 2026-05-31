@@ -435,6 +435,99 @@ private val CloseIconVector: ImageVector by lazy {
     }
 }
 
+// 心形（实心 = 已收藏；描边 = 未收藏）。AI 收藏 / 取消收藏结果卡用。
+private val HeartFilledIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            fill = SolidColor(Color.White),
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 1.6f,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(12f, 20.3f)
+            curveTo(12f, 20.3f, 3.5f, 13.4f, 3.5f, 8.3f)
+            curveTo(3.5f, 5.7f, 5.6f, 4f, 7.9f, 4f)
+            curveTo(9.6f, 4f, 11.2f, 5.1f, 12f, 6.5f)
+            curveTo(12.8f, 5.1f, 14.4f, 4f, 16.1f, 4f)
+            curveTo(18.4f, 4f, 20.5f, 5.7f, 20.5f, 8.3f)
+            curveTo(20.5f, 13.4f, 12f, 20.3f, 12f, 20.3f)
+            close()
+        }
+    }
+}
+
+private val HeartOutlineIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(12f, 20.3f)
+            curveTo(12f, 20.3f, 3.5f, 13.4f, 3.5f, 8.3f)
+            curveTo(3.5f, 5.7f, 5.6f, 4f, 7.9f, 4f)
+            curveTo(9.6f, 4f, 11.2f, 5.1f, 12f, 6.5f)
+            curveTo(12.8f, 5.1f, 14.4f, 4f, 16.1f, 4f)
+            curveTo(18.4f, 4f, 20.5f, 5.7f, 20.5f, 8.3f)
+            curveTo(20.5f, 13.4f, 12f, 20.3f, 12f, 20.3f)
+            close()
+        }
+    }
+}
+
+// 加 / 减号：加入 / 移出歌单结果卡用。
+private val PlusIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.4f,
+            strokeLineCap = StrokeCap.Round,
+        ) {
+            moveTo(12f, 5.5f); verticalLineTo(18.5f)
+            moveTo(5.5f, 12f); horizontalLineTo(18.5f)
+        }
+    }
+}
+
+private val MinusIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.4f,
+            strokeLineCap = StrokeCap.Round,
+        ) {
+            moveTo(5.5f, 12f); horizontalLineTo(18.5f)
+        }
+    }
+}
+
+// 警示三角（叹号）：失败 / "现在没在放歌" 等错误态结果卡用。
+private val AlertIconVector: ImageVector by lazy {
+    iconVector {
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(12f, 4.8f)
+            lineTo(20.8f, 19f)
+            lineTo(3.2f, 19f)
+            close()
+        }
+        path(
+            stroke = SolidColor(Color.White),
+            strokeLineWidth = 2.0f,
+            strokeLineCap = StrokeCap.Round,
+        ) {
+            // 叹号竖线
+            moveTo(12f, 10f); verticalLineTo(13.6f)
+            // 叹号圆点（零长线段 + 圆头 = 实心圆点）
+            moveTo(12f, 16.3f); lineTo(12f, 16.34f)
+        }
+    }
+}
+
 private fun iconVector(builder: ImageVector.Builder.() -> Unit): ImageVector {
     return ImageVector.Builder(
         name = "PipoGlyph",
@@ -557,4 +650,42 @@ fun CloseIcon(
     modifier: Modifier = Modifier.size(14.dp),
 ) {
     Icon(imageVector = CloseIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun HeartGlyph(
+    filled: Boolean,
+    color: Color = Color(0xFFF5F7FF),
+    modifier: Modifier = Modifier.size(16.dp),
+) {
+    Icon(
+        imageVector = if (filled) HeartFilledIconVector else HeartOutlineIconVector,
+        contentDescription = null,
+        tint = color,
+        modifier = modifier,
+    )
+}
+
+@Composable
+fun PlaylistAddGlyph(
+    color: Color = Color(0xFFF5F7FF),
+    modifier: Modifier = Modifier.size(16.dp),
+) {
+    Icon(imageVector = PlusIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun PlaylistRemoveGlyph(
+    color: Color = Color(0xFFF5F7FF),
+    modifier: Modifier = Modifier.size(16.dp),
+) {
+    Icon(imageVector = MinusIconVector, contentDescription = null, tint = color, modifier = modifier)
+}
+
+@Composable
+fun AlertGlyph(
+    color: Color = Color(0xFFF5F7FF),
+    modifier: Modifier = Modifier.size(16.dp),
+) {
+    Icon(imageVector = AlertIconVector, contentDescription = null, tint = color, modifier = modifier)
 }

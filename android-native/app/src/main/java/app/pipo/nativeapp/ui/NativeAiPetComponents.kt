@@ -663,10 +663,10 @@ internal fun ChatHistoryPanel(
 ) {
     val listState = rememberLazyListState()
 
+    // reverseLayout 下 index 0 在最底部。新消息进来滚到 0 即贴底显示最新一条。
     LaunchedEffect(messages.size, pending) {
-        val totalItems = messages.size + (if (pending) 1 else 0)
-        if (totalItems > 0) {
-            listState.animateScrollToItem(totalItems - 1)
+        if (messages.isNotEmpty() || pending) {
+            listState.animateScrollToItem(0)
         }
     }
 
@@ -699,16 +699,21 @@ internal fun ChatHistoryPanel(
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxWidth(),
+            // 反向布局：底部对齐，最新一条永远贴在命令条上方。键盘弹起时可视高度从底部收缩，
+            // 底部锚点(index 0)自动保持不动 —— 最新消息跟着键盘一起升上来，无需监听 ime 手动
+            // 回滚（这正是「键盘升起后最新消息不跟上」的根因修复）。
+            reverseLayout = true,
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(messages.size) { index ->
-                val msg = messages[index]
-                MessageBubbleItem(msg = msg, palette = palette)
-            }
+            // reverseLayout 下先声明的排在最底：thinking 泡 → 最新消息 → … → 最旧(顶部)。
             if (pending) {
                 item {
                     ThinkingBubbleItem(palette = palette)
                 }
+            }
+            items(messages.size) { index ->
+                val msg = messages[messages.size - 1 - index]
+                MessageBubbleItem(msg = msg, palette = palette)
             }
         }
     }
@@ -897,7 +902,7 @@ internal fun GlowBackdrop(
     }
 }
 
-/** 放歌结果卡:▶ + 封面缩略条 + "开整 N 首" + 艺人。映射 AgentAction.Play。 */
+/** 放歌结果卡:播放图标 + 封面缩略条 + "开整 N 首" + 艺人。映射 AgentAction.Play。 */
 @Composable
 internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
     val title = when {
@@ -929,7 +934,7 @@ internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
                 .background(palette.accent.copy(alpha = 0.9f)),
             contentAlignment = Alignment.Center,
         ) {
-            Text("▶", color = palette.actionText, style = TextStyle(fontSize = 15.sp))
+            PlayGlyph(color = palette.actionText, modifier = Modifier.size(18.dp))
         }
         val covers = card.covers.filterNotNull().take(3)
         if (covers.isNotEmpty()) {
@@ -965,19 +970,34 @@ internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
 /** 单行动作 chip:收藏 / 进出歌单 / 切歌。映射 AgentAction.Like / Playlist / Skip。 */
 @Composable
 internal fun ActionChip(card: PetResultCard.Action, palette: PetPalette) {
-    val bg = if (card.ok) palette.accent.copy(alpha = 0.18f) else Color(0x33FF6B6B)
+    val ok = card.ok
+    val bg = if (ok) palette.accent.copy(alpha = 0.16f) else Color(0x29FF6B6B)
+    // 图标 / 文字都用 CenterVertically 的 Row 对齐；图标再套一层定尺寸 Box 居中 ——
+    // 这样不管哪个图标，光学中心都落在同一基线上，不会像之前 emoji 那样各自漂移。
+    val iconTint = if (ok) palette.panelText else Color(0xFFFF8A8A)
+    val labelColor = if (ok) palette.panelText else Color(0xFFFFD9D9)
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
             .background(bg)
-            .padding(horizontal = 12.dp, vertical = 7.dp),
+            .padding(start = 10.dp, end = 14.dp, top = 7.dp, bottom = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
     ) {
-        Text(card.glyph, style = TextStyle(fontSize = 13.sp))
+        Box(modifier = Modifier.size(18.dp), contentAlignment = Alignment.Center) {
+            val iconModifier = Modifier.size(15.dp)
+            when (card.icon) {
+                PetActionIcon.Skip -> SkipForwardGlyph(color = iconTint, modifier = iconModifier)
+                PetActionIcon.Like -> HeartGlyph(filled = true, color = iconTint, modifier = iconModifier)
+                PetActionIcon.Unlike -> HeartGlyph(filled = false, color = iconTint, modifier = iconModifier)
+                PetActionIcon.PlaylistAdd -> PlaylistAddGlyph(color = iconTint, modifier = iconModifier)
+                PetActionIcon.PlaylistRemove -> PlaylistRemoveGlyph(color = iconTint, modifier = iconModifier)
+                PetActionIcon.Error -> AlertGlyph(color = iconTint, modifier = iconModifier)
+            }
+        }
         Text(
             card.label,
-            color = palette.panelText,
+            color = labelColor,
             style = TextStyle(fontSize = 12.5.sp, fontWeight = FontWeight.Medium, lineHeight = 16.sp),
         )
     }

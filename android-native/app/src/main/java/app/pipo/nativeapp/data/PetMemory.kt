@@ -263,6 +263,22 @@ class PetMemory(context: Context) {
     }
 
     /**
+     * 只清对话相关记忆（对话流 / 摘要 / 最近原话 / 可执行音乐指代），**保留** userFacts
+     * （ABOUT YOU 是用户显式编辑的画像，不该被「清空对话」误删）和 firstSeenAt（相识时间）。
+     * 供设置页「清空 AI 对话记忆」调用，与 PetChatStore.clear() 一起把界面与底层都归零。
+     */
+    @Synchronized
+    fun clearConversation() {
+        val m = load()
+        m.conversation.clear()
+        m.musicReferences.clear()
+        m.utterances.clear()
+        m.conversationSummary = ""
+        m.lastSeenAt = System.currentTimeMillis() / 1000
+        save()
+    }
+
+    /**
      * AI prompt 用的一行 digest。
      * 镜像 React getMemoryDigest：陪伴痕迹（总播放数 + 上次说过的话）+ 用户自述
      * 故意**不**包含 loveArtists / skipHotArtists —— 见 React 顶部注释

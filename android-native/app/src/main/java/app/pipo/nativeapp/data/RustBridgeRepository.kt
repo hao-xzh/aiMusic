@@ -195,6 +195,10 @@ class RustBridgeRepository(
     }
 
     override suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean): List<NativeTrack> {
+        // 网盘 sentinel 不是真实 NetEase 歌单，neteasePlaylistTracks(-1) 拿不到东西——
+        // 路由到 cloudDiskTracks（同样命中 tracksMemoryCache[sentinel] 缓存）。让 AI 的
+        // play_playlist / get_playlist_tracks 和蒸馏 DistillEngine 都能把"我的网盘"当普通歌单用。
+        if (playlistId == CLOUD_DISK_PLAYLIST_ID) return cloudDiskTracks(forceRefresh)
         if (!forceRefresh) {
             synchronized(tracksCacheLock) {
                 tracksMemoryCache[playlistId]

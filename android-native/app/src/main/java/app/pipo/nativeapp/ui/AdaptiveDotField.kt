@@ -19,16 +19,15 @@ import androidx.compose.ui.unit.dp
 /**
  * AdaptiveDotField —— 当前曲目封面驱动的全屏背景。
  *
- * 镜像 src/components/AdaptiveDotField.tsx：
  *   - 底层：模糊封面（CrossfadeCoverImage 处理切歌 1100ms 溶解过渡）
  *   - 中层：暗化压底渐变
- *   - 上层：DotField 浅色颗粒
+ *
+ * 原本上层还有一层 DotField 游动点阵，因常驻全屏 60fps 重绘、拖着底层模糊每帧重合成，
+ * 是播放期发热主力，已整体移除（连带设置里的"隐藏点阵"开关）。背景现在是静态的。
  */
 @Composable
 fun AdaptiveDotField(
     coverUrl: String?,
-    isPlaying: Boolean,
-    showDots: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -50,13 +49,6 @@ fun AdaptiveDotField(
                     ),
                 ),
         )
-
-        if (showDots) {
-            DotField(
-                playing = isPlaying && coverUrl != null,
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
     }
 }
 
@@ -76,28 +68,22 @@ private fun BlurredCoverLayer(coverUrl: String?) {
     )
     if (coverUrl == null) return
 
-    // React `blur(70px) saturate(1.3)` —— Compose `Modifier.blur` 单层上限 25dp，
-    // 这里"叠两层 + 高 scale 让 sampling 区域扩大"近似 React 70dp 的视觉烈度。
-    // 嵌套两个 Box 各 blur(25.dp) 等价于一次 ~50dp 的高斯，配合 scale 1.10 让封面
-    // 边缘"溢出 inset:-80"区域，整体观感跟 React 的 saturate + brightness 接近。
+    // React `blur(70px) saturate(1.3)` —— Compose `Modifier.blur` 单层上限 25dp。
+    // 原本叠两层 blur(25dp) 近似 ~50dp 高斯，但这张全屏模糊纹理被上层 DotField 每帧
+    // 拖着重新合成，两层 = 两张全屏 RenderEffect 纹理每帧重采样，是播放期 GPU 发热主力。
+    // 收成单层 blur(25dp) + scale 1.10 扩大 sampling，视觉略锐但去掉一整层全屏混合开销。
     Box(
         modifier = Modifier
             .fillMaxSize()
             .alpha(alpha)
-            .blur(25.dp), // 第二层
+            .scale(scale)
+            .blur(25.dp),
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .scale(scale)
-                .blur(25.dp), // 第一层
-        ) {
-            CrossfadeCoverImage(
-                url = coverUrl,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
-                durationMs = PipoMotion.CoverFadeMs,
-            )
-        }
+        CrossfadeCoverImage(
+            url = coverUrl,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+            durationMs = PipoMotion.CoverFadeMs,
+        )
     }
 }

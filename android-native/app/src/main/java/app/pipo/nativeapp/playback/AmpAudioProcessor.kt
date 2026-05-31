@@ -14,7 +14,7 @@ import kotlin.math.sqrt
  *
  *   1. 拼接到 DefaultAudioSink 的 audioProcessors 链中（passthrough：原样转发输出）
  *   2. 每帧把 PCM 数据 RMS 算出来归一化到 0..1，写到全局 Amp.flow
- *   3. AiPet / DotField 等视觉组件读 Amp.flow 驱动节拍 / 流速 / 颗粒亮度
+ *   3. AiPet 圆球读 Amp.flow 驱动节拍弹跳 / 光晕呼吸
  *
  * 支持 16-bit PCM、24-bit PCM、32-bit float —— ExoPlayer 解码后的常见三种主格式。
  */
@@ -44,7 +44,7 @@ class AmpAudioProcessor : BaseAudioProcessor() {
 
         val rms = runCatching { computeRms(inputBuffer, pos, limit) }.getOrDefault(0f)
         // React 端 baseAlpha 0.42 + amp 0.3 系数，amp 大致在 0..1
-        // 这里直接把 RMS 归一化到 0..1 写进去，AiPet / DotField 自己再二阶平滑
+        // 这里直接把 RMS 归一化到 0..1 写进去，AiPet 圆球自己再二阶平滑
         Amp.set(rms.coerceIn(0f, 1f))
 
         // 把数据原样拷给输出（让音频继续往下游 sink 流）

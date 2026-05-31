@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.ui
 
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
@@ -15,6 +16,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -24,7 +26,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -43,9 +44,11 @@ import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.runtime.Amp
 import app.pipo.nativeapp.runtime.AppForeground
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.PI
 import kotlin.math.sin
 
@@ -83,7 +86,9 @@ fun NativeAiPet(
     val coverCaption by AiCaptionBus.caption.collectAsState()
     val appInForeground by AppForeground.isForeground.collectAsState()
     val scope = rememberCoroutineScope()
-    val messages = remember { mutableStateListOf<PetMessage>() }
+    // 进程级保留 —— 离开播放页 / 看歌词 / 横竖屏切换都不再清空（NativeAiPet 是条件挂载的）。
+    // 冷启动由下方 LaunchedEffect 从 PetMemory 回填最近对话，不再是一进来就空白。
+    val messages = PetChatStore.messages
     var open by remember { mutableStateOf(false) }
     var pending by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf("") }
@@ -91,6 +96,15 @@ fun NativeAiPet(
     // 最新一条助手回复（贴在底部输入条上方，6s 后自动消散）
     var latestReply by remember { mutableStateOf<String?>(null) }
     val emptyHint = remember { EMPTY_HINTS.random() }
+
+    // 冷启动回填：把 PetMemory 里持久化的最近对话还原成气泡。hydrateOnce 幂等，进程存活期间
+    // 反复进出播放页不会重复回填，也不会覆盖本会话已累积的卡片；只有进程被杀后才真正再跑一次。
+    LaunchedEffect(Unit) {
+        val turns = withContext(Dispatchers.IO) {
+            runCatching { PipoGraph.petMemory.conversationContext().turns }.getOrDefault(emptyList())
+        }
+        PetChatStore.hydrateOnce(turns)
+    }
 
     // latestReply 的自动消散
     LaunchedEffect(latestReply) {
@@ -133,11 +147,32 @@ fun NativeAiPet(
     val sway = remember { mutableFloatStateOf(0f) }
     val pulseScale = remember { mutableFloatStateOf(1f) }
     val haloPulse = remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(settings.hideAiPetOrb) {
+    LaunchedEffect(settings.hideAiPetOrb, isPlaying) {
         if (settings.hideAiPetOrb) {
             sway.floatValue = 0f
             pulseScale.floatValue = 1f
             haloPulse.floatValue = 0f
+            return@LaunchedEffect
+        }
+        // 没在播放 → 缓动落位后停掉这条 60fps 风场循环。之前不管放没放、只要停在播放页就
+        // 一直 60fps 写 sway/scale/halo 驱动重绘，待机白烧。isPlaying 变 true 时本 effect
+        // 自动重启，重新进入下面的风场循环；播放中的"思考摆动"仍由循环内 pending 分支处理。
+        if (!isPlaying) {
+            var settleNs = 0L
+            while (kotlin.math.abs(sway.floatValue) > 0.05f ||
+                kotlin.math.abs(pulseScale.floatValue - 1f) > 0.002f
+            ) {
+                androidx.compose.runtime.withFrameNanos { ns ->
+                    val dt = if (settleNs == 0L) 0.016f else
+                        kotlin.math.min(0.05f, (ns - settleNs) / 1_000_000_000f)
+                    settleNs = ns
+                    val k = 1f - kotlin.math.exp(-dt / 0.18f)
+                    sway.floatValue += (0f - sway.floatValue) * k
+                    pulseScale.floatValue += (1f - pulseScale.floatValue) * k
+                }
+            }
+            sway.floatValue = 0f
+            pulseScale.floatValue = 1f
             return@LaunchedEffect
         }
         val rnd = kotlin.random.Random(System.currentTimeMillis())
@@ -309,6 +344,14 @@ fun NativeAiPet(
 
     val keyboard = LocalSoftwareKeyboardController.current
 
+    // 面板打开时，系统返回键 / 返回手势 = 关闭面板。这是最稳的关闭途径，跟圆球是否隐藏、
+    // 面板撑多高都无关 —— 修「面板全屏后盖住点击关闭层、又没圆球，结果关不掉」的死角。
+    // open=false 时本 handler 关闭，返回键交还给 PipoNativeApp 的路由 BackHandler。
+    BackHandler(enabled = open) {
+        keyboard?.hide()
+        open = false
+    }
+
     // 唤起强度 0→1：驱动覆盖层入场。真实播放页仍在下面作为背景。
     val backdropIntensity by androidx.compose.animation.core.animateFloatAsState(
         targetValue = if (open) 1f else 0f,
@@ -398,6 +441,10 @@ fun NativeAiPet(
             ),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
+                // 顶部只让开状态栏，不再留会露出播放页的空白：面板从状态栏下直接铺到命令条。
+                // 关闭改由返回键(上面的 BackHandler)负责，不依赖"点空白处"，所以无需为了能关
+                // 而露出背后的播放页。
+                .statusBarsPadding()
                 .padding(horizontal = 14.dp)
                 // 输入条高 ~52dp + nav bar inset + 间距 8dp
                 .padding(bottom = 70.dp)
@@ -408,7 +455,9 @@ fun NativeAiPet(
                 messages = messages,
                 pending = pending,
                 palette = petPalette,
-                maxHeight = 480.dp,
+                // 用满「状态栏下 → 命令条上」的整段高度，不再固定 480dp：内容少时自然贴在
+                // 输入框上方(wrap)，内容多时撑满可用高度并内部滚动 —— 解决「没全屏 + 底部被截」。
+                maxHeight = configuration.screenHeightDp.dp,
                 transparent = true,
             )
         }
@@ -507,7 +556,7 @@ fun NativeAiPet(
                                 when (action) {
                                     is app.pipo.nativeapp.data.PetAgent.AgentAction.Skip -> {
                                         onSkipFromAgent()
-                                        messages += PetMessage(false, "", PetResultCard.Action(glyph = "⏭", label = "换一首"))
+                                        messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Skip, label = "换一首"))
                                     }
                                     is app.pipo.nativeapp.data.PetAgent.AgentAction.Like -> {
                                         val tid = currentTrack?.neteaseId
@@ -521,42 +570,42 @@ fun NativeAiPet(
                                             runCatching { repository.likeSong(tid, like) }
                                                 .onSuccess {
                                                     messages += PetMessage(false, "", PetResultCard.Action(
-                                                        glyph = if (like) "♥" else "♡",
+                                                        icon = if (like) PetActionIcon.Like else PetActionIcon.Unlike,
                                                         label = if (like) "已加心：${currentTrack?.title.orEmpty()}"
                                                             else "已取消收藏：${currentTrack?.title.orEmpty()}",
                                                     ))
                                                 }
                                                 .onFailure { err ->
                                                     messages += PetMessage(false, "", PetResultCard.Action(
-                                                        glyph = "⚠", ok = false,
+                                                        icon = PetActionIcon.Error, ok = false,
                                                         label = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
                                                     ))
                                                 }
                                         } else {
-                                            messages += PetMessage(false, "", PetResultCard.Action(glyph = "⚠", label = "现在没在放歌", ok = false))
+                                            messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Error, label = "现在没在放歌", ok = false))
                                         }
                                     }
                                     is app.pipo.nativeapp.data.PetAgent.AgentAction.Playlist -> {
                                         val tid = currentTrack?.neteaseId
                                         val opStr = if (action.add) "add" else "del"
                                         if (tid == null) {
-                                            messages += PetMessage(false, "", PetResultCard.Action(glyph = "⚠", label = "现在没在放歌", ok = false))
+                                            messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Error, label = "现在没在放歌", ok = false))
                                         } else {
                                             val playlists = repository.playlists.first()
                                             val target = matchPlaylist(playlists, action.name)
                                             if (target == null) {
-                                                messages += PetMessage(false, "", PetResultCard.Action(glyph = "⚠", label = "没找到歌单「${action.name}」", ok = false))
+                                                messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Error, label = "没找到歌单「${action.name}」", ok = false))
                                             } else {
                                                 runCatching {
                                                     repository.playlistModifyTracks(target.id, opStr, listOf(tid))
                                                 }.onSuccess {
                                                     messages += PetMessage(false, "", PetResultCard.Action(
-                                                        glyph = if (action.add) "＋" else "－",
+                                                        icon = if (action.add) PetActionIcon.PlaylistAdd else PetActionIcon.PlaylistRemove,
                                                         label = "${if (action.add) "已加入" else "已移出"}「${target.name}」",
                                                     ))
                                                 }.onFailure { err ->
                                                     messages += PetMessage(false, "", PetResultCard.Action(
-                                                        glyph = "⚠", ok = false,
+                                                        icon = PetActionIcon.Error, ok = false,
                                                         label = "操作歌单失败：${err.message ?: err::class.java.simpleName}",
                                                     ))
                                                 }
