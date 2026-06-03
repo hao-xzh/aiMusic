@@ -9,9 +9,7 @@ use serde::Serialize;
 use tauri::State;
 
 use super::client::NeteaseClient;
-use super::models::{
-    LyricData, PlaylistDetail, PlaylistInfo, SongUrl, TrackInfo, UserProfile,
-};
+use super::models::{LyricData, PlaylistDetail, PlaylistInfo, SongUrl, TrackInfo, UserProfile};
 
 pub type NeteaseState<'a> = State<'a, Arc<NeteaseClient>>;
 
@@ -44,10 +42,7 @@ pub struct QrCheckOut {
 }
 
 #[tauri::command]
-pub async fn netease_qr_check(
-    state: NeteaseState<'_>,
-    key: String,
-) -> Result<QrCheckOut, String> {
+pub async fn netease_qr_check(state: NeteaseState<'_>, key: String) -> Result<QrCheckOut, String> {
     let r = state.qr_check(&key).await.map_err(to_err)?;
     Ok(QrCheckOut {
         code: r.code,
@@ -73,6 +68,23 @@ pub async fn netease_captcha_sent(
 ) -> Result<CaptchaSentOut, String> {
     let r = state
         .captcha_sent(&phone, ctcode.unwrap_or(86))
+        .await
+        .map_err(to_err)?;
+    Ok(CaptchaSentOut {
+        code: r.code,
+        message: r.message,
+    })
+}
+
+#[tauri::command]
+pub async fn netease_captcha_verify(
+    state: NeteaseState<'_>,
+    phone: String,
+    captcha: String,
+    ctcode: Option<i32>,
+) -> Result<CaptchaSentOut, String> {
+    let r = state
+        .captcha_verify(&phone, &captcha, ctcode.unwrap_or(86))
         .await
         .map_err(to_err)?;
     Ok(CaptchaSentOut {
@@ -110,9 +122,7 @@ pub async fn netease_phone_login(
 }
 
 #[tauri::command]
-pub async fn netease_account(
-    state: NeteaseState<'_>,
-) -> Result<Option<UserProfile>, String> {
+pub async fn netease_account(state: NeteaseState<'_>) -> Result<Option<UserProfile>, String> {
     state.account().await.map_err(to_err)
 }
 
@@ -151,10 +161,7 @@ pub async fn netease_song_urls(
 }
 
 #[tauri::command]
-pub async fn netease_song_lyric(
-    state: NeteaseState<'_>,
-    id: i64,
-) -> Result<LyricData, String> {
+pub async fn netease_song_lyric(state: NeteaseState<'_>, id: i64) -> Result<LyricData, String> {
     state.song_lyric(id).await.map_err(to_err)
 }
 

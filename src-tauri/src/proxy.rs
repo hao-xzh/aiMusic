@@ -48,8 +48,8 @@ async fn fetch(req: Request<Vec<u8>>) -> anyhow::Result<Response<Vec<u8>>> {
     //   http://claudio-cdn.localhost/?u=...
     // 两种都被 url crate 当成合法 URL 解析。
     let uri_str = req.uri().to_string();
-    let parsed = Url::parse(&uri_str)
-        .map_err(|e| anyhow::anyhow!("parse scheme uri {uri_str}: {e}"))?;
+    let parsed =
+        Url::parse(&uri_str).map_err(|e| anyhow::anyhow!("parse scheme uri {uri_str}: {e}"))?;
     let upstream = parsed
         .query_pairs()
         .find(|(k, _)| k == "u")
@@ -57,8 +57,8 @@ async fn fetch(req: Request<Vec<u8>>) -> anyhow::Result<Response<Vec<u8>>> {
         .ok_or_else(|| anyhow::anyhow!("missing ?u= query"))?;
 
     // ---- 2) 校验域名白名单，禁止当开放代理 ----
-    let upstream_url = Url::parse(&upstream)
-        .map_err(|e| anyhow::anyhow!("parse upstream {upstream}: {e}"))?;
+    let upstream_url =
+        Url::parse(&upstream).map_err(|e| anyhow::anyhow!("parse upstream {upstream}: {e}"))?;
     validate_upstream(&upstream_url)?;
 
     // ---- 3) 发给上游，注入官方 Referer + UA ----

@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::netease::models::{AlbumShort, ArtistShort, LyricData, PlaylistDetail, PlaylistInfo, TrackInfo};
+use crate::netease::models::{
+    AlbumShort, ArtistShort, LyricData, PlaylistDetail, PlaylistInfo, TrackInfo,
+};
 
 // --------- schema ---------
 
@@ -105,12 +107,11 @@ impl CacheDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("open cache db: {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open cache db: {}", path.display()))?;
         // WAL：降低写入时的读阻塞；NORMAL：牺牲一点 crash safety 换写吞吐。
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        conn.execute_batch(SCHEMA_V1)
-            .context("apply schema v1")?;
+        conn.execute_batch(SCHEMA_V1).context("apply schema v1")?;
         // 老 lyrics 表没 yrc 列；ALTER 已存在就报错忽略
         let _ = conn.execute("ALTER TABLE lyrics ADD COLUMN yrc TEXT", []);
         Ok(Self {
@@ -203,7 +204,10 @@ impl CacheDb {
                 .collect::<Result<Vec<_>, _>>()?;
             for id in existing {
                 if !ids.contains(&id) {
-                    tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", params![id])?;
+                    tx.execute(
+                        "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+                        params![id],
+                    )?;
                     tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
                 }
             }
@@ -247,8 +251,8 @@ impl CacheDb {
         let tracks = stmt
             .query_map(params![id], |row| {
                 let artists_json: String = row.get(6)?;
-                let artists: Vec<ArtistShort> = serde_json::from_str(&artists_json)
-                    .unwrap_or_default();
+                let artists: Vec<ArtistShort> =
+                    serde_json::from_str(&artists_json).unwrap_or_default();
                 let album_id: Option<i64> = row.get(3)?;
                 let album_name: Option<String> = row.get(4)?;
                 let album_cover: Option<String> = row.get(5)?;
@@ -326,8 +330,8 @@ impl CacheDb {
                    artists_json=excluded.artists_json",
             )?;
             for t in &detail.tracks {
-                let artists_json = serde_json::to_string(&t.artists)
-                    .unwrap_or_else(|_| "[]".into());
+                let artists_json =
+                    serde_json::to_string(&t.artists).unwrap_or_else(|_| "[]".into());
                 let (album_id, album_name, album_cover) = match &t.album {
                     Some(a) => (Some(a.id), Some(a.name.clone()), a.pic_url.clone()),
                     None => (None, None, None),
@@ -385,13 +389,15 @@ impl CacheDb {
                 },
             )
             .optional()?;
-        Ok(row.map(|(lyric, translation, yrc, instrumental, uncollected)| LyricData {
-            lyric,
-            translation,
-            yrc,
-            instrumental: instrumental != 0,
-            uncollected: uncollected != 0,
-        }))
+        Ok(row.map(
+            |(lyric, translation, yrc, instrumental, uncollected)| LyricData {
+                lyric,
+                translation,
+                yrc,
+                instrumental: instrumental != 0,
+                uncollected: uncollected != 0,
+            },
+        ))
     }
 
     pub fn save_lyric(&self, track_id: i64, ly: &LyricData) -> Result<()> {

@@ -145,6 +145,21 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         )
     }
 
+    override suspend fun neteaseCaptchaVerify(
+        phone: String,
+        captcha: String,
+        countryCode: Int,
+    ): CaptchaSentStatus {
+        val o = callObject(
+            "netease_captcha_verify",
+            jsonObject("phone" to phone, "captcha" to captcha, "ctcode" to countryCode),
+        )
+        return CaptchaSentStatus(
+            code = o.getInt("code"),
+            message = o.optStringOrNull("message"),
+        )
+    }
+
     override suspend fun neteasePhoneLogin(
         phone: String,
         captcha: String,
@@ -236,14 +251,61 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             durationS = o.getDouble("durationS"),
             bpm = o.optDoubleOrNull("bpm"),
             bpmConfidence = o.getDouble("bpmConfidence"),
+            firstBeatS = o.optDoubleOrNull("firstBeatS"),
             rmsDb = o.getDouble("rmsDb"),
             peakDb = o.getDouble("peakDb"),
             dynamicRangeDb = o.getDouble("dynamicRangeDb"),
             introEnergy = o.getDouble("introEnergy"),
             outroEnergy = o.getDouble("outroEnergy"),
+            introLowEnergy = o.optDouble("introLowEnergy", 0.0),
+            outroLowEnergy = o.optDouble("outroLowEnergy", 0.0),
+            introVocalDensity = o.optDouble("introVocalDensity", 0.0),
+            outroVocalDensity = o.optDouble("outroVocalDensity", 0.0),
+            drumEntryS = o.optDoubleOrNull("drumEntryS"),
+            vocalEntryS = o.optDoubleOrNull("vocalEntryS"),
+            outroStartS = o.optDoubleOrNull("outroStartS"),
             spectralCentroidHz = o.getDouble("spectralCentroidHz"),
+            tonalKey = if (o.has("tonalKey") && !o.isNull("tonalKey")) o.optInt("tonalKey") else null,
+            tonalConfidence = o.optDouble("tonalConfidence", 0.0),
             headSilenceS = o.optDouble("headSilenceS", 0.0),
             tailSilenceS = o.optDouble("tailSilenceS", 0.0),
+        )
+    }
+
+    override suspend fun audioBuildTransitionClip(
+        currentTrackId: Long,
+        currentUrl: String,
+        nextTrackId: Long,
+        nextUrl: String,
+        currentDurationMs: Long,
+        mixMs: Long,
+        nextStartPositionMs: Long,
+        nextTempoScale: Float,
+        currentGain: Float,
+        nextGain: Float,
+    ): AutoMixTransitionClip {
+        val o = callObject(
+            "audio_build_transition_clip",
+            jsonObject(
+                "currentTrackId" to currentTrackId,
+                "currentUrl" to currentUrl,
+                "nextTrackId" to nextTrackId,
+                "nextUrl" to nextUrl,
+                "currentDurationMs" to currentDurationMs,
+                "mixMs" to mixMs,
+                "nextStartPositionMs" to nextStartPositionMs,
+                "nextTempoScale" to nextTempoScale.toDouble(),
+                "currentGain" to currentGain.toDouble(),
+                "nextGain" to nextGain.toDouble(),
+            ),
+        )
+        return AutoMixTransitionClip(
+            path = o.getString("path"),
+            uri = o.getString("uri"),
+            durationMs = o.getLong("durationMs"),
+            nextResumePositionMs = o.getLong("nextResumePositionMs"),
+            sampleRate = o.optInt("sampleRate", 44_100),
+            channels = o.optInt("channels", 2),
         )
     }
 

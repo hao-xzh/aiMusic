@@ -338,6 +338,7 @@ fun PipoNativeApp() {
                             openTaste = { route = Route.Taste },
                             openSettings = { route = Route.Settings },
                             openDistill = { route = Route.Distill },
+                            openLogin = { route = Route.Login },
                         ),
                     ) {
                         when (route) {

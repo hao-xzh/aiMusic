@@ -23,6 +23,7 @@ use crate::cache::CacheDb;
 /// 默认上限：1024 MB。用户可在设置里改。
 const DEFAULT_MAX_BYTES: i64 = 1024 * 1024 * 1024;
 const KEY_MAX_BYTES: &str = "audio_cache_max_bytes";
+const FEATURE_SCHEMA_VERSION: i64 = 2;
 
 /// schema 单独建表 —— audio_cache（字节）+ audio_features（声学特征）。
 /// 两张表的生命周期不一样：clear 缓存时只清 audio_cache（字节占盘大），
@@ -43,14 +44,25 @@ CREATE TABLE IF NOT EXISTS audio_features (
     duration_s          REAL NOT NULL,
     bpm                 REAL,           -- nullable：解不出来 = NULL
     bpm_confidence      REAL NOT NULL,
+    first_beat_s        REAL,
     rms_db              REAL NOT NULL,
     peak_db             REAL NOT NULL,
     dynamic_range_db    REAL NOT NULL,
     intro_energy        REAL NOT NULL,
     outro_energy        REAL NOT NULL,
+    intro_low_energy    REAL NOT NULL DEFAULT 0,
+    outro_low_energy    REAL NOT NULL DEFAULT 0,
+    intro_vocal_density REAL NOT NULL DEFAULT 0,
+    outro_vocal_density REAL NOT NULL DEFAULT 0,
+    drum_entry_s        REAL,
+    vocal_entry_s       REAL,
+    outro_start_s       REAL,
     spectral_centroid_hz REAL NOT NULL,
+    tonal_key           INTEGER,
+    tonal_confidence    REAL NOT NULL DEFAULT 0,
     head_silence_s      REAL NOT NULL DEFAULT 0,
     tail_silence_s      REAL NOT NULL DEFAULT 0,
+    feature_version     INTEGER NOT NULL DEFAULT 2,
     computed_at         INTEGER NOT NULL
 );
 "#;
@@ -60,6 +72,17 @@ CREATE TABLE IF NOT EXISTS audio_features (
 const SCHEMA_MIGRATIONS: &[&str] = &[
     "ALTER TABLE audio_features ADD COLUMN head_silence_s REAL NOT NULL DEFAULT 0",
     "ALTER TABLE audio_features ADD COLUMN tail_silence_s REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE audio_features ADD COLUMN first_beat_s REAL",
+    "ALTER TABLE audio_features ADD COLUMN intro_low_energy REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE audio_features ADD COLUMN outro_low_energy REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE audio_features ADD COLUMN intro_vocal_density REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE audio_features ADD COLUMN outro_vocal_density REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE audio_features ADD COLUMN drum_entry_s REAL",
+    "ALTER TABLE audio_features ADD COLUMN vocal_entry_s REAL",
+    "ALTER TABLE audio_features ADD COLUMN outro_start_s REAL",
+    "ALTER TABLE audio_features ADD COLUMN tonal_key INTEGER",
+    "ALTER TABLE audio_features ADD COLUMN tonal_confidence REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE audio_features ADD COLUMN feature_version INTEGER NOT NULL DEFAULT 1",
 ];
 
 #[derive(Debug, Clone)]
@@ -107,7 +130,8 @@ impl AudioCache {
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create audio cache dir {}", root.display()))?;
         with_conn(&db, |c| {
-            c.execute_batch(SCHEMA).context("apply audio_cache schema")?;
+            c.execute_batch(SCHEMA)
+                .context("apply audio_cache schema")?;
             // 列追加：已存在就报 duplicate column，忽略
             for sql in SCHEMA_MIGRATIONS {
                 let _ = c.execute(sql, []);
@@ -199,19 +223,13 @@ impl AudioCache {
     }
 
     /// 落盘 + 入库。失败时会回滚（删半成品文件）。
-    pub fn put(
-        &self,
-        track_id: i64,
-        bytes: &[u8],
-        format: Option<&str>,
-    ) -> Result<CacheEntry> {
+    pub fn put(&self, track_id: i64, bytes: &[u8], format: Option<&str>) -> Result<CacheEntry> {
         let ext = format.unwrap_or("bin");
         let path = self.root.join(format!("{track_id}.{ext}"));
 
         // 写 tmp + rename，避免半成品被并发 reader 读到
         let tmp = path.with_extension(format!("{ext}.tmp"));
-        std::fs::write(&tmp, bytes)
-            .with_context(|| format!("write tmp {}", tmp.display()))?;
+        std::fs::write(&tmp, bytes).with_context(|| format!("write tmp {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
 
@@ -301,30 +319,49 @@ impl AudioCache {
 
     pub fn get_features(&self, track_id: i64) -> Result<Option<Acoustics>> {
         with_conn(&self.db, |c| {
-            Ok(c.query_row(
-                "SELECT duration_s, bpm, bpm_confidence, rms_db, peak_db,
-                        dynamic_range_db, intro_energy, outro_energy, spectral_centroid_hz,
-                        head_silence_s, tail_silence_s
+            let row = c
+                .query_row(
+                    "SELECT duration_s, bpm, bpm_confidence, rms_db, peak_db,
+                        dynamic_range_db, intro_energy, outro_energy,
+                        first_beat_s, intro_low_energy, outro_low_energy,
+                        intro_vocal_density, outro_vocal_density, drum_entry_s,
+                        vocal_entry_s, outro_start_s, spectral_centroid_hz,
+                        tonal_key, tonal_confidence, head_silence_s, tail_silence_s,
+                        feature_version
                  FROM audio_features WHERE track_id = ?1",
-                params![track_id],
-                |row| {
-                    Ok(Acoustics {
-                        track_id,
-                        duration_s: row.get::<_, f64>(0)? as f32,
-                        bpm: row.get::<_, Option<f64>>(1)?.map(|v| v as f32),
-                        bpm_confidence: row.get::<_, f64>(2)? as f32,
-                        rms_db: row.get::<_, f64>(3)? as f32,
-                        peak_db: row.get::<_, f64>(4)? as f32,
-                        dynamic_range_db: row.get::<_, f64>(5)? as f32,
-                        intro_energy: row.get::<_, f64>(6)? as f32,
-                        outro_energy: row.get::<_, f64>(7)? as f32,
-                        spectral_centroid_hz: row.get::<_, f64>(8)? as f32,
-                        head_silence_s: row.get::<_, f64>(9)? as f32,
-                        tail_silence_s: row.get::<_, f64>(10)? as f32,
-                    })
-                },
-            )
-            .optional()?)
+                    params![track_id],
+                    |row| {
+                        let features = Acoustics {
+                            track_id,
+                            duration_s: row.get::<_, f64>(0)? as f32,
+                            bpm: row.get::<_, Option<f64>>(1)?.map(|v| v as f32),
+                            bpm_confidence: row.get::<_, f64>(2)? as f32,
+                            rms_db: row.get::<_, f64>(3)? as f32,
+                            peak_db: row.get::<_, f64>(4)? as f32,
+                            dynamic_range_db: row.get::<_, f64>(5)? as f32,
+                            intro_energy: row.get::<_, f64>(6)? as f32,
+                            outro_energy: row.get::<_, f64>(7)? as f32,
+                            first_beat_s: row.get::<_, Option<f64>>(8)?.map(|v| v as f32),
+                            intro_low_energy: row.get::<_, f64>(9)? as f32,
+                            outro_low_energy: row.get::<_, f64>(10)? as f32,
+                            intro_vocal_density: row.get::<_, f64>(11)? as f32,
+                            outro_vocal_density: row.get::<_, f64>(12)? as f32,
+                            drum_entry_s: row.get::<_, Option<f64>>(13)?.map(|v| v as f32),
+                            vocal_entry_s: row.get::<_, Option<f64>>(14)?.map(|v| v as f32),
+                            outro_start_s: row.get::<_, Option<f64>>(15)?.map(|v| v as f32),
+                            spectral_centroid_hz: row.get::<_, f64>(16)? as f32,
+                            tonal_key: row.get::<_, Option<i64>>(17)?.map(|v| v as i32),
+                            tonal_confidence: row.get::<_, f64>(18)? as f32,
+                            head_silence_s: row.get::<_, f64>(19)? as f32,
+                            tail_silence_s: row.get::<_, f64>(20)? as f32,
+                        };
+                        Ok((features, row.get::<_, i64>(21)?))
+                    },
+                )
+                .optional()?;
+            Ok(row.and_then(|(features, version)| {
+                (version >= FEATURE_SCHEMA_VERSION).then_some(features)
+            }))
         })
     }
 
@@ -332,35 +369,61 @@ impl AudioCache {
         with_conn(&self.db, |c| {
             c.execute(
                 "INSERT INTO audio_features (track_id, duration_s, bpm, bpm_confidence,
-                    rms_db, peak_db, dynamic_range_db, intro_energy, outro_energy,
-                    spectral_centroid_hz, head_silence_s, tail_silence_s, computed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    first_beat_s, rms_db, peak_db, dynamic_range_db, intro_energy, outro_energy,
+                    intro_low_energy, outro_low_energy, intro_vocal_density, outro_vocal_density,
+                    drum_entry_s, vocal_entry_s, outro_start_s, spectral_centroid_hz,
+                    tonal_key, tonal_confidence, head_silence_s, tail_silence_s,
+                    feature_version, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                  ON CONFLICT(track_id) DO UPDATE SET
                    duration_s=excluded.duration_s,
                    bpm=excluded.bpm,
                    bpm_confidence=excluded.bpm_confidence,
+                   first_beat_s=excluded.first_beat_s,
                    rms_db=excluded.rms_db,
                    peak_db=excluded.peak_db,
                    dynamic_range_db=excluded.dynamic_range_db,
                    intro_energy=excluded.intro_energy,
                    outro_energy=excluded.outro_energy,
+                   intro_low_energy=excluded.intro_low_energy,
+                   outro_low_energy=excluded.outro_low_energy,
+                   intro_vocal_density=excluded.intro_vocal_density,
+                   outro_vocal_density=excluded.outro_vocal_density,
+                   drum_entry_s=excluded.drum_entry_s,
+                   vocal_entry_s=excluded.vocal_entry_s,
+                   outro_start_s=excluded.outro_start_s,
                    spectral_centroid_hz=excluded.spectral_centroid_hz,
+                   tonal_key=excluded.tonal_key,
+                   tonal_confidence=excluded.tonal_confidence,
                    head_silence_s=excluded.head_silence_s,
                    tail_silence_s=excluded.tail_silence_s,
+                   feature_version=excluded.feature_version,
                    computed_at=excluded.computed_at",
                 params![
                     a.track_id,
                     a.duration_s as f64,
                     a.bpm.map(|v| v as f64),
                     a.bpm_confidence as f64,
+                    a.first_beat_s.map(|v| v as f64),
                     a.rms_db as f64,
                     a.peak_db as f64,
                     a.dynamic_range_db as f64,
                     a.intro_energy as f64,
                     a.outro_energy as f64,
+                    a.intro_low_energy as f64,
+                    a.outro_low_energy as f64,
+                    a.intro_vocal_density as f64,
+                    a.outro_vocal_density as f64,
+                    a.drum_entry_s.map(|v| v as f64),
+                    a.vocal_entry_s.map(|v| v as f64),
+                    a.outro_start_s.map(|v| v as f64),
                     a.spectral_centroid_hz as f64,
+                    a.tonal_key.map(|v| v as i64),
+                    a.tonal_confidence as f64,
                     a.head_silence_s as f64,
                     a.tail_silence_s as f64,
+                    FEATURE_SCHEMA_VERSION,
                     now_ms(),
                 ],
             )?;
@@ -373,10 +436,7 @@ impl AudioCache {
     pub fn clear_features(&self) -> Result<()> {
         with_conn(&self.db, |c| {
             c.execute("DELETE FROM audio_features", [])?;
-            c.execute(
-                "DELETE FROM app_state WHERE key LIKE 'analysis:v3:%'",
-                [],
-            )?;
+            c.execute("DELETE FROM app_state WHERE key LIKE 'analysis:v3:%'", [])?;
             Ok(())
         })
     }
@@ -406,13 +466,17 @@ pub fn infer_ext_from_url(url: &str) -> Option<String> {
     let dot = last.rfind('.')?;
     let ext = last[dot + 1..].to_ascii_lowercase();
     // 白名单一下，避免奇怪扩展名落盘
-    matches!(ext.as_str(), "mp3" | "flac" | "m4a" | "aac" | "ogg" | "wav")
-        .then_some(ext)
+    matches!(ext.as_str(), "mp3" | "flac" | "m4a" | "aac" | "ogg" | "wav").then_some(ext)
 }
 
 /// 简单的 content-type → ext 兜底。
 pub fn ext_from_content_type(ct: &str) -> Option<String> {
-    let main = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+    let main = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
     match main.as_str() {
         "audio/mpeg" => Some("mp3".into()),
         "audio/flac" | "audio/x-flac" => Some("flac".into()),

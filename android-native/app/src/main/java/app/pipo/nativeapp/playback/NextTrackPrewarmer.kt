@@ -24,7 +24,7 @@ class NextTrackPrewarmer(
         val dataSource = PipoMediaDataSources.cacheFactory(appContext).createDataSourceForDownloading()
         val dataSpec = DataSpec.Builder()
             .setUri(Uri.parse(url))
-            .setKey(url)
+            .setKey(PlaybackCacheKeys.forTrack(track) ?: url)
             .setPosition(0L)
             .setLength(PREWARM_BYTES)
             .setFlags(DataSpec.FLAG_ALLOW_CACHE_FRAGMENTATION or DataSpec.FLAG_MIGHT_NOT_USE_FULL_NETWORK_SPEED)

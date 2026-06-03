@@ -20,10 +20,7 @@ fn to_err<E: std::fmt::Display>(e: E) -> String {
 // --------- playlists ---------
 
 #[tauri::command]
-pub fn cache_get_playlists(
-    state: CacheState<'_>,
-    uid: i64,
-) -> Result<Vec<CachedPlaylist>, String> {
+pub fn cache_get_playlists(state: CacheState<'_>, uid: i64) -> Result<Vec<CachedPlaylist>, String> {
     state.get_playlists(uid).map_err(to_err)
 }
 
@@ -58,10 +55,7 @@ pub fn cache_save_playlist_detail(
 // --------- lyrics ---------
 
 #[tauri::command]
-pub fn cache_get_lyric(
-    state: CacheState<'_>,
-    track_id: i64,
-) -> Result<Option<LyricData>, String> {
+pub fn cache_get_lyric(state: CacheState<'_>, track_id: i64) -> Result<Option<LyricData>, String> {
     state.get_lyric(track_id).map_err(to_err)
 }
 
@@ -77,18 +71,11 @@ pub fn cache_save_lyric(
 // --------- app_state KV（上次播放位置等） ---------
 
 #[tauri::command]
-pub fn cache_get_state(
-    state: CacheState<'_>,
-    key: String,
-) -> Result<Option<String>, String> {
+pub fn cache_get_state(state: CacheState<'_>, key: String) -> Result<Option<String>, String> {
     state.get_state(&key).map_err(to_err)
 }
 
 #[tauri::command]
-pub fn cache_set_state(
-    state: CacheState<'_>,
-    key: String,
-    value: String,
-) -> Result<(), String> {
+pub fn cache_set_state(state: CacheState<'_>, key: String, value: String) -> Result<(), String> {
     state.set_state(&key, &value).map_err(to_err)
 }

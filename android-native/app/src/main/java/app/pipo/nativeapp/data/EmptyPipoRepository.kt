@@ -59,6 +59,12 @@ class EmptyPipoRepository : PipoRepository {
     override suspend fun sendPhoneCaptcha(phone: String, countryCode: Int): CaptchaSentStatus =
         CaptchaSentStatus(code = -1, message = "Bridge unavailable")
 
+    override suspend fun verifyPhoneCaptcha(
+        phone: String,
+        captcha: String,
+        countryCode: Int,
+    ): CaptchaSentStatus = CaptchaSentStatus(code = -1, message = "Bridge unavailable")
+
     override suspend fun loginWithPhone(
         phone: String,
         captcha: String,
@@ -107,6 +113,21 @@ class EmptyPipoRepository : PipoRepository {
         headSilenceS = 0.0,
         tailSilenceS = 0.0,
     )
+
+    override suspend fun audioBuildTransitionClip(
+        currentTrackId: Long,
+        currentUrl: String,
+        nextTrackId: Long,
+        nextUrl: String,
+        currentDurationMs: Long,
+        mixMs: Long,
+        nextStartPositionMs: Long,
+        nextTempoScale: Float,
+        currentGain: Float,
+        nextGain: Float,
+    ): AutoMixTransitionClip {
+        throw UnsupportedOperationException("Native bridge unavailable")
+    }
 
     override suspend fun refreshAiConfig() = Unit
     override suspend fun setAiProvider(providerId: String) {

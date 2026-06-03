@@ -12,6 +12,7 @@
 //!   - BPM：低通 200Hz → onset envelope（spectral flux 简化版：能量差正部分）→
 //!          自相关在 60-200 BPM 区间找最大峰
 //!   - 响度：整曲 RMS（dBFS），头 8s / 尾 8s 单独算，给 mix-planner 用
+//!   - 结构：低频/人声频段的秒级能量，用来估计鼓点入口、人声入口、尾奏起点
 //!   - 动态范围：peak dBFS - mean dBFS（粗略 DR，不是 EBU DR）
 //!   - 谱重心：FFT 一帧的频率加权均值，反映"亮 / 暗"
 //!
@@ -40,6 +41,8 @@ pub struct Acoustics {
     pub bpm: Option<f32>,
     /// 0..1 自相关主峰强度
     pub bpm_confidence: f32,
+    /// 前 6 秒内最明显的低频 onset，给单播放器 AutoMix 找 phrase 边界用。
+    pub first_beat_s: Option<f32>,
     /// 整曲 RMS dBFS（负数）
     pub rms_db: f32,
     /// 整曲峰值 dBFS（≤0）
@@ -50,8 +53,31 @@ pub struct Acoustics {
     pub intro_energy: f32,
     /// 尾 8 秒 RMS
     pub outro_energy: f32,
+    /// 头 8 秒低频 RMS，判断下一首是否一进来就很重。
+    #[serde(default)]
+    pub intro_low_energy: f32,
+    /// 尾 8 秒低频 RMS，判断当前歌尾部是否还很满。
+    #[serde(default)]
+    pub outro_low_energy: f32,
+    /// 头 8 秒人声密度代理，0..1。
+    #[serde(default)]
+    pub intro_vocal_density: f32,
+    /// 尾 8 秒人声密度代理，0..1。
+    #[serde(default)]
+    pub outro_vocal_density: f32,
+    /// 第一次明显低频鼓/节拍入口（秒）。
+    pub drum_entry_s: Option<f32>,
+    /// 第一段人声入口（秒）。
+    pub vocal_entry_s: Option<f32>,
+    /// 最后一段人声结束后的尾奏起点（秒）；如果人声唱到文件尾则为 None。
+    pub outro_start_s: Option<f32>,
     /// 谱重心（Hz）—— 音色亮度的代理。男声唱大约 1500，女声 2500，金属 4000+
     pub spectral_centroid_hz: f32,
+    /// 粗略主 pitch class，0=C, 1=C#, ... 11=B。不是 mastering 级调性，只做兼容性弱信号。
+    pub tonal_key: Option<i32>,
+    /// tonal_key 的置信度，0..1。
+    #[serde(default)]
+    pub tonal_confidence: f32,
     /// 头部连续静音长度（秒）—— 第一帧 RMS > -50 dBFS 之前的时长。
     /// "natural" silence（如 fade-in 前的静默），跟编码器 padding 不一样。
     pub head_silence_s: f32,
@@ -81,9 +107,36 @@ pub fn analyze_file(track_id: i64, path: &Path) -> Result<Acoustics> {
     let outro_energy = rms_lin(&samples[outro_start..]);
 
     let lowband = lowpass(&samples, TARGET_SR as f32, 200.0);
-    let (bpm, bpm_conf) = detect_bpm(&lowband);
+    let vocal_band = biquad_filter(
+        &biquad_filter(
+            &samples,
+            TARGET_SR as f32,
+            BiquadKind::Highpass,
+            250.0,
+            0.707,
+        ),
+        TARGET_SR as f32,
+        BiquadKind::Lowpass,
+        3500.0,
+        0.707,
+    );
+    let energy_per_sec = rms_per_second(&samples, TARGET_SR);
+    let low_energy_per_sec = rms_per_second(&lowband, TARGET_SR);
+    let vocal_energy_per_sec = rms_per_second(&vocal_band, TARGET_SR);
+    let vocal_per_sec =
+        compute_vocal_prob(&energy_per_sec, &vocal_energy_per_sec, &low_energy_per_sec);
+    let total_sec = energy_per_sec.len();
+    let intro_low_energy = mean_window(&low_energy_per_sec, 0, 8);
+    let outro_low_energy = mean_window(&low_energy_per_sec, total_sec.saturating_sub(8), total_sec);
+    let intro_vocal_density = mean_window(&vocal_per_sec, 0, 8);
+    let outro_vocal_density = mean_window(&vocal_per_sec, total_sec.saturating_sub(8), total_sec);
+    let drum_entry_s = detect_drum_entry(&low_energy_per_sec);
+    let vocal_entry_s = detect_vocal_entry(&vocal_per_sec);
+    let outro_start_s = detect_outro_start(&vocal_per_sec, total_sec);
+    let (bpm, bpm_conf, first_beat_s) = detect_bpm(&lowband);
 
     let spectral_centroid_hz = spectral_centroid(&samples, TARGET_SR);
+    let (tonal_key, tonal_confidence) = estimate_tonal_key(&samples, TARGET_SR);
     let (head_silence_s, tail_silence_s) = silence_boundaries(&samples, TARGET_SR);
 
     Ok(Acoustics {
@@ -91,12 +144,22 @@ pub fn analyze_file(track_id: i64, path: &Path) -> Result<Acoustics> {
         duration_s,
         bpm,
         bpm_confidence: bpm_conf,
+        first_beat_s,
         rms_db,
         peak_db,
         dynamic_range_db: peak_db - rms_db,
         intro_energy,
         outro_energy,
+        intro_low_energy,
+        outro_low_energy,
+        intro_vocal_density,
+        outro_vocal_density,
+        drum_entry_s,
+        vocal_entry_s,
+        outro_start_s,
         spectral_centroid_hz,
+        tonal_key,
+        tonal_confidence,
         head_silence_s,
         tail_silence_s,
     })
@@ -333,14 +396,167 @@ fn lowpass(input: &[f32], sr: f32, fc: f32) -> Vec<f32> {
     out
 }
 
+enum BiquadKind {
+    Lowpass,
+    Highpass,
+}
+
+fn biquad_filter(input: &[f32], sr: f32, kind: BiquadKind, fc: f32, q: f32) -> Vec<f32> {
+    let w0 = std::f32::consts::TAU * fc / sr;
+    let cosw = w0.cos();
+    let sinw = w0.sin();
+    let alpha = sinw / (2.0 * q);
+    let a0 = 1.0 + alpha;
+    let (b0, b1, b2) = match kind {
+        BiquadKind::Lowpass => (
+            ((1.0 - cosw) / 2.0) / a0,
+            (1.0 - cosw) / a0,
+            ((1.0 - cosw) / 2.0) / a0,
+        ),
+        BiquadKind::Highpass => (
+            ((1.0 + cosw) / 2.0) / a0,
+            (-(1.0 + cosw)) / a0,
+            ((1.0 + cosw) / 2.0) / a0,
+        ),
+    };
+    let a1 = (-2.0 * cosw) / a0;
+    let a2 = (1.0 - alpha) / a0;
+    let mut out = Vec::with_capacity(input.len());
+    let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &x0 in input {
+        let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        out.push(y0);
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+    out
+}
+
+fn rms_per_second(samples: &[f32], sr: u32) -> Vec<f32> {
+    let sr = sr as usize;
+    let total_sec = samples.len() / sr;
+    let mut out = Vec::with_capacity(total_sec);
+    for s in 0..total_sec {
+        let start = s * sr;
+        let end = start + sr;
+        out.push(rms_lin(&samples[start..end]));
+    }
+    out
+}
+
+fn compute_vocal_prob(total: &[f32], vocal: &[f32], low: &[f32]) -> Vec<f32> {
+    let n = total.len().min(vocal.len()).min(low.len());
+    let mut raw = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = total[i] + 1e-6;
+        let v = vocal[i] / t;
+        let l = low[i] / t;
+        raw.push((v * 1.4 - l * 0.6 - 0.12).clamp(0.0, 1.0));
+    }
+    median_filter(&raw, 5)
+}
+
+fn median_filter(input: &[f32], window: usize) -> Vec<f32> {
+    if input.is_empty() || window <= 1 {
+        return input.to_vec();
+    }
+    let half = window / 2;
+    let mut out = Vec::with_capacity(input.len());
+    for i in 0..input.len() {
+        let start = i.saturating_sub(half);
+        let end = (i + half + 1).min(input.len());
+        let mut slice = input[start..end].to_vec();
+        slice.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out.push(slice[slice.len() / 2]);
+    }
+    out
+}
+
+fn mean_window(arr: &[f32], start: usize, end: usize) -> f32 {
+    let a = start.min(arr.len());
+    let b = end.min(arr.len());
+    if b <= a {
+        return 0.0;
+    }
+    arr[a..b].iter().copied().sum::<f32>() / (b - a) as f32
+}
+
+fn median(arr: &[f32]) -> f32 {
+    if arr.is_empty() {
+        return 0.0;
+    }
+    let mut s = arr.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
+fn detect_drum_entry(low_per_sec: &[f32]) -> Option<f32> {
+    if low_per_sec.len() < 10 {
+        return None;
+    }
+    let baseline = median(&low_per_sec[..low_per_sec.len().min(5)]);
+    let threshold = (baseline * 1.4).max(0.02);
+    let mut run = 0usize;
+    for (i, &v) in low_per_sec.iter().enumerate() {
+        if v >= threshold {
+            run += 1;
+            if run >= 2 {
+                return Some((i + 1 - run) as f32);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+fn detect_vocal_entry(vocal_per_sec: &[f32]) -> Option<f32> {
+    let mut run = 0usize;
+    for (i, &v) in vocal_per_sec.iter().enumerate() {
+        if v >= 0.5 {
+            run += 1;
+            if run >= 2 {
+                return Some((i + 1 - run) as f32);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+fn detect_outro_start(vocal_per_sec: &[f32], total_sec: usize) -> Option<f32> {
+    let mut last_vocal_end: Option<usize> = None;
+    let mut in_vocal = false;
+    for (i, &v) in vocal_per_sec.iter().enumerate() {
+        if v >= 0.5 {
+            in_vocal = true;
+        } else if in_vocal {
+            last_vocal_end = Some(i);
+            in_vocal = false;
+        }
+    }
+    if in_vocal {
+        return None;
+    }
+    let last = last_vocal_end?;
+    if total_sec.saturating_sub(last) < 3 {
+        return None;
+    }
+    let start = (last + 1).min(total_sec.saturating_sub(2));
+    (start > 0).then_some(start as f32)
+}
+
 /// BPM 检测：能量包络（hop=256, ~86 fps）→ 高通去 DC → 自相关在 60-200 BPM 找峰。
 ///
 /// 返回 (bpm, confidence)。confidence 是主峰高度归一化到 0..1，0.3 以上算可信。
-fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32) {
+fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32, Option<f32>) {
     const HOP: usize = 256;
     let frame_count = lowband.len() / HOP;
     if frame_count < 64 {
-        return (None, 0.0);
+        return (None, 0.0, None);
     }
     let frame_rate = TARGET_SR as f32 / HOP as f32; // ~86 Hz
 
@@ -374,7 +590,7 @@ fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32) {
     let lag_max = (frame_rate * 60.0 / 60.0).ceil() as usize; // 60 BPM
     let lag_max = lag_max.min(env.len() / 2);
     if lag_min >= lag_max {
-        return (None, 0.0);
+        return (None, 0.0, None);
     }
 
     // 自相关系数 r(lag)
@@ -395,14 +611,23 @@ fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32) {
         }
     }
     if best_lag == 0 || energy0 < 1e-9 {
-        return (None, 0.0);
+        return (None, 0.0, None);
     }
     let bpm = 60.0 * frame_rate / best_lag as f32;
     let confidence = (best_val / energy0).clamp(0.0, 1.0);
     if confidence < 0.05 {
-        return (None, confidence);
+        return (None, confidence, None);
     }
-    (Some(bpm), confidence)
+    let search_end = (frame_rate * 6.0).floor() as usize;
+    let mut peak_i = 0usize;
+    let mut peak_v = 0.0f32;
+    for (i, &v) in onset.iter().take(search_end.min(onset.len())).enumerate() {
+        if v > peak_v {
+            peak_i = i;
+            peak_v = v;
+        }
+    }
+    (Some(bpm), confidence, Some(peak_i as f32 / frame_rate))
 }
 
 /// 谱重心：取曲中中段的 N 帧 FFT，频率加权均值。
@@ -435,6 +660,56 @@ fn spectral_centroid(samples: &[f32], sr: u32) -> f32 {
         (acc_num / acc_den) as f32
     } else {
         0.0
+    }
+}
+
+fn estimate_tonal_key(samples: &[f32], sr: u32) -> (Option<i32>, f32) {
+    const FFT_SIZE: usize = 2048;
+    if samples.len() < FFT_SIZE * 8 {
+        return (None, 0.0);
+    }
+    let start = samples.len() / 4;
+    let end = (samples.len() * 3 / 4).min(samples.len());
+    let frames_available = (end - start) / FFT_SIZE;
+    if frames_available == 0 {
+        return (None, 0.0);
+    }
+    let step = (frames_available / 12).max(1);
+    let mut chroma = [0.0f64; 12];
+    let mut used = 0usize;
+    for f in (0..frames_available).step_by(step).take(16) {
+        let frame_start = start + f * FFT_SIZE;
+        let bins = fft_mag_dft(&samples[frame_start..frame_start + FFT_SIZE]);
+        let bin_hz = sr as f32 / FFT_SIZE as f32;
+        for (i, &mag) in bins.iter().enumerate().skip(5) {
+            let hz = i as f32 * bin_hz;
+            if !(55.0..=5000.0).contains(&hz) {
+                continue;
+            }
+            let midi = 69.0 + 12.0 * (hz / 440.0).log2();
+            let pc = ((midi.round() as i32).rem_euclid(12)) as usize;
+            // 低频基音更可信，高频泛音弱化。
+            let weight = (1.0 / (1.0 + hz / 1600.0)) as f64;
+            chroma[pc] += mag as f64 * weight;
+        }
+        used += 1;
+    }
+    if used == 0 {
+        return (None, 0.0);
+    }
+    let total: f64 = chroma.iter().sum();
+    if total <= 1e-9 {
+        return (None, 0.0);
+    }
+    let mut indexed: Vec<(usize, f64)> = chroma.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let best = indexed[0];
+    let second = indexed.get(1).map(|(_, v)| *v).unwrap_or(0.0);
+    let confidence = ((best.1 - second) / total).clamp(0.0, 1.0) as f32;
+    if confidence < 0.015 {
+        (None, confidence)
+    } else {
+        (Some(best.0 as i32), confidence)
     }
 }
 

@@ -28,7 +28,9 @@ pub fn handle_audio(
     responder: UriSchemeResponder,
 ) {
     // 提前抓 state（在主线程 ctx 还活着时拿）
-    let cache: Option<Arc<AudioCache>> = ctx.app_handle().try_state::<Arc<AudioCache>>()
+    let cache: Option<Arc<AudioCache>> = ctx
+        .app_handle()
+        .try_state::<Arc<AudioCache>>()
         .map(|s| s.inner().clone());
 
     tauri::async_runtime::spawn(async move {
@@ -76,10 +78,7 @@ async fn handle(
             match std::fs::read(&entry.path) {
                 Ok(bytes) => {
                     let _ = cache.touch(track_id);
-                    log::debug!(
-                        "[audio_cache] HIT track={track_id} bytes={}",
-                        bytes.len()
-                    );
+                    log::debug!("[audio_cache] HIT track={track_id} bytes={}", bytes.len());
                     return Ok(local_response(
                         bytes,
                         entry.format.as_deref(),
@@ -139,11 +138,8 @@ async fn handle(
         .map(String::from);
 
     // ---- 5) 写缓存（best-effort） ----
-    let format = infer_ext_from_url(&upstream).or_else(|| {
-        content_type
-            .as_deref()
-            .and_then(ext_from_content_type)
-    });
+    let format = infer_ext_from_url(&upstream)
+        .or_else(|| content_type.as_deref().and_then(ext_from_content_type));
     if let Some(cache) = cache.as_ref() {
         if let Err(e) = cache.put(track_id, &bytes, format.as_deref()) {
             log::warn!("[audio_cache] put failed for track {track_id}: {e}");
@@ -157,7 +153,11 @@ async fn handle(
     }
 
     // ---- 6) 回响应 ----
-    Ok(local_response(bytes, format.as_deref(), range_header.as_deref()))
+    Ok(local_response(
+        bytes,
+        format.as_deref(),
+        range_header.as_deref(),
+    ))
 }
 
 /// 用本地字节构造响应 —— 命中走它，新下完也走它。

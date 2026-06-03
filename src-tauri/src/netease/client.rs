@@ -30,9 +30,8 @@ const LINUX_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                         (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36";
 const HOST: &str = "https://music.163.com";
 
-/// "realIP" 业务参数：网易云风控信这个参数里的 IP，不看 TCP 源。
-/// 随便填一个中国大陆公网 IP 就能绕过 `-462 风控触发`。
-/// （这是社区通行做法，YesPlayMusic / NeteaseCloudMusicApi 也这么干。）
+/// "realIP" 业务参数：网易云会把它作为地区/客户端身份信号之一。
+/// 使用稳定的大陆公网 IP 可以减少 `-462` 这类地区误判，但不能保证通过账号风险校验。
 const FAKE_REAL_IP: &str = "116.25.146.177";
 const SEED_COOKIES: &[&str] = &[
     "os=pc",
@@ -54,6 +53,7 @@ pub struct NeteaseClient {
 
 impl NeteaseClient {
     /// 不带持久化 —— 测试 / 探针用。
+    #[allow(dead_code)]
     pub fn new() -> Result<Self> {
         Self::new_with_persist(None)
     }
@@ -80,7 +80,7 @@ impl NeteaseClient {
         };
 
         // 2. 再把 PC 身份种子 cookie 插进去（存在就覆盖；不存在就新增）。
-        //    这些是网易云 PC 客户端每次请求都带的"身份信标"，跟 realIP 一起骗过 -462。
+        //    这些是网易云 PC 客户端每次请求都带的"身份信标"，跟 realIP 一起降低地区误判。
         seed_identity_cookies(&mut store)?;
 
         let cookies = Arc::new(CookieStoreMutex::new(store));
@@ -145,7 +145,47 @@ impl NeteaseClient {
     }
 
     /// 内部用：发一个 weapi POST。`endpoint` 不带前导 `/`，例如 `"login/qrcode/unikey"`。
-    pub async fn weapi<T: DeserializeOwned>(&self, endpoint: &str, mut params: Value) -> Result<T> {
+    pub async fn weapi<T: DeserializeOwned>(&self, endpoint: &str, params: Value) -> Result<T> {
+        self.weapi_at_path(
+            format!("weapi/{}", endpoint.trim_start_matches('/')),
+            params,
+            &[],
+        )
+        .await
+    }
+
+    /// 发到 `/api/...` 路径，但仍使用 weapi 加密体。
+    pub async fn weapi_api<T: DeserializeOwned>(&self, endpoint: &str, params: Value) -> Result<T> {
+        self.weapi_at_path(
+            format!("api/{}", endpoint.trim_start_matches('/')),
+            params,
+            &[],
+        )
+        .await
+    }
+
+    /// 发 weapi 请求时临时覆盖 Cookie header。用于手机号登录这种对客户端身份
+    /// 比较敏感的端点，避免把 iOS 身份永久写进全局 cookie jar。
+    pub async fn weapi_with_cookie_overrides<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        params: Value,
+        cookie_overrides: &[(&str, &str)],
+    ) -> Result<T> {
+        self.weapi_at_path(
+            format!("weapi/{}", endpoint.trim_start_matches('/')),
+            params,
+            cookie_overrides,
+        )
+        .await
+    }
+
+    async fn weapi_at_path<T: DeserializeOwned>(
+        &self,
+        path: String,
+        mut params: Value,
+        cookie_overrides: &[(&str, &str)],
+    ) -> Result<T> {
         // 注入两个"身份"参数：
         //   - csrf_token: 未登录时空串，登录后从 cookie 里拿
         //   - realIP:     告诉风控这是大陆来源，否则 -462
@@ -160,14 +200,25 @@ impl NeteaseClient {
         }
 
         let body = weapi_encrypt(&params);
-        let url = format!("{HOST}/weapi/{}", endpoint.trim_start_matches('/'));
+        let path = path.trim_start_matches('/');
+        let url = format!("{HOST}/{path}");
+        let cookie_url = Url::parse(&url).with_context(|| format!("parse url {url}"))?;
 
-        let resp = self
+        let mut request = self
             .http
             .post(&url)
             .header("Referer", format!("{HOST}/"))
             .header("Origin", HOST)
-            .form(&[("params", body.params), ("encSecKey", body.enc_sec_key)])
+            .form(&[("params", body.params), ("encSecKey", body.enc_sec_key)]);
+
+        if !cookie_overrides.is_empty() {
+            request = request.header(
+                reqwest::header::COOKIE,
+                self.cookie_header_with_overrides(&cookie_url, cookie_overrides)?,
+            );
+        }
+
+        let resp = request
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -176,12 +227,12 @@ impl NeteaseClient {
         let text = resp.text().await.context("read body")?;
         if !status.is_success() {
             return Err(anyhow!(
-                "netease {endpoint} -> {status}: {}",
+                "netease {path} -> {status}: {}",
                 truncate(&text, 400)
             ));
         }
         serde_json::from_str::<T>(&text)
-            .with_context(|| format!("parse {endpoint} response: {}", truncate(&text, 400)))
+            .with_context(|| format!("parse {path} response: {}", truncate(&text, 400)))
     }
 
     /// linuxapi 转发请求。NeteaseCloudMusicApi 的歌单详情实现用这条链路：
@@ -238,6 +289,32 @@ impl NeteaseClient {
         found
     }
 
+    fn cookie_header_with_overrides(
+        &self,
+        url: &Url,
+        overrides: &[(&str, &str)],
+    ) -> Result<String> {
+        let store = self
+            .cookies
+            .lock()
+            .map_err(|_| anyhow!("cookie store poisoned"))?;
+        let mut pairs = store
+            .get_request_values(url)
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        drop(store);
+
+        for (name, value) in overrides {
+            pairs.retain(|(existing, _)| existing.as_str() != *name);
+            pairs.push(((*name).to_string(), (*value).to_string()));
+        }
+
+        Ok(pairs
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
 }
 
 fn seed_identity_cookies(store: &mut cookie_store::CookieStore) -> Result<()> {

@@ -383,7 +383,11 @@ pub struct UserCloudTrack {
     #[serde(default, rename = "fileId")]
     pub file_id: Option<i64>,
     /// simpleSong 里 `id` 可能为 null（纯用户上传 + 没对上库），所以走 lenient 解析。
-    #[serde(default, rename = "simpleSong", deserialize_with = "deserialize_optional_track")]
+    #[serde(
+        default,
+        rename = "simpleSong",
+        deserialize_with = "deserialize_optional_track"
+    )]
     pub simple_song: Option<TrackInfo>,
     /// `v1/cloud/get` 返回的纯网盘元数据 —— 这里 `songId` 才是真正的 NetEase 曲目 id。
     #[serde(default, rename = "privateCloud")]
@@ -726,7 +730,10 @@ mod tests {
         assert_eq!(id, 414264836);
         assert_eq!(track.id, 414264836);
         assert_eq!(track.name, "六月飞霜");
-        assert_eq!(track.artists.first().map(|a| a.name.as_str()), Some("陈奕迅"));
+        assert_eq!(
+            track.artists.first().map(|a| a.name.as_str()),
+            Some("陈奕迅")
+        );
     }
 
     /// `code` 缺失或为 null 时也要解（之前会因为 `code: i32` 必填整体 reject）。

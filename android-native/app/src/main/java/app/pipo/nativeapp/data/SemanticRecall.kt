@@ -85,6 +85,9 @@ object SemanticRecall {
         val needs = intent.softQualityWords.isNotEmpty() ||
             intent.refStyles.isNotEmpty() ||
             intent.refArtists.isNotEmpty() ||
+            intent.aiMainStyles.isNotEmpty() ||
+            intent.aiAdjacentStyles.isNotEmpty() ||
+            intent.aiSurpriseStyles.isNotEmpty() ||
             intent.softMoods.isNotEmpty() ||
             intent.softScenes.isNotEmpty() ||
             intent.hardGenres.isNotEmpty() ||
@@ -122,7 +125,9 @@ object SemanticRecall {
             intent.hardLanguages + intent.hardVocalTypes +
             intent.softMoods + intent.softScenes + intent.softTextures + intent.softQualityWords +
             listOf(intent.softEnergy, intent.softTempoFeel, intent.emotionalDirection ?: "") +
-            intent.refStyles).joinToString(" ").lowercase()
+            intent.refStyles + intent.aiMainStyles + intent.aiAdjacentStyles + intent.aiSurpriseStyles)
+            .joinToString(" ")
+            .lowercase()
 
         val mapped = raw
             .replace("欧美", "western english")

@@ -137,6 +137,17 @@ class RustBridgeRepository(
         )
     }
 
+    override suspend fun verifyPhoneCaptcha(
+        phone: String,
+        captcha: String,
+        countryCode: Int,
+    ): CaptchaSentStatus {
+        return safe(
+            { bridge.neteaseCaptchaVerify(phone, captcha, countryCode) },
+            { CaptchaSentStatus(code = -1, message = "Captcha bridge unavailable") },
+        )
+    }
+
     override suspend fun loginWithPhone(
         phone: String,
         captcha: String,
@@ -452,6 +463,32 @@ class RustBridgeRepository(
         return bridge.audioGetFeatures(trackId, url, cacheBytes)
     }
 
+    override suspend fun audioBuildTransitionClip(
+        currentTrackId: Long,
+        currentUrl: String,
+        nextTrackId: Long,
+        nextUrl: String,
+        currentDurationMs: Long,
+        mixMs: Long,
+        nextStartPositionMs: Long,
+        nextTempoScale: Float,
+        currentGain: Float,
+        nextGain: Float,
+    ): AutoMixTransitionClip {
+        return bridge.audioBuildTransitionClip(
+            currentTrackId = currentTrackId,
+            currentUrl = currentUrl,
+            nextTrackId = nextTrackId,
+            nextUrl = nextUrl,
+            currentDurationMs = currentDurationMs,
+            mixMs = mixMs,
+            nextStartPositionMs = nextStartPositionMs,
+            nextTempoScale = nextTempoScale,
+            currentGain = currentGain,
+            nextGain = nextGain,
+        )
+    }
+
     override suspend fun setAiProvider(providerId: String) {
         safe({ bridge.aiSetProvider(providerId) }, { Unit })
         refreshAiConfig()
@@ -561,6 +598,7 @@ interface RustPipoBridge {
     suspend fun neteaseQrStart(): QrLoginStart
     suspend fun neteaseQrCheck(key: String): QrLoginStatus
     suspend fun neteaseCaptchaSent(phone: String, countryCode: Int): CaptchaSentStatus
+    suspend fun neteaseCaptchaVerify(phone: String, captcha: String, countryCode: Int): CaptchaSentStatus
     suspend fun neteasePhoneLogin(phone: String, captcha: String, countryCode: Int): PhoneLoginStatus
     suspend fun neteaseSongUrls(ids: List<Long>, level: String): List<NativeSongUrl>
     suspend fun neteaseSongLyric(trackId: String): List<PipoLyricLine>
@@ -570,6 +608,18 @@ interface RustPipoBridge {
     suspend fun audioCacheSetMaxMb(mb: Long)
     suspend fun audioCacheClear()
     suspend fun audioGetFeatures(trackId: Long, url: String, cacheBytes: Boolean): AudioFeatures
+    suspend fun audioBuildTransitionClip(
+        currentTrackId: Long,
+        currentUrl: String,
+        nextTrackId: Long,
+        nextUrl: String,
+        currentDurationMs: Long,
+        mixMs: Long,
+        nextStartPositionMs: Long,
+        nextTempoScale: Float,
+        currentGain: Float,
+        nextGain: Float,
+    ): AutoMixTransitionClip
     suspend fun aiSetProvider(providerId: String)
     suspend fun aiGetConfig(): AiConfigView
     suspend fun aiListModels(providerId: String): List<ModelOption>

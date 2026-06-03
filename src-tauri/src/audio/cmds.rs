@@ -59,10 +59,7 @@ pub fn audio_cache_clear(state: AudioCacheState<'_>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn audio_cache_clear_entry(
-    state: AudioCacheState<'_>,
-    track_id: i64,
-) -> Result<(), String> {
+pub fn audio_cache_clear_entry(state: AudioCacheState<'_>, track_id: i64) -> Result<(), String> {
     state.clear_entry(track_id).map_err(to_err)
 }
 
@@ -81,11 +78,8 @@ pub async fn audio_prefetch(
         return Ok(true); // 已命中
     }
     let raw = unwrap_url_arg(&url)?;
-    let upstream =
-        Url::parse(&raw).map_err(|e| format!("parse url {raw}: {e}"))?;
-    let resp = cdn_get(&upstream, None, None, None)
-        .await
-        .map_err(to_err)?;
+    let upstream = Url::parse(&raw).map_err(|e| format!("parse url {raw}: {e}"))?;
+    let resp = cdn_get(&upstream, None, None, None).await.map_err(to_err)?;
     if resp.status >= 400 {
         return Err(format!("upstream {} for {track_id}", resp.status));
     }
@@ -140,9 +134,7 @@ pub async fn audio_get_features(
             .path
     } else {
         let upstream = Url::parse(&raw).map_err(|e| format!("parse url: {e}"))?;
-        let resp = cdn_get(&upstream, None, None, None)
-            .await
-            .map_err(to_err)?;
+        let resp = cdn_get(&upstream, None, None, None).await.map_err(to_err)?;
         if resp.status >= 400 {
             return Err(format!("upstream {} for {track_id}", resp.status));
         }
@@ -166,14 +158,12 @@ pub async fn audio_get_features(
             // 在所有平台都是 app 沙箱内可写目录。文件名加 .tmp 避免被 cache 扫描器
             // 误当成已 cache 的字节。
             let scratch_dir = state.root().join("scratch");
-            std::fs::create_dir_all(&scratch_dir)
-                .map_err(|e| format!("mkdir scratch: {e}"))?;
+            std::fs::create_dir_all(&scratch_dir).map_err(|e| format!("mkdir scratch: {e}"))?;
             let tmp = scratch_dir.join(format!(
                 "claudio_analyze_{track_id}.{}.tmp",
                 format.as_deref().unwrap_or("bin"),
             ));
-            std::fs::write(&tmp, &resp.body)
-                .map_err(|e| format!("write tmp: {e}"))?;
+            std::fs::write(&tmp, &resp.body).map_err(|e| format!("write tmp: {e}"))?;
             tmp
         }
     };
@@ -181,12 +171,11 @@ pub async fn audio_get_features(
     // 3) 解码 + 算特征 —— blocking 线程
     let cache_clone = Arc::clone(&state);
     let path_clone = path.clone();
-    let acoustics = tauri::async_runtime::spawn_blocking(move || {
-        analyze_file(track_id, &path_clone)
-    })
-    .await
-    .map_err(|e| format!("blocking join: {e}"))?
-    .map_err(|e| format!("analyze: {e:#}"))?;
+    let acoustics =
+        tauri::async_runtime::spawn_blocking(move || analyze_file(track_id, &path_clone))
+            .await
+            .map_err(|e| format!("blocking join: {e}"))?
+            .map_err(|e| format!("analyze: {e:#}"))?;
 
     // 临时文件用完即删
     if !cache_bytes {

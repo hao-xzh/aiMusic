@@ -23,10 +23,11 @@ object CandidateRanker {
     )
 
     // 权重 v2(2026-05) —— 跟 Web 端 candidate-ranker.ts 对齐。
-    // TASTE 0.25 → 0.40,内部走 max(profileTags/1.2, acoustic*0.9, profile*0.5, audio*0.7),
+    // TASTE 0.25 → 0.40,内部走 max(profileTags/1.2, acoustic*0.9, profile*0.25, audio*0.7),
     // 让画像维度(风格/情绪/年代/文化/声学)替代旧版"只看 topArtists"的主信号。
     private const val W_INTENT = 0.30
-    private const val W_TRANSITION = 0.13
+    // 接歌适配只做同档候选的 tie-breaker，不能压过用户需求/口味画像。
+    private const val W_TRANSITION = 0.12
     private const val W_FRESHNESS = 0.07
     private const val W_TASTE = 0.40
     private const val W_BEHAVIOR = 0.10
@@ -36,12 +37,18 @@ object CandidateRanker {
         intent: PetIntent,
         options: Options = Options(),
     ): List<Ranked> {
-        val avoidKeys = intent.avoidWords.map { it.lowercase().trim() }.filter { it.isNotBlank() }
+        val avoidKeys = (intent.avoidWords + intent.aiAvoidStyles)
+            .map { it.lowercase().trim() }
+            .filter { it.isNotBlank() }
+        val excludedArtistKeys = intent.excludeArtists
+            .map(::normalizeArtistKey)
+            .filter { it.isNotBlank() }
         val ranked = ArrayList<Ranked>()
         val rnd = java.util.Random()
 
         for (c in candidates) {
             if (avoidKeys.isNotEmpty() && hitsAvoid(c, avoidKeys)) continue
+            if (excludedArtistKeys.isNotEmpty() && hitsExcludedArtist(c.track, excludedArtistKeys)) continue
             val explicitlyMentioned = TrackDedupe.queryExplicitlyMentions(
                 c.track,
                 intent.hardArtists, intent.hardTracks,
@@ -59,14 +66,14 @@ object CandidateRanker {
                 c.sourceScores[CandidateRecall.Source.Semantic] ?: 0.0,
                 (c.sourceScores[CandidateRecall.Source.SemanticBroad] ?: 0.0) * 0.65,
             ))
-            // taste 内部:ProfileTags(风格维度) + Acoustic(声学维度)主导,Profile(artist) 0.5×
+            // taste 内部:ProfileTags(风格维度) + Acoustic(声学维度)主导,Profile(artist) 0.25×
             val tasteScore = clamp01(maxOf(
                 maxOf(
                     (c.sourceScores[CandidateRecall.Source.ProfileTags] ?: 0.0) / 1.2,
                     (c.sourceScores[CandidateRecall.Source.Acoustic] ?: 0.0) * 0.9,
                 ),
                 maxOf(
-                    (c.sourceScores[CandidateRecall.Source.Profile] ?: 0.0) * 0.5,
+                    (c.sourceScores[CandidateRecall.Source.Profile] ?: 0.0) * 0.25,
                     (c.sourceScores[CandidateRecall.Source.Audio] ?: 0.0) * 0.7,
                 ),
             ))
@@ -97,7 +104,7 @@ object CandidateRanker {
             val recentPlayPenalty = if (explicitlyMentioned) 0.0
                 else recentPenalty(neteaseId, options.recentPlay?.last24hTrackIds, options.recentPlay?.last7dTrackIds, 0.5, 0.25)
             val recentRecPenalty = if (explicitlyMentioned) 0.0
-                else recentPenalty(neteaseId, options.recentRecommendation?.last24hTrackIds, options.recentRecommendation?.last7dTrackIds, 0.35, 0.15)
+                else recentPenalty(neteaseId, options.recentRecommendation?.last24hTrackIds, options.recentRecommendation?.last7dTrackIds, 0.55, 0.24)
             // artist-level fatigue —— 修"自由推荐总是同一歌手"。
             // 阈值: 24h ≥5 次 -0.30, ≥10 -0.30(累计), 7d ≥20 -0.20。explicit 时不 fatigue。
             val artistFatiguePenalty = if (explicitlyMentioned) 0.0
@@ -108,8 +115,12 @@ object CandidateRanker {
             } else {
                 preferenceDeltaScore * 0.16
             }
+            // 能量方向罚分 —— 用户明确要安静/低能量(或嗨/高能量)时，声学能量严重不符的歌降权。
+            // 修"来点安静的却端出最吵的最爱"：taste 信号再强也不该违背当下能量诉求。点名要的不罚。
+            val energyMismatch = if (explicitlyMentioned) 0.0
+                else energyDirectionPenalty(intent, c.features)
             val finalScore = baseScore + preferenceDeltaAdjust -
-                recentPlayPenalty - recentRecPenalty - artistFatiguePenalty
+                recentPlayPenalty - recentRecPenalty - artistFatiguePenalty - energyMismatch
             if (finalScore <= 0) continue
             ranked.add(Ranked(c, finalScore))
         }
@@ -174,8 +185,39 @@ object CandidateRanker {
         return penalty
     }
 
+    /**
+     * 能量方向罚分 —— 只在用户明确给了能量方向(softEnergy / musicHintsEnergy != any)时生效。
+     * 用声学能量 eMid=(introEnergy+outroEnergy)/2 衡量：要安静(low)时越吵罚越多，要嗨(high)时
+     * 越蔫罚越多。没有声学特征的歌中性(0 罚，不奖不惩)，避免误伤未分析曲目。
+     * 上限 0.35：足以把"最常听的吵歌"挤下安静请求的队首，又不至于一刀切。
+     */
+    private fun energyDirectionPenalty(intent: PetIntent, features: AudioFeatures?): Double {
+        if (features == null) return 0.0
+        val target = intent.musicHintsEnergy.takeIf { it != "any" }
+            ?: intent.softEnergy.takeIf { it != "any" }
+            ?: return 0.0
+        val eMid = (features.introEnergy + features.outroEnergy) / 2.0
+        return when (target) {
+            "low", "mid_low" -> (((eMid - 0.32) / 0.40).coerceIn(0.0, 1.0)) * 0.35
+            "high", "mid_high" -> (((0.42 - eMid) / 0.40).coerceIn(0.0, 1.0)) * 0.30
+            else -> 0.0
+        }
+    }
+
     private fun normalizeArtistKey(s: String): String =
         s.lowercase().replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？]+"), "")
+
+    private fun hitsExcludedArtist(track: NativeTrack, excludedArtistKeys: List<String>): Boolean {
+        val whole = normalizeArtistKey(track.artist)
+        val parts = track.artist
+            .split("/", "&", ",", "、", " feat.", " feat ", "feat.", "feat ", " featuring ", " ft.", " ft ")
+            .map(::normalizeArtistKey)
+            .filter { it.isNotBlank() }
+        return excludedArtistKeys.any { key ->
+            parts.any { part -> part == key || (part.length >= 3 && key.length >= 3 && (part in key || key in part)) } ||
+                (whole.length >= 3 && key.length >= 3 && key in whole)
+        }
+    }
 
     private fun dedupeByCandidate(items: List<Ranked>): List<Ranked> {
         val seen = HashSet<String>()
@@ -204,7 +246,14 @@ object CandidateRanker {
 
     private fun hitsAvoid(c: CandidateRecall.Candidate, avoid: List<String>): Boolean {
         val hay = (c.track.title + " " + c.track.artist + " " + c.track.album).lowercase()
-        return avoid.any { it in hay }
+        val semanticHay = c.semanticProfile?.let { sp ->
+            (sp.genres + sp.subGenres + sp.styleAnchors + sp.moods + sp.scenes +
+                sp.textures + sp.energyWords + sp.tempoFeel + sp.negativeTags +
+                listOf(sp.language.key, sp.region.key, sp.vocalType.key, sp.summary))
+                .joinToString(" ")
+                .lowercase()
+        }.orEmpty()
+        return avoid.any { it in hay || it in semanticHay }
     }
 
     private fun recentPenalty(

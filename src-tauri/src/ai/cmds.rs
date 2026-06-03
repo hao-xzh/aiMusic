@@ -131,16 +131,16 @@ pub fn ai_set_provider(state: AiState<'_>, provider: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn ai_set_api_key(
-    state: AiState<'_>,
-    provider: String,
-    key: String,
-) -> Result<(), String> {
+pub fn ai_set_api_key(state: AiState<'_>, provider: String, key: String) -> Result<(), String> {
     let p = parse_provider(&provider)?;
     state
         .update(|c| {
             let trimmed = key.trim().to_string();
-            let new_key = if trimmed.is_empty() { None } else { Some(trimmed) };
+            let new_key = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            };
             slot_mut(c, p).api_key = new_key;
         })
         .map_err(to_err)
@@ -157,11 +157,7 @@ pub fn ai_clear_api_key(state: AiState<'_>, provider: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub fn ai_set_model(
-    state: AiState<'_>,
-    provider: String,
-    model: String,
-) -> Result<(), String> {
+pub fn ai_set_model(state: AiState<'_>, provider: String, model: String) -> Result<(), String> {
     let p = parse_provider(&provider)?;
     let m = model.trim().to_string();
     if m.is_empty() {

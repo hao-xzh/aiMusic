@@ -54,6 +54,7 @@ pub fn run() {
             netease_qr_start,
             netease_qr_check,
             netease_captcha_sent,
+            netease_captcha_verify,
             netease_phone_login,
             netease_account,
             netease_user_playlists,
@@ -94,22 +95,18 @@ pub fn run() {
         .setup(|app| {
             // 所有持久化都落在 app_config_dir（macOS: ~/Library/Application Support/claudio/）
             // 卸载 app 默认不会被清掉，符合"用户级配置"语义。
-            let dir = app
-                .path()
-                .app_config_dir()
-                .expect("resolve app_config_dir");
+            let dir = app.path().app_config_dir().expect("resolve app_config_dir");
             std::fs::create_dir_all(&dir).ok();
 
             // --- netease cookie ---
             let cookie_path = dir.join("netease_cookies.json");
-            let client = NeteaseClient::new_with_persist(Some(cookie_path))
-                .expect("build netease client");
+            let client =
+                NeteaseClient::new_with_persist(Some(cookie_path)).expect("build netease client");
             app.manage(Arc::new(client));
 
             // --- ai config ---
             let ai_config_path = dir.join("ai_config.json");
-            let ai_store =
-                AiConfigStore::load(ai_config_path).expect("build ai config store");
+            let ai_store = AiConfigStore::load(ai_config_path).expect("build ai config store");
             app.manage(Arc::new(ai_store));
 
             // --- cache db ---
@@ -125,8 +122,7 @@ pub fn run() {
                 .app_cache_dir()
                 .unwrap_or_else(|_| dir.clone())
                 .join("audio");
-            let audio_cache = AudioCache::init(cache, audio_root)
-                .expect("init audio cache");
+            let audio_cache = AudioCache::init(cache, audio_root).expect("init audio cache");
             app.manage(Arc::new(audio_cache));
 
             // 启动时先把网易云 CDN 的 TLS 连接建好 —— 用户第一次切歌时

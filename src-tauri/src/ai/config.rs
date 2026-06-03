@@ -29,6 +29,7 @@ pub enum Provider {
 }
 
 impl Provider {
+    #[allow(dead_code)]
     pub fn as_key(self) -> &'static str {
         match self {
             Provider::Deepseek => "deepseek",

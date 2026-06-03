@@ -33,6 +33,12 @@ object TagRecall {
             score += matchArray(intent.softTextures, profile.textures) * 0.2
             score += energyFit(intent.softEnergy, profile.energyWords) * 0.28
             score += tempoFit(intent.softTempoFeel, profile.tempoFeel) * 0.18
+            val styleBag = profile.genres + profile.subGenres + profile.styleAnchors +
+                profile.moods + profile.scenes + profile.textures + profile.energyWords +
+                profile.tempoFeel + profile.vocalDelivery
+            score += matchArray(intent.aiMainStyles, styleBag) * 0.42
+            score += matchArray(intent.aiAdjacentStyles, styleBag) * 0.26
+            score += matchArray(intent.aiSurpriseStyles, styleBag) * 0.12
 
             val hasExplicit = intent.hardLanguages.isNotEmpty() ||
                 intent.hardRegions.isNotEmpty() ||
@@ -43,7 +49,10 @@ object TagRecall {
                 intent.softScenes.isNotEmpty() ||
                 intent.softTextures.isNotEmpty() ||
                 intent.softEnergy != "any" ||
-                intent.softTempoFeel != "any"
+                intent.softTempoFeel != "any" ||
+                intent.aiMainStyles.isNotEmpty() ||
+                intent.aiAdjacentStyles.isNotEmpty() ||
+                intent.aiSurpriseStyles.isNotEmpty()
             if (hasExplicit && score > 0) {
                 out.add(Hit(track, kotlin.math.min(1.8, score)))
             }
@@ -57,12 +66,18 @@ object TagRecall {
         if (intent.hardRegions.isNotEmpty() && !includesAny(intent.hardRegions, listOf(profile.region.key))) return false
         if (intent.hardGenres.isNotEmpty() && !includesAny(intent.hardGenres, profile.genres)) return false
         if (intent.hardSubGenres.isNotEmpty() && !includesAny(intent.hardSubGenres, profile.subGenres)) return false
-        if (intent.hardVocalTypes.isNotEmpty() && !includesAny(intent.hardVocalTypes, listOf(profile.vocalType.key))) return false
+        if (intent.hardVocalTypes.isNotEmpty() &&
+            profile.vocalType != VocalType.Unknown &&
+            !includesAny(intent.hardVocalTypes, listOf(profile.vocalType.key))
+        ) return false
 
         if (includesAny(intent.excludeLanguages, listOf(profile.language.key))) return false
         if (includesAny(intent.excludeRegions, listOf(profile.region.key))) return false
         if (includesAny(intent.excludeGenres, profile.genres + profile.subGenres)) return false
-        if (includesAny(intent.excludeVocalTypes, listOf(profile.vocalType.key))) return false
+        if (profile.vocalType != VocalType.Unknown &&
+            includesAny(intent.excludeVocalTypes, listOf(profile.vocalType.key))
+        ) return false
+        if (includesAny(intent.excludeArtists, profile.artists)) return false
         if (includesAny(
                 intent.excludeTags,
                 profile.negativeTags + profile.moods + profile.scenes + profile.textures + profile.genres + profile.subGenres,
@@ -140,6 +155,11 @@ data class PetIntent(
     val musicHintsTransitionStyle: String = "soft",
     val refStyles: List<String> = emptyList(),
     val refArtists: List<String> = emptyList(),
+    val aiMainStyles: List<String> = emptyList(),
+    val aiAdjacentStyles: List<String> = emptyList(),
+    val aiSurpriseStyles: List<String> = emptyList(),
+    val aiAvoidStyles: List<String> = emptyList(),
+    val aiExploration: String = "balanced",
     val emotionalDirection: String? = null,
     val orderStyle: String = "smooth",
     val desiredCount: Int = 30,

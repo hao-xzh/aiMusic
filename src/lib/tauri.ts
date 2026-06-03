@@ -105,6 +105,8 @@ export const netease = {
   /** 给手机发验证码。ctcode 不传 = 86（中国大陆）。 */
   captchaSent: (phone: string, ctcode?: number) =>
     invoke<CaptchaSent>("netease_captcha_sent", { phone, ctcode }),
+  captchaVerify: (phone: string, captcha: string, ctcode?: number) =>
+    invoke<CaptchaSent>("netease_captcha_verify", { phone, captcha, ctcode }),
   /** 拿验证码换 cookie。code=200 后跟扫码登录成功一样，已自动 persist。 */
   phoneLogin: (phone: string, captcha: string, ctcode?: number) =>
     invoke<PhoneLogin>("netease_phone_login", { phone, captcha, ctcode }),

@@ -154,6 +154,28 @@ fn dispatch(command: &str, args: Value) -> String {
                 }))
             })
         }
+        "netease_captcha_verify" => {
+            let phone = args
+                .get("phone")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let captcha = args
+                .get("captcha")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let ctcode = args.get("ctcode").and_then(Value::as_i64).unwrap_or(86) as i32;
+            run_json(async move {
+                let r = netease_client()
+                    .captcha_verify(&phone, &captcha, ctcode)
+                    .await?;
+                Ok(json!({
+                    "code": r.code,
+                    "message": r.message
+                }))
+            })
+        }
         "netease_phone_login" => {
             let phone = args
                 .get("phone")
@@ -258,6 +280,60 @@ fn dispatch(command: &str, args: Value) -> String {
             run_json(async move {
                 audio_store()
                     .features_json(track_id, url, cache_bytes)
+                    .await
+            })
+        }
+        "audio_build_transition_clip" => {
+            let current_track_id = args
+                .get("currentTrackId")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let current_url = args
+                .get("currentUrl")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let next_track_id = args.get("nextTrackId").and_then(Value::as_i64).unwrap_or(0);
+            let next_url = args
+                .get("nextUrl")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let current_duration_ms = args
+                .get("currentDurationMs")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let mix_ms = args.get("mixMs").and_then(Value::as_i64).unwrap_or(0);
+            let next_start_position_ms = args
+                .get("nextStartPositionMs")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let next_tempo_scale = args
+                .get("nextTempoScale")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            let current_gain = args
+                .get("currentGain")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            let next_gain = args
+                .get("nextGain")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            run_json(async move {
+                audio_store()
+                    .transition_clip_json(
+                        current_track_id,
+                        current_url,
+                        next_track_id,
+                        next_url,
+                        current_duration_ms,
+                        mix_ms,
+                        next_start_position_ms,
+                        next_tempo_scale,
+                        current_gain,
+                        next_gain,
+                    )
                     .await
             })
         }

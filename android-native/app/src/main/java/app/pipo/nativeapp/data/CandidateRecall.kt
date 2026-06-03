@@ -167,14 +167,14 @@ object CandidateRecall {
         profile.topArtists.take(40).forEach { topArtistKeys[normalize(it.name)] = it.affinity.toDouble() }
         val tagWords = (intent.musicHintsMoods + intent.musicHintsGenres).map(::normalize).filter { it.isNotBlank() }.toSet()
 
-        // affinity * 0.45 → * 0.15(跟 Web 端对齐):让艺人维度变成"加分项"而不是
-        // 主信号,避免推荐总是围着 topArtists 几个人转。真正的画像主信号走
-        // recallByProfileTags / recallByAcoustic。
+        // affinity * 0.45 → * 0.06:让艺人维度只做轻微加分,不能把心动模式锁死在
+        // Taylor / 陈奕迅 这类画像 top artist 上。真正的画像主信号走
+        // recallByProfileTags / recallByAcoustic / recommendationPlan。
         val out = ArrayList<Hit>()
         for (t in library) {
             var score = 0.0
             t.artist.split("/", "&", ",").forEach { a ->
-                topArtistKeys[normalize(a.trim())]?.let { score += it * 0.15 }
+                topArtistKeys[normalize(a.trim())]?.let { score += it * 0.06 }
             }
             if (tagWords.isNotEmpty()) {
                 val titleN = normalize(t.title)

@@ -39,6 +39,7 @@ internal class PlayerMediaFactory(
             .setMediaId(track.id)
             .setUri(track.streamUrl)
             .setMediaMetadata(metadata)
+        PlaybackCacheKeys.forTrack(track)?.let { builder.setCustomCacheKey(it) }
 
         val features = featuresStore.get(track.id)
         if (features != null) {

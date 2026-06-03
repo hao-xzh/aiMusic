@@ -107,6 +107,7 @@ data class PipoNav(
     val openTaste: () -> Unit,
     val openSettings: () -> Unit,
     val openDistill: () -> Unit,
+    val openLogin: () -> Unit,
 )
 val LocalNav = staticCompositionLocalOf<PipoNav?> { null }
 

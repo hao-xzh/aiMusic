@@ -10,18 +10,32 @@ internal class PlaybackUrlResolver(
     private val streamLevelFallbacks: List<String>,
     private val streamUrlTimeoutMs: Long,
 ) {
-    suspend fun fetchPlayableUrl(id: Long): String? {
+    data class ResolvedPlaybackUrl(
+        val url: String,
+        val cacheKey: String,
+    )
+
+    suspend fun fetchPlayable(id: Long): ResolvedPlaybackUrl? {
         var attemptedLevels = 0
         for (level in streamLevelFallbacks) {
             attemptedLevels += 1
-            val url = withTimeoutOrNull(streamUrlTimeoutMs) {
+            val songUrl = withTimeoutOrNull(streamUrlTimeoutMs) {
                 runCatching { repository.songUrls(listOf(id), level) }
                     .getOrNull()
                     ?.firstOrNull { it.id == id }
-                    ?.url
-                    ?.takeIf { it.isNotBlank() }
             }
-            if (!url.isNullOrBlank()) return url
+            val url = songUrl?.url?.takeIf { it.isNotBlank() }
+            if (!url.isNullOrBlank()) {
+                return ResolvedPlaybackUrl(
+                    url = url,
+                    cacheKey = PlaybackCacheKeys.resolvedNetease(
+                        id = id,
+                        level = level,
+                        bitrate = songUrl.bitrate,
+                        sizeBytes = songUrl.sizeBytes,
+                    ),
+                )
+            }
         }
         DiagnosticsLogStore.record(
             area = "playback",
@@ -35,11 +49,19 @@ internal class PlaybackUrlResolver(
         return null
     }
 
+    suspend fun fetchPlayableUrl(id: Long): String? = fetchPlayable(id)?.url
+
     suspend fun resolveSinglePlayable(track: NativeTrack): NativeTrack? {
-        if (track.streamUrl.isNotBlank()) return track
+        if (track.streamUrl.isNotBlank()) {
+            return if (track.streamCacheKey.isNullOrBlank()) {
+                track.copy(streamCacheKey = PlaybackCacheKeys.forTrack(track))
+            } else {
+                track
+            }
+        }
         val id = track.neteaseId ?: return null
-        val url = fetchPlayableUrl(id) ?: return null
-        return track.copy(streamUrl = url)
+        val resolved = fetchPlayable(id) ?: return null
+        return track.copy(streamUrl = resolved.url, streamCacheKey = resolved.cacheKey)
     }
 
     suspend fun resolveFirstPlayable(
@@ -58,14 +80,24 @@ internal class PlaybackUrlResolver(
         }.distinct()
         if (missingIds.isEmpty()) return queue
 
-        val urls = HashMap<Long, String>()
+        val urls = HashMap<Long, ResolvedPlaybackUrl>()
         var unresolved = missingIds
         for (level in streamLevelFallbacks) {
             for (chunk in unresolved.chunked(50)) {
                 withTimeoutOrNull(streamUrlTimeoutMs) {
                     runCatching { repository.songUrls(chunk, level) }.getOrNull()
                 }?.forEach { u ->
-                    u.url?.takeIf { it.isNotBlank() }?.let { urls[u.id] = it }
+                    u.url?.takeIf { it.isNotBlank() }?.let { url ->
+                        urls[u.id] = ResolvedPlaybackUrl(
+                            url = url,
+                            cacheKey = PlaybackCacheKeys.resolvedNetease(
+                                id = u.id,
+                                level = level,
+                                bitrate = u.bitrate,
+                                sizeBytes = u.sizeBytes,
+                            ),
+                        )
+                    }
                 }
             }
             unresolved = unresolved.filter { it !in urls }
@@ -88,8 +120,10 @@ internal class PlaybackUrlResolver(
         return queue.map { track ->
             val id = track.neteaseId
             val resolved = if (id != null) urls[id] else null
-            if (track.streamUrl.isBlank() && !resolved.isNullOrBlank()) {
-                track.copy(streamUrl = resolved)
+            if (track.streamUrl.isBlank() && resolved != null) {
+                track.copy(streamUrl = resolved.url, streamCacheKey = resolved.cacheKey)
+            } else if (track.streamUrl.isNotBlank() && track.streamCacheKey.isNullOrBlank()) {
+                track.copy(streamCacheKey = PlaybackCacheKeys.forTrack(track))
             } else {
                 track
             }

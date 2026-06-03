@@ -67,12 +67,22 @@ class AudioFeaturesStore(context: Context) {
         put("durationS", f.durationS)
         f.bpm?.let { put("bpm", it) }
         put("bpmConfidence", f.bpmConfidence)
+        f.firstBeatS?.let { put("firstBeatS", it) }
         put("rmsDb", f.rmsDb)
         put("peakDb", f.peakDb)
         put("dynamicRangeDb", f.dynamicRangeDb)
         put("introEnergy", f.introEnergy)
         put("outroEnergy", f.outroEnergy)
+        put("introLowEnergy", f.introLowEnergy)
+        put("outroLowEnergy", f.outroLowEnergy)
+        put("introVocalDensity", f.introVocalDensity)
+        put("outroVocalDensity", f.outroVocalDensity)
+        f.drumEntryS?.let { put("drumEntryS", it) }
+        f.vocalEntryS?.let { put("vocalEntryS", it) }
+        f.outroStartS?.let { put("outroStartS", it) }
         put("spectralCentroidHz", f.spectralCentroidHz)
+        f.tonalKey?.let { put("tonalKey", it) }
+        put("tonalConfidence", f.tonalConfidence)
         put("headSilenceS", f.headSilenceS)
         put("tailSilenceS", f.tailSilenceS)
     }
@@ -83,12 +93,22 @@ class AudioFeaturesStore(context: Context) {
             durationS = o.optDouble("durationS"),
             bpm = if (o.has("bpm")) o.optDouble("bpm") else null,
             bpmConfidence = o.optDouble("bpmConfidence"),
+            firstBeatS = if (o.has("firstBeatS")) o.optDouble("firstBeatS") else null,
             rmsDb = o.optDouble("rmsDb"),
             peakDb = o.optDouble("peakDb"),
             dynamicRangeDb = o.optDouble("dynamicRangeDb"),
             introEnergy = o.optDouble("introEnergy"),
             outroEnergy = o.optDouble("outroEnergy"),
+            introLowEnergy = o.optDouble("introLowEnergy", 0.0),
+            outroLowEnergy = o.optDouble("outroLowEnergy", 0.0),
+            introVocalDensity = o.optDouble("introVocalDensity", 0.0),
+            outroVocalDensity = o.optDouble("outroVocalDensity", 0.0),
+            drumEntryS = if (o.has("drumEntryS")) o.optDouble("drumEntryS") else null,
+            vocalEntryS = if (o.has("vocalEntryS")) o.optDouble("vocalEntryS") else null,
+            outroStartS = if (o.has("outroStartS")) o.optDouble("outroStartS") else null,
             spectralCentroidHz = o.optDouble("spectralCentroidHz"),
+            tonalKey = if (o.has("tonalKey")) o.optInt("tonalKey") else null,
+            tonalConfidence = o.optDouble("tonalConfidence", 0.0),
             headSilenceS = o.optDouble("headSilenceS"),
             tailSilenceS = o.optDouble("tailSilenceS"),
         )
@@ -96,7 +116,7 @@ class AudioFeaturesStore(context: Context) {
 
     companion object {
         private const val PREFS_NAME = "claudio_audio_features"
-        private const val KEY = "v1"
+        private const val KEY = "v2"
         private const val MAX_ENTRIES = 1000
     }
 }

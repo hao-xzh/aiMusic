@@ -17,6 +17,8 @@ use serde_json::json;
 use super::client::NeteaseClient;
 use super::models::*;
 
+const PHONE_LOGIN_COOKIE_OVERRIDES: &[(&str, &str)] = &[("os", "ios"), ("appver", "8.7.01")];
+
 #[derive(Default)]
 struct CloudHydrationResult {
     tracks: Vec<TrackInfo>,
@@ -59,9 +61,26 @@ impl NeteaseClient {
     /// 后端常见返回码：200 = 已发送 / 400 = 参数错误 / 503 = 频繁触发风控。
     pub async fn captcha_sent(&self, phone: &str, ctcode: i32) -> Result<CaptchaResp> {
         let resp: CaptchaResp = self
-            .weapi(
+            .weapi_api(
                 "sms/captcha/sent",
                 json!({ "ctcode": ctcode, "cellphone": phone }),
+            )
+            .await?;
+        Ok(resp)
+    }
+
+    /// 校验短信验证码。先 verify 再 login/cellphone，比直接拿验证码登录更接近官方流程，
+    /// 能减少一部分“存在风险，请稍后再试”这类误判。
+    pub async fn captcha_verify(
+        &self,
+        phone: &str,
+        captcha: &str,
+        ctcode: i32,
+    ) -> Result<CaptchaResp> {
+        let resp: CaptchaResp = self
+            .weapi(
+                "sms/captcha/verify",
+                json!({ "ctcode": ctcode, "cellphone": phone, "captcha": captcha }),
             )
             .await?;
         Ok(resp)
@@ -75,8 +94,16 @@ impl NeteaseClient {
         captcha: &str,
         ctcode: i32,
     ) -> Result<CellphoneLoginResp> {
+        let verify = self.captcha_verify(phone, captcha, ctcode).await?;
+        if verify.code != 200 {
+            return Ok(CellphoneLoginResp {
+                code: verify.code,
+                message: verify.message,
+                profile: None,
+            });
+        }
         let resp: CellphoneLoginResp = self
-            .weapi(
+            .weapi_with_cookie_overrides(
                 "login/cellphone",
                 json!({
                     "phone": phone,
@@ -84,6 +111,7 @@ impl NeteaseClient {
                     "captcha": captcha,
                     "rememberLogin": true,
                 }),
+                PHONE_LOGIN_COOKIE_OVERRIDES,
             )
             .await?;
         if resp.code == 200 {

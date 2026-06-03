@@ -51,10 +51,12 @@ object SmoothQueue {
                     sameArtistPenalty,
                 )
                 val autoMixReady = autoMixReadiness(current.features, cand.features, fit)
+                val clashPenalty = smoothClashPenalty(current.features, cand.features)
                 val drift = TransitionScore.orderDriftPenalty(current.originalIndex, cand.originalIndex, tracks.size)
-                val score = risk * 1.05 -
-                    fit.score * 1.05 -
-                    autoMixReady * 0.85 +
+                val score = risk * 1.10 -
+                    fit.score * 1.18 -
+                    autoMixReady * 1.30 +
+                    clashPenalty * 0.88 +
                     drift * 0.18
                 if (score < bestScore) { bestScore = score; bestIdx = i }
             }
@@ -77,13 +79,47 @@ object SmoothQueue {
             to.bpmConfidence >= 0.32
         val bpmDelta = if (bpmReliable) kotlin.math.abs(bpmA!! - bpmB!!) else 10.0
         val energyDelta = kotlin.math.abs(from.outroEnergy - to.introEnergy)
+        val lowDelta = kotlin.math.abs(from.outroLowEnergy - to.introLowEnergy)
+        val vocalClash = from.outroVocalDensity * to.introVocalDensity
         val boundaryScore = when {
             from.tailSilenceS <= 0.45 && to.headSilenceS <= 0.45 -> 0.25
             from.tailSilenceS <= 0.8 || to.headSilenceS <= 0.8 -> 0.12
             else -> 0.0
         }
         val bpmScore = if (bpmReliable) (1.0 - (bpmDelta / 8.0)).coerceIn(0.0, 1.0) * 0.35 else 0.08
-        val energyScore = (1.0 - (energyDelta / 0.26)).coerceIn(0.0, 1.0) * 0.25
-        return (fit.score * 0.15 + bpmScore + energyScore + boundaryScore).coerceIn(0.0, 1.0)
+        val energyScore = (1.0 - (energyDelta / 0.26)).coerceIn(0.0, 1.0) * 0.22
+        val lowScore = (1.0 - (lowDelta / 0.18)).coerceIn(0.0, 1.0) * 0.10
+        val vocalScore = (1.0 - (vocalClash / 0.18)).coerceIn(0.0, 1.0) * 0.12
+        return (fit.score * 0.15 + bpmScore + energyScore + lowScore + vocalScore + boundaryScore)
+            .coerceIn(0.0, 1.0)
+    }
+
+    private fun smoothClashPenalty(from: AudioFeatures?, to: AudioFeatures?): Double {
+        if (from == null || to == null) return 0.0
+        var penalty = 0.0
+        val vocalClash = from.outroVocalDensity * to.introVocalDensity
+        if (vocalClash >= 0.16) penalty += 0.75
+        if (from.outroVocalDensity >= 0.44 && from.outroStartS == null && from.tailSilenceS < 0.85) {
+            penalty += 0.9
+        }
+        if ((to.vocalEntryS ?: 99.0) <= 1.2 && to.introVocalDensity >= 0.32) penalty += 0.35
+        if ((to.drumEntryS ?: 99.0) <= 0.8 && to.introLowEnergy >= 0.09) penalty += 0.22
+        if (kotlin.math.abs(from.outroLowEnergy - to.introLowEnergy) > 0.16) penalty += 0.28
+        val tonalDistance = tonalDistance(from, to)
+        if (tonalDistance != null &&
+            tonalDistance >= 5 &&
+            from.tonalConfidence >= 0.025 &&
+            to.tonalConfidence >= 0.025
+        ) {
+            penalty += 0.22
+        }
+        return penalty.coerceIn(0.0, 1.8)
+    }
+
+    private fun tonalDistance(a: AudioFeatures, b: AudioFeatures): Int? {
+        val ak = a.tonalKey ?: return null
+        val bk = b.tonalKey ?: return null
+        val raw = kotlin.math.abs(ak - bk).mod(12)
+        return kotlin.math.min(raw, 12 - raw)
     }
 }

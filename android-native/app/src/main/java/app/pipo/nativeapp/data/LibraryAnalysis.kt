@@ -102,8 +102,8 @@ class LibraryAnalysis(
                         }
                         val ok = runCatching {
                             val f = repository.audioFeatures(ne, url)
-                            if (f != null) featuresStore.put(t.id, f)
-                            f != null
+                            featuresStore.put(t.id, f)
+                            true
                         }.getOrDefault(false)
                         synchronized(this@LibraryAnalysis) {
                             if (!ok) failed++

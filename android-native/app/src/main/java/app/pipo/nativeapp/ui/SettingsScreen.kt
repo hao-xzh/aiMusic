@@ -80,6 +80,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
     val aiConfig by repository.aiConfig.collectAsState(initial = AiConfigView(activeProvider = "", providers = emptyList()))
     val settings by repository.settings.collectAsState(initial = NativeSettings())
     val scope = rememberCoroutineScope()
+    val nav = LocalNav.current
     var loginStatus by remember { mutableStateOf<String?>(null) }
     var qrContent by remember { mutableStateOf<String?>(null) }
     var qrJob by remember { mutableStateOf<Job?>(null) }
@@ -110,9 +111,16 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
         // 网易云登录
         PipoRow(
             title = "网易云登录",
-            subtitle = account?.nickname ?: "未登录 —— 用网易云 App 扫码"
+            subtitle = account?.nickname ?: "未登录 —— 手机验证码或网易云 App 扫码"
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (account == null) {
+                    PipoButton(
+                        text = "手机号登录",
+                        onClick = { nav?.openLogin?.invoke() },
+                        isPrimary = true,
+                    )
+                }
                 PipoButton(
                     text = if (qrContent == null) "扫码登录" else "刷新二维码",
                     onClick = {
@@ -182,7 +190,6 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
                             }
                         }
                     },
-                    isPrimary = account == null
                 )
                 if (account != null) {
                     PipoButton(

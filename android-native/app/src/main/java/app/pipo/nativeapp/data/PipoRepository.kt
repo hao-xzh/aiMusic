@@ -81,14 +81,33 @@ data class AudioFeatures(
     val durationS: Double,
     val bpm: Double?,
     val bpmConfidence: Double,
+    val firstBeatS: Double? = null,
     val rmsDb: Double,
     val peakDb: Double,
     val dynamicRangeDb: Double,
     val introEnergy: Double,
     val outroEnergy: Double,
+    val introLowEnergy: Double = 0.0,
+    val outroLowEnergy: Double = 0.0,
+    val introVocalDensity: Double = 0.0,
+    val outroVocalDensity: Double = 0.0,
+    val drumEntryS: Double? = null,
+    val vocalEntryS: Double? = null,
+    val outroStartS: Double? = null,
     val spectralCentroidHz: Double,
+    val tonalKey: Int? = null,
+    val tonalConfidence: Double = 0.0,
     val headSilenceS: Double,
     val tailSilenceS: Double,
+)
+
+data class AutoMixTransitionClip(
+    val path: String,
+    val uri: String,
+    val durationMs: Long,
+    val nextResumePositionMs: Long,
+    val sampleRate: Int,
+    val channels: Int,
 )
 
 enum class PipoLyricTiming {
@@ -171,6 +190,7 @@ interface PipoRepository {
     suspend fun startQrLogin(): QrLoginStart
     suspend fun checkQrLogin(key: String): QrLoginStatus
     suspend fun sendPhoneCaptcha(phone: String, countryCode: Int = 86): CaptchaSentStatus
+    suspend fun verifyPhoneCaptcha(phone: String, captcha: String, countryCode: Int = 86): CaptchaSentStatus
     suspend fun loginWithPhone(phone: String, captcha: String, countryCode: Int = 86): PhoneLoginStatus
     suspend fun refreshPlaylists()
     suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean = false): List<NativeTrack>
@@ -198,6 +218,18 @@ interface PipoRepository {
     suspend fun setCacheMaxMb(mb: Long)
     suspend fun clearAudioCache()
     suspend fun audioFeatures(trackId: Long, url: String, cacheBytes: Boolean = true): AudioFeatures
+    suspend fun audioBuildTransitionClip(
+        currentTrackId: Long,
+        currentUrl: String,
+        nextTrackId: Long,
+        nextUrl: String,
+        currentDurationMs: Long,
+        mixMs: Long,
+        nextStartPositionMs: Long,
+        nextTempoScale: Float,
+        currentGain: Float = 1f,
+        nextGain: Float = 1f,
+    ): AutoMixTransitionClip
     suspend fun refreshAiConfig()
     suspend fun setAiProvider(providerId: String)
     suspend fun aiListModels(providerId: String): List<ModelOption>

@@ -75,8 +75,8 @@ fun NativeAiPet(
     currentTitle: String,
     currentArtist: String,
     coverUrl: String?,
-    onPlayFromAgent: (List<app.pipo.nativeapp.data.NativeTrack>, app.pipo.nativeapp.data.ContinuousQueueSource?) -> Unit,
-    onInsertFromAgent: (app.pipo.nativeapp.data.NativeTrack) -> Unit,
+    onPlayFromAgent: (List<app.pipo.nativeapp.data.NativeTrack>, app.pipo.nativeapp.data.ContinuousQueueSource?) -> Boolean,
+    onInsertFromAgent: (app.pipo.nativeapp.data.NativeTrack) -> Boolean,
     onSkipFromAgent: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -614,15 +614,26 @@ fun NativeAiPet(
                                     }
                                     is app.pipo.nativeapp.data.PetAgent.AgentAction.Play -> {
                                         if (action.initialBatch.isNotEmpty()) {
-                                            if (action.insert) onInsertFromAgent(action.initialBatch.first())
-                                            else onPlayFromAgent(action.initialBatch, action.continuous)
-                                            messages += PetMessage(false, "", PetResultCard.Play(
-                                                count = action.initialBatch.size,
-                                                artists = action.initialBatch.map { it.artist }.filter { it.isNotBlank() }.distinct().take(3).joinToString("、"),
-                                                covers = action.initialBatch.mapNotNull { it.artworkUrl }.take(3),
-                                                insert = action.insert,
-                                                similar = action.similar,
-                                            ))
+                                            val accepted = if (action.insert) {
+                                                onInsertFromAgent(action.initialBatch.first())
+                                            } else {
+                                                onPlayFromAgent(action.initialBatch, action.continuous)
+                                            }
+                                            if (accepted) {
+                                                messages += PetMessage(false, "", PetResultCard.Play(
+                                                    count = action.initialBatch.size,
+                                                    artists = action.initialBatch.map { it.artist }.filter { it.isNotBlank() }.distinct().take(3).joinToString("、"),
+                                                    covers = action.initialBatch.mapNotNull { it.artworkUrl }.take(3),
+                                                    insert = action.insert,
+                                                    similar = action.similar,
+                                                ))
+                                            } else {
+                                                messages += PetMessage(false, "", PetResultCard.Action(
+                                                    icon = PetActionIcon.Error,
+                                                    ok = false,
+                                                    label = "播放请求没有被播放器接收",
+                                                ))
+                                            }
                                         }
                                     }
                                 }
