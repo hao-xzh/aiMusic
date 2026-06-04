@@ -283,60 +283,6 @@ fn dispatch(command: &str, args: Value) -> String {
                     .await
             })
         }
-        "audio_build_transition_clip" => {
-            let current_track_id = args
-                .get("currentTrackId")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let current_url = args
-                .get("currentUrl")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let next_track_id = args.get("nextTrackId").and_then(Value::as_i64).unwrap_or(0);
-            let next_url = args
-                .get("nextUrl")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let current_duration_ms = args
-                .get("currentDurationMs")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let mix_ms = args.get("mixMs").and_then(Value::as_i64).unwrap_or(0);
-            let next_start_position_ms = args
-                .get("nextStartPositionMs")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let next_tempo_scale = args
-                .get("nextTempoScale")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0) as f32;
-            let current_gain = args
-                .get("currentGain")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0) as f32;
-            let next_gain = args
-                .get("nextGain")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0) as f32;
-            run_json(async move {
-                audio_store()
-                    .transition_clip_json(
-                        current_track_id,
-                        current_url,
-                        next_track_id,
-                        next_url,
-                        current_duration_ms,
-                        mix_ms,
-                        next_start_position_ms,
-                        next_tempo_scale,
-                        current_gain,
-                        next_gain,
-                    )
-                    .await
-            })
-        }
         "ai_set_provider" => {
             let provider = args
                 .get("provider")

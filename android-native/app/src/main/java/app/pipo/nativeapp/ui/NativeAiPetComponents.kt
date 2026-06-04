@@ -902,7 +902,7 @@ internal fun GlowBackdrop(
     }
 }
 
-/** 放歌结果卡:播放图标 + 封面缩略条 + "开整 N 首" + 艺人。映射 AgentAction.Play。 */
+/** 放歌结果卡:播放图标 + 封面缩略条 + "开整 N 首" + 艺人。映射 AgentUiCard.Play。 */
 @Composable
 internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
     val title = when {
@@ -967,7 +967,7 @@ internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
     }
 }
 
-/** 单行动作 chip:收藏 / 进出歌单 / 切歌。映射 AgentAction.Like / Playlist / Skip。 */
+/** 单行动作 chip:收藏 / 进出歌单 / 切歌。映射 AgentUiCard 的动作结果。 */
 @Composable
 internal fun ActionChip(card: PetResultCard.Action, palette: PetPalette) {
     val ok = card.ok

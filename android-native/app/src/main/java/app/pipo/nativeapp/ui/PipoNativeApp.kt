@@ -40,6 +40,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
@@ -55,11 +56,23 @@ import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoLyricRole
-import app.pipo.nativeapp.data.PetAgent
 import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
+import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
+import app.pipo.nativeapp.data.agent.domain.AgentUiCard
+import app.pipo.nativeapp.data.agent.domain.MusicGoal
+import app.pipo.nativeapp.data.agent.domain.PlayMode
+import app.pipo.nativeapp.data.agent.domain.TrackRequirement
+import app.pipo.nativeapp.data.agent.context.StyleCapsuleBuilder
+import app.pipo.nativeapp.data.agent.execute.AgentActionExecutor
+import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
+import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
 import app.pipo.nativeapp.playback.PlayerUiState
 import app.pipo.nativeapp.playback.PlayerViewModel
+import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
+import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
+import app.pipo.nativeapp.playback.orchestrator.QueueOperation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -241,9 +254,7 @@ fun PipoNativeApp() {
             immersive = immersive,
             isLandscape = isLandscape,
             playerState = playerState,
-            onReady = { tracks, continuous ->
-                viewModel.playFromAgent(tracks, continuous)
-            },
+            onApplyAgentQueueRequest = { request -> viewModel.applyAgentQueueRequest(request) },
         )
 
         val aiOverlayOpen by AiPetCommandBus.isOpen.collectAsState()
@@ -348,7 +359,17 @@ fun PipoNativeApp() {
                                 onPlayTracks = { tracks ->
                                     if (tracks.isNotEmpty()) {
                                         route = Route.Player
-                                        viewModel.playFromAgent(tracks, null)
+                                        scope.launch {
+                                            viewModel.applyAgentQueueRequest(
+                                                AgentQueueRequest(
+                                                    requestId = "taste_${System.currentTimeMillis()}",
+                                                    sourceUserText = "taste_screen_play",
+                                                    operation = QueueOperation.ReplaceQueue,
+                                                    tracks = tracks,
+                                                    desiredCount = tracks.size,
+                                                ),
+                                            )
+                                        }
                                     }
                                 },
                             )
@@ -367,16 +388,12 @@ fun PipoNativeApp() {
                     NativeAiPet(
                         isPlaying = playerState.isPlaying,
                         currentTrack = currentTrack,
+                        currentQueue = playerState.queue,
                         currentTrackKey = currentTrack?.id,
                         currentTitle = playerState.title,
                         currentArtist = playerState.artist,
                         coverUrl = playerState.artworkUrl,
-                        onPlayFromAgent = { batch, continuous ->
-                            viewModel.playFromAgent(batch, continuous)
-                        },
-                        onInsertFromAgent = { track ->
-                            viewModel.insertNext(track)
-                        },
+                        onApplyAgentQueueRequest = { request -> viewModel.applyAgentQueueRequest(request) },
                         onSkipFromAgent = { viewModel.next() },
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -424,7 +441,7 @@ private enum class Route { Player, Distill, Settings, Taste, Login }
  *
  * - 默认开启（AI 的本职工作）
  * - 30 分钟冷却防循环纠偏
- * - 增强：检测"同艺人连跳" → prompt 里点名让 PetAgent 在新队列里避开
+ * - 增强：检测"同艺人连跳" → Planner 上下文里点名让新队列避开
  */
 @Composable
 private fun SkipCorrectionEffect(
@@ -433,8 +450,15 @@ private fun SkipCorrectionEffect(
     immersive: Boolean,
     isLandscape: Boolean,
     playerState: PlayerUiState,
-    onReady: (List<NativeTrack>, ContinuousQueueSource?) -> Unit,
+    onApplyAgentQueueRequest: suspend (AgentQueueRequest) -> QueueCommitResult,
 ) {
+    val context = LocalContext.current
+    val runtime = remember(context) {
+        AgentRuntime(
+            repository = PipoGraph.repository,
+            ledger = AgentLedgerStore(context),
+        )
+    }
     var lastTriggerTs by remember { mutableStateOf(0L) }
     LaunchedEffect(route, immersive, isLandscape) {
         while (route == Route.Player && !immersive && !isLandscape) {
@@ -454,7 +478,7 @@ private fun SkipCorrectionEffect(
 
             lastTriggerTs = newest.tsMs
 
-            // 增强：识别"同艺人连跳" → prompt 里点名让 PetAgent 避开
+            // 增强：识别"同艺人连跳" → Planner 上下文里点名让新队列避开
             val skipArtists = skipped.mapNotNull { it.artist.takeIf { a -> a.isNotBlank() } }
             val artistRepeated = skipArtists.size >= 2 && skipArtists.toSet().size == 1
             val hintLine = if (artistRepeated) {
@@ -473,15 +497,134 @@ private fun SkipCorrectionEffect(
                 ),
             )
 
-            val response = try {
-	                PetAgent(PipoGraph.repository).chat(
-		                    userText = hintLine,
-		                    history = emptyList(),
-		                    historySummary = "",
-		                    musicReferences = emptyList(),
-		                    currentTrack = null,
-	                    userFacts = settings.userFacts,
-	                    persona = PetPersona.fromId(settings.personaId),
+            val outcome = try {
+                val executor = object : AgentActionExecutor {
+                    override suspend fun playQueue(
+                        actionId: String,
+                        mode: PlayMode,
+                        tracks: List<NativeTrack>,
+                        continuous: ContinuousQueueSource?,
+                        primaryGoal: MusicGoal,
+                        target: TrackRequirement?,
+                        similar: Boolean,
+                        musicIntent: app.pipo.nativeapp.data.agent.intent.MusicIntent?,
+                        continuationPolicy: app.pipo.nativeapp.data.agent.session.ContinuationPolicy?,
+                        sessionMutation: app.pipo.nativeapp.data.agent.session.SessionMutation,
+                        styleCapsule: app.pipo.nativeapp.data.agent.context.StyleCapsule?,
+                        referenceBindings: List<app.pipo.nativeapp.data.agent.context.ReferenceBinding>,
+                    ): ActionExecutionResult {
+                        if (tracks.isEmpty()) {
+                            return ActionExecutionResult(actionId, "play_queue", success = false, message = "这次没排出能播的歌。")
+                        }
+                        val request = AgentQueueRequest(
+                            requestId = actionId,
+                            sourceUserText = hintLine,
+                            operation = when {
+                                similar -> QueueOperation.PlaySimilar
+                                mode == PlayMode.PlayNow -> QueueOperation.PlayNow
+                                else -> QueueOperation.ReplaceQueue
+                            },
+                            tracks = tracks,
+                            continuous = continuous,
+                            desiredCount = tracks.size,
+                        )
+                        return when (val commit = onApplyAgentQueueRequest(request)) {
+                            is QueueCommitResult.Success -> ActionExecutionResult(
+                                actionId = actionId,
+                                type = "play_queue",
+                                success = true,
+                                message = "纠偏队列已接收",
+                                tracks = commit.plan.tracks,
+                                queueSnapshot = commit.plan.tracks,
+                                similar = similar,
+                                committedQueueSummary = commit.plan.toSummary(accepted = true),
+                            )
+                            is QueueCommitResult.Rejected -> ActionExecutionResult(
+                                actionId = actionId,
+                                type = "play_queue",
+                                success = false,
+                                message = commit.messages.joinToString("、").ifBlank { "纠偏队列没有被播放器接收" },
+                                errorMessage = commit.reason,
+                            )
+                        }
+                    }
+
+                    override suspend fun insertNext(
+                        actionId: String,
+                        track: NativeTrack,
+                        jumpToInserted: Boolean,
+                    ): ActionExecutionResult {
+                        val request = AgentQueueRequest(
+                            requestId = actionId,
+                            sourceUserText = hintLine,
+                            operation = QueueOperation.InsertNext,
+                            tracks = listOf(track),
+                            jumpToInserted = jumpToInserted,
+                            desiredCount = 1,
+                        )
+                        return when (val commit = onApplyAgentQueueRequest(request)) {
+                            is QueueCommitResult.Success -> ActionExecutionResult(
+                                actionId = actionId,
+                                type = "insert_next",
+                                success = true,
+                                message = "纠偏单曲已接收",
+                                tracks = commit.plan.tracks,
+                                queueSnapshot = commit.plan.tracks,
+                                insert = true,
+                                committedQueueSummary = commit.plan.toSummary(accepted = true),
+                            )
+                            is QueueCommitResult.Rejected -> ActionExecutionResult(
+                                actionId = actionId,
+                                type = "insert_next",
+                                success = false,
+                                message = commit.messages.joinToString("、").ifBlank { "纠偏单曲没有被播放器接收" },
+                                errorMessage = commit.reason,
+                            )
+                        }
+                    }
+
+                    override suspend fun skip(actionId: String): ActionExecutionResult =
+                        ActionExecutionResult(actionId, "skip", success = false, message = "后台纠偏不执行跳过。")
+
+                    override suspend fun likeCurrent(actionId: String, like: Boolean): ActionExecutionResult =
+                        ActionExecutionResult(actionId, "like", success = false, message = "后台纠偏不执行收藏。")
+
+                    override suspend fun modifyPlaylist(
+                        actionId: String,
+                        add: Boolean,
+                        playlistName: String,
+                    ): ActionExecutionResult =
+                        ActionExecutionResult(actionId, "playlist", success = false, message = "后台纠偏不操作歌单。")
+
+                    override suspend fun updateContinuation(
+                        actionId: String,
+                        policy: app.pipo.nativeapp.data.agent.session.ContinuationPolicy,
+                        currentQueue: List<NativeTrack>,
+                        currentTrack: NativeTrack?,
+                        styleCapsule: app.pipo.nativeapp.data.agent.context.StyleCapsule?,
+                        referenceBindings: List<app.pipo.nativeapp.data.agent.context.ReferenceBinding>,
+                    ): ActionExecutionResult =
+                        ActionExecutionResult(actionId, "continuation", success = false, message = "后台纠偏不改续播。")
+                }
+                runtime.handle(
+                    input = AgentTurnInput(
+                        userText = hintLine,
+                        history = emptyList(),
+                        historySummary = "",
+                        musicReferences = emptyList(),
+                        currentTrack = null,
+                        currentQueue = playerState.queue,
+                        userFacts = settings.userFacts,
+                        persona = PetPersona.fromId(settings.personaId),
+                        activeSession = runCatching { PipoGraph.playbackIntentSessionStore.active() }.getOrNull(),
+                        currentQueueStyle = StyleCapsuleBuilder.fromQueue(playerState.queue),
+                        references = runCatching { PipoGraph.agentReferenceStore.recent() }.getOrDefault(emptyList()),
+                        aiAutoContinueEnabled = settings.aiAutoContinueEnabled || settings.playbackMode == "AiRadio",
+                        defaultContinuationMode = settings.defaultContinuationMode,
+                        inheritAgentIntentWhenAvailable = settings.inheritAgentIntentWhenAvailable,
+                        inferManualQueueStyleWhenNoAgentIntent = settings.inferManualQueueStyleWhenNoAgentIntent,
+                    ),
+                    executor = executor,
                 )
             } catch (e: CancellationException) {
                 throw e
@@ -497,16 +640,15 @@ private fun SkipCorrectionEffect(
                 null
             } ?: continue
 
-            val play = response.firstPlay()
-	            if (play != null && play.initialBatch.isNotEmpty()) {
-	                DiagnosticsLogStore.record(
-	                    area = "skip_correction",
-	                    event = "applied",
-	                    fields = mapOf("trackCount" to play.initialBatch.size),
-	                )
-	                AiCaptionBus.show(response.reply.ifBlank { "这队不对，我换一组。" })
-	                onReady(play.initialBatch, play.continuous)
-	            }
+            val applied = outcome.cards.firstOrNull { it.kind == AgentUiCard.Kind.Play && it.ok }
+            if (applied != null) {
+                DiagnosticsLogStore.record(
+                    area = "skip_correction",
+                    event = "applied",
+                    fields = mapOf("trackCount" to applied.count),
+                )
+                AiCaptionBus.show(outcome.reply.ifBlank { "这队不对，我换一组。" })
+            }
 	        }
     }
 }

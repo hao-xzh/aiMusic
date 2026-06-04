@@ -3,6 +3,7 @@ package app.pipo.nativeapp.playback
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.net.Uri
@@ -79,13 +80,29 @@ class PipoPlaybackService : MediaLibraryService() {
     private var lastProgressAtMs: Long = 0L
     private var badSourceRefreshJob: Job? = null
     private var audioFocusResumeJob: Job? = null
+    private var audioFocusPauseJob: Job? = null
     private var resumeAfterAudioFocusLoss = false
+    private var autoPausingForExternalAudio = false
+    private var hasAudioFocus = false
+    private var waitingForAudioFocusGain = false
+    private var externalAudioObservedSincePause = false
+    private var externalAudioQuietSinceMs = 0L
+    private var lastExternalFocusInterruptionAtMs = 0L
+    private var audioFocusRequest: AudioFocusRequest? = null
     private var playbackCallbackRegistered = false
     private val audioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            handleAudioFocusChange(focusChange)
+        } else {
+            mainHandler.post { handleAudioFocusChange(focusChange) }
+        }
+    }
     private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
+            maybePauseForExternalAudio("playback-callback", configs)
             maybeResumeAfterExternalAudioStops("playback-callback", configs)
         }
     }
@@ -267,6 +284,16 @@ class PipoPlaybackService : MediaLibraryService() {
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
             .build()
+        val platformMusicAttrs = android.media.AudioAttributes.Builder()
+            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+            .build()
+        audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(platformMusicAttrs)
+            .setWillPauseWhenDucked(true)
+            .setAcceptsDelayedFocusGain(false)
+            .setOnAudioFocusChangeListener(audioFocusChangeListener, mainHandler)
+            .build()
 
         // gapless 接歌的 buffer 调小一些（默认 50s 太大，next track 切到时机会拖）。
         // 给 min/max 留更多余量是为了网络抖动时不至于秒空 —— 之前 minBufferMs=15s 在
@@ -305,7 +332,7 @@ class PipoPlaybackService : MediaLibraryService() {
         val player = ExoPlayer.Builder(this)
             .setRenderersFactory(renderersFactory)
             .setMediaSourceFactory(DefaultMediaSourceFactory(cacheDataSourceFactory))
-            .setAudioAttributes(musicAttrs, /* handleAudioFocus = */ true)
+            .setAudioAttributes(musicAttrs, /* handleAudioFocus = */ false)
             .setHandleAudioBecomingNoisy(true)
             .setLoadControl(loadControl)
             .setSeekBackIncrementMs(10_000)
@@ -440,17 +467,46 @@ class PipoPlaybackService : MediaLibraryService() {
                         )
                         // 进度看门狗随"想播"开关:想播就盯,暂停就歇(playWhenReady 不受 buffering/ready 抖动影响)
                         if (playWhenReady) armProgressWatchdog(this@apply) else cancelProgressWatchdog()
+                        if (playWhenReady && !requestAudioFocusForPlayback("play-when-ready")) {
+                            autoPausingForExternalAudio = false
+                            clearAudioFocusAutoResume("focus-request-denied")
+                            runCatching { this@apply.pause() }
+                            updatePlaybackCallbackRegistration(this@apply)
+                            return
+                        }
                         when (reason) {
                             Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> {
                                 if (!playWhenReady) {
-                                    armAudioFocusAutoResume(this@apply)
+                                    armAudioFocusAutoResume(
+                                        player = this@apply,
+                                        reason = "audio-focus-loss",
+                                        observedExternalAudio = true,
+                                        waitForAudioFocusGain = true,
+                                    )
                                 }
                             }
                             Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST,
                             Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> {
-                                clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
+                                if (!playWhenReady && autoPausingForExternalAudio) {
+                                    autoPausingForExternalAudio = false
+                                    armAudioFocusAutoResume(
+                                        player = this@apply,
+                                        reason = "external-audio-pause",
+                                        observedExternalAudio = true,
+                                    )
+                                } else {
+                                    clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
+                                    abandonAudioFocus("play-when-ready-${playWhenReadyReason(reason)}")
+                                }
+                            }
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> {
+                                if (!playWhenReady) {
+                                    clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
+                                    abandonAudioFocus("play-when-ready-${playWhenReadyReason(reason)}")
+                                }
                             }
                         }
+                        updatePlaybackCallbackRegistration(this@apply)
                     }
 
                     override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
@@ -466,7 +522,14 @@ class PipoPlaybackService : MediaLibraryService() {
                             ),
                         )
                         if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
-                            armAudioFocusAutoResume(this@apply)
+                            if (this@apply.playWhenReady || this@apply.isPlaying) {
+                                armAudioFocusAutoResume(
+                                    player = this@apply,
+                                    reason = "transient-audio-focus-loss",
+                                    observedExternalAudio = true,
+                                    waitForAudioFocusGain = true,
+                                )
+                            }
                         }
                     }
 
@@ -478,11 +541,16 @@ class PipoPlaybackService : MediaLibraryService() {
                             fields = playerFields(this@apply) + mapOf("isPlaying" to isPlaying),
                         )
                         if (isPlaying) {
+                            requestAudioFocusForPlayback("is-playing")
                             clearAudioFocusAutoResume("playing")
                             notificationPlayer?.clearRecoveryWindow()
                             mediaSession?.let { session ->
                                 updateNotificationSafely(session, true, "playing")
                             }
+                        }
+                        updatePlaybackCallbackRegistration(this@apply)
+                        if (isPlaying) {
+                            maybePauseForExternalAudio("is-playing")
                         }
                     }
                 })
@@ -513,55 +581,12 @@ class PipoPlaybackService : MediaLibraryService() {
             mainPlayer = player,
             auxPlayer = auxPlayer,
             auxGain = auxPlaybackGain,
+            onResult = { result -> smartAutoMixer?.onRealtimeCrossfadeResult(result) },
         )
 
         smartAutoMixer = SmartAutoMixer(
             mainPlayer = player,
             featuresStore = PipoGraph.audioFeaturesStore,
-            transitionClipLoader = { request, onReady ->
-                serviceScope.launch {
-                    val clip = withContext(Dispatchers.IO) {
-                        runCatching {
-                            PipoGraph.repository.audioBuildTransitionClip(
-                                currentTrackId = request.currentTrackId,
-                                currentUrl = request.currentUrl,
-                                nextTrackId = request.nextTrackId,
-                                nextUrl = request.nextUrl,
-                                currentDurationMs = request.currentDurationMs,
-                                mixMs = request.mixMs,
-                                nextStartPositionMs = request.nextStartPositionMs,
-                                nextTempoScale = request.nextTempoScale,
-                                currentGain = request.currentGainLinear,
-                                nextGain = request.nextGainLinear,
-                            )
-                        }
-                    }.onFailure { err ->
-                        DiagnosticsLogStore.record(
-                            area = "automix",
-                            event = "transition_clip_build_failed",
-                            fields = mapOf(
-                                "currentTrackId" to request.currentTrackId,
-                                "nextTrackId" to request.nextTrackId,
-                                "mixMs" to request.mixMs,
-                                "nextTempoScale" to "%.4f".format(request.nextTempoScale),
-                                "errorType" to err::class.java.simpleName,
-                                "message" to err.message,
-                            ),
-                        )
-                    }.getOrNull()
-                    onReady(
-                        clip?.let {
-                            AutoMixPreparedTransitionClip(
-                                key = request.key,
-                                path = it.path,
-                                uri = it.uri,
-                                durationMs = it.durationMs,
-                                nextResumePositionMs = it.nextResumePositionMs,
-                            )
-                        },
-                    )
-                }
-            },
             crossfadeController = crossfadeController,
         )
 
@@ -807,19 +832,57 @@ class PipoPlaybackService : MediaLibraryService() {
         }
     }
 
-    private fun armAudioFocusAutoResume(player: Player) {
+    private fun armAudioFocusAutoResume(
+        player: Player,
+        reason: String,
+        observedExternalAudio: Boolean = false,
+        waitForAudioFocusGain: Boolean = false,
+    ) {
         if (player.mediaItemCount == 0 || player.currentMediaItem == null) return
         resumeAfterAudioFocusLoss = true
+        waitingForAudioFocusGain = waitForAudioFocusGain
+        if (observedExternalAudio) {
+            externalAudioObservedSincePause = true
+        }
+        externalAudioQuietSinceMs = 0L
         registerPlaybackCallback()
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "audio_focus_auto_resume_armed",
-            fields = playerFields(player),
+            fields = playerFields(player) + mapOf(
+                "reason" to reason,
+                "observedExternalAudio" to externalAudioObservedSincePause,
+                "waitForAudioFocusGain" to waitingForAudioFocusGain,
+            ),
         )
         audioFocusResumeJob?.cancel()
+        scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "delayed-probe")
+    }
+
+    private fun scheduleAudioFocusResumeProbe(delayMs: Long, reason: String) {
+        audioFocusResumeJob?.cancel()
         audioFocusResumeJob = serviceScope.launch {
-            delay(AUDIO_FOCUS_RESUME_PROBE_MS)
-            maybeResumeAfterExternalAudioStops("delayed-probe")
+            delay(delayMs)
+            maybeResumeAfterExternalAudioStops(reason)
+        }
+    }
+
+    private fun scheduleAudioFocusPauseProbe(reason: String) {
+        audioFocusPauseJob?.cancel()
+        audioFocusPauseJob = serviceScope.launch {
+            delay(AUDIO_FOCUS_PAUSE_CONFIRM_MS)
+            maybePauseForExternalAudio("audio-focus-$reason")
+        }
+    }
+
+    private fun updatePlaybackCallbackRegistration(player: Player? = mediaSession?.player) {
+        val shouldMonitor = resumeAfterAudioFocusLoss ||
+            player?.playWhenReady == true ||
+            player?.isPlaying == true
+        if (shouldMonitor) {
+            registerPlaybackCallback()
+        } else {
+            unregisterPlaybackCallback()
         }
     }
 
@@ -848,6 +911,77 @@ class PipoPlaybackService : MediaLibraryService() {
         playbackCallbackRegistered = false
     }
 
+    private fun requestAudioFocusForPlayback(reason: String): Boolean {
+        if (hasAudioFocus) return true
+        val request = audioFocusRequest ?: return true
+        val result = audioManager.requestAudioFocus(request)
+        val granted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        hasAudioFocus = granted
+        waitingForAudioFocusGain = result == AudioManager.AUDIOFOCUS_REQUEST_DELAYED
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "audio_focus_request",
+            fields = mapOf(
+                "reason" to reason,
+                "result" to audioFocusRequestResultName(result),
+            ),
+        )
+        return granted
+    }
+
+    private fun abandonAudioFocus(reason: String) {
+        val request = audioFocusRequest ?: return
+        runCatching { audioManager.abandonAudioFocusRequest(request) }
+        hasAudioFocus = false
+        waitingForAudioFocusGain = false
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "audio_focus_abandoned",
+            fields = mapOf("reason" to reason),
+        )
+    }
+
+    private fun handleAudioFocusChange(focusChange: Int) {
+        val player = mediaSession?.player
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "audio_focus_changed",
+            fields = player?.let(::playerFields).orEmpty() + mapOf(
+                "focusChange" to audioFocusChangeName(focusChange),
+            ),
+        )
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasAudioFocus = true
+                waitingForAudioFocusGain = false
+                maybeResumeAfterExternalAudioStops("audio-focus-gain")
+            }
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                hasAudioFocus = false
+                waitingForAudioFocusGain = false
+                lastExternalFocusInterruptionAtMs = SystemClock.elapsedRealtime()
+                if (player?.isPlaying == true || player?.playWhenReady == true) {
+                    maybePauseForExternalAudio("audio-focus-loss")
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                hasAudioFocus = false
+                waitingForAudioFocusGain = true
+                lastExternalFocusInterruptionAtMs = SystemClock.elapsedRealtime()
+                if (player?.isPlaying == true || player?.playWhenReady == true) {
+                    scheduleAudioFocusPauseProbe("loss-transient")
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                hasAudioFocus = false
+                waitingForAudioFocusGain = true
+                if (player?.isPlaying == true || player?.playWhenReady == true) {
+                    scheduleAudioFocusPauseProbe("duck")
+                }
+            }
+        }
+    }
+
     private fun maybeResumeAfterExternalAudioStops(
         reason: String,
         configs: List<AudioPlaybackConfiguration> = audioManager.activePlaybackConfigurations,
@@ -858,20 +992,123 @@ class PipoPlaybackService : MediaLibraryService() {
             clearAudioFocusAutoResume("not-needed-$reason")
             return
         }
-        if (hasExternalActiveMedia(configs)) return
+        if (hasExternalInterruptingAudio(configs, allowMediaWithoutRecentFocus = true)) {
+            externalAudioObservedSincePause = true
+            externalAudioQuietSinceMs = 0L
+            scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "external-still-active")
+            return
+        }
+        if (!externalAudioObservedSincePause) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "audio_focus_auto_resume_waiting",
+                fields = playerFields(player) + mapOf(
+                    "reason" to reason,
+                    "wait" to "no-external-audio-observed",
+                ),
+            )
+            scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "wait-external-observed")
+            return
+        }
+        if (waitingForAudioFocusGain && !hasAudioFocus) {
+            scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "wait-focus-gain")
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (externalAudioQuietSinceMs == 0L) {
+            externalAudioQuietSinceMs = now
+            scheduleAudioFocusResumeProbe(EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS, "quiet-window")
+            return
+        }
+        val quietForMs = now - externalAudioQuietSinceMs
+        if (quietForMs < EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS) {
+            scheduleAudioFocusResumeProbe(
+                EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS - quietForMs,
+                "quiet-window",
+            )
+            return
+        }
+        if (!requestAudioFocusForPlayback("auto-resume-$reason")) {
+            scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "focus-not-ready")
+            return
+        }
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "audio_focus_auto_resume",
-            fields = playerFields(player) + mapOf("reason" to reason),
+            fields = playerFields(player) + mapOf(
+                "reason" to reason,
+                "quietForMs" to quietForMs,
+            ),
         )
         player.prepare()
         player.play()
     }
 
-    private fun hasExternalActiveMedia(configs: List<AudioPlaybackConfiguration>): Boolean {
-        return configs.any { config ->
-            isMediaPlaybackUsage(config.audioAttributes.usage)
+    private fun maybePauseForExternalAudio(
+        reason: String,
+        configs: List<AudioPlaybackConfiguration> = audioManager.activePlaybackConfigurations,
+    ) {
+        val player = mediaSession?.player ?: return
+        if (player.mediaItemCount == 0 || player.currentMediaItem == null) return
+        if (!player.playWhenReady && !player.isPlaying) return
+        if (!hasExternalInterruptingAudio(configs, allowMediaWithoutRecentFocus = false)) return
+        if (!resumeAfterAudioFocusLoss) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "external_audio_auto_pause",
+                fields = playerFields(player) + mapOf(
+                    "reason" to reason,
+                    "activeUsages" to activeUsageSummary(configs),
+                ),
+            )
         }
+        autoPausingForExternalAudio = true
+        armAudioFocusAutoResume(
+            player = player,
+            reason = "external-audio-$reason",
+            observedExternalAudio = true,
+            waitForAudioFocusGain = !hasAudioFocus,
+        )
+        runCatching { player.pause() }
+            .onFailure { err ->
+                autoPausingForExternalAudio = false
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "external_audio_auto_pause_failed",
+                    fields = playerFields(player) + mapOf(
+                        "reason" to reason,
+                        "errorType" to err::class.java.simpleName,
+                        "message" to err.message,
+                    ),
+                )
+            }
+        mainHandler.postDelayed({
+            autoPausingForExternalAudio = false
+        }, EXTERNAL_AUDIO_PAUSE_FLAG_CLEAR_MS)
+    }
+
+    private fun hasExternalInterruptingAudio(
+        configs: List<AudioPlaybackConfiguration>,
+        allowMediaWithoutRecentFocus: Boolean,
+    ): Boolean {
+        val interruptingUsages = configs.map { it.audioAttributes.usage }
+            .filter(::isInterruptingPlaybackUsage)
+        if (interruptingUsages.isEmpty()) return false
+        if (interruptingUsages.any(::isVoiceOrAssistantUsage)) return true
+        val externalMediaCount = interruptingUsages.count(::isMediaPlaybackUsage) - expectedOwnMediaPlaybackCount()
+        if (externalMediaCount <= 0) return false
+        return allowMediaWithoutRecentFocus || hasRecentExternalFocusInterruption()
+    }
+
+    private fun expectedOwnMediaPlaybackCount(): Int {
+        val player = mediaSession?.player
+        val mainExpected = if (player?.isPlaying == true) 1 else 0
+        val auxExpected = if (crossfadeController?.hasActiveAuxPlayback == true) 1 else 0
+        return mainExpected + auxExpected
+    }
+
+    private fun isInterruptingPlaybackUsage(usage: Int): Boolean {
+        return isMediaPlaybackUsage(usage) || isVoiceOrAssistantUsage(usage)
     }
 
     private fun isMediaPlaybackUsage(usage: Int): Boolean {
@@ -879,17 +1116,48 @@ class PipoPlaybackService : MediaLibraryService() {
             usage == android.media.AudioAttributes.USAGE_GAME
     }
 
+    private fun isVoiceOrAssistantUsage(usage: Int): Boolean {
+        return usage == android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION ||
+            usage == android.media.AudioAttributes.USAGE_ASSISTANT
+    }
+
+    private fun hasRecentExternalFocusInterruption(): Boolean {
+        return SystemClock.elapsedRealtime() - lastExternalFocusInterruptionAtMs <=
+            EXTERNAL_MEDIA_FOCUS_LINK_WINDOW_MS
+    }
+
+    private fun activeUsageSummary(configs: List<AudioPlaybackConfiguration>): String {
+        return configs
+            .map { playbackUsageName(it.audioAttributes.usage) }
+            .groupingBy { it }
+            .eachCount()
+            .entries
+            .sortedBy { it.key }
+            .joinToString(",") { "${it.key}:${it.value}" }
+    }
+
     private fun clearAudioFocusAutoResume(reason: String) {
-        if (!resumeAfterAudioFocusLoss && !playbackCallbackRegistered) return
+        if (!resumeAfterAudioFocusLoss) {
+            audioFocusResumeJob?.cancel()
+            audioFocusResumeJob = null
+            externalAudioObservedSincePause = false
+            externalAudioQuietSinceMs = 0L
+            waitingForAudioFocusGain = false
+            updatePlaybackCallbackRegistration()
+            return
+        }
         resumeAfterAudioFocusLoss = false
         audioFocusResumeJob?.cancel()
         audioFocusResumeJob = null
-        unregisterPlaybackCallback()
+        externalAudioObservedSincePause = false
+        externalAudioQuietSinceMs = 0L
+        waitingForAudioFocusGain = false
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "audio_focus_auto_resume_cleared",
             fields = mapOf("reason" to reason),
         )
+        updatePlaybackCallbackRegistration()
     }
 
     private fun recoverBadSourceOrSkip(player: Player, error: PlaybackException) {
@@ -1449,6 +1717,8 @@ class PipoPlaybackService : MediaLibraryService() {
         cancelProgressWatchdog()
         badSourceRefreshJob?.cancel()
         audioFocusResumeJob?.cancel()
+        audioFocusPauseJob?.cancel()
+        abandonAudioFocus("service-destroy")
         unregisterPlaybackCallback()
         serviceScope.cancel()
         mediaSession?.let { session ->
@@ -1478,6 +1748,10 @@ class PipoPlaybackService : MediaLibraryService() {
         // 先轻量重踢这么多次(原地 seek+prepare);还卡就升级到 URL 重签/跳过(源/URL 问题,重踢无用)。
         private const val PROGRESS_STALL_REKICK_LIMIT = 2
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
+        private const val AUDIO_FOCUS_PAUSE_CONFIRM_MS = 350L
+        private const val EXTERNAL_AUDIO_PAUSE_FLAG_CLEAR_MS = 500L
+        private const val EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS = 1_200L
+        private const val EXTERNAL_MEDIA_FOCUS_LINK_WINDOW_MS = 2_000L
         private const val LIBRARY_ROOT_ID = "pipo:root"
         private const val CURRENT_QUEUE_ID = "pipo:current-queue"
         private const val TRACK_MEDIA_ID_PREFIX = "pipo:track:"
@@ -1537,4 +1811,40 @@ private fun playbackSuppressionReasonName(reason: Int): String = when (reason) {
     Player.PLAYBACK_SUPPRESSION_REASON_NONE -> "none"
     Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS -> "transient_audio_focus_loss"
     else -> reason.toString()
+}
+
+private fun audioFocusChangeName(focusChange: Int): String = when (focusChange) {
+    AudioManager.AUDIOFOCUS_GAIN -> "gain"
+    AudioManager.AUDIOFOCUS_LOSS -> "loss"
+    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "loss_transient"
+    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "loss_transient_can_duck"
+    else -> focusChange.toString()
+}
+
+private fun audioFocusRequestResultName(result: Int): String = when (result) {
+    AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> "granted"
+    AudioManager.AUDIOFOCUS_REQUEST_FAILED -> "failed"
+    AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> "delayed"
+    else -> result.toString()
+}
+
+@Suppress("DEPRECATION")
+private fun playbackUsageName(usage: Int): String = when (usage) {
+    android.media.AudioAttributes.USAGE_MEDIA -> "media"
+    android.media.AudioAttributes.USAGE_GAME -> "game"
+    android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION -> "voice_communication"
+    android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING -> "voice_signalling"
+    android.media.AudioAttributes.USAGE_ASSISTANT -> "assistant"
+    android.media.AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY -> "accessibility"
+    android.media.AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE -> "navigation"
+    android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION -> "sonification"
+    android.media.AudioAttributes.USAGE_NOTIFICATION -> "notification"
+    android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT -> "notification_instant"
+    android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_DELAYED -> "notification_delayed"
+    android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_REQUEST -> "notification_request"
+    android.media.AudioAttributes.USAGE_NOTIFICATION_EVENT -> "notification_event"
+    android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE -> "ringtone"
+    android.media.AudioAttributes.USAGE_ALARM -> "alarm"
+    android.media.AudioAttributes.USAGE_UNKNOWN -> "unknown"
+    else -> usage.toString()
 }

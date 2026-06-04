@@ -103,11 +103,12 @@ object DiagnosticsLogStore {
                 appendLine("sdk=${Build.VERSION.SDK_INT}")
                 appendLine()
                 appendCrashSection(app)
-                appendLine("---- recent events ----")
                 val files = dir.listFiles()
                     ?.filter { it.isFile && it.name.endsWith(".ndjson") }
                     ?.sortedBy { it.lastModified() }
                     .orEmpty()
+                appendTransitionSection(files)
+                appendLine("---- recent events ----")
                 val budgetPerFile = (maxBytes / files.size.coerceAtLeast(1)).coerceAtLeast(48_000)
                 files.forEach { file ->
                     appendLine("## ${file.name}")
@@ -154,6 +155,77 @@ object DiagnosticsLogStore {
             if (!endsWith("\n")) appendLine()
         }
         appendLine()
+    }
+
+    private fun StringBuilder.appendTransitionSection(files: List<File>) {
+        appendLine("---- seamless transitions (recent 20) ----")
+        val lines = recentTransitionLines(files, maxEvents = 20)
+        if (lines.isEmpty()) {
+            appendLine("none")
+        } else {
+            lines.forEach(::appendLine)
+        }
+        appendLine()
+    }
+
+    private fun recentTransitionLines(files: List<File>, maxEvents: Int): List<String> {
+        val events = setOf(
+            "queue_commit",
+            "transition_prepare_report",
+            "transition_summary",
+            "stale_transition_cancel",
+        )
+        val out = ArrayList<String>()
+        for (file in files.asReversed()) {
+            if (out.size >= maxEvents) break
+            val lines = tailText(file, maxBytes = 220_000)
+                .lineSequence()
+                .map { it.trim() }
+                .filter { it.startsWith("{") }
+                .toList()
+                .asReversed()
+            for (line in lines) {
+                val json = runCatching { JSONObject(line) }.getOrNull() ?: continue
+                val event = json.optString("event")
+                if (event !in events) continue
+                out.add(formatTransitionLine(json))
+                if (out.size >= maxEvents) break
+            }
+        }
+        return out.asReversed()
+    }
+
+    private fun formatTransitionLine(json: JSONObject): String {
+        val fields = listOf(
+            "queueVersion",
+            "operation",
+            "pairKey",
+            "mode",
+            "success",
+            "risk",
+            "accepted",
+            "reordered",
+            "reason",
+            "failureReason",
+            "handoffGapMs",
+            "resumeDriftMs",
+            "actualOverlapMs",
+            "auxReadyDelayMs",
+            "featuresReadyCount",
+            "resolvedCount",
+        ).mapNotNull { key ->
+            json.optCompact(key)?.let { "$key=$it" }
+        }.joinToString(" ")
+        return listOf(
+            json.optCompact("ts").orEmpty(),
+            "${json.optCompact("area").orEmpty()}/${json.optCompact("event").orEmpty()}",
+            fields,
+        ).filter { it.isNotBlank() }.joinToString(" ")
+    }
+
+    private fun JSONObject.optCompact(key: String): String? {
+        if (!has(key) || isNull(key)) return null
+        return optString(key).takeIf { it.isNotBlank() }?.take(120)
     }
 
     private fun rotateIfNeeded(dir: File) {

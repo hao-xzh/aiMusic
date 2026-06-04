@@ -62,8 +62,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -282,58 +280,20 @@ private fun DistillLibrary(
     var pullOffset by remember { mutableStateOf(0f) }
     var isRefreshing by remember { mutableStateOf(false) }
     var refreshDragBlockedUntilRelease by remember { mutableStateOf(false) }
-    var searchSettledListKey by remember { mutableStateOf(focusedListKey) }
     var locateTargetListKey by remember { mutableStateOf<String?>(null) }
 
-    val searchBarMaxHeight = 44.dp
     val localDensity = androidx.compose.ui.platform.LocalDensity.current
-    val searchBarMaxHeightPx = with(localDensity) { searchBarMaxHeight.toPx() }
     val refreshThresholdPx = with(localDensity) { 92.dp.toPx() }
     val refreshHoldOffsetPx = with(localDensity) { 38.dp.toPx() }
     val refreshMaxGapPx = with(localDensity) { 54.dp.toPx() }
-    val trackTopTolerancePx = with(localDensity) { 6.dp.toPx() }.toInt()
-    val searchHeightAnim = remember { Animatable(0f) }
-    val searchFocusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
-    val isTrackListAwayFromTop by remember(trackListState, trackTopTolerancePx) {
-        derivedStateOf {
-            trackListState.firstVisibleItemIndex > 0 ||
-                trackListState.firstVisibleItemScrollOffset > trackTopTolerancePx
-        }
-    }
-    val isSwitchingTrackList = focusedListKey != searchSettledListKey
-    val shouldShowSearchBar = !isSwitchingTrackList &&
-        (isTrackListAwayFromTop || searchQuery.isNotBlank())
 
     fun closeSearch() {
         searchQuery = ""
         focusManager.clearFocus()
         keyboardController?.hide()
-    }
-
-    LaunchedEffect(shouldShowSearchBar) {
-        val target = if (shouldShowSearchBar) searchBarMaxHeightPx else 0f
-        searchHeightAnim.animateTo(
-            target,
-            tween(durationMillis = 220, easing = androidx.compose.animation.core.FastOutSlowInEasing),
-        )
-        if (!shouldShowSearchBar) {
-            focusManager.clearFocus()
-            keyboardController?.hide()
-        }
-    }
-
-    LaunchedEffect(isTrackListAwayFromTop) {
-        if (isTrackListAwayFromTop) {
-            pullOffset = 0f
-        } else {
-            if (searchQuery.isBlank()) {
-                focusManager.clearFocus()
-                keyboardController?.hide()
-            }
-        }
     }
 
     val filteredTracks = remember(tracks, searchQuery) {
@@ -464,9 +424,6 @@ private fun DistillLibrary(
         keyboardController?.hide()
         pullOffset = 0f
         refreshDragBlockedUntilRelease = false
-        // searchHeightAnim 不 snap —— shouldShowSearchBar=false 已经在驱动它自然渐隐
-        // （原 snapTo(0f) 会抢掉 220ms 的 animateTo，体感像被一刀切）。
-        searchSettledListKey = focusedListKey
     }
     LaunchedEffect(focusedListKey, focusedQueue, focusedPlaylist, trackLoadRetry) {
         // 关键原则：cache 已经把 tracks 灌成非空时，整个 LaunchedEffect 走"静默 verify"——
@@ -552,7 +509,8 @@ private fun DistillLibrary(
         if (!pendingLocateCurrent) return@LaunchedEffect
         val idx = currentTrackId?.let { id -> tracks.indexOfFirst { it.id == id } } ?: -1
         if (idx >= 0) {
-            trackListState.animateScrollToItem(idx)
+            // 列表第 0 项是搜索栏（tracks 非空时恒在），曲目从 index 1 起，定位要 +1
+            trackListState.animateScrollToItem(idx + 1)
             pendingLocateCurrent = false
             locateTargetListKey = null
         }
@@ -609,7 +567,7 @@ private fun DistillLibrary(
                     coordinator.start(
                         playlists = playlistsToDistill,
                         onComplete = {
-                            // 蒸馏完后让本地库 cache 也刷新，让 PetAgent 召回拿到最新的曲库
+                            // 蒸馏完后让本地库 cache 也刷新，让 AgentRuntime 召回拿到最新的曲库
                             app.pipo.nativeapp.data.PipoGraph.library.invalidate()
                         },
                     )
@@ -718,7 +676,10 @@ private fun DistillLibrary(
                             .weight(1f),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 88.dp),
                     ) {
-                        items(items = distillablePlaylists, key = { it.id }) { p ->
+                        itemsIndexed(
+                            items = distillablePlaylists,
+                            key = { index, p -> "${p.id}:$index" },
+                        ) { _, p ->
                             val checked = selectedIds[p.id] == true
                             Row(
                                 modifier = Modifier
@@ -963,6 +924,18 @@ private fun DistillLibrary(
 	                                }
 	                            }
 	                        }
+	                        // 搜索框：作为列表第一项，随内容一起滚动（iOS 风），不再用浮层遮挡歌曲
+	                        if (tracks.isNotEmpty()) {
+	                            item(key = "__track_search__") {
+	                                TrackSearchField(
+	                                    query = searchQuery,
+	                                    onQueryChange = { searchQuery = it },
+	                                    onClear = { closeSearch() },
+	                                    onSearch = { keyboardController?.hide() },
+                                    modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 2.dp, bottom = 10.dp),
+	                                )
+	                            }
+	                        }
 	                        when {
                             // 只有"真没东西可显"才让位给加载文案；切歌单时 cache 命中很快，
                             // 旧 tracks 先撑着，新 tracks 一到直接替换 → 用户看不到"多行→
@@ -1040,76 +1013,6 @@ private fun DistillLibrary(
                         }
                     }
 
-                    // 搜索框作为覆盖层，不参与 LazyColumn 测量，避免出现/收起时挤压列表导致抖动。
-                    if (searchHeightAnim.value > 0f) {
-	                        val searchProgress = (searchHeightAnim.value / searchBarMaxHeightPx).coerceIn(0f, 1f)
-	                        val searchShape = RoundedCornerShape(14.dp)
-	                        Row(
-	                            modifier = Modifier
-	                                .align(Alignment.TopCenter)
-	                                .fillMaxWidth()
-	                                .padding(horizontal = 16.dp)
-	                                .height(38.dp)
-	                                .graphicsLayer {
-	                                    alpha = searchProgress
-	                                    translationY = with(localDensity) {
-	                                        (-10).dp.toPx() * (1f - searchProgress)
-	                                    }
-	                                }
-	                                .clip(searchShape)
-	                                .background(Color(0xF238403A))
-	                                .border(1.dp, Color.White.copy(alpha = 0.12f), searchShape)
-	                                .padding(horizontal = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            SearchIcon(
-                                color = PipoColors.TextDim,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            androidx.compose.foundation.text.BasicTextField(
-                                value = searchQuery,
-                                onValueChange = { searchQuery = it },
-                                textStyle = TextStyle(
-                                    color = PipoColors.Ink,
-                                    fontSize = 13.sp
-                                ),
-                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                                    imeAction = androidx.compose.ui.text.input.ImeAction.Search
-                                ),
-                                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                                    onSearch = { keyboardController?.hide() }
-                                ),
-	                                modifier = Modifier
-	                                    .weight(1f)
-	                                    .focusRequester(searchFocusRequester),
-	                                cursorBrush = androidx.compose.ui.graphics.SolidColor(PipoColors.Ink),
-                                decorationBox = { innerTextField ->
-                                    if (searchQuery.isEmpty()) {
-                                        Text(
-                                            text = "搜索当前歌单歌曲",
-                                            color = PipoColors.TextDim,
-                                            style = TextStyle(fontSize = 13.sp)
-                                        )
-                                    }
-                                    innerTextField()
-                                }
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .clip(CircleShape)
-                                    .clickable { closeSearch() }
-                                    .semantics { contentDescription = "关闭搜索" }
-                                    .padding(4.dp)
-                            ) {
-                                CloseIcon(
-                                    color = PipoColors.TextDim,
-                                    modifier = Modifier.size(10.dp)
-                                )
-                            }
-                        }
-                    }
-
 	                    if (shouldShowLocateCurrent) {
 	                        Box(
 	                            modifier = Modifier
@@ -1123,7 +1026,8 @@ private fun DistillLibrary(
                                 .clickable {
                                     scope.launch {
                                         if (currentTrackIndexInVisibleTracks >= 0) {
-                                            trackListState.animateScrollToItem(currentTrackIndexInVisibleTracks)
+                                            // +1：列表第 0 项是搜索栏，曲目从 index 1 起
+                                            trackListState.animateScrollToItem(currentTrackIndexInVisibleTracks + 1)
                                         } else {
 	                                            val queuePage = libraryPages.indexOfFirst { it is LibraryPage.CurrentQueue }
 	                                            if (queuePage >= 0) {
@@ -1300,6 +1204,75 @@ private fun SwipeToRevealDeleteRow(
                 isPlaying = isPlaying,
                 onClick = onClick
             )
+        }
+    }
+}
+
+/**
+ * 歌单内搜索框 —— 作为曲目列表的第一项随内容滚动（iOS 风），不再做悬浮覆盖层。
+ * 视觉走项目统一的 glass token（GlassFill + GlassStroke），跟其它沉浸式控件一致。
+ */
+@Composable
+private fun TrackSearchField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onClear: () -> Unit,
+    onSearch: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(40.dp)
+            .clip(shape)
+            .background(PipoColors.GlassFill)
+            .border(1.dp, PipoColors.GlassStroke, shape)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SearchIcon(
+            color = PipoColors.TextDim,
+            modifier = Modifier.size(15.dp),
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        androidx.compose.foundation.text.BasicTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            singleLine = true,
+            textStyle = TextStyle(color = PipoColors.Ink, fontSize = 13.sp),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                imeAction = androidx.compose.ui.text.input.ImeAction.Search,
+            ),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                onSearch = { onSearch() },
+            ),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(PipoColors.Ink),
+            modifier = Modifier.weight(1f),
+            decorationBox = { innerTextField ->
+                if (query.isEmpty()) {
+                    Text(
+                        text = "搜索当前歌单歌曲",
+                        color = PipoColors.TextDim,
+                        style = TextStyle(fontSize = 13.sp),
+                    )
+                }
+                innerTextField()
+            },
+        )
+        if (query.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .clickable { onClear() }
+                    .semantics { contentDescription = "清除搜索" }
+                    .padding(4.dp),
+            ) {
+                CloseIcon(
+                    color = PipoColors.TextDim,
+                    modifier = Modifier.size(10.dp),
+                )
+            }
         }
     }
 }

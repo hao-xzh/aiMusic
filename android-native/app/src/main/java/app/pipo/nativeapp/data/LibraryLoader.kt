@@ -29,7 +29,6 @@ class LibraryLoader(private val repository: PipoRepository) {
                 repository.refreshPlaylists()
             }
             playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
-            if (playlists.isEmpty()) return emptyList()
         }
         val tracks = coroutineScope {
             val deferred = playlists.map { p ->
@@ -39,12 +38,18 @@ class LibraryLoader(private val repository: PipoRepository) {
                     }
                 }
             }
+            val cloudDeferred = async {
+                runCatching { repository.cloudDiskTracks() }.getOrDefault(emptyList())
+            }
             val seen = HashSet<String>()
             val out = ArrayList<NativeTrack>()
             deferred.forEach { d ->
                 d.await().forEach { t ->
                     if (seen.add(t.id)) out.add(t)
                 }
+            }
+            cloudDeferred.await().forEach { t ->
+                if (seen.add(t.id)) out.add(t)
             }
             out
         }

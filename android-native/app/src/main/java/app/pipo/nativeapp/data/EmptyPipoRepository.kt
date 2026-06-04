@@ -114,21 +114,6 @@ class EmptyPipoRepository : PipoRepository {
         tailSilenceS = 0.0,
     )
 
-    override suspend fun audioBuildTransitionClip(
-        currentTrackId: Long,
-        currentUrl: String,
-        nextTrackId: Long,
-        nextUrl: String,
-        currentDurationMs: Long,
-        mixMs: Long,
-        nextStartPositionMs: Long,
-        nextTempoScale: Float,
-        currentGain: Float,
-        nextGain: Float,
-    ): AutoMixTransitionClip {
-        throw UnsupportedOperationException("Native bridge unavailable")
-    }
-
     override suspend fun refreshAiConfig() = Unit
     override suspend fun setAiProvider(providerId: String) {
         aiConfigState.value = aiConfigState.value.copy(activeProvider = providerId)

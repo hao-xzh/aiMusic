@@ -41,42 +41,51 @@ import app.pipo.nativeapp.data.AiPetCommandBus
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.data.agent.context.AgentContextAssembler
+import app.pipo.nativeapp.data.agent.context.AgentReference
+import app.pipo.nativeapp.data.agent.domain.AgentUiCard
+import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
+import app.pipo.nativeapp.data.agent.execute.PlayerAgentExecutor
+import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
+import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
+import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.runtime.Amp
 import app.pipo.nativeapp.runtime.AppForeground
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.PI
 import kotlin.math.sin
 
-/**
- * AI 说"加到 [工作] 歌单" → 在用户 playlist 列表里模糊匹配一个出来。
- * 1) 精确同名 2) playlist 名含查询 3) 查询含 playlist 名（用户说短、歌单名长）。
- */
-private fun matchPlaylist(
-    playlists: List<app.pipo.nativeapp.data.PipoPlaylist>,
-    query: String,
-): app.pipo.nativeapp.data.PipoPlaylist? {
-    val q = query.lowercase().trim()
-    if (q.isEmpty()) return null
-    return playlists.firstOrNull { it.name.lowercase() == q }
-        ?: playlists.firstOrNull { it.name.lowercase().contains(q) }
-        ?: playlists.firstOrNull { q.contains(it.name.lowercase()) }
-}
+private fun AgentUiCard.toPetResultCard(): PetResultCard =
+    when (kind) {
+        AgentUiCard.Kind.Play -> PetResultCard.Play(
+            count = count,
+            artists = artists,
+            covers = covers,
+            insert = insert,
+            similar = similar,
+        )
+        AgentUiCard.Kind.Skip -> PetResultCard.Action(icon = PetActionIcon.Skip, label = label, ok = ok)
+        AgentUiCard.Kind.Like -> PetResultCard.Action(icon = PetActionIcon.Like, label = label, ok = ok)
+        AgentUiCard.Kind.Unlike -> PetResultCard.Action(icon = PetActionIcon.Unlike, label = label, ok = ok)
+        AgentUiCard.Kind.PlaylistAdd -> PetResultCard.Action(icon = PetActionIcon.PlaylistAdd, label = label, ok = ok)
+        AgentUiCard.Kind.PlaylistRemove -> PetResultCard.Action(icon = PetActionIcon.PlaylistRemove, label = label, ok = ok)
+        AgentUiCard.Kind.Error -> PetResultCard.Action(icon = PetActionIcon.Error, label = label, ok = false)
+    }
 
 @Composable
 fun NativeAiPet(
     isPlaying: Boolean,
     currentTrack: app.pipo.nativeapp.data.NativeTrack?,
+    currentQueue: List<app.pipo.nativeapp.data.NativeTrack>,
     currentTrackKey: String?,
     currentTitle: String,
     currentArtist: String,
     coverUrl: String?,
-    onPlayFromAgent: (List<app.pipo.nativeapp.data.NativeTrack>, app.pipo.nativeapp.data.ContinuousQueueSource?) -> Boolean,
-    onInsertFromAgent: (app.pipo.nativeapp.data.NativeTrack) -> Boolean,
+    onApplyAgentQueueRequest: suspend (AgentQueueRequest) -> QueueCommitResult,
     onSkipFromAgent: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -104,6 +113,13 @@ fun NativeAiPet(
             runCatching { PipoGraph.petMemory.conversationContext().turns }.getOrDefault(emptyList())
         }
         PetChatStore.hydrateOnce(turns)
+    }
+
+    val currentQueueSignature = remember(currentQueue) {
+        currentQueue.joinToString(separator = "|") { it.id }
+    }
+    LaunchedEffect(currentQueueSignature) {
+        PetChatStore.syncLatestPlayCardCount(currentQueue.size)
     }
 
     // latestReply 的自动消散
@@ -137,7 +153,18 @@ fun NativeAiPet(
     val coverRect = anchor.state.value.rect
     // 封面采样色统一驱动宠物、输入条和回复气泡，避免常驻球体在播放页里突兀。
     val petPalette = rememberPetPalette(useCoverEdgeColors(coverUrl))
-    val petAgent = remember(repository) { app.pipo.nativeapp.data.PetAgent(repository) }
+    val agentRuntime = remember(repository, context) {
+        AgentRuntime(
+            repository = repository,
+            ledger = AgentLedgerStore(context),
+        )
+    }
+    val contextAssembler = remember(context) {
+        AgentContextAssembler(
+            sessionStore = PipoGraph.playbackIntentSessionStore,
+            referenceProvider = { PipoGraph.agentReferenceStore.recent() },
+        )
+    }
 
     // 风场弹簧物理 + 节拍包络 —— 镜像 src/components/AiPet.tsx 159-289 行
     //   - 三层不同频率正弦叠加形成"自然风"
@@ -505,154 +532,143 @@ fun NativeAiPet(
                 pending = pending,
                 hintText = if (messages.isEmpty()) emptyHint else "说点什么…",
                 onInputChange = { input = it },
-	                onSend = {
-	                    val text = input.trim()
-	                    if (text.isEmpty()) return@PetCommandBar
-	                    val promptContext = runCatching { PipoGraph.petMemory.conversationContext() }
-	                        .getOrDefault(app.pipo.nativeapp.data.PetMemory.ConversationContext())
-	                    input = ""
-	                    messages += PetMessage(fromUser = true, text = text)
-	                    PetBubbleState.lastUserContext = text
-	                    runCatching { PipoGraph.petMemory.recordUtterance(text) }
-	                    pending = true
-	                    scope.launch {
-	                        try {
-	                            try {
-	                                PipoGraph.petMemory.recordConversationTurn(
-	                                    app.pipo.nativeapp.data.PetMemory.ROLE_USER,
-	                                    text,
-	                                )
-	                            } catch (_: Exception) {
-	                                // 记忆失败不能阻塞点歌。
-	                            }
-	                            val response = petAgent.chat(
-		                                userText = text,
-		                                history = promptContext.turns,
-		                                historySummary = promptContext.summary,
-		                                musicReferences = promptContext.musicReferences,
-		                                currentTrack = currentTrack,
-		                                userFacts = settings.userFacts,
-		                                persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
-		                            )
-	                            messages += PetMessage(fromUser = false, text = response.reply)
-	                            try {
-	                                PipoGraph.petMemory.recordConversationTurn(
-	                                    app.pipo.nativeapp.data.PetMemory.ROLE_ASSISTANT,
-	                                    response.reply,
-	                                )
-		                            } catch (_: Exception) {
-		                                // 只保存干净的 assistant 文本；失败不影响 UI/播放动作。
-		                            }
-		                            try {
-		                                PipoGraph.petMemory.recordMusicReferences(response.musicReferences)
-		                            } catch (_: Exception) {
-		                                // 可执行指代记忆失败不能影响 UI/播放动作。
-		                            }
-		                            latestReply = response.reply
-	                            AiCaptionBus.show(response.reply)
-                            // agent 一轮可链式落多个写动作（"收藏这首再放点类似的" → Like + Play），
-                            // 按顺序执行,每个动作落一张结果卡片 / chip 进对话流。纯聊天 / explain 时 actions 为空。
-                            for (action in response.actions) {
-                                when (action) {
-                                    is app.pipo.nativeapp.data.PetAgent.AgentAction.Skip -> {
-                                        onSkipFromAgent()
-                                        messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Skip, label = "换一首"))
-                                    }
-                                    is app.pipo.nativeapp.data.PetAgent.AgentAction.Like -> {
-                                        val tid = currentTrack?.neteaseId
-                                        val like = action.like
-                                        if (tid != null) {
-                                            app.pipo.nativeapp.DiagnosticsLogStore.record(
-                                                area = "ai_agent",
-                                                event = "like_intent_invoke",
-                                                fields = mapOf("neteaseId" to tid, "like" to like, "title" to currentTrack?.title),
-                                            )
-                                            runCatching { repository.likeSong(tid, like) }
-                                                .onSuccess {
-                                                    messages += PetMessage(false, "", PetResultCard.Action(
-                                                        icon = if (like) PetActionIcon.Like else PetActionIcon.Unlike,
-                                                        label = if (like) "已加心：${currentTrack?.title.orEmpty()}"
-                                                            else "已取消收藏：${currentTrack?.title.orEmpty()}",
-                                                    ))
-                                                }
-                                                .onFailure { err ->
-                                                    messages += PetMessage(false, "", PetResultCard.Action(
-                                                        icon = PetActionIcon.Error, ok = false,
-                                                        label = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
-                                                    ))
-                                                }
-                                        } else {
-                                            messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Error, label = "现在没在放歌", ok = false))
-                                        }
-                                    }
-                                    is app.pipo.nativeapp.data.PetAgent.AgentAction.Playlist -> {
-                                        val tid = currentTrack?.neteaseId
-                                        val opStr = if (action.add) "add" else "del"
-                                        if (tid == null) {
-                                            messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Error, label = "现在没在放歌", ok = false))
-                                        } else {
-                                            val playlists = repository.playlists.first()
-                                            val target = matchPlaylist(playlists, action.name)
-                                            if (target == null) {
-                                                messages += PetMessage(false, "", PetResultCard.Action(icon = PetActionIcon.Error, label = "没找到歌单「${action.name}」", ok = false))
-                                            } else {
-                                                runCatching {
-                                                    repository.playlistModifyTracks(target.id, opStr, listOf(tid))
-                                                }.onSuccess {
-                                                    messages += PetMessage(false, "", PetResultCard.Action(
-                                                        icon = if (action.add) PetActionIcon.PlaylistAdd else PetActionIcon.PlaylistRemove,
-                                                        label = "${if (action.add) "已加入" else "已移出"}「${target.name}」",
-                                                    ))
-                                                }.onFailure { err ->
-                                                    messages += PetMessage(false, "", PetResultCard.Action(
-                                                        icon = PetActionIcon.Error, ok = false,
-                                                        label = "操作歌单失败：${err.message ?: err::class.java.simpleName}",
-                                                    ))
-                                                }
-                                            }
-                                        }
-                                    }
-                                    is app.pipo.nativeapp.data.PetAgent.AgentAction.Play -> {
-                                        if (action.initialBatch.isNotEmpty()) {
-                                            val accepted = if (action.insert) {
-                                                onInsertFromAgent(action.initialBatch.first())
-                                            } else {
-                                                onPlayFromAgent(action.initialBatch, action.continuous)
-                                            }
-                                            if (accepted) {
-                                                messages += PetMessage(false, "", PetResultCard.Play(
-                                                    count = action.initialBatch.size,
-                                                    artists = action.initialBatch.map { it.artist }.filter { it.isNotBlank() }.distinct().take(3).joinToString("、"),
-                                                    covers = action.initialBatch.mapNotNull { it.artworkUrl }.take(3),
-                                                    insert = action.insert,
-                                                    similar = action.similar,
-                                                ))
-                                            } else {
-                                                messages += PetMessage(false, "", PetResultCard.Action(
-                                                    icon = PetActionIcon.Error,
-                                                    ok = false,
-                                                    label = "播放请求没有被播放器接收",
-                                                ))
-                                            }
-                                        }
+                onSend = {
+                    val text = input.trim()
+                    if (text.isEmpty()) return@PetCommandBar
+                    val promptContext = runCatching { PipoGraph.petMemory.conversationContext() }
+                        .getOrDefault(app.pipo.nativeapp.data.PetMemory.ConversationContext())
+                    val currentTrackSnapshot = currentTrack
+                    input = ""
+                    messages += PetMessage(fromUser = true, text = text)
+                    PetBubbleState.lastUserContext = text
+                    runCatching { PipoGraph.petMemory.recordUtterance(text) }
+                    pending = true
+                    scope.launch {
+                        try {
+                            try {
+                                PipoGraph.petMemory.recordConversationTurn(
+                                    app.pipo.nativeapp.data.PetMemory.ROLE_USER,
+                                    text,
+                                )
+                            } catch (_: Exception) {
+                                // 记忆失败不能阻塞点歌。
+                            }
+                            val executor = PlayerAgentExecutor(
+                                repository = repository,
+                                currentTrackProvider = { currentTrackSnapshot },
+                                currentQueueProvider = { currentQueue },
+                                sourceUserText = text,
+                                onApplyAgentQueueRequest = onApplyAgentQueueRequest,
+                                onSkip = onSkipFromAgent,
+                            )
+                            val agentInput = contextAssembler.assemble(
+                                userText = text,
+                                promptContext = promptContext,
+                                currentTrack = currentTrackSnapshot,
+                                currentQueue = currentQueue,
+                                settings = settings,
+                                persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
+                            )
+                            val outcome = agentRuntime.handle(
+                                input = agentInput,
+                                executor = executor,
+                            )
+                            messages += PetMessage(fromUser = false, text = outcome.reply)
+                            outcome.cards.forEach { card ->
+                                messages += PetMessage(false, "", card.toPetResultCard())
+                            }
+                            try {
+                                PipoGraph.petMemory.recordConversationTurn(
+                                    app.pipo.nativeapp.data.PetMemory.ROLE_ASSISTANT,
+                                    outcome.reply,
+                                )
+                            } catch (_: Exception) {
+                                // 只保存干净的 assistant 文本；失败不影响 UI/播放动作。
+                            }
+                            try {
+                                PipoGraph.petMemory.recordMusicReferences(outcome.musicReferences)
+                            } catch (_: Exception) {
+                                // 可执行指代记忆失败不能影响 UI/播放动作。
+                            }
+                            try {
+                                val refs = mutableListOf<AgentReference>()
+                                currentTrackSnapshot?.let { track ->
+                                    refs += AgentReference.TrackRef(
+                                        refId = "track:${track.id}",
+                                        label = listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" - "),
+                                        track = track,
+                                        reason = "current_track",
+                                    )
+                                }
+                                if (currentQueue.isNotEmpty()) {
+                                    refs += AgentReference.QueueRef(
+                                        refId = "queue:${currentQueue.joinToString("|") { it.id }.hashCode().toUInt().toString(16)}",
+                                        label = "当前队列",
+                                        trackIds = currentQueue.map { it.id },
+                                        reason = "current_queue",
+                                    )
+                                }
+                                if (
+                                    app.pipo.nativeapp.data.agent.normalize.CommandTextSignals.styleQuestion(text) ||
+                                    app.pipo.nativeapp.data.agent.normalize.CommandTextSignals.currentStyleRequest(text)
+                                ) {
+                                    (agentInput.resolvedStyleReference ?: agentInput.currentTrackStyle ?: agentInput.currentQueueStyle)?.let { style ->
+                                        refs += AgentReference.StyleRef(
+                                            refId = style.capsuleId,
+                                            label = style.summary.ifBlank { "当前风格" },
+                                            capsule = style,
+                                            reason = "answer_style",
+                                        )
                                     }
                                 }
+                                PipoGraph.playbackIntentSessionStore.active()?.let { session ->
+                                    refs += AgentReference.IntentRef(
+                                        refId = session.sessionId,
+                                        label = session.rootUserText.ifBlank { "当前音乐要求" }.take(80),
+                                        intent = session.activeIntent,
+                                        intentHash = session.activeIntentHash,
+                                        reason = "active_session",
+                                    )
+                                    session.activeIntent.primaryArtists.forEach { artist ->
+                                        if (artist.isNotBlank()) {
+                                            refs += AgentReference.ArtistRef(
+                                                refId = "artist:${artist.hashCode().toUInt().toString(16)}",
+                                                label = artist,
+                                                artist = artist,
+                                                reason = "active_session_artist",
+                                            )
+                                        }
+                                    }
+                                    session.styleAnchor?.let { style ->
+                                        refs += AgentReference.StyleRef(
+                                            refId = style.capsuleId,
+                                            label = style.summary.ifBlank { "当前风格" },
+                                            capsule = style,
+                                            reason = "active_session_style",
+                                        )
+                                    }
+                                }
+                                if (refs.isNotEmpty()) PipoGraph.agentReferenceStore.record(refs)
+                            } catch (_: Exception) {
+                                // typed reference 只辅助连续对话，失败不影响播放。
                             }
-                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            latestReply = outcome.reply
+                            AiCaptionBus.show(outcome.reply)
+                        } catch (e: CancellationException) {
                             throw e
-	                        } catch (e: Exception) {
-	                            val reply = "我这边刚刚断了一下，再说一次。"
-	                            messages += PetMessage(fromUser = false, text = reply)
-	                            try {
-	                                PipoGraph.petMemory.recordConversationTurn(
-	                                    app.pipo.nativeapp.data.PetMemory.ROLE_ASSISTANT,
-	                                    reply,
-	                                )
-	                            } catch (_: Exception) {
-	                                // ignore
-	                            }
-	                            latestReply = reply
-	                            AiCaptionBus.show(reply)
+                        } catch (e: Exception) {
+                            val reply = "我这边刚刚断了一下，再说一次。"
+                            messages += PetMessage(fromUser = false, text = reply)
+                            try {
+                                PipoGraph.petMemory.recordConversationTurn(
+                                    app.pipo.nativeapp.data.PetMemory.ROLE_ASSISTANT,
+                                    reply,
+                                )
+                            } catch (_: Exception) {
+                                // ignore
+                            }
+                            latestReply = reply
+                            AiCaptionBus.show(reply)
                         } finally {
                             pending = false
                         }

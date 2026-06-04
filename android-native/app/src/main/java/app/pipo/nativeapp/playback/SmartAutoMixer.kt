@@ -1,12 +1,10 @@
 package app.pipo.nativeapp.playback
 
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -15,33 +13,15 @@ import app.pipo.nativeapp.data.AudioFeatures
 import app.pipo.nativeapp.data.AudioFeaturesStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.TransitionScore
+import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlanStore
+import app.pipo.nativeapp.playback.orchestrator.TransitionMode
+import app.pipo.nativeapp.playback.orchestrator.TransitionResult
+import app.pipo.nativeapp.playback.orchestrator.TransitionRisk
+import app.pipo.nativeapp.playback.transition.TransitionMetrics
 import app.pipo.nativeapp.runtime.Amp
-import java.io.File
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToLong
-
-internal data class AutoMixTransitionClipRequest(
-    val key: String,
-    val currentTrackId: Long,
-    val currentUrl: String,
-    val nextTrackId: Long,
-    val nextUrl: String,
-    val currentDurationMs: Long,
-    val mixMs: Long,
-    val nextStartPositionMs: Long,
-    val nextTempoScale: Float,
-    val currentGainLinear: Float,
-    val nextGainLinear: Float,
-)
-
-internal data class AutoMixPreparedTransitionClip(
-    val key: String,
-    val path: String,
-    val uri: String,
-    val durationMs: Long,
-    val nextResumePositionMs: Long,
-)
 
 /**
  * Service-side smart AutoMix controller.
@@ -53,10 +33,6 @@ internal data class AutoMixPreparedTransitionClip(
 internal class SmartAutoMixer(
     private val mainPlayer: ExoPlayer,
     private val featuresStore: AudioFeaturesStore,
-    private val transitionClipLoader: ((
-        request: AutoMixTransitionClipRequest,
-        onReady: (AutoMixPreparedTransitionClip?) -> Unit,
-    ) -> Unit)? = null,
     private val crossfadeController: CrossfadeController? = null,
 ) {
     private val handler = Handler(Looper.getMainLooper())
@@ -64,6 +40,7 @@ internal class SmartAutoMixer(
     private var armed: ArmedMix? = null
     private var active: ActiveMix? = null
     private var lastCompletedKey: String? = null
+    private var lastCompletedQueueVersion: Long = 0L
     private var lastCompletedAtMs: Long = 0L
     private var lastArmDiagAtMs: Long = 0L
 
@@ -92,11 +69,7 @@ internal class SmartAutoMixer(
             if (!mainPlayer.playWhenReady) {
                 cancel("main-not-playing", keepMainVolume = true)
             } else if (mainPlayer.playbackState == Player.STATE_IDLE) {
-                if (running.phase == MixPhase.TransitionClip) {
-                    recoverTransitionClipToNext(running, "transition-clip-idle")
-                } else {
-                    cancel("main-not-playing", keepMainVolume = true)
-                }
+                cancel("main-not-playing", keepMainVolume = true)
             } else {
                 updateActiveMix(running)
             }
@@ -110,23 +83,12 @@ internal class SmartAutoMixer(
     }
 
     fun onMainPlayerError() {
-        val running = active
-        if (running?.phase == MixPhase.TransitionClip) {
-            recoverTransitionClipToNext(running, "main-error")
-            return
-        }
         cancel("main-error", keepMainVolume = true)
     }
 
     fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         val running = active
         if (running != null) {
-            if (running.phase == MixPhase.TransitionClip &&
-                mediaItem?.mediaId == running.transitionClipMediaId
-            ) {
-                updateActiveMix(running)
-                return
-            }
             if (mediaItem?.mediaId == running.plan.nextId) {
                 updateActiveMix(running)
                 return
@@ -183,13 +145,13 @@ internal class SmartAutoMixer(
         val prepareLeadMs = prepareLeadMs(plan)
         if (remainingMs > plan.mixMs + prepareLeadMs) return
         if (remainingMs < MIN_REMAINING_TO_ARM_MS) return
-        if (plan.key == lastCompletedKey &&
+        if (plan.queueVersion == lastCompletedQueueVersion &&
+            plan.key == lastCompletedKey &&
             SystemClock.elapsedRealtime() - lastCompletedAtMs < COMPLETED_PAIR_COOLDOWN_MS
         ) return
 
         val waiting = ArmedMix(plan = plan)
         armed = waiting
-        maybePrepareTransitionClip(waiting)
         logMixEvent(
             "armed",
             plan,
@@ -198,13 +160,14 @@ internal class SmartAutoMixer(
                 "reason" to plan.reason,
                 "remainingMs" to remainingMs,
                 "prepareLeadMs" to prepareLeadMs,
-                "transitionMode" to MAIN_ONLY_TRANSITION_MODE,
-                "clipEligible" to plan.clipEligible,
-                "clipMode" to plan.clipMode,
+                "transitionMode" to plan.targetTransitionMode.name,
+                "transitionModeSource" to plan.transitionModeSource,
+                "realtimeCrossfadeEligible" to plan.realtimeCrossfadeEligible,
+                "realtimeCrossfadeMs" to plan.realtimeCrossfadeMs,
                 "nextStartPositionMs" to plan.nextStartPositionMs,
                 "tempoLockSpeed" to "%.4f".format(plan.tempoLockSpeed),
                 "tempoLockLeadMs" to plan.tempoLockLeadMs,
-                "clipNextTempoScale" to "%.4f".format(plan.clipNextTempoScale),
+                "nextTempoScale" to "%.4f".format(plan.nextTempoScale),
             ),
         )
     }
@@ -243,6 +206,20 @@ internal class SmartAutoMixer(
 
     private fun updateArmedMix(waiting: ArmedMix) {
         val plan = waiting.plan
+        if (!PlaybackSessionClock.isCurrent(plan.queueVersion)) {
+            DiagnosticsLogStore.record(
+                area = "transition",
+                event = "stale_transition_cancel",
+                fields = mapOf(
+                    "pairKey" to plan.key,
+                    "planQueueVersion" to plan.queueVersion,
+                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
+                    "stage" to "armed",
+                ),
+            )
+            cancel("stale-transition-plan", keepMainVolume = true)
+            return
+        }
         val currentId = mainPlayer.currentMediaItem?.mediaId
         if (currentId != plan.currentId) {
             cancel("armed-current-changed", keepMainVolume = true)
@@ -260,47 +237,12 @@ internal class SmartAutoMixer(
         }
         maybeApplyTempoLock(waiting, remainingMs)
 
-        // 双 player 实时 crossfade(seek 接管,不重播)优先于离线 clip:该叠加且进入窗口就启动。
-        // 离线 clip 的 gapless 接续在真机上会重播下一首开头("同一句两遍"),所以优先走 seek 接管的双
-        // player;双 player 不可用(controller 缺失 / 忙 / 条件不足 / 开关关)时,再回落到离线 clip 或 main-only。
-        if (plan.clipEligible &&
-            remainingMs <= plan.clipMixMs + TRANSITION_CLIP_START_EARLY_TOLERANCE_MS
+        if (plan.realtimeCrossfadeEligible &&
+            remainingMs <= plan.realtimeCrossfadeMs + REALTIME_CROSSFADE_START_TOLERANCE_MS
         ) {
             if (startRealtimeCrossfade(waiting, remainingMs)) {
-                waiting.transitionClip = null
                 return
             }
-        }
-
-        if (waiting.transitionClip != null) {
-            val clipLeadMs = plan.clipMixMs
-            if (remainingMs > clipLeadMs + TRANSITION_CLIP_START_EARLY_TOLERANCE_MS) return
-            if (remainingMs >= clipLeadMs - TRANSITION_CLIP_START_LATE_TOLERANCE_MS) {
-                if (!tailSignalAllowsMix(waiting, remainingMs)) return
-                startTransitionClip(waiting, remainingMs)
-                return
-            }
-            logMixEvent(
-                "transition_clip_window_missed",
-                plan,
-                mapOf(
-                    "remainingMs" to remainingMs,
-                    "clipMixMs" to clipLeadMs,
-                    "lateByMs" to (clipLeadMs - remainingMs),
-                ),
-            )
-            waiting.transitionClip = null
-        } else if (waiting.clipPreparing && plan.clipEligible) {
-            val latestUsefulStartMs = plan.clipMixMs - TRANSITION_CLIP_START_LATE_TOLERANCE_MS
-            if (remainingMs > latestUsefulStartMs) return
-            logMixEvent(
-                "transition_clip_not_ready_for_window",
-                plan,
-                mapOf(
-                    "remainingMs" to remainingMs,
-                    "clipMixMs" to plan.clipMixMs,
-                ),
-            )
         }
 
         if (remainingMs > plan.mixMs) return
@@ -308,73 +250,31 @@ internal class SmartAutoMixer(
         startMainOnlyNext(waiting, remainingMs)
     }
 
-    private fun maybePrepareTransitionClip(waiting: ArmedMix) {
-        val loader = transitionClipLoader ?: return
-        val plan = waiting.plan
-        if (!plan.clipEligible || waiting.clipPreparing || waiting.transitionClip != null) return
-        val currentTrackId = plan.currentId.toLongOrNull() ?: return
-        val nextTrackId = plan.nextId.toLongOrNull() ?: return
-        if (plan.currentUrl.isBlank() || plan.nextUrl.isBlank()) return
-        waiting.clipPreparing = true
-        val request = AutoMixTransitionClipRequest(
-            key = plan.key,
-            currentTrackId = currentTrackId,
-            currentUrl = plan.currentUrl,
-            nextTrackId = nextTrackId,
-            nextUrl = plan.nextUrl,
-            currentDurationMs = plan.currentDurationMs,
-            mixMs = plan.clipMixMs,
-            nextStartPositionMs = plan.nextStartPositionMs,
-            nextTempoScale = plan.clipNextTempoScale,
-            currentGainLinear = PlaybackGain.linearForRms(featuresStore.get(plan.currentId)?.rmsDb),
-            nextGainLinear = PlaybackGain.linearForRms(featuresStore.get(plan.nextId)?.rmsDb),
-        )
-        loader(request) { clip ->
-            handler.post {
-                val stillWaiting = armed
-                if (stillWaiting?.plan?.key != plan.key) return@post
-                stillWaiting.clipPreparing = false
-                if (clip == null || clip.key != plan.key) {
-                    logMixEvent(
-                        "transition_clip_unavailable",
-                        plan,
-                        mapOf("clipEligible" to plan.clipEligible),
-                    )
-                    return@post
-                }
-                stillWaiting.transitionClip = clip
-                val clipFile = clip.path.takeIf { it.isNotBlank() }?.let(::File)
-                logMixEvent(
-                    "transition_clip_ready",
-                    plan,
-                    mapOf(
-                        "clipDurationMs" to clip.durationMs,
-                        "nextResumePositionMs" to clip.nextResumePositionMs,
-                        "nextConsumedMs" to (clip.nextResumePositionMs - plan.nextStartPositionMs)
-                            .coerceAtLeast(0L),
-                        "clipMode" to plan.clipMode,
-                        "clipNextTempoScale" to "%.4f".format(plan.clipNextTempoScale),
-                        "clipPath" to clip.path,
-                        "clipUri" to clip.uri,
-                        "clipExists" to (clipFile?.exists() ?: false),
-                        "clipBytes" to (clipFile?.length() ?: 0L),
-                    ),
-                )
-            }
-        }
-    }
-
     /**
-     * 用实时双 player crossfade 接歌(真·叠加,等功率)。在「该叠加但离线 clip 没渲染好」的窗口触发,
-     * 替代原本降级到 main-only 的顺序淡变。启动后把控制权交给 CrossfadeController:它自己监听主
+     * 用实时双 player crossfade 接歌(真·叠加,等功率)。启动后把控制权交给 CrossfadeController:它自己监听主
      * player 的接管/打断,SmartAutoMixer 不再干预本对(armed=null + 进 cooldown)。
      * @return true 表示已交给实时 crossfade;false 则调用方继续走 main-only。
      */
     private fun startRealtimeCrossfade(waiting: ArmedMix, remainingMs: Long): Boolean {
-        if (!REALTIME_CROSSFADE_ENABLED) return false
+        val plan = waiting.plan
+        if (plan.targetTransitionMode != TransitionMode.RealtimeCrossfade) return false
+        if (!REALTIME_CROSSFADE_ENABLED || !SeamlessRuntimeFlags.current.realtimeCrossfadeV2Enabled) return false
         val controller = crossfadeController ?: return false
         if (controller.isRunning) return false
-        val plan = waiting.plan
+        if (!PlaybackSessionClock.isCurrent(plan.queueVersion)) {
+            cancel("stale-transition-plan", keepMainVolume = true)
+            DiagnosticsLogStore.record(
+                area = "transition",
+                event = "stale_transition_cancel",
+                fields = mapOf(
+                    "pairKey" to plan.key,
+                    "planQueueVersion" to plan.queueVersion,
+                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
+                    "stage" to "realtime_start",
+                ),
+            )
+            return false
+        }
         if (remainingMs < MIN_REALTIME_CROSSFADE_MS) return false
         // 主控必须正播在当前曲,否则接续点/位置对不上。
         if (mainPlayer.currentMediaItem?.mediaId != plan.currentId) return false
@@ -385,23 +285,31 @@ internal class SmartAutoMixer(
             nextIndex = plan.nextIndex,
             nextStartMs = plan.nextStartPositionMs,
             crossfadeMs = remainingMs,
-            beatmatchSpeed = plan.clipNextTempoScale,
+            beatmatchSpeed = plan.nextTempoScale,
             nextGainLinear = nextGain,
+            queueVersion = plan.queueVersion,
+            pairKey = plan.key,
         )
         armed = null
-        lastCompletedKey = plan.key
-        lastCompletedAtMs = SystemClock.elapsedRealtime()
         logMixEvent(
             "realtime_crossfade_started",
             plan,
             mapOf(
                 "remainingMs" to remainingMs,
                 "nextStartPositionMs" to plan.nextStartPositionMs,
-                "beatmatchSpeed" to "%.4f".format(plan.clipNextTempoScale),
+                "beatmatchSpeed" to "%.4f".format(plan.nextTempoScale),
                 "nextGain" to "%.3f".format(nextGain),
             ),
         )
         return true
+    }
+
+    fun onRealtimeCrossfadeResult(result: TransitionResult) {
+        TransitionMetrics.record(result)
+        if (!result.success) return
+        lastCompletedKey = result.pairKey
+        lastCompletedQueueVersion = result.queueVersion
+        lastCompletedAtMs = SystemClock.elapsedRealtime()
     }
 
     private fun startMainOnlyNext(waiting: ArmedMix, remainingMs: Long) {
@@ -437,135 +345,23 @@ internal class SmartAutoMixer(
         updateActiveMix(active ?: return)
     }
 
-    private fun startTransitionClip(waiting: ArmedMix, remainingMs: Long) {
-        val clip = waiting.transitionClip ?: run {
-            startMainOnlyNext(waiting, remainingMs)
-            return
-        }
-        val plan = waiting.plan
-        val clipFile = clip.path.takeIf { it.isNotBlank() }?.let(::File)
-        if (clipFile == null || !clipFile.exists() || !clipFile.canRead() || clipFile.length() <= WAV_HEADER_BYTES) {
-            logMixEvent(
-                "transition_clip_file_invalid",
-                plan,
-                mapOf(
-                    "clipPath" to clip.path,
-                    "clipUri" to clip.uri,
-                    "clipExists" to (clipFile?.exists() ?: false),
-                    "clipCanRead" to (clipFile?.canRead() ?: false),
-                    "clipBytes" to (clipFile?.length() ?: 0L),
-                ),
-            )
-            startMainOnlyNext(waiting, remainingMs)
-            return
-        }
-        val clipMediaId = "automix:${plan.key}"
-        val transitionItem = transitionClipMediaItem(plan, clipMediaId, clip)
-        val nextAfterClip = plan.nextMediaItem.buildUpon()
-            .setClippingConfiguration(
-                MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(clip.nextResumePositionMs)
-                    .setEndPositionMs(C.TIME_END_OF_SOURCE)
-                    .build(),
-            )
-            .build()
-        runCatching {
-            if (plan.nextIndex < mainPlayer.mediaItemCount) {
-                mainPlayer.replaceMediaItem(plan.nextIndex, transitionItem)
-                mainPlayer.addMediaItem(plan.nextIndex + 1, nextAfterClip)
-            } else {
-                mainPlayer.addMediaItem(transitionItem)
-                mainPlayer.addMediaItem(nextAfterClip)
-            }
-            resetTempoLock(plan, "transition-clip")
-            mainPlayer.volume = 1f
-            active = ActiveMix(
-                plan = plan,
-                startedAtMs = SystemClock.elapsedRealtime(),
-                phase = MixPhase.TransitionClip,
-                tempoLockApplied = waiting.tempoLockApplied,
-                transitionClipMediaId = clipMediaId,
-                transitionClipNextResumeMs = clip.nextResumePositionMs,
-            )
-            armed = null
-            mainPlayer.seekTo(plan.nextIndex, 0L)
-            if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
-                mainPlayer.prepare()
-            }
-            mainPlayer.play()
-            logMixEvent(
-                "transition_clip_started",
-                plan,
-                mapOf(
-                    "remainingMs" to remainingMs,
-                    "clipDurationMs" to clip.durationMs,
-                    "nextResumePositionMs" to clip.nextResumePositionMs,
-                    "nextConsumedMs" to (clip.nextResumePositionMs - plan.nextStartPositionMs)
-                        .coerceAtLeast(0L),
-                    "clipMode" to plan.clipMode,
-                    "clipNextTempoScale" to "%.4f".format(plan.clipNextTempoScale),
-                    "mediaIndex" to plan.nextIndex,
-                    "clipPath" to clip.path,
-                    "clipBytes" to clipFile.length(),
-                ),
-            )
-        }.onFailure { err ->
-            active = null
-            logMixEvent(
-                "transition_clip_start_failed",
-                plan,
-                mapOf(
-                    "errorType" to err::class.java.simpleName,
-                    "message" to err.message,
-                ),
-            )
-            startMainOnlyNext(ArmedMix(plan = plan), remainingMs)
-        }
-    }
-
-    private fun transitionClipMediaItem(
-        plan: AutoMixPlan,
-        mediaId: String,
-        clip: AutoMixPreparedTransitionClip,
-    ): MediaItem {
-        val metadata = MediaMetadata.Builder()
-            .setTitle(plan.nextTitle)
-            .setArtist(plan.nextArtist)
-            .setAlbumTitle(plan.nextAlbum)
-            .setArtworkUri(plan.nextMediaItem.mediaMetadata.artworkUri)
-            .setIsPlayable(true)
-            .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
-            .build()
-        val clipUri = clip.path
-            .takeIf { it.isNotBlank() }
-            ?.let { Uri.fromFile(File(it)) }
-            ?: Uri.parse(clip.uri)
-        return MediaItem.Builder()
-            .setMediaId(mediaId)
-            .setUri(clipUri)
-            .setMediaMetadata(metadata)
-            .build()
-    }
-
     private fun updateActiveMix(running: ActiveMix) {
         val plan = running.plan
-        val currentId = mainPlayer.currentMediaItem?.mediaId
-        if (running.phase == MixPhase.TransitionClip) {
-            when (currentId) {
-                running.transitionClipMediaId -> {
-                    mainPlayer.volume = 1f
-                    return
-                }
-                plan.nextId -> {
-                    completeTransitionClipMix(running, SystemClock.elapsedRealtime())
-                    return
-                }
-                else -> {
-                    cancel("transition-clip-current-changed", keepMainVolume = true)
-                    return
-                }
-            }
+        if (!PlaybackSessionClock.isCurrent(plan.queueVersion)) {
+            DiagnosticsLogStore.record(
+                area = "transition",
+                event = "stale_transition_cancel",
+                fields = mapOf(
+                    "pairKey" to plan.key,
+                    "planQueueVersion" to plan.queueVersion,
+                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
+                    "stage" to "active",
+                ),
+            )
+            cancel("stale-transition-plan", keepMainVolume = true)
+            return
         }
+        val currentId = mainPlayer.currentMediaItem?.mediaId
         if (running.phase == MixPhase.FadingOut) {
             when (currentId) {
                 plan.currentId -> {
@@ -683,163 +479,12 @@ internal class SmartAutoMixer(
         )
     }
 
-    private fun completeTransitionClipMix(running: ActiveMix, now: Long) {
-        val plan = running.plan
-        lastCompletedKey = plan.key
-        lastCompletedAtMs = now
-        active = null
-        mainPlayer.volume = 1f
-        val restoredNextItem = restoreNormalNextItemAfterTransition(running)
-        removeTransitionClipItem(running.transitionClipMediaId)
-        logMixEvent(
-            "transition_clip_completed",
-            plan,
-            mapOf(
-                "mainPositionMs" to mainPlayer.currentPosition.coerceAtLeast(0L),
-                "nextResumePositionMs" to running.transitionClipNextResumeMs,
-                "nextConsumedMs" to (running.transitionClipNextResumeMs - plan.nextStartPositionMs)
-                    .coerceAtLeast(0L),
-                "clipMode" to plan.clipMode,
-                "restoredNextItem" to restoredNextItem,
-                "tempoLockApplied" to running.tempoLockApplied,
-                "continuityMode" to "generated-transition-clip",
-            ),
-        )
-    }
-
-    private fun restoreNormalNextItemAfterTransition(running: ActiveMix): Boolean {
-        val plan = running.plan
-        val currentIndex = mainPlayer.currentMediaItemIndex
-        if (currentIndex < 0) return false
-        val currentItem = mainPlayer.currentMediaItem ?: return false
-        if (currentItem.mediaId != plan.nextId) return false
-        val currentClipStartMs = currentItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
-        if (currentClipStartMs <= 0L) return false
-        val sourcePositionMs = running.transitionClipNextResumeMs + mainPlayer.currentPosition.coerceAtLeast(0L)
-        val normalStartMs = plan.nextMediaItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
-        val restoredSeekMs = (sourcePositionMs - normalStartMs).coerceAtLeast(0L)
-        return runCatching {
-            mainPlayer.replaceMediaItem(currentIndex, plan.nextMediaItem)
-            mainPlayer.seekTo(currentIndex, restoredSeekMs)
-            if (mainPlayer.playWhenReady) mainPlayer.play()
-            logMixEvent(
-                "transition_next_item_restored",
-                plan,
-                mapOf(
-                    "currentIndex" to currentIndex,
-                    "sourcePositionMs" to sourcePositionMs,
-                    "normalStartMs" to normalStartMs,
-                    "restoredSeekMs" to restoredSeekMs,
-                ),
-            )
-            true
-        }.onFailure { err ->
-            logMixEvent(
-                "transition_next_item_restore_failed",
-                plan,
-                mapOf(
-                    "errorType" to err::class.java.simpleName,
-                    "message" to err.message,
-                ),
-            )
-        }.getOrDefault(false)
-    }
-
-    private fun removeTransitionClipItem(mediaId: String?) {
-        if (mediaId.isNullOrBlank()) return
-        val currentIndex = mainPlayer.currentMediaItemIndex
-        val clipIndex = mediaItemIndexOf(mediaId)
-            ?: return
-        if (clipIndex != currentIndex) {
-            runCatching { mainPlayer.removeMediaItem(clipIndex) }
-        }
-    }
-
-    private fun recoverTransitionClipToNext(running: ActiveMix, reason: String) {
-        val plan = running.plan
-        val clipMediaId = running.transitionClipMediaId
-        val stateBefore = playbackStateName(mainPlayer.playbackState)
-        val currentIndexBefore = mainPlayer.currentMediaItemIndex
-        val clipIndex = mediaItemIndexOf(clipMediaId)
-        val targetIndex = clipIndex ?: currentIndexBefore.takeIf {
-            it >= 0 && it < mainPlayer.mediaItemCount
-        }
-        armed = null
-        active = null
-        resetTempoLock(plan, reason)
-        mainPlayer.volume = 1f
-
-        var removedDuplicateNext = false
-        val recovered = runCatching {
-            val seekIndex = if (targetIndex != null && targetIndex < mainPlayer.mediaItemCount) {
-                mainPlayer.replaceMediaItem(targetIndex, plan.nextMediaItem)
-                removedDuplicateNext = removeAdjacentDuplicateNextItem(targetIndex, plan.nextId)
-                targetIndex
-            } else {
-                mainPlayer.addMediaItem(plan.nextMediaItem)
-                mainPlayer.mediaItemCount - 1
-            }
-            mainPlayer.seekTo(seekIndex, plan.nextStartPositionMs)
-            if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
-                mainPlayer.prepare()
-            }
-            mainPlayer.play()
-            true
-        }.onFailure { err ->
-            logMixEvent(
-                "transition_clip_recover_failed",
-                plan,
-                mapOf(
-                    "reason" to reason,
-                    "clipMediaId" to clipMediaId,
-                    "clipIndex" to clipIndex,
-                    "currentIndexBefore" to currentIndexBefore,
-                    "stateBefore" to stateBefore,
-                    "errorType" to err::class.java.simpleName,
-                    "message" to err.message,
-                ),
-            )
-        }.getOrDefault(false)
-
-        logMixEvent(
-            "transition_clip_recover_to_next",
-            plan,
-            mapOf(
-                "reason" to reason,
-                "clipMediaId" to clipMediaId,
-                "clipIndex" to clipIndex,
-                "currentIndexBefore" to currentIndexBefore,
-                "stateBefore" to stateBefore,
-                "recovered" to recovered,
-                "removedDuplicateNext" to removedDuplicateNext,
-                "resumePositionMs" to plan.nextStartPositionMs,
-                "mainState" to playbackStateName(mainPlayer.playbackState),
-                "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
-            ),
-        )
-    }
-
-    private fun removeAdjacentDuplicateNextItem(keptIndex: Int, nextId: String): Boolean {
-        val duplicateIndex = keptIndex + 1
-        if (duplicateIndex >= mainPlayer.mediaItemCount) return false
-        if (mainPlayer.getMediaItemAt(duplicateIndex).mediaId != nextId) return false
-        return runCatching {
-            mainPlayer.removeMediaItem(duplicateIndex)
-            true
-        }.getOrDefault(false)
-    }
-
-    private fun mediaItemIndexOf(mediaId: String?): Int? {
-        if (mediaId.isNullOrBlank()) return null
-        return (0 until mainPlayer.mediaItemCount)
-            .firstOrNull { idx -> mainPlayer.getMediaItemAt(idx).mediaId == mediaId }
-    }
-
     private fun completeMainNextMix(running: ActiveMix, now: Long, fadeElapsedMs: Long) {
         val plan = running.plan
         val mainPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
         resetTempoLock(plan, "completed")
         lastCompletedKey = plan.key
+        lastCompletedQueueVersion = plan.queueVersion
         lastCompletedAtMs = now
         active = null
         mainPlayer.volume = 1f
@@ -854,6 +499,36 @@ internal class SmartAutoMixer(
                 "tempoLockApplied" to running.tempoLockApplied,
                 "continuityMode" to "main-only-next",
                 "offsetOutsideTolerance" to false,
+            ),
+        )
+        logTransitionSummary(
+            plan = plan,
+            mode = TransitionMode.SafeCut,
+            success = true,
+            completedReason = "main_only_completed",
+            failureReason = null,
+        )
+    }
+
+    private fun logTransitionSummary(
+        plan: AutoMixPlan,
+        mode: TransitionMode,
+        success: Boolean,
+        completedReason: String?,
+        failureReason: String?,
+    ) {
+        TransitionMetrics.record(
+            TransitionResult(
+                pairKey = plan.key,
+                sessionId = PlaybackSessionClock.sessionId,
+                queueVersion = plan.queueVersion,
+                mode = mode,
+                success = success,
+                plannedMode = plan.targetTransitionMode,
+                modeSource = plan.transitionModeSource,
+                plannedRisk = plan.committedTransitionRisk,
+                completedReason = completedReason,
+                failureReason = failureReason,
             ),
         )
     }
@@ -871,6 +546,29 @@ internal class SmartAutoMixer(
         val currentClipSourceDurationMs = currentDurationMs +
             currentItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
         if (shouldLeaveAlbumGapless(currentTrack, nextTrack, currentFeatures, nextFeatures)) return null
+        val queueVersion = PlaybackSessionClock.currentQueueVersion()
+        val committedTransitionPlan = CommittedQueuePlanStore.transitionFor(
+            queueVersion = queueVersion,
+            fromTrackId = currentTrack.id,
+            toTrackId = nextTrack.id,
+        )
+        if (committedTransitionPlan?.risk == TransitionRisk.High ||
+            committedTransitionPlan?.mode == TransitionMode.NoMix ||
+            committedTransitionPlan?.mode == TransitionMode.NativeGapless
+        ) {
+            DiagnosticsLogStore.record(
+                area = "automix",
+                event = "committed_transition_downgraded",
+                fields = mapOf(
+                    "queueVersion" to queueVersion,
+                    "pairKey" to "${currentTrack.id}->${nextTrack.id}",
+                    "committedMode" to committedTransitionPlan.mode.name,
+                    "committedRisk" to committedTransitionPlan.risk.name,
+                    "reason" to "committed_no_mix_or_high_risk",
+                ),
+            )
+            return null
+        }
         val mix = chooseMixWindow(
             currentTrack = currentTrack,
             nextTrack = nextTrack,
@@ -878,8 +576,17 @@ internal class SmartAutoMixer(
             nextFeatures = nextFeatures,
             currentDurationMs = currentDurationMs,
         ) ?: return null
+        val targetTransitionMode = when (committedTransitionPlan?.mode) {
+            TransitionMode.RealtimeCrossfade ->
+                if (mix.realtimeCrossfadeEligible) TransitionMode.RealtimeCrossfade else TransitionMode.SafeCut
+            TransitionMode.SafeCut -> TransitionMode.SafeCut
+            TransitionMode.NativeGapless, TransitionMode.NoMix -> return null
+            null -> if (mix.realtimeCrossfadeEligible) TransitionMode.RealtimeCrossfade else TransitionMode.SafeCut
+        }
+        val transitionModeSource = if (committedTransitionPlan != null) "committed_plan" else "runtime"
         return AutoMixPlan(
             key = "${currentTrack.id}->${nextTrack.id}",
+            queueVersion = queueVersion,
             currentId = currentTrack.id,
             nextId = nextTrack.id,
             nextIndex = nextIndex,
@@ -893,9 +600,9 @@ internal class SmartAutoMixer(
             nextArtist = nextTrack.artist,
             nextAlbum = nextTrack.album,
             mixMs = mix.mixMs,
-            clipMixMs = mix.clipMixMs,
-            clipEligible = mix.clipEligible,
-            clipMode = mix.clipMode,
+            realtimeCrossfadeMs = mix.realtimeCrossfadeMs,
+            realtimeCrossfadeEligible = targetTransitionMode == TransitionMode.RealtimeCrossfade && mix.realtimeCrossfadeEligible,
+            realtimeCrossfadeMode = mix.realtimeCrossfadeMode,
             requiresTailDip = mix.requiresTailDip,
             tailAmpThreshold = mix.tailAmpThreshold,
             requiredTailDipTicks = mix.requiredTailDipTicks,
@@ -903,10 +610,18 @@ internal class SmartAutoMixer(
             fadeInMs = mix.fadeInMs,
             tempoLockSpeed = mix.tempoLockSpeed,
             tempoLockLeadMs = mix.tempoLockLeadMs,
-            clipNextTempoScale = mix.clipNextTempoScale,
+            nextTempoScale = mix.nextTempoScale,
             policy = mix.policy,
             reason = mix.reason,
-            diagnostics = mix.diagnostics,
+            targetTransitionMode = targetTransitionMode,
+            transitionModeSource = transitionModeSource,
+            committedTransitionRisk = committedTransitionPlan?.risk,
+            diagnostics = mix.diagnostics + mapOf(
+                "targetTransitionMode" to targetTransitionMode.name,
+                "transitionModeSource" to transitionModeSource,
+                "committedTransitionMode" to committedTransitionPlan?.mode?.name,
+                "committedTransitionRisk" to committedTransitionPlan?.risk?.name,
+            ),
         )
     }
 
@@ -1198,8 +913,8 @@ internal class SmartAutoMixer(
             vocalEntryTooEarly = vocalEntryTooEarly,
             drumEntryTooEarly = drumEntryTooEarly,
         )
-        val clipNextTempoScale = transitionClipNextTempoScale(tempoLock)
-        val clipEligible = transitionClipEligible(
+        val nextTempoScale = realtimeCrossfadeNextTempoScale(tempoLock)
+        val realtimeCrossfadeEligible = realtimeCrossfadeEligible(
             policy = policy,
             fit = fit,
             melodicTailRisk = melodicTailRisk,
@@ -1208,33 +923,29 @@ internal class SmartAutoMixer(
             currentFeatures = currentFeatures,
             nextFeatures = nextFeatures,
         )
-        // clip 是离线渲染的真·叠加 crossfade,可以远比 main-only 的快速淡变长 —— 对标
-        // Apple Music 的 3–6 秒 crossfade。按更长的乐句(8–16 拍)取时长并对齐节拍,叠加
-        // 段鼓点重合;没有可靠 BPM 时(多为抒情/氛围曲)用秒级固定目标兜底。注意不能复用
-        // 上面的 mixMs:它是 main-only 的启动窗口,被 MAX_MIX_MS(1.8s)钉死,远不够叠加。
-        val clipBeats = when {
+        val realtimeBeats = when {
             melodicTailRisk || clashRisk -> 8
             policy == "seamless-tight" -> 16
             policy == "smart-cut" -> 12
             else -> 8
         }
-        val clipTargetMs = avgBpm?.let { ((60_000.0 / it) * clipBeats).roundToLong() }
+        val realtimeTargetMs = avgBpm?.let { ((60_000.0 / it) * realtimeBeats).roundToLong() }
             ?: when (policy) {
                 "seamless-tight" -> 4_600L
                 "smart-cut" -> 3_800L
                 else -> 3_000L
             }
-        val clipMixMs = clipTargetMs.coerceIn(MIN_TRANSITION_CLIP_MS, MAX_TRANSITION_CLIP_MS)
-        val clipMode = if (clipEligible) {
+        val realtimeCrossfadeMs = realtimeTargetMs.coerceIn(MIN_REALTIME_CROSSFADE_MS, MAX_REALTIME_CROSSFADE_MS)
+        val realtimeCrossfadeMode = if (realtimeCrossfadeEligible) {
             if (policy == "breath-cut") "short-breath-handoff" else "beatmatched-handoff"
         } else {
             "none"
         }
         return MixWindow(
             mixMs = mixMs,
-            clipMixMs = clipMixMs,
-            clipEligible = clipEligible,
-            clipMode = clipMode,
+            realtimeCrossfadeMs = realtimeCrossfadeMs,
+            realtimeCrossfadeEligible = realtimeCrossfadeEligible,
+            realtimeCrossfadeMode = realtimeCrossfadeMode,
             nextStartPositionMs = entryCue.positionMs,
             requiresTailDip = requiredDipTicks > 0,
             tailAmpThreshold = tailAmpThreshold(currentFeatures, melodicTailRisk || clashRisk),
@@ -1243,7 +954,7 @@ internal class SmartAutoMixer(
             fadeInMs = fadeInMs,
             tempoLockSpeed = tempoLock.speed,
             tempoLockLeadMs = tempoLock.leadMs,
-            clipNextTempoScale = clipNextTempoScale,
+            nextTempoScale = nextTempoScale,
             policy = policy,
             reason = "${fit.style} policy=$policy score=${"%.2f".format(fit.score)} bpmDelta=${"%.1f".format(bpmDelta)} energyDelta=${"%.2f".format(energyDelta)} vocalClash=${"%.2f".format(vocalClash)} boundary=${if (boundaryIsTight) "tight" else "soft"}",
             diagnostics = diagnostics + mapOf(
@@ -1251,10 +962,10 @@ internal class SmartAutoMixer(
                 "phraseAlignedCutLeadMs" to alignedCutLeadMs,
                 "fadeOutJumpDelayMs" to jumpDelayMs,
                 "startLeadMs" to mixMs,
-                "clipEligible" to clipEligible,
-                "clipMode" to clipMode,
-                "clipMixMs" to clipMixMs,
-                "clipNextTempoScale" to "%.4f".format(clipNextTempoScale),
+                "realtimeCrossfadeEligible" to realtimeCrossfadeEligible,
+                "realtimeCrossfadeMode" to realtimeCrossfadeMode,
+                "realtimeCrossfadeMs" to realtimeCrossfadeMs,
+                "nextTempoScale" to "%.4f".format(nextTempoScale),
                 "nextStartPositionMs" to entryCue.positionMs,
                 "nextStartReason" to entryCue.reason,
                 "tempoLockSpeed" to "%.4f".format(tempoLock.speed),
@@ -1290,20 +1001,12 @@ internal class SmartAutoMixer(
             introVocal >= BUSY_INTRO_VOCAL_DENSITY
         ) return null
 
-        val mainOnlyEntryCue = nextEntryCue(nextFeatures, "live-tail-cut")
-        val clipEntryCue = nextEntryCue(nextFeatures, "safe-fallback-clip")
-        val fallbackClip = fallbackTransitionClipDecision(
-            reason = reason,
-            currentFeatures = currentFeatures,
-            nextFeatures = nextFeatures,
-            clipEntryCue = clipEntryCue,
-        )
-        val entryCue = if (fallbackClip.eligible) clipEntryCue else mainOnlyEntryCue
+        val entryCue = nextEntryCue(nextFeatures, "live-tail-cut")
         return MixWindow(
             mixMs = FALLBACK_LIVE_TAIL_MIX_MS,
-            clipMixMs = if (fallbackClip.eligible) fallbackClip.mixMs else FALLBACK_LIVE_TAIL_MIX_MS,
-            clipEligible = fallbackClip.eligible,
-            clipMode = if (fallbackClip.eligible) fallbackClip.mode else "none",
+            realtimeCrossfadeMs = FALLBACK_LIVE_TAIL_MIX_MS,
+            realtimeCrossfadeEligible = false,
+            realtimeCrossfadeMode = "none",
             nextStartPositionMs = entryCue.positionMs,
             requiresTailDip = true,
             tailAmpThreshold = currentFeatures
@@ -1314,98 +1017,18 @@ internal class SmartAutoMixer(
             fadeInMs = FALLBACK_FADE_IN_MS,
             tempoLockSpeed = DEFAULT_PLAYBACK_SPEED,
             tempoLockLeadMs = 0L,
-            clipNextTempoScale = DEFAULT_PLAYBACK_SPEED,
+            nextTempoScale = DEFAULT_PLAYBACK_SPEED,
             policy = "live-tail-cut",
             reason = "fallback=$reason currentFeatures=${currentFeatures != null} nextFeatures=${nextFeatures != null}",
             diagnostics = diagnostics + mapOf(
                 "fallbackReason" to reason,
                 "fallbackMode" to "live-tail-cut",
-                "fallbackClipEligible" to fallbackClip.eligible,
-                "fallbackClipReason" to fallbackClip.reason,
-                "fallbackClipMode" to fallbackClip.mode,
-                "fallbackMainOnlyEntryReason" to mainOnlyEntryCue.reason,
-                "fallbackClipEntryReason" to clipEntryCue.reason,
                 "nextStartPositionMs" to entryCue.positionMs,
                 "nextStartReason" to entryCue.reason,
                 "outroVocalDensity" to "%.2f".format(outroVocal),
                 "introVocalDensity" to "%.2f".format(introVocal),
             ),
         )
-    }
-
-    private fun fallbackTransitionClipDecision(
-        reason: String,
-        currentFeatures: AudioFeatures?,
-        nextFeatures: AudioFeatures?,
-        clipEntryCue: EntryCue,
-    ): FallbackClipDecision {
-        // 止血:fallback clip 走的是 nextAfterClip + gapless 接续,真机上 gapless 预加载残留会让下一首
-        // 开头被多播 ~160ms(用户报告的"同一句听到两遍")。这类多是尾巴静音/低 fit 的勉强叠加,直接走
-        // main-only(seekTo 接续,不经过 gapless,不重播)更稳更自然。待接续机制改用 seek 后再恢复。
-        if (!FALLBACK_TRANSITION_CLIP_ENABLED) {
-            return FallbackClipDecision(false, "none", "fallback-clip-disabled", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        if (currentFeatures == null || nextFeatures == null) {
-            return FallbackClipDecision(false, "none", "missing-features", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        val energyDelta = abs(currentFeatures.outroEnergy - nextFeatures.introEnergy)
-        val lowEnergyDelta = abs(currentFeatures.outroLowEnergy - nextFeatures.introLowEnergy)
-        val vocalClash = currentFeatures.outroVocalDensity * nextFeatures.introVocalDensity
-        val earlyBusyVocal = nextFeatures.vocalEntryS?.let { it <= EARLY_VOCAL_ENTRY_S } == true &&
-            nextFeatures.introVocalDensity >= BUSY_INTRO_VOCAL_DENSITY
-        if (earlyBusyVocal) {
-            return FallbackClipDecision(false, "none", "protect-early-vocal", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        val openVocalTail = currentFeatures.outroVocalDensity >= FALLBACK_CLIP_MAX_OPEN_OUTRO_VOCAL_DENSITY &&
-            currentFeatures.outroStartS == null &&
-            currentFeatures.tailSilenceS < FALLBACK_CLIP_MIN_TAIL_SILENCE_FOR_OPEN_VOCAL
-        if (openVocalTail) {
-            return FallbackClipDecision(false, "none", "open-vocal-tail", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        if (vocalClash > FALLBACK_CLIP_MAX_VOCAL_CLASH) {
-            return FallbackClipDecision(false, "none", "vocal-clash", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        if (nextFeatures.introVocalDensity > FALLBACK_CLIP_MAX_INTRO_VOCAL_DENSITY) {
-            return FallbackClipDecision(false, "none", "busy-intro-vocal", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        if (energyDelta > FALLBACK_CLIP_MAX_ENERGY_DELTA) {
-            return FallbackClipDecision(false, "none", "energy-delta", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        if (lowEnergyDelta > FALLBACK_CLIP_MAX_LOW_ENERGY_DELTA) {
-            return FallbackClipDecision(false, "none", "low-energy-delta", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        if (reason == "clash-risk" && currentFeatures.tailSilenceS < FALLBACK_CLIP_CLASH_MIN_TAIL_SILENCE) {
-            return FallbackClipDecision(false, "none", "clash-needs-main-only", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-        val tonalDistance = tonalDistance(currentFeatures, nextFeatures)
-        val tonalReady = currentFeatures.tonalConfidence >= MIN_TONAL_CONFIDENCE &&
-            nextFeatures.tonalConfidence >= MIN_TONAL_CONFIDENCE
-        if (tonalReady &&
-            tonalDistance != null &&
-            tonalDistance >= TONAL_CLASH_DISTANCE &&
-            currentFeatures.tailSilenceS < FALLBACK_CLIP_TONAL_ESCAPE_TAIL_SILENCE
-        ) {
-            return FallbackClipDecision(false, "none", "tonal-clash", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-
-        val breathableTail = currentFeatures.tailSilenceS >= FALLBACK_CLIP_MIN_TAIL_SILENCE
-        val breathableHead = nextFeatures.headSilenceS >= FALLBACK_CLIP_MIN_HEAD_SILENCE
-        val musicalCue = clipEntryCue.reason == "first-beat-pickup" ||
-            clipEntryCue.reason == "drum-pickup" ||
-            clipEntryCue.reason == "first-beat-after-silence" ||
-            clipEntryCue.reason == "head-silence"
-        val quietFromZero = clipEntryCue.reason == "from-zero" &&
-            nextFeatures.introVocalDensity <= FALLBACK_CLIP_LOW_INTRO_VOCAL_DENSITY &&
-            nextFeatures.introEnergy <= FALLBACK_CLIP_MAX_FROM_ZERO_INTRO_ENERGY
-        if (!breathableTail && !breathableHead && !musicalCue && !quietFromZero) {
-            return FallbackClipDecision(false, "none", "no-safe-pickup", FALLBACK_LIVE_TAIL_MIX_MS)
-        }
-
-        val mixMs = when {
-            breathableTail || breathableHead -> FALLBACK_TRANSITION_CLIP_MS
-            else -> FALLBACK_SHORT_TRANSITION_CLIP_MS
-        }
-        return FallbackClipDecision(true, "safe-fallback-handoff", "safe-fallback", mixMs)
     }
 
     private fun shouldLeaveAlbumGapless(
@@ -1455,7 +1078,7 @@ internal class SmartAutoMixer(
         return (fadeOutMs * FADE_OUT_JUMP_THRESHOLD).roundToLong()
     }
 
-    private fun transitionClipEligible(
+    private fun realtimeCrossfadeEligible(
         policy: String,
         fit: TransitionScore.FitScore,
         melodicTailRisk: Boolean,
@@ -1466,55 +1089,55 @@ internal class SmartAutoMixer(
     ): Boolean {
         if (policy == "live-tail-cut") return false
         if (melodicTailRisk || clashRisk) return false
-        if (fit.score < MIN_TRANSITION_CLIP_SCORE) return false
-        if (vocalClash > MAX_TRANSITION_CLIP_VOCAL_CLASH) return false
+        if (fit.score < MIN_REALTIME_CROSSFADE_SCORE) return false
+        if (vocalClash > MAX_REALTIME_CROSSFADE_VOCAL_CLASH) return false
         if (policy == "breath-cut" &&
-            (fit.score < MIN_BREATH_TRANSITION_CLIP_SCORE ||
-                vocalClash > MAX_BREATH_TRANSITION_CLIP_VOCAL_CLASH)
+            (fit.score < MIN_BREATH_REALTIME_CROSSFADE_SCORE ||
+                vocalClash > MAX_BREATH_REALTIME_CROSSFADE_VOCAL_CLASH)
         ) return false
         val bpmReady = currentFeatures.bpm != null &&
             nextFeatures.bpm != null &&
-            currentFeatures.bpmConfidence >= TRANSITION_CLIP_MIN_BPM_CONFIDENCE &&
-            nextFeatures.bpmConfidence >= TRANSITION_CLIP_MIN_BPM_CONFIDENCE
+            currentFeatures.bpmConfidence >= REALTIME_CROSSFADE_MIN_BPM_CONFIDENCE &&
+            nextFeatures.bpmConfidence >= REALTIME_CROSSFADE_MIN_BPM_CONFIDENCE
         val breathableWithoutBpm = !bpmReady &&
             (currentFeatures.tailSilenceS >= BREATHABLE_SILENCE_S ||
                 nextFeatures.headSilenceS >= BREATHABLE_SILENCE_S) &&
-            fit.score >= MIN_BREATH_TRANSITION_CLIP_SCORE
-        if (!bpmReady && !breathableWithoutBpm && fit.score < HIGH_CONFIDENCE_CLIP_WITHOUT_BPM_SCORE) return false
+            fit.score >= MIN_BREATH_REALTIME_CROSSFADE_SCORE
+        if (!bpmReady && !breathableWithoutBpm && fit.score < HIGH_CONFIDENCE_CROSSFADE_WITHOUT_BPM_SCORE) return false
         val energyDelta = abs(currentFeatures.outroEnergy - nextFeatures.introEnergy)
         val lowEnergyDelta = abs(currentFeatures.outroLowEnergy - nextFeatures.introLowEnergy)
         val maxEnergyDelta = if (policy == "breath-cut") {
-            MAX_BREATH_TRANSITION_CLIP_ENERGY_DELTA
+            MAX_BREATH_REALTIME_CROSSFADE_ENERGY_DELTA
         } else {
-            MAX_TRANSITION_CLIP_ENERGY_DELTA
+            MAX_REALTIME_CROSSFADE_ENERGY_DELTA
         }
         val maxLowEnergyDelta = if (policy == "breath-cut") {
-            MAX_BREATH_TRANSITION_CLIP_LOW_ENERGY_DELTA
+            MAX_BREATH_REALTIME_CROSSFADE_LOW_ENERGY_DELTA
         } else {
-            MAX_TRANSITION_CLIP_LOW_ENERGY_DELTA
+            MAX_REALTIME_CROSSFADE_LOW_ENERGY_DELTA
         }
         if (energyDelta > maxEnergyDelta) return false
         if (lowEnergyDelta > maxLowEnergyDelta) return false
         val tonalDistance = tonalDistance(currentFeatures, nextFeatures)
         val tonalReady = currentFeatures.tonalConfidence >= MIN_TONAL_CONFIDENCE &&
             nextFeatures.tonalConfidence >= MIN_TONAL_CONFIDENCE
-        if (tonalReady && tonalDistance != null && tonalDistance > MAX_TRANSITION_CLIP_TONAL_DISTANCE) {
+        if (tonalReady && tonalDistance != null && tonalDistance > MAX_REALTIME_CROSSFADE_TONAL_DISTANCE) {
             return false
         }
-        if (currentFeatures.outroVocalDensity >= TRANSITION_CLIP_MAX_OUTRO_VOCAL_DENSITY &&
+        if (currentFeatures.outroVocalDensity >= REALTIME_CROSSFADE_MAX_OUTRO_VOCAL_DENSITY &&
             currentFeatures.outroStartS == null &&
-            currentFeatures.tailSilenceS < FALLBACK_CLIP_MIN_TAIL_SILENCE_FOR_OPEN_VOCAL
+            currentFeatures.tailSilenceS < MIN_TAIL_SILENCE_FOR_OPEN_VOCAL
         ) return false
-        if (nextFeatures.introVocalDensity >= TRANSITION_CLIP_MAX_INTRO_VOCAL_DENSITY &&
+        if (nextFeatures.introVocalDensity >= REALTIME_CROSSFADE_MAX_INTRO_VOCAL_DENSITY &&
             (nextFeatures.vocalEntryS ?: 99.0) <= EARLY_VOCAL_ENTRY_S
         ) return false
         return true
     }
 
-    private fun transitionClipNextTempoScale(tempoLock: TempoLock): Float {
+    private fun realtimeCrossfadeNextTempoScale(tempoLock: TempoLock): Float {
         if (tempoLock.speed == DEFAULT_PLAYBACK_SPEED) return DEFAULT_PLAYBACK_SPEED
         return (DEFAULT_PLAYBACK_SPEED / tempoLock.speed)
-            .coerceIn(MIN_CLIP_NEXT_TEMPO_SCALE, MAX_CLIP_NEXT_TEMPO_SCALE)
+            .coerceIn(MIN_REALTIME_NEXT_TEMPO_SCALE, MAX_REALTIME_NEXT_TEMPO_SCALE)
     }
 
     private fun nextEntryCue(features: AudioFeatures?, policy: String): EntryCue {
@@ -1665,7 +1288,6 @@ internal class SmartAutoMixer(
 
     private fun maybeApplyTempoLock(waiting: ArmedMix, remainingMs: Long) {
         if (waiting.tempoLockApplied) return
-        if (waiting.transitionClip != null || waiting.clipPreparing) return
         val plan = waiting.plan
         val speed = plan.tempoLockSpeed
         if (speed == DEFAULT_PLAYBACK_SPEED || plan.tempoLockLeadMs <= 0L) return
@@ -1823,15 +1445,16 @@ internal class SmartAutoMixer(
             else -> SOFT_MIX_PREPARE_LEAD_MS
         }
         val tailLeadMs = if (plan.requiresTailDip) TAIL_DIP_PREPARE_LEAD_MS else styleLeadMs
-        // clip 叠加越长,startTransitionClip 触发得越早(remainingMs≈clipMixMs),渲染必须更
-        // 早开始 —— 至少留出 clipMixMs + 渲染余量,否则长 clip 渲染不完,白白降级回快速淡变。
-        val clipLeadMs = if (plan.clipEligible) plan.clipMixMs + CLIP_RENDER_HEADROOM_MS else 0L
-        return maxOf(styleLeadMs, tailLeadMs, clipLeadMs).coerceAtMost(MAX_PREPARE_LEAD_MS)
+        val realtimeLeadMs = if (plan.realtimeCrossfadeEligible) {
+            plan.realtimeCrossfadeMs + REALTIME_CROSSFADE_PREPARE_HEADROOM_MS
+        } else {
+            0L
+        }
+        return maxOf(styleLeadMs, tailLeadMs, realtimeLeadMs).coerceAtMost(MAX_PREPARE_LEAD_MS)
     }
 
     private fun cancel(reason: String, keepMainVolume: Boolean) {
         val plan = active?.plan ?: armed?.plan
-        val clipMediaId = active?.transitionClipMediaId
         val phase = when {
             active != null -> "active"
             armed != null -> "armed"
@@ -1839,7 +1462,6 @@ internal class SmartAutoMixer(
         }
         armed = null
         active = null
-        removeTransitionClipItem(clipMediaId)
         resetTempoLock(plan, reason)
         if (keepMainVolume) mainPlayer.volume = 1f
         if (reason != "main-not-playing" || plan != null) {
@@ -1872,6 +1494,10 @@ internal class SmartAutoMixer(
                 "nextTitle" to plan.nextTitle,
                 "mixPolicy" to plan.policy,
                 "mixReason" to plan.reason,
+                "queueVersion" to plan.queueVersion,
+                "targetTransitionMode" to plan.targetTransitionMode.name,
+                "transitionModeSource" to plan.transitionModeSource,
+                "committedTransitionRisk" to plan.committedTransitionRisk?.name,
             ) + plan.diagnostics + extra,
         )
     }
@@ -1898,9 +1524,9 @@ internal class SmartAutoMixer(
 
     private data class MixWindow(
         val mixMs: Long,
-        val clipMixMs: Long,
-        val clipEligible: Boolean,
-        val clipMode: String,
+        val realtimeCrossfadeMs: Long,
+        val realtimeCrossfadeEligible: Boolean,
+        val realtimeCrossfadeMode: String,
         val nextStartPositionMs: Long,
         val requiresTailDip: Boolean,
         val tailAmpThreshold: Float,
@@ -1909,7 +1535,7 @@ internal class SmartAutoMixer(
         val fadeInMs: Long,
         val tempoLockSpeed: Float,
         val tempoLockLeadMs: Long,
-        val clipNextTempoScale: Float,
+        val nextTempoScale: Float,
         val policy: String,
         val reason: String,
         val diagnostics: Map<String, Any?>,
@@ -1917,6 +1543,7 @@ internal class SmartAutoMixer(
 
     private data class AutoMixPlan(
         val key: String,
+        val queueVersion: Long,
         val currentId: String,
         val nextId: String,
         val nextIndex: Int,
@@ -1930,9 +1557,9 @@ internal class SmartAutoMixer(
         val nextArtist: String,
         val nextAlbum: String,
         val mixMs: Long,
-        val clipMixMs: Long,
-        val clipEligible: Boolean,
-        val clipMode: String,
+        val realtimeCrossfadeMs: Long,
+        val realtimeCrossfadeEligible: Boolean,
+        val realtimeCrossfadeMode: String,
         val requiresTailDip: Boolean,
         val tailAmpThreshold: Float,
         val requiredTailDipTicks: Int,
@@ -1940,9 +1567,12 @@ internal class SmartAutoMixer(
         val fadeInMs: Long,
         val tempoLockSpeed: Float,
         val tempoLockLeadMs: Long,
-        val clipNextTempoScale: Float,
+        val nextTempoScale: Float,
         val policy: String,
         val reason: String,
+        val targetTransitionMode: TransitionMode,
+        val transitionModeSource: String,
+        val committedTransitionRisk: TransitionRisk?,
         val diagnostics: Map<String, Any?>,
     )
 
@@ -1950,8 +1580,6 @@ internal class SmartAutoMixer(
         val plan: AutoMixPlan,
         var tailDipTicks: Int = 0,
         var tempoLockApplied: Boolean = false,
-        var clipPreparing: Boolean = false,
-        var transitionClip: AutoMixPreparedTransitionClip? = null,
     )
 
     private data class ActiveMix(
@@ -1959,8 +1587,6 @@ internal class SmartAutoMixer(
         val startedAtMs: Long,
         var phase: MixPhase = MixPhase.FadingOut,
         var tempoLockApplied: Boolean = false,
-        var transitionClipMediaId: String? = null,
-        var transitionClipNextResumeMs: Long = 0L,
         var fadeOutStartedAtMs: Long? = startedAtMs,
         var fadeStartedAtMs: Long? = null,
         var mainNextReadyLogged: Boolean = false,
@@ -1986,7 +1612,6 @@ internal class SmartAutoMixer(
     )
 
     private enum class MixPhase {
-        TransitionClip,
         FadingOut,
         WaitingForNext,
         FadingIn,
@@ -2004,12 +1629,11 @@ internal class SmartAutoMixer(
         private const val SOFT_MIX_PREPARE_LEAD_MS = 9_500L
         private const val TAIL_DIP_PREPARE_LEAD_MS = 11_000L
         private const val MAX_PREPARE_LEAD_MS = 13_000L
-        private const val CLIP_RENDER_HEADROOM_MS = 5_000L
+        private const val REALTIME_CROSSFADE_PREPARE_HEADROOM_MS = 700L
         private const val MIN_REMAINING_TO_ARM_MS = 1_200L
         private const val MIN_REMAINING_TO_START_MS = 500L
         private const val MAIN_ONLY_TRANSITION_MODE = "main-only-next"
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
-        private const val WAV_HEADER_BYTES = 44L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
         private const val MIN_TRACK_DURATION_S = 35.0
         private const val MIN_BPM_CONFIDENCE = 0.28
@@ -2040,45 +1664,27 @@ internal class SmartAutoMixer(
         private const val MAX_SEAMLESS_MIX_MS = 1_650L
         private const val MAX_SMART_CUT_MIX_MS = 1_350L
         private const val MAX_BREATH_CUT_MIX_MS = 950L
-        private const val MIN_TRANSITION_CLIP_MS = 2_500L
-        private const val MAX_TRANSITION_CLIP_MS = 5_500L
         private const val MIN_REALTIME_CROSSFADE_MS = 1_800L
-        // 实时双 player crossfade 总开关。改 false 重新打包即回到稳定的「离线 clip + 顺序淡变」
-        // (阶段1:响度对齐 + 等功率长 clip,本身无重复),用于双 player 接管同步还在真机调优期间兜底。
+        private const val MAX_REALTIME_CROSSFADE_MS = 5_500L
+        // 实时双 player crossfade 总开关。改 false 后回到 main-only SafeCut。
         private const val REALTIME_CROSSFADE_ENABLED = true
-        // 止血开关:见 fallbackTransitionClipDecision —— gapless 接续重播(同一句两遍)修好前,禁用勉强的 fallback clip。
-        private const val FALLBACK_TRANSITION_CLIP_ENABLED = false
-        private const val TRANSITION_CLIP_START_EARLY_TOLERANCE_MS = 160L
-        private const val TRANSITION_CLIP_START_LATE_TOLERANCE_MS = 180L
-        private const val MIN_TRANSITION_CLIP_SCORE = 0.82
-        private const val MIN_BREATH_TRANSITION_CLIP_SCORE = 0.88
-        private const val HIGH_CONFIDENCE_CLIP_WITHOUT_BPM_SCORE = 0.88
-        private const val MAX_TRANSITION_CLIP_VOCAL_CLASH = 0.12
-        private const val MAX_BREATH_TRANSITION_CLIP_VOCAL_CLASH = 0.08
-        private const val TRANSITION_CLIP_MAX_OUTRO_VOCAL_DENSITY = 0.28
-        private const val TRANSITION_CLIP_MAX_INTRO_VOCAL_DENSITY = 0.28
-        private const val TRANSITION_CLIP_MIN_BPM_CONFIDENCE = 0.25
-        private const val MAX_TRANSITION_CLIP_ENERGY_DELTA = 0.22
-        private const val MAX_TRANSITION_CLIP_LOW_ENERGY_DELTA = 0.16
-        private const val MAX_BREATH_TRANSITION_CLIP_ENERGY_DELTA = 0.16
-        private const val MAX_BREATH_TRANSITION_CLIP_LOW_ENERGY_DELTA = 0.11
-        private const val MAX_TRANSITION_CLIP_TONAL_DISTANCE = 4
-        private const val FALLBACK_TRANSITION_CLIP_MS = 1_350L
-        private const val FALLBACK_SHORT_TRANSITION_CLIP_MS = 1_050L
-        private const val FALLBACK_CLIP_MIN_TAIL_SILENCE = 1.15
-        private const val FALLBACK_CLIP_MIN_HEAD_SILENCE = 0.75
-        private const val FALLBACK_CLIP_MAX_OPEN_OUTRO_VOCAL_DENSITY = 0.36
-        private const val FALLBACK_CLIP_MIN_TAIL_SILENCE_FOR_OPEN_VOCAL = 1.20
-        private const val FALLBACK_CLIP_MAX_VOCAL_CLASH = 0.10
-        private const val FALLBACK_CLIP_MAX_INTRO_VOCAL_DENSITY = 0.30
-        private const val FALLBACK_CLIP_LOW_INTRO_VOCAL_DENSITY = 0.08
-        private const val FALLBACK_CLIP_MAX_ENERGY_DELTA = 0.28
-        private const val FALLBACK_CLIP_MAX_LOW_ENERGY_DELTA = 0.30
-        private const val FALLBACK_CLIP_MAX_FROM_ZERO_INTRO_ENERGY = 0.36
-        private const val FALLBACK_CLIP_CLASH_MIN_TAIL_SILENCE = 1.15
-        private const val FALLBACK_CLIP_TONAL_ESCAPE_TAIL_SILENCE = 1.45
-        private const val MIN_CLIP_NEXT_TEMPO_SCALE = 0.965f
-        private const val MAX_CLIP_NEXT_TEMPO_SCALE = 1.035f
+        private const val REALTIME_CROSSFADE_START_TOLERANCE_MS = 160L
+        private const val MIN_REALTIME_CROSSFADE_SCORE = 0.82
+        private const val MIN_BREATH_REALTIME_CROSSFADE_SCORE = 0.88
+        private const val HIGH_CONFIDENCE_CROSSFADE_WITHOUT_BPM_SCORE = 0.88
+        private const val MAX_REALTIME_CROSSFADE_VOCAL_CLASH = 0.12
+        private const val MAX_BREATH_REALTIME_CROSSFADE_VOCAL_CLASH = 0.08
+        private const val REALTIME_CROSSFADE_MAX_OUTRO_VOCAL_DENSITY = 0.28
+        private const val REALTIME_CROSSFADE_MAX_INTRO_VOCAL_DENSITY = 0.28
+        private const val REALTIME_CROSSFADE_MIN_BPM_CONFIDENCE = 0.25
+        private const val MAX_REALTIME_CROSSFADE_ENERGY_DELTA = 0.22
+        private const val MAX_REALTIME_CROSSFADE_LOW_ENERGY_DELTA = 0.16
+        private const val MAX_BREATH_REALTIME_CROSSFADE_ENERGY_DELTA = 0.16
+        private const val MAX_BREATH_REALTIME_CROSSFADE_LOW_ENERGY_DELTA = 0.11
+        private const val MAX_REALTIME_CROSSFADE_TONAL_DISTANCE = 4
+        private const val MIN_TAIL_SILENCE_FOR_OPEN_VOCAL = 1.20
+        private const val MIN_REALTIME_NEXT_TEMPO_SCALE = 0.965f
+        private const val MAX_REALTIME_NEXT_TEMPO_SCALE = 1.035f
         private const val FALLBACK_LIVE_TAIL_MIX_MS = 1_450L
         private const val FALLBACK_FADE_OUT_MS = 170L
         private const val FALLBACK_FADE_IN_MS = 430L

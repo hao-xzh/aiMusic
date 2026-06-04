@@ -272,43 +272,6 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         )
     }
 
-    override suspend fun audioBuildTransitionClip(
-        currentTrackId: Long,
-        currentUrl: String,
-        nextTrackId: Long,
-        nextUrl: String,
-        currentDurationMs: Long,
-        mixMs: Long,
-        nextStartPositionMs: Long,
-        nextTempoScale: Float,
-        currentGain: Float,
-        nextGain: Float,
-    ): AutoMixTransitionClip {
-        val o = callObject(
-            "audio_build_transition_clip",
-            jsonObject(
-                "currentTrackId" to currentTrackId,
-                "currentUrl" to currentUrl,
-                "nextTrackId" to nextTrackId,
-                "nextUrl" to nextUrl,
-                "currentDurationMs" to currentDurationMs,
-                "mixMs" to mixMs,
-                "nextStartPositionMs" to nextStartPositionMs,
-                "nextTempoScale" to nextTempoScale.toDouble(),
-                "currentGain" to currentGain.toDouble(),
-                "nextGain" to nextGain.toDouble(),
-            ),
-        )
-        return AutoMixTransitionClip(
-            path = o.getString("path"),
-            uri = o.getString("uri"),
-            durationMs = o.getLong("durationMs"),
-            nextResumePositionMs = o.getLong("nextResumePositionMs"),
-            sampleRate = o.optInt("sampleRate", 44_100),
-            channels = o.optInt("channels", 2),
-        )
-    }
-
     override suspend fun aiSetProvider(providerId: String) {
         callRaw("ai_set_provider", jsonObject("provider" to providerId))
     }

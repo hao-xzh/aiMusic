@@ -227,7 +227,7 @@ class RecommendEngine(
     /** ch3: 跟用户口味画像匹配（仅 artist affinity 主信号）。
      *  之前还做"标题包含 mood/genre 词" 的子串匹配 —— 任何标题里出现 "happy" / "love"
      *  / "sad" 这种常见词的歌都会被误召为 taste 候选。命中率不准、噪声大，去掉。
-     *  真正的 mood/genre 召回 应该走 SemanticIndexer 的 vector 召回（见 PetAgent 路径）。 */
+     *  真正的 mood/genre 召回 应该走 SemanticIndexer 的 vector 召回（见 AgentRuntime 路径）。 */
     private fun recallTaste(
         taste: TasteProfile?,
         lib: List<NativeTrack>,

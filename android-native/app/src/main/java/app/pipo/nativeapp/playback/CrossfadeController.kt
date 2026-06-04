@@ -9,6 +9,8 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.playback.orchestrator.TransitionMode
+import app.pipo.nativeapp.playback.orchestrator.TransitionResult
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -30,18 +32,26 @@ internal class CrossfadeController(
     private val mainPlayer: ExoPlayer,
     private val auxPlayer: ExoPlayer,
     private val auxGain: PlaybackGain,
+    private val onResult: (TransitionResult) -> Unit = {},
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private var active: Active? = null
 
     val isRunning: Boolean get() = active != null
+    val hasActiveAuxPlayback: Boolean
+        get() = auxPlayer.isPlaying
 
     private class Active(
+        val pairKey: String,
+        val queueVersion: Long,
         val nextId: String,
         val nextIndex: Int,
+        val nextStartMs: Long,
         val resumePositionMs: Long,
         val crossfadeMs: Long,
         val startedAtMs: Long,
+        var auxReadyDelayMs: Long? = null,
+        var fadeStartedAtMs: Long? = null,
         var takingOver: Boolean = false,
     )
 
@@ -75,8 +85,23 @@ internal class CrossfadeController(
         crossfadeMs: Long,
         beatmatchSpeed: Float,
         nextGainLinear: Float,
+        queueVersion: Long,
+        pairKey: String,
     ) {
         if (active != null || crossfadeMs <= 0L) return
+        if (!PlaybackSessionClock.isCurrent(queueVersion)) {
+            DiagnosticsLogStore.record(
+                area = "transition",
+                event = "stale_transition_cancel",
+                fields = mapOf(
+                    "pairKey" to pairKey,
+                    "planQueueVersion" to queueVersion,
+                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
+                    "stage" to "crossfade_start",
+                ),
+            )
+            return
+        }
         val resumeMs = (nextStartMs + crossfadeMs).coerceAtLeast(0L)
         // B 播下一首 [nextStart, resume+pad] 头段(留点余量,避免接管前 B 提前 ended 静音)。
         val auxItem = nextMediaItem.buildUpon()
@@ -100,8 +125,11 @@ internal class CrossfadeController(
 
         mainPlayer.addListener(mainListener)
         active = Active(
+            pairKey = pairKey,
+            queueVersion = queueVersion,
             nextId = nextMediaItem.mediaId,
             nextIndex = nextIndex,
+            nextStartMs = nextStartMs.coerceAtLeast(0L),
             resumePositionMs = resumeMs,
             crossfadeMs = crossfadeMs,
             startedAtMs = SystemClock.elapsedRealtime(),
@@ -111,6 +139,8 @@ internal class CrossfadeController(
             event = "realtime_crossfade_start",
             fields = mapOf(
                 "nextId" to nextMediaItem.mediaId,
+                "pairKey" to pairKey,
+                "queueVersion" to queueVersion,
                 "crossfadeMs" to crossfadeMs,
                 "nextStartMs" to nextStartMs,
                 "resumeMs" to resumeMs,
@@ -130,7 +160,49 @@ internal class CrossfadeController(
     private fun tick() {
         val a = active ?: return
         if (a.takingOver) return
-        val elapsed = SystemClock.elapsedRealtime() - a.startedAtMs
+        if (!PlaybackSessionClock.isCurrent(a.queueVersion)) {
+            DiagnosticsLogStore.record(
+                area = "transition",
+                event = "stale_transition_cancel",
+                fields = mapOf(
+                    "pairKey" to a.pairKey,
+                    "planQueueVersion" to a.queueVersion,
+                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
+                    "stage" to "crossfade_tick",
+                ),
+            )
+            cancel("stale-transition-plan")
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        val fadeStartedAtMs = a.fadeStartedAtMs
+        if (fadeStartedAtMs == null) {
+            val auxReady = auxPlayer.playbackState == Player.STATE_READY &&
+                (auxPlayer.isPlaying || auxPlayer.currentPosition > 0L || auxPlayer.playWhenReady)
+            if (!auxReady) {
+                if (now - a.startedAtMs >= AUX_READY_TIMEOUT_MS) {
+                    cancel("aux-ready-timeout")
+                    return
+                }
+                scheduleTick()
+                return
+            }
+            a.auxReadyDelayMs = now - a.startedAtMs
+            a.fadeStartedAtMs = now
+            DiagnosticsLogStore.record(
+                area = "automix",
+                event = "realtime_crossfade_aux_ready",
+                fields = mapOf(
+                    "nextId" to a.nextId,
+                    "pairKey" to a.pairKey,
+                    "queueVersion" to a.queueVersion,
+                    "auxReadyDelayMs" to a.auxReadyDelayMs,
+                ),
+            )
+            scheduleTick()
+            return
+        }
+        val elapsed = now - fadeStartedAtMs
         val p = (elapsed.toFloat() / a.crossfadeMs.toFloat()).coerceIn(0f, 1f)
         // 等功率:A(当前曲尾)淡出 cos,B(下一曲头)淡入 sin
         val theta = p * (Math.PI / 2.0)
@@ -143,40 +215,152 @@ internal class CrossfadeController(
         scheduleTick()
     }
 
-    /** 接管:停 B;A 主动 seekTo 到接续点(不靠 gapless → 不重播)。 */
+    /** 接管:先让 A 静音 seek/ready,B 继续出声;A 接上后再断 B。 */
     private fun takeover(a: Active, reason: String) {
         if (a.takingOver) return
         a.takingOver = true
         handler.removeCallbacks(tickRunnable)
-        auxPlayer.volume = 0f
-        runCatching { auxPlayer.stop() }
-        runCatching { auxPlayer.clearMediaItems() }
+        val handoffStartedAtMs = SystemClock.elapsedRealtime()
+        val actualResumeMs = actualResumePositionMs(a)
         runCatching {
+            mainPlayer.volume = 0f
             if (mainPlayer.currentMediaItem?.mediaId == a.nextId) {
                 // A 已在 next(early-transition):同 item 内直接 seek 到接续点
-                mainPlayer.seekTo(a.resumePositionMs)
+                mainPlayer.seekTo(actualResumeMs)
             } else {
                 // 常规:A 还在当前曲,主动跳到 next 的接续点(跳过当前曲剩余的极小尾巴)
-                mainPlayer.seekTo(a.nextIndex, a.resumePositionMs)
+                mainPlayer.seekTo(a.nextIndex, actualResumeMs)
             }
             if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
                 mainPlayer.prepare()
             }
             mainPlayer.play()
+            waitForMainReadyThenFinish(a, reason, actualResumeMs, handoffStartedAtMs)
+        }.onFailure { err ->
+            finishHandoff(
+                a = a,
+                reason = reason,
+                actualResumeMs = actualResumeMs,
+                handoffStartedAtMs = handoffStartedAtMs,
+                success = false,
+                failureReason = "main-seek-failed:${err::class.java.simpleName}",
+            )
         }
-        mainPlayer.volume = 1f
+    }
+
+    private fun waitForMainReadyThenFinish(
+        a: Active,
+        reason: String,
+        actualResumeMs: Long,
+        handoffStartedAtMs: Long,
+    ) {
+        if (active !== a) return
+        val now = SystemClock.elapsedRealtime()
+        val ready = mainPlayer.currentMediaItem?.mediaId == a.nextId &&
+            mainPlayer.playbackState == Player.STATE_READY
+        if (!ready && now - handoffStartedAtMs < HANDOFF_READY_TIMEOUT_MS) {
+            handler.postDelayed(
+                { waitForMainReadyThenFinish(a, reason, actualResumeMs, handoffStartedAtMs) },
+                TICK_MS,
+            )
+            return
+        }
+        fadeMainInAuxOut(
+            a = a,
+            reason = reason,
+            actualResumeMs = actualResumeMs,
+            handoffStartedAtMs = handoffStartedAtMs,
+            success = ready,
+            fadeStartedAtMs = now,
+        )
+    }
+
+    private fun fadeMainInAuxOut(
+        a: Active,
+        reason: String,
+        actualResumeMs: Long,
+        handoffStartedAtMs: Long,
+        success: Boolean,
+        fadeStartedAtMs: Long,
+    ) {
+        if (active !== a) return
+        val elapsed = SystemClock.elapsedRealtime() - fadeStartedAtMs
+        val p = (elapsed.toFloat() / HANDOFF_FADE_MS.toFloat()).coerceIn(0f, 1f)
+        mainPlayer.volume = p
+        auxPlayer.volume = 1f - p
+        if (p < 1f) {
+            handler.postDelayed(
+                { fadeMainInAuxOut(a, reason, actualResumeMs, handoffStartedAtMs, success, fadeStartedAtMs) },
+                TICK_MS,
+            )
+            return
+        }
+        finishHandoff(
+            a = a,
+            reason = reason,
+            actualResumeMs = actualResumeMs,
+            handoffStartedAtMs = handoffStartedAtMs,
+            success = success,
+            failureReason = if (success) null else "main-ready-timeout",
+        )
+    }
+
+    private fun finishHandoff(
+        a: Active,
+        reason: String,
+        actualResumeMs: Long,
+        handoffStartedAtMs: Long,
+        success: Boolean,
+        failureReason: String?,
+    ) {
+        handler.removeCallbacks(tickRunnable)
         runCatching { mainPlayer.removeListener(mainListener) }
+        restorePlayers()
+        runCatching { auxPlayer.stop() }
+        runCatching { auxPlayer.clearMediaItems() }
         active = null
+        val fadeStart = a.fadeStartedAtMs ?: a.startedAtMs
+        val now = SystemClock.elapsedRealtime()
         DiagnosticsLogStore.record(
             area = "automix",
             event = "realtime_crossfade_takeover",
             fields = mapOf(
                 "nextId" to a.nextId,
+                "pairKey" to a.pairKey,
+                "queueVersion" to a.queueVersion,
                 "reason" to reason,
                 "resumeMs" to a.resumePositionMs,
+                "actualResumeMs" to actualResumeMs,
                 "mainMediaId" to mainPlayer.currentMediaItem?.mediaId,
+                "success" to success,
+                "failureReason" to failureReason,
             ),
         )
+        onResult(
+            TransitionResult(
+                pairKey = a.pairKey,
+                sessionId = PlaybackSessionClock.sessionId,
+                queueVersion = a.queueVersion,
+                mode = TransitionMode.RealtimeCrossfade,
+                success = success,
+                completedReason = reason.takeIf { success },
+                failureReason = failureReason,
+                auxReadyDelayMs = a.auxReadyDelayMs,
+                actualOverlapMs = (handoffStartedAtMs - fadeStart).coerceAtLeast(0L),
+                handoffGapMs = (now - handoffStartedAtMs).coerceAtLeast(0L),
+                resumeDriftMs = kotlin.math.abs(actualResumeMs - a.resumePositionMs),
+                actualResumePositionMs = actualResumeMs,
+            ),
+        )
+    }
+
+    private fun actualResumePositionMs(a: Active): Long {
+        val auxPosition = auxPlayer.currentPosition.coerceAtLeast(0L)
+        return if (auxPosition >= a.nextStartMs) {
+            auxPosition
+        } else {
+            a.nextStartMs + auxPosition
+        }.coerceAtLeast(a.nextStartMs)
     }
 
     /** 被打断(手动切歌/暂停/seek/错误)时:停 B、恢复音量。A 队列未被改动,无需还原。 */
@@ -184,16 +368,39 @@ internal class CrossfadeController(
         val a = active ?: return
         handler.removeCallbacks(tickRunnable)
         runCatching { mainPlayer.removeListener(mainListener) }
-        mainPlayer.volume = 1f
-        auxPlayer.volume = 0f
+        restorePlayers()
         runCatching { auxPlayer.stop() }
         runCatching { auxPlayer.clearMediaItems() }
         active = null
         DiagnosticsLogStore.record(
             area = "automix",
             event = "realtime_crossfade_cancel",
-            fields = mapOf("nextId" to a.nextId, "reason" to reason),
+            fields = mapOf(
+                "nextId" to a.nextId,
+                "pairKey" to a.pairKey,
+                "queueVersion" to a.queueVersion,
+                "reason" to reason,
+            ),
         )
+        onResult(
+            TransitionResult(
+                pairKey = a.pairKey,
+                sessionId = PlaybackSessionClock.sessionId,
+                queueVersion = a.queueVersion,
+                mode = TransitionMode.RealtimeCrossfade,
+                success = false,
+                failureReason = reason,
+                auxReadyDelayMs = a.auxReadyDelayMs,
+            ),
+        )
+    }
+
+    private fun restorePlayers() {
+        mainPlayer.volume = 1f
+        auxPlayer.volume = 0f
+        runCatching { mainPlayer.setPlaybackParameters(PlaybackParameters(1f)) }
+        runCatching { auxPlayer.setPlaybackParameters(PlaybackParameters(1f)) }
+        runCatching { auxGain.setLinear(1f) }
     }
 
     fun release() {
@@ -204,5 +411,8 @@ internal class CrossfadeController(
     private companion object {
         private const val TICK_MS = 33L
         private const val AUX_TAIL_PAD_MS = 600L
+        private const val AUX_READY_TIMEOUT_MS = 1_200L
+        private const val HANDOFF_READY_TIMEOUT_MS = 900L
+        private const val HANDOFF_FADE_MS = 180L
     }
 }

@@ -3,7 +3,7 @@ package app.pipo.nativeapp.data
 /**
  * 标签召回 —— 镜像 src/lib/tag-recall.ts。
  *
- * 输入：用户意图（已经在 PetAgent 解析过 → MusicIntent）+ 用户库 + 已有的 TrackSemanticProfile
+ * 输入：用户意图（已经在 AgentRuntime 归一化为 PetIntent）+ 用户库 + 已有的 TrackSemanticProfile
  * 输出：按 tag 命中分排序的 (track, score) 候选
  *
  * 不主动叫 AI —— LLM 索引由 SemanticIndexer 后台跑。这里只拿现有 profile。
@@ -120,12 +120,13 @@ object TagRecall {
 }
 
 /**
- * 跨模块共享的"已解析意图"——PetAgent.ParsedIntent 的简化暴露版。
- * 把内部 ParsedIntent 抽成顶层 PetIntent，方便 TagRecall / SemanticRecall / Ranker 复用。
+ * 跨模块共享的"已解析意图"。
+ * 把 Agent 归一化后的约束抽成顶层 PetIntent，方便 TagRecall / SemanticRecall / Ranker 复用。
  */
 data class PetIntent(
     val queryText: String = "",
     val hardArtists: List<String> = emptyList(),
+    val artistDistribution: String = "PrimaryDominant",
     val hardTracks: List<String> = emptyList(),
     val hardGenres: List<String> = emptyList(),
     val hardSubGenres: List<String> = emptyList(),

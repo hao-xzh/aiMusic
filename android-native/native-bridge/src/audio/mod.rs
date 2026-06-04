@@ -7,19 +7,16 @@ use tokio::io::AsyncWriteExt;
 
 #[path = "../../../../src-tauri/src/audio/analysis.rs"]
 mod analysis;
-mod transition;
 
 const DEFAULT_MAX_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 const MIN_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const FEATURE_CACHE_VERSION: &str = "v2";
-const MAX_TRANSITION_CACHE_BYTES: i64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct NativeAudioStore {
     root: PathBuf,
     audio_dir: PathBuf,
     feature_dir: PathBuf,
-    transition_dir: PathBuf,
     config_path: PathBuf,
     client: reqwest::Client,
 }
@@ -48,13 +45,10 @@ impl NativeAudioStore {
         let root = root.join("native-audio");
         let audio_dir = root.join("audio-cache");
         let feature_dir = root.join("audio-features");
-        let transition_dir = root.join("transition-cache");
         std::fs::create_dir_all(&audio_dir)
             .with_context(|| format!("create audio cache dir {}", audio_dir.display()))?;
         std::fs::create_dir_all(&feature_dir)
             .with_context(|| format!("create audio feature dir {}", feature_dir.display()))?;
-        std::fs::create_dir_all(&transition_dir)
-            .with_context(|| format!("create transition cache dir {}", transition_dir.display()))?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
@@ -65,7 +59,6 @@ impl NativeAudioStore {
             root,
             audio_dir,
             feature_dir,
-            transition_dir,
             client,
         })
     }
@@ -129,55 +122,6 @@ impl NativeAudioStore {
         let features = features_result?;
         self.write_features(track_id, &features)?;
         Ok(serde_json::to_value(features)?)
-    }
-
-    pub async fn transition_clip_json(
-        &self,
-        current_track_id: i64,
-        current_url: String,
-        next_track_id: i64,
-        next_url: String,
-        current_duration_ms: i64,
-        mix_ms: i64,
-        next_start_position_ms: i64,
-        next_tempo_scale: f32,
-        current_gain: f32,
-        next_gain: f32,
-    ) -> Result<Value> {
-        let current = self
-            .ensure_audio_file(current_track_id, &current_url, true)
-            .await?;
-        let next = self
-            .ensure_audio_file(next_track_id, &next_url, true)
-            .await?;
-        let safe_next_tempo_scale = next_tempo_scale.clamp(0.965, 1.035);
-        let safe_current_gain = current_gain.clamp(0.05, 1.0);
-        let safe_next_gain = next_gain.clamp(0.05, 1.0);
-        // 文件名带上 gain 分量 —— 改了响度对齐后旧的无增益 clip 缓存不会被错误命中。
-        let output_path = self.transition_dir.join(format!(
-            "{}-{}-{}-{}-{}-{}-{}-{}.wav",
-            current_track_id,
-            next_track_id,
-            current_duration_ms.max(0),
-            mix_ms.max(0),
-            next_start_position_ms.max(0),
-            (safe_next_tempo_scale * 10_000.0).round() as i32,
-            (safe_current_gain * 1_000.0).round() as i32,
-            (safe_next_gain * 1_000.0).round() as i32,
-        ));
-        let clip = transition::build_transition_clip(transition::TransitionClipSpec {
-            current_path: current.path,
-            next_path: next.path,
-            output_path,
-            current_duration_ms,
-            mix_ms,
-            next_start_position_ms,
-            next_tempo_scale: safe_next_tempo_scale,
-            current_gain: safe_current_gain,
-            next_gain: safe_next_gain,
-        })?;
-        self.evict_transition_cache()?;
-        Ok(serde_json::to_value(clip)?)
     }
 
     fn max_bytes(&self) -> i64 {
@@ -320,31 +264,6 @@ impl NativeAudioStore {
         Ok(())
     }
 
-    fn evict_transition_cache(&self) -> Result<()> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&self.transition_dir)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            if !meta.is_file() {
-                continue;
-            }
-            entries.push((entry.path(), meta.len() as i64, meta.modified().ok()));
-        }
-        let mut total: i64 = entries.iter().map(|(_, bytes, _)| *bytes).sum();
-        if total <= MAX_TRANSITION_CACHE_BYTES {
-            return Ok(());
-        }
-        entries.sort_by_key(|(_, _, modified)| *modified);
-        for (path, bytes, _) in entries {
-            if total <= MAX_TRANSITION_CACHE_BYTES {
-                break;
-            }
-            if std::fs::remove_file(path).is_ok() {
-                total -= bytes;
-            }
-        }
-        Ok(())
-    }
 }
 
 async fn write_response_to_file(mut response: reqwest::Response, path: &PathBuf) -> Result<()> {

@@ -11,10 +11,11 @@ internal data class PetMessage(
     val text: String,
     /** 非空时这条消息渲染成结果卡片(放歌/收藏/加歌单等),而不是纯文字气泡。 */
     val card: PetResultCard? = null,
+    val createdAtMillis: Long = System.currentTimeMillis(),
 )
 
 /**
- * 助手写动作的可视化结果,进对话流。映射 PetAgent.AgentAction —— 比纯文字"已加心"更像 AI 产品。
+ * 助手写动作的可视化结果,进对话流。映射 AgentRuntime 的真实执行结果 —— 比纯文字"已加心"更像 AI 产品。
  */
 internal sealed interface PetResultCard {
     /** 放歌:封面缩略 + 数量 + 艺人。[insert]=插一首,[similar]=配同款。 */
@@ -87,6 +88,20 @@ internal object PetChatStore {
         messages.clear()
         hydrated = true
     }
+
+    @Synchronized
+    fun syncLatestPlayCardCount(queueCount: Int) {
+        if (queueCount <= 0 || messages.isEmpty()) return
+        val index = messages.indexOfLast { it.card is PetResultCard.Play }
+        if (index != messages.lastIndex) return
+        val message = messages[index]
+        val card = message.card as? PetResultCard.Play ?: return
+        if (card.insert || card.count == queueCount) return
+        if (System.currentTimeMillis() - message.createdAtMillis > PLAY_CARD_QUEUE_SYNC_WINDOW_MS) return
+        messages[index] = message.copy(card = card.copy(count = queueCount))
+    }
+
+    private const val PLAY_CARD_QUEUE_SYNC_WINDOW_MS = 20_000L
 }
 
 internal val EMPTY_HINTS = listOf("在。说吧。", "醒着呢。", "嗯？", "想听啥。", "随便说。", "说点。", "嗯。")

@@ -463,32 +463,6 @@ class RustBridgeRepository(
         return bridge.audioGetFeatures(trackId, url, cacheBytes)
     }
 
-    override suspend fun audioBuildTransitionClip(
-        currentTrackId: Long,
-        currentUrl: String,
-        nextTrackId: Long,
-        nextUrl: String,
-        currentDurationMs: Long,
-        mixMs: Long,
-        nextStartPositionMs: Long,
-        nextTempoScale: Float,
-        currentGain: Float,
-        nextGain: Float,
-    ): AutoMixTransitionClip {
-        return bridge.audioBuildTransitionClip(
-            currentTrackId = currentTrackId,
-            currentUrl = currentUrl,
-            nextTrackId = nextTrackId,
-            nextUrl = nextUrl,
-            currentDurationMs = currentDurationMs,
-            mixMs = mixMs,
-            nextStartPositionMs = nextStartPositionMs,
-            nextTempoScale = nextTempoScale,
-            currentGain = currentGain,
-            nextGain = nextGain,
-        )
-    }
-
     override suspend fun setAiProvider(providerId: String) {
         safe({ bridge.aiSetProvider(providerId) }, { Unit })
         refreshAiConfig()
@@ -608,18 +582,6 @@ interface RustPipoBridge {
     suspend fun audioCacheSetMaxMb(mb: Long)
     suspend fun audioCacheClear()
     suspend fun audioGetFeatures(trackId: Long, url: String, cacheBytes: Boolean): AudioFeatures
-    suspend fun audioBuildTransitionClip(
-        currentTrackId: Long,
-        currentUrl: String,
-        nextTrackId: Long,
-        nextUrl: String,
-        currentDurationMs: Long,
-        mixMs: Long,
-        nextStartPositionMs: Long,
-        nextTempoScale: Float,
-        currentGain: Float,
-        nextGain: Float,
-    ): AutoMixTransitionClip
     suspend fun aiSetProvider(providerId: String)
     suspend fun aiGetConfig(): AiConfigView
     suspend fun aiListModels(providerId: String): List<ModelOption>

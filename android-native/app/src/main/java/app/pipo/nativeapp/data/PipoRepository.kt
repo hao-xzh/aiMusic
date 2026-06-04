@@ -101,15 +101,6 @@ data class AudioFeatures(
     val tailSilenceS: Double,
 )
 
-data class AutoMixTransitionClip(
-    val path: String,
-    val uri: String,
-    val durationMs: Long,
-    val nextResumePositionMs: Long,
-    val sampleRate: Int,
-    val channels: Int,
-)
-
 enum class PipoLyricTiming {
     Line,
     Word,
@@ -167,6 +158,10 @@ data class NativeSettings(
     val lyricTranslation: Boolean = false,
     val aiNarration: Boolean = false,
     val playbackMode: String = "PlaylistLoop",
+    val aiAutoContinueEnabled: Boolean = false,
+    val defaultContinuationMode: String = "SameIntent",
+    val inheritAgentIntentWhenAvailable: Boolean = true,
+    val inferManualQueueStyleWhenNoAgentIntent: Boolean = true,
     val userFacts: String = "",
     val personaId: String = PetPersona.DEFAULT.id,
 )
@@ -218,18 +213,6 @@ interface PipoRepository {
     suspend fun setCacheMaxMb(mb: Long)
     suspend fun clearAudioCache()
     suspend fun audioFeatures(trackId: Long, url: String, cacheBytes: Boolean = true): AudioFeatures
-    suspend fun audioBuildTransitionClip(
-        currentTrackId: Long,
-        currentUrl: String,
-        nextTrackId: Long,
-        nextUrl: String,
-        currentDurationMs: Long,
-        mixMs: Long,
-        nextStartPositionMs: Long,
-        nextTempoScale: Float,
-        currentGain: Float = 1f,
-        nextGain: Float = 1f,
-    ): AutoMixTransitionClip
     suspend fun refreshAiConfig()
     suspend fun setAiProvider(providerId: String)
     suspend fun aiListModels(providerId: String): List<ModelOption>
