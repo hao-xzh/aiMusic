@@ -143,6 +143,11 @@ object SemanticRecall {
             .replace("松弛", "chill smooth")
             .replace("高级", "sophisticated alternative neo soul")
             .replace(Regex("不吵|不要太吵|别太吵"), "calm soft minimal")
+            .replace(Regex("嗨|高能|燃|动感|提神|派对|节奏强|鼓点"), "energetic exciting uplifting rhythmic party")
+            .replace(Regex("忧郁|伤感|emo|丧|孤独|失恋|心碎|苦"), "melancholic sad introspective emotional")
+            .replace(Regex("开车|车上|通勤|公路|自驾"), "drive road-trip steady uplifting")
+            .replace(Regex("睡前|助眠|想睡|晚安"), "sleep calm soothing soft gentle")
+            .replace(Regex("专注|工作|上班|学习|写代码|coding"), "focus work coding steady minimal")
 
         return mapped.split(Regex("[^a-z0-9&\\u4e00-\\u9fff-]+", RegexOption.IGNORE_CASE))
             .map { it.trim() }

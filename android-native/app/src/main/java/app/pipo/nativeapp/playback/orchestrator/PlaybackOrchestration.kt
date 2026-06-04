@@ -11,11 +11,7 @@ import app.pipo.nativeapp.data.agent.domain.CommittedQueueSummary
 import app.pipo.nativeapp.data.agent.domain.MusicGoal
 import app.pipo.nativeapp.data.agent.domain.TrackPlacement
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
-import app.pipo.nativeapp.data.agent.context.ReferenceBinding
-import app.pipo.nativeapp.data.agent.intent.MusicIntent
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
-import app.pipo.nativeapp.data.agent.session.ContinuationPolicy
-import app.pipo.nativeapp.data.agent.session.SessionMutation
 import app.pipo.nativeapp.playback.PlaybackSessionClock
 import app.pipo.nativeapp.playback.SeamlessRuntimeFlags
 import kotlin.math.abs
@@ -32,13 +28,6 @@ data class AgentQueueRequest(
     val mixPolicy: MixPolicy = MixPolicy.fromUserText(sourceUserText),
     val hardConstraints: QueueHardConstraints = QueueHardConstraints.fromUserText(sourceUserText),
     val softPreferences: QueueSoftPreferences = QueueSoftPreferences.fromUserText(sourceUserText),
-    val musicIntent: MusicIntent? = null,
-    val continuationPolicy: ContinuationPolicy? = null,
-    val sessionMutation: SessionMutation = SessionMutation.None,
-    val sessionId: String = "",
-    val generation: Long = 0L,
-    val activeIntentHash: String = "",
-    val referenceBindings: List<ReferenceBinding> = emptyList(),
 )
 
 enum class QueueOperation {
@@ -63,7 +52,7 @@ data class MixPolicy(
 ) {
     companion object {
         fun fromUserText(text: String): MixPolicy {
-            val key = text.lowercase()
+            val key = CommandTextSignals.normalizeCommandText(text)
             if (listOf("不用接歌", "不要接歌", "直接正常播", "正常播").any { it in key }) {
                 return MixPolicy(enabled = false, mode = MixMode.Off)
             }
@@ -80,7 +69,7 @@ data class MixPolicy(
             if (listOf("开车", "车上", "一路听").any { it in key }) {
                 return MixPolicy(priority = MixPriority.High, transitionFeel = TransitionFeel.Drive)
             }
-            if (listOf("慢慢嗨", "嗨起来", "派对", "party").any { it in key }) {
+            if (listOf("慢慢嗨", "嗨起来", "嗨一点", "放嗨", "燃一点", "高能", "动感", "提神", "派对", "party", "运动", "健身", "跑步").any { it in key }) {
                 return MixPolicy(priority = MixPriority.High, transitionFeel = TransitionFeel.Party)
             }
             if (listOf("顺一点", "顺滑", "不要硬切", "别硬切", "像电台", "电台一样", "接得自然").any { it in key }) {
@@ -199,10 +188,10 @@ data class QueueSoftPreferences(
     companion object {
         fun fromUserText(text: String): QueueSoftPreferences {
             val energyCurve = when {
-                listOf("睡前", "安静", "别突然", "慢慢降").any { it in text } -> EnergyCurve.Sleep
-                listOf("慢慢嗨", "嗨起来", "越来越嗨").any { it in text } -> EnergyCurve.EnergyUp
-                listOf("专注", "上班", "工作", "focus").any { it in text.lowercase() } -> EnergyCurve.Focus
-                listOf("派对", "party").any { it in text.lowercase() } -> EnergyCurve.Party
+                listOf("睡前", "安静", "别突然", "慢慢降", "舒缓", "放松", "低能量").any { it in text } -> EnergyCurve.Sleep
+                listOf("慢慢嗨", "嗨起来", "越来越嗨", "嗨一点", "放嗨", "燃一点", "高能", "动感", "提神", "运动", "健身", "跑步").any { it in text } -> EnergyCurve.EnergyUp
+                listOf("专注", "上班", "工作", "学习", "写代码", "focus").any { it in text.lowercase() } -> EnergyCurve.Focus
+                listOf("派对", "party", "蹦", "炸场").any { it in text.lowercase() } -> EnergyCurve.Party
                 else -> EnergyCurve.Smooth
             }
             return QueueSoftPreferences(energyCurve = energyCurve)
@@ -232,15 +221,11 @@ data class QueueSlot(
 enum class SlotType {
     FirstRequired,
     NextRequired,
-    AfterCurrentRequired,
-    MiddleRequired,
-    AtIndexRequired,
     EndingRequired,
     MustInclude,
     PrimaryGoal,
     SimilarFill,
     TransitionFill,
-    ContinuationFill,
 }
 
 enum class SlotSource {
@@ -313,7 +298,6 @@ data class TransitionResult(
 
 data class CommittedQueuePlan(
     val sessionId: String,
-    val generation: Long,
     val queueVersion: Long,
     val requestId: String,
     val operation: QueueOperation,
@@ -327,11 +311,6 @@ data class CommittedQueuePlan(
     val softPreferences: QueueSoftPreferences,
     val continuous: ContinuousQueueSource?,
     val jumpToInserted: Boolean,
-    val musicIntent: MusicIntent?,
-    val continuationPolicy: ContinuationPolicy?,
-    val sessionMutation: SessionMutation,
-    val activeIntentHash: String,
-    val referenceBindings: List<ReferenceBinding>,
 ) {
     val tracks: List<NativeTrack> get() = slots.map { it.track }
 
@@ -371,7 +350,6 @@ data class CommittedQueuePlan(
             }
             return CommittedQueuePlan(
                 sessionId = sessionId,
-                generation = 0L,
                 queueVersion = queueVersion,
                 requestId = requestId,
                 operation = operation,
@@ -391,11 +369,6 @@ data class CommittedQueuePlan(
                 softPreferences = QueueSoftPreferences.fromUserText(sourceUserText),
                 continuous = continuous,
                 jumpToInserted = false,
-                musicIntent = null,
-                continuationPolicy = null,
-                sessionMutation = SessionMutation.None,
-                activeIntentHash = "",
-                referenceBindings = emptyList(),
             )
         }
     }
@@ -416,11 +389,6 @@ data class CommittedQueuePlan(
             validationPassed = validation.passed,
             reordered = smoothnessReport.reordered,
             warnings = validation.messages,
-            sessionId = sessionId,
-            generation = generation,
-            sessionMutation = sessionMutation.name,
-            continuationMode = continuationPolicy?.mode?.name.orEmpty(),
-            activeIntentHash = activeIntentHash,
         )
 }
 
@@ -471,11 +439,6 @@ class PlaybackSessionManager(
                 "hardPassed" to plan.validation.passed,
                 "accepted" to accepted,
                 "reordered" to plan.smoothnessReport.reordered,
-                "sessionId" to plan.sessionId,
-                "sessionMutation" to plan.sessionMutation.name,
-                "continuationMode" to (plan.continuationPolicy?.mode?.name.orEmpty()),
-                "activeIntentHash" to plan.activeIntentHash,
-                "referenceBindings" to plan.referenceBindings.joinToString("|") { "${it.phrase}:${it.refType}" }.take(140),
             ),
         )
         return if (accepted) {
@@ -498,13 +461,6 @@ class PlaybackSessionManager(
             mixPolicy = mixPolicy,
             hardConstraints = hardConstraints,
             softPreferences = softPreferences,
-            musicIntent = musicIntent,
-            continuationPolicy = continuationPolicy,
-            sessionMutation = sessionMutation,
-            sessionId = sessionId,
-            generation = generation,
-            activeIntentHash = activeIntentHash,
-            referenceBindings = referenceBindings,
         )
 }
 
@@ -556,8 +512,7 @@ class PlaybackOrchestrator(
         val queueVersion = PlaybackSessionClock.bump("agent_${request.operation.name.lowercase()}")
         val transitionPlans = buildTransitionPlans(finalOptimized, queueVersion, request.mixPolicy)
         val plan = CommittedQueuePlan(
-            sessionId = request.sessionId.ifBlank { PlaybackSessionClock.sessionId },
-            generation = request.generation,
+            sessionId = PlaybackSessionClock.sessionId,
             queueVersion = queueVersion,
             requestId = request.requestId,
             operation = request.operation,
@@ -571,11 +526,6 @@ class PlaybackOrchestrator(
             softPreferences = request.softPreferences,
             continuous = request.continuous,
             jumpToInserted = request.jumpToInserted,
-            musicIntent = request.musicIntent,
-            continuationPolicy = request.continuationPolicy,
-            sessionMutation = request.sessionMutation,
-            activeIntentHash = request.activeIntentHash,
-            referenceBindings = request.referenceBindings,
         )
         return sessionManager.commitQueue(plan)
     }
@@ -711,43 +661,22 @@ private class AgentQueueBuilder {
             request.hardConstraints.preserveUserOrder
         val includeTitles = request.hardConstraints.mustIncludeTracks.map { it.title }
         val closerTitle = request.hardConstraints.endingTrack?.title
-        val placementByTitle = request.musicIntent
-            ?.let { intent -> intent.primaryTracks + intent.mustIncludeTracks }
-            .orEmpty()
-            .filter { it.title.isNotBlank() }
-            .associateBy { CommandTextSignals.normalizeForMatch(it.title) }
         val slots = request.tracks.mapIndexed { index, track ->
-            val placement = placementByTitle[CommandTextSignals.normalizeForMatch(track.title)]?.placement
             val isFirst = index == 0 &&
-                request.operation in setOf(
-                    QueueOperation.PlayNow,
-                    QueueOperation.ReplaceQueue,
-                    QueueOperation.PlaySimilar,
-                    QueueOperation.PreserveCurrentThenReplace,
-                )
+                request.operation in setOf(QueueOperation.PlayNow, QueueOperation.ReplaceQueue, QueueOperation.PlaySimilar)
             val isInsert = request.operation == QueueOperation.InsertNext && index == 0
-            val isAfterCurrent = placement == TrackPlacement.AfterCurrent
-            val isMiddle = placement == TrackPlacement.Middle
-            val isAtIndex = placement == TrackPlacement.AtIndex
             val isCloser = !closerTitle.isNullOrBlank() && track.title.contains(closerTitle, ignoreCase = true)
-                || placement == TrackPlacement.End
             val isMustInclude = includeTitles.any { include ->
                 include.isNotBlank() && track.title.contains(include, ignoreCase = true)
             }
-            val isContinuationFill = request.operation == QueueOperation.AppendQueue ||
-                (request.sessionId.isNotBlank() && request.sessionMutation == SessionMutation.KeepCurrentSession && request.operation != QueueOperation.InsertNext)
-            val locked = preserveOrder || isFirst || isInsert || isAfterCurrent || isMiddle || isAtIndex || isCloser
+            val locked = preserveOrder || isFirst || isInsert || isCloser || isMustInclude
             QueueSlot(
                 track = track,
                 slotType = when {
                     isInsert -> SlotType.NextRequired
-                    isAfterCurrent -> SlotType.AfterCurrentRequired
-                    isMiddle -> SlotType.MiddleRequired
-                    isAtIndex -> SlotType.AtIndexRequired
                     isFirst -> SlotType.FirstRequired
                     isCloser -> SlotType.EndingRequired
                     isMustInclude -> SlotType.MustInclude
-                    isContinuationFill -> SlotType.ContinuationFill
                     index < max(3, request.desiredCount / 3) -> SlotType.PrimaryGoal
                     else -> SlotType.SimilarFill
                 },
@@ -755,13 +684,9 @@ private class AgentQueueBuilder {
                 reason = when {
                     preserveOrder -> "preserve_user_order"
                     isInsert -> "insert_next"
-                    isAfterCurrent -> "after_current"
-                    isMiddle -> "middle_required"
-                    isAtIndex -> "at_index_required"
                     isFirst -> "first_track"
                     isCloser -> "ending_track"
                     isMustInclude -> "must_include"
-                    isContinuationFill -> "continuation_fill"
                     else -> "soft_slot"
                 },
                 source = when {
@@ -904,14 +829,14 @@ private class QueueValidator {
         if (request.operation == QueueOperation.InsertNext && tracks.firstOrNull() == null) {
             messages.add("下一首插入目标为空")
         }
-        if (request.operation in setOf(QueueOperation.PlayNow, QueueOperation.ReplaceQueue, QueueOperation.PreserveCurrentThenReplace) &&
+        if (request.operation in setOf(QueueOperation.PlayNow, QueueOperation.ReplaceQueue) &&
             request.tracks.firstOrNull()?.id != tracks.firstOrNull()?.id
         ) {
             messages.add("第一首被无缝优化移动")
         }
         request.hardConstraints.firstTrack?.title?.takeIf { it.isNotBlank() }?.let { firstTitle ->
             if (!tracks.firstOrNull()?.title.orEmpty().contains(firstTitle, ignoreCase = true) &&
-                request.operation in setOf(QueueOperation.PlayNow, QueueOperation.ReplaceQueue, QueueOperation.PreserveCurrentThenReplace)
+                request.operation in setOf(QueueOperation.PlayNow, QueueOperation.ReplaceQueue)
             ) {
                 messages.add("第一首没有满足用户点名的《$firstTitle》")
             }
@@ -931,7 +856,7 @@ private class QueueValidator {
         if (!closerTitle.isNullOrBlank() && !tracks.lastOrNull()?.title.orEmpty().contains(closerTitle, ignoreCase = true)) {
             messages.add("最后一首不是用户要求的《$closerTitle》")
         }
-        if (request.operation in setOf(QueueOperation.ReplaceQueue, QueueOperation.PreserveCurrentThenReplace) && requiredArtists.isNotEmpty()) {
+        if (request.operation == QueueOperation.ReplaceQueue && requiredArtists.isNotEmpty()) {
             val exceptionTitles = (
                 request.hardConstraints.mustIncludeTracks +
                     listOfNotNull(request.hardConstraints.endingTrack)

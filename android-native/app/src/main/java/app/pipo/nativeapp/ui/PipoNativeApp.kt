@@ -64,7 +64,6 @@ import app.pipo.nativeapp.data.agent.domain.AgentUiCard
 import app.pipo.nativeapp.data.agent.domain.MusicGoal
 import app.pipo.nativeapp.data.agent.domain.PlayMode
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
-import app.pipo.nativeapp.data.agent.context.StyleCapsuleBuilder
 import app.pipo.nativeapp.data.agent.execute.AgentActionExecutor
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
@@ -507,11 +506,6 @@ private fun SkipCorrectionEffect(
                         primaryGoal: MusicGoal,
                         target: TrackRequirement?,
                         similar: Boolean,
-                        musicIntent: app.pipo.nativeapp.data.agent.intent.MusicIntent?,
-                        continuationPolicy: app.pipo.nativeapp.data.agent.session.ContinuationPolicy?,
-                        sessionMutation: app.pipo.nativeapp.data.agent.session.SessionMutation,
-                        styleCapsule: app.pipo.nativeapp.data.agent.context.StyleCapsule?,
-                        referenceBindings: List<app.pipo.nativeapp.data.agent.context.ReferenceBinding>,
                     ): ActionExecutionResult {
                         if (tracks.isEmpty()) {
                             return ActionExecutionResult(actionId, "play_queue", success = false, message = "这次没排出能播的歌。")
@@ -595,16 +589,6 @@ private fun SkipCorrectionEffect(
                         playlistName: String,
                     ): ActionExecutionResult =
                         ActionExecutionResult(actionId, "playlist", success = false, message = "后台纠偏不操作歌单。")
-
-                    override suspend fun updateContinuation(
-                        actionId: String,
-                        policy: app.pipo.nativeapp.data.agent.session.ContinuationPolicy,
-                        currentQueue: List<NativeTrack>,
-                        currentTrack: NativeTrack?,
-                        styleCapsule: app.pipo.nativeapp.data.agent.context.StyleCapsule?,
-                        referenceBindings: List<app.pipo.nativeapp.data.agent.context.ReferenceBinding>,
-                    ): ActionExecutionResult =
-                        ActionExecutionResult(actionId, "continuation", success = false, message = "后台纠偏不改续播。")
                 }
                 runtime.handle(
                     input = AgentTurnInput(
@@ -616,13 +600,6 @@ private fun SkipCorrectionEffect(
                         currentQueue = playerState.queue,
                         userFacts = settings.userFacts,
                         persona = PetPersona.fromId(settings.personaId),
-                        activeSession = runCatching { PipoGraph.playbackIntentSessionStore.active() }.getOrNull(),
-                        currentQueueStyle = StyleCapsuleBuilder.fromQueue(playerState.queue),
-                        references = runCatching { PipoGraph.agentReferenceStore.recent() }.getOrDefault(emptyList()),
-                        aiAutoContinueEnabled = settings.aiAutoContinueEnabled || settings.playbackMode == "AiRadio",
-                        defaultContinuationMode = settings.defaultContinuationMode,
-                        inheritAgentIntentWhenAvailable = settings.inheritAgentIntentWhenAvailable,
-                        inferManualQueueStyleWhenNoAgentIntent = settings.inferManualQueueStyleWhenNoAgentIntent,
                     ),
                     executor = executor,
                 )

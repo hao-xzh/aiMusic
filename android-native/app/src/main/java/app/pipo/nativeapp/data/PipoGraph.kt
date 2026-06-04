@@ -1,8 +1,6 @@
 package app.pipo.nativeapp.data
 
 import android.content.Context
-import app.pipo.nativeapp.data.agent.memory.AgentReferenceStore
-import app.pipo.nativeapp.data.agent.session.PlaybackIntentSessionStore
 
 /**
  * 全局 DI 容器。RustBridgeRepository 在 PipoApplication.onCreate 装配；
@@ -32,12 +30,6 @@ object PipoGraph {
 
     @Volatile
     private var memory: PetMemory? = null
-
-    @Volatile
-    private var agentRefs: AgentReferenceStore? = null
-
-    @Volatile
-    private var playbackIntentSessions: PlaybackIntentSessionStore? = null
 
     @Volatile
     private var recLog: RecommendationLog? = null
@@ -90,12 +82,6 @@ object PipoGraph {
 
     val petMemory: PetMemory
         get() = memory ?: error("PipoGraph.installContext() must be called before petMemory")
-
-    val agentReferenceStore: AgentReferenceStore
-        get() = agentRefs ?: error("PipoGraph.installContext() must be called before agentReferenceStore")
-
-    val playbackIntentSessionStore: PlaybackIntentSessionStore
-        get() = playbackIntentSessions ?: error("PipoGraph.installContext() must be called before playbackIntentSessionStore")
 
     val recommendationLog: RecommendationLog
         get() = recLog ?: error("PipoGraph.installContext() must be called before recommendationLog")
@@ -165,8 +151,6 @@ object PipoGraph {
         if (lastPlaybackStore == null) lastPlaybackStore = LastPlaybackStore(app)
         if (semanticStore == null) semanticStore = TrackSemanticStore(app)
         if (memory == null) memory = PetMemory(app)
-        if (agentRefs == null) agentRefs = AgentReferenceStore(app)
-        if (playbackIntentSessions == null) playbackIntentSessions = PlaybackIntentSessionStore(app)
         if (recLog == null) recLog = RecommendationLog(app)
         if (embedStore == null) embedStore = EmbeddingStore(app)
     }

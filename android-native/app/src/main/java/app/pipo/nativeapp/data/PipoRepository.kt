@@ -158,10 +158,6 @@ data class NativeSettings(
     val lyricTranslation: Boolean = false,
     val aiNarration: Boolean = false,
     val playbackMode: String = "PlaylistLoop",
-    val aiAutoContinueEnabled: Boolean = false,
-    val defaultContinuationMode: String = "SameIntent",
-    val inheritAgentIntentWhenAvailable: Boolean = true,
-    val inferManualQueueStyleWhenNoAgentIntent: Boolean = true,
     val userFacts: String = "",
     val personaId: String = PetPersona.DEFAULT.id,
 )

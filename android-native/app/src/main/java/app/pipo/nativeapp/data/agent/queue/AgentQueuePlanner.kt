@@ -12,7 +12,7 @@ class AgentQueuePlanner(
 ) {
     fun plan(turnPlan: MusicTurnPlan): QueuePlan {
         val actions = turnPlan.actions.map { action ->
-            if (action is PlannedAction.PlayTracks && action.mode in setOf(PlayMode.ReplaceQueue, PlayMode.PreserveCurrentThenReplace)) {
+            if (action is PlannedAction.PlayTracks && action.mode == PlayMode.ReplaceQueue) {
                 action.copy(tracks = placementEngine.reorderReplaceQueue(turnPlan.userText, action.tracks))
             } else {
                 action

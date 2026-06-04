@@ -126,7 +126,6 @@ object TagRecall {
 data class PetIntent(
     val queryText: String = "",
     val hardArtists: List<String> = emptyList(),
-    val artistDistribution: String = "PrimaryDominant",
     val hardTracks: List<String> = emptyList(),
     val hardGenres: List<String> = emptyList(),
     val hardSubGenres: List<String> = emptyList(),

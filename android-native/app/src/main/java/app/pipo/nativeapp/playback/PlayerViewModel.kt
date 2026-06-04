@@ -27,31 +27,15 @@ import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.SmoothQueue
 import app.pipo.nativeapp.data.TrackDedupe
 import app.pipo.nativeapp.data.TransitionScore
-import app.pipo.nativeapp.data.agent.context.StyleCapsuleBuilder
-import app.pipo.nativeapp.data.agent.intent.IntentSource
-import app.pipo.nativeapp.data.agent.intent.MusicIntent
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
-import app.pipo.nativeapp.data.agent.session.ContinuationMode
-import app.pipo.nativeapp.data.agent.session.ContinuationContext
-import app.pipo.nativeapp.data.agent.session.ContinuationPolicy
-import app.pipo.nativeapp.data.agent.session.ContinuationReason
-import app.pipo.nativeapp.data.agent.session.LegacySessionContinuousSource
-import app.pipo.nativeapp.data.agent.session.MusicIntentSessionContinuousSource
-import app.pipo.nativeapp.data.agent.session.PlaybackIntentSession
-import app.pipo.nativeapp.data.agent.session.QueuePolicy
-import app.pipo.nativeapp.data.agent.session.SessionContinuousSource
-import app.pipo.nativeapp.data.agent.session.SessionOrigin
 import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
 import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlan
 import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlanStore
-import app.pipo.nativeapp.playback.orchestrator.MixPolicy
 import app.pipo.nativeapp.playback.orchestrator.PlaybackOrchestrator
 import app.pipo.nativeapp.playback.orchestrator.PlaybackQueueWriter
 import app.pipo.nativeapp.playback.orchestrator.PlaybackSessionManager
-import app.pipo.nativeapp.playback.orchestrator.QueueHardConstraints
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
-import app.pipo.nativeapp.playback.orchestrator.QueueSoftPreferences
 import app.pipo.nativeapp.playback.orchestrator.TransitionPreparer
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
@@ -114,10 +98,6 @@ class PlayerViewModel(
     private var playGen: Int = 0
 
     private sealed interface PendingAgentPlayback {
-        data class ReplacePlan(
-            val plan: CommittedQueuePlan,
-        ) : PendingAgentPlayback
-
         data class Replace(
             val initialBatch: List<NativeTrack>,
             val source: ContinuousQueueSource?,
@@ -162,9 +142,11 @@ class PlayerViewModel(
             unique
         }
     }
-    private var activeIntentSession: PlaybackIntentSession? = null
-    private var activeSessionSource: SessionContinuousSource? = null
     private var continuousSource: ContinuousQueueSource? = null
+    /** 最近一次 Agent 主队列的续播源。
+     * active source 受播放模式控制：OrderOnce/Shuffle 不续，AiRadio 才启用；
+     * InsertNext 不会写这个字段，所以“下一首插歌”不会污染当前主指令的自动续播。 */
+    private var lastAgentContinuousSource: ContinuousQueueSource? = null
     /** 续杯调用是否在飞行中 —— 防短时间内重复触发 */
     private var fetchingMore = false
     /** current 后剩 < N 首时触发续杯。3 = 至少留 2 首缓冲 */
@@ -243,7 +225,12 @@ class PlayerViewModel(
         PlaybackSessionManager(
             writer = object : PlaybackQueueWriter {
                 override fun replaceQueue(plan: CommittedQueuePlan): Boolean =
-                    playFromAgentPlan(plan)
+                    playFromAgent(
+                        plan.tracks,
+                        continuousSourceForPlan(plan),
+                        queueVersion = plan.queueVersion,
+                        requestId = plan.requestId,
+                    )
 
                 override fun insertNext(plan: CommittedQueuePlan): Boolean {
                     val track = plan.tracks.firstOrNull() ?: return false
@@ -257,30 +244,11 @@ class PlayerViewModel(
         )
     }
 
-    private fun sessionContinuousSourceForPlan(plan: CommittedQueuePlan): ContinuousQueueSource? {
-        plan.continuous?.let { source ->
-            if (source is SessionContinuousSource) return source
-            if (plan.sessionId.isNotBlank() && plan.generation > 0L && plan.activeIntentHash.isNotBlank()) {
-                return LegacySessionContinuousSource(
-                    sessionId = plan.sessionId,
-                    generation = plan.generation,
-                    activeIntentHash = plan.activeIntentHash,
-                    origin = PipoGraph.playbackIntentSessionStore.active()
-                        ?.takeIf { it.sessionId == plan.sessionId }
-                        ?.origin
-                        ?: SessionOrigin.AgentInstruction,
-                    policy = plan.continuationPolicy ?: ContinuationPolicy(enabled = true, mode = ContinuationMode.SameIntent),
-                    legacy = source,
-                    store = PipoGraph.playbackIntentSessionStore,
-                )
-            }
-            return source
-        }
+    private fun continuousSourceForPlan(plan: CommittedQueuePlan): ContinuousQueueSource? {
+        plan.continuous?.let { return it }
         val manualOrigin = plan.sourceUserText.startsWith("manual_") || plan.sourceUserText == "taste_screen_play"
-        return if (manualOrigin && preferredPlaybackMode == PlaybackQueueMode.AiRadio) {
-            sessionSourceForManualAiRadio(forceCurrentQueueSession = true)
-        } else {
-            null
+        return defaultContinuousSource.takeIf {
+            manualOrigin && preferredPlaybackMode == PlaybackQueueMode.AiRadio
         }
     }
     private val playbackOrchestrator by lazy {
@@ -720,13 +688,11 @@ class PlayerViewModel(
             fields = mapOf(
                 "reason" to reason,
                 "type" to when (request) {
-                    is PendingAgentPlayback.ReplacePlan -> "replace_plan"
                     is PendingAgentPlayback.Replace -> "replace"
                     is PendingAgentPlayback.Insert -> "insert"
                     is PendingAgentPlayback.QueueNext -> "queue_next"
                 },
                 "count" to when (request) {
-                    is PendingAgentPlayback.ReplacePlan -> request.plan.tracks.size
                     is PendingAgentPlayback.Replace -> request.initialBatch.size
                     is PendingAgentPlayback.Insert -> 1
                     is PendingAgentPlayback.QueueNext -> 1
@@ -766,7 +732,6 @@ class PlayerViewModel(
             fields = mapOf(
                 "reason" to reason,
                 "type" to when (request) {
-                    is PendingAgentPlayback.ReplacePlan -> "replace_plan"
                     is PendingAgentPlayback.Replace -> "replace"
                     is PendingAgentPlayback.Insert -> "insert"
                     is PendingAgentPlayback.QueueNext -> "queue_next"
@@ -774,7 +739,6 @@ class PlayerViewModel(
             ),
         )
         when (request) {
-            is PendingAgentPlayback.ReplacePlan -> playFromAgentPlan(request.plan)
             is PendingAgentPlayback.Replace -> playFromAgent(request.initialBatch, request.source, request.queueVersion, request.requestId)
             is PendingAgentPlayback.Insert -> insertNext(request.track, request.queueVersion, request.requestId)
             is PendingAgentPlayback.QueueNext -> queueNext(request.track, request.queueVersion, request.requestId)
@@ -1297,18 +1261,6 @@ class PlayerViewModel(
     }
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    fun playFromAgentPlan(plan: CommittedQueuePlan): Boolean {
-        val source = sessionContinuousSourceForPlan(plan)
-        return playFromAgentInternal(
-            initialBatch = plan.tracks,
-            source = source,
-            queueVersion = plan.queueVersion,
-            requestId = plan.requestId,
-            committedPlan = plan,
-        )
-    }
-
-    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun playFromAgent(
         initialBatch: List<NativeTrack>,
         source: ContinuousQueueSource?,
@@ -1327,33 +1279,12 @@ class PlayerViewModel(
                 ),
             ) is QueueCommitResult.Success
         }
-        return playFromAgentInternal(
-            initialBatch = initialBatch,
-            source = source,
-            queueVersion = queueVersion,
-            requestId = requestId,
-            committedPlan = null,
-        )
-    }
-
-    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    private fun playFromAgentInternal(
-        initialBatch: List<NativeTrack>,
-        source: ContinuousQueueSource?,
-        queueVersion: Long,
-        requestId: String,
-        committedPlan: CommittedQueuePlan?,
-    ): Boolean {
         val committedQueueVersion = queueVersion
         if (initialBatch.isEmpty()) return false
         val first = initialBatch.first()
         if (first.streamUrl.isBlank() && first.neteaseId == null) return false
         val player = controller ?: run {
-            if (committedPlan != null) {
-                deferAgentPlayback(PendingAgentPlayback.ReplacePlan(committedPlan), "controller_not_ready")
-            } else {
-                deferAgentPlayback(PendingAgentPlayback.Replace(initialBatch, source, committedQueueVersion, requestId), "controller_not_ready")
-            }
+            deferAgentPlayback(PendingAgentPlayback.Replace(initialBatch, source, committedQueueVersion, requestId), "controller_not_ready")
             return true
         }
         DiagnosticsLogStore.record(
@@ -1381,8 +1312,9 @@ class PlayerViewModel(
                 }
                 if (gen != playGen) return@launch
                 firstResolvedForAppend = firstResolved
-                val queueMode = modeForNewQueue(committedPlan, source)
-                installContinuationSource(queueMode, explicitSource = source, plan = committedPlan)
+                lastAgentContinuousSource = source
+                val queueMode = modeForNewQueue(source)
+                continuousSource = continuousSourceForMode(queueMode, explicitSource = source)
                 app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
                 val pendingQueue = buildCommittedOrder(
                     firstResolved = firstResolved,
@@ -1419,8 +1351,7 @@ class PlayerViewModel(
             val plannedQueue = state.queue
             val rest = plannedQueue.drop(1)
             if (rest.isEmpty()) return@launch
-            val queueMode = modeForNewQueue(committedPlan, source)
-            installContinuationSource(queueMode, explicitSource = source, plan = committedPlan)
+            val queueMode = modeForNewQueue(source)
             state = state.copy(
                 queue = plannedQueue,
                 currentIndex = 0,
@@ -1570,8 +1501,9 @@ class PlayerViewModel(
                 // phase-1 期间显式 null —— 此时 queue 只有 1 首，开 continuous 会立刻触发
                 // maybeExtendQueue（remaining=0 ≤ 阈值 3），跟 phase-2 的 addMediaItems 抢插。
                 // phase-2 完成后再切回 RecommendEngine，让 "歌单播完接续相似歌" 这条 UX 也能用上。
+                lastAgentContinuousSource = null
                 val queueMode = preferredPlaybackMode
-                installContinuationSource(queueMode, explicitSource = sessionSourceForManualAiRadio(forceCurrentQueueSession = true), plan = null)
+                continuousSource = continuousSourceForMode(queueMode, explicitSource = null)
                 app.pipo.nativeapp.ui.PetBubbleStateAccessor.resetForNewQueue()
                 
                 val plannedQueue = buildCommittedOrder(
@@ -1701,13 +1633,7 @@ class PlayerViewModel(
     }
 
     private fun triggerForceExtendAndPlayNext(player: Player) {
-        val sessionSourceSnapshot = activeSessionSource
-        val sessionSnapshot = activeIntentSession
-        val sourceSnapshot = sessionSourceSnapshot ?: continuousSource ?: run {
-            fallbackWrapAround(player)
-            return
-        }
-        if (sessionSourceSnapshot != null && !isSessionSourceCurrent(sessionSnapshot, sessionSourceSnapshot)) {
+        val sourceSnapshot = continuousSource ?: run {
             fallbackWrapAround(player)
             return
         }
@@ -1735,25 +1661,11 @@ class PlayerViewModel(
                 }
                 val excludeIds = queueSnapshot.mapNotNull { it.neteaseId }.toSet()
                 val more = try {
-                    if (sessionSourceSnapshot != null && sessionSnapshot != null) {
-                        sessionSourceSnapshot.fetchMore(
-                            ContinuationContext(
-                                activeSession = sessionSnapshot,
-                                currentTrack = currentTrackFor(player),
-                                currentQueue = queueSnapshot,
-                                excludeIds = excludeIds,
-                                excludeSongKeys = queueSnapshot.mapTo(HashSet()) { TrackDedupe.songKey(it) },
-                                reason = ContinuationReason.ForceNextAtQueueEnd,
-                            ),
-                        ).tracks
-                    } else {
-                        sourceSnapshot.fetchMore(excludeIds)
-                    }
+                    sourceSnapshot.fetchMore(excludeIds)
                 } catch (_: Exception) {
                     emptyList()
                 }
                 if (gen != playGen) return@launch
-                if (sessionSourceSnapshot != null && !isSessionSourceCurrent(sessionSnapshot, sessionSourceSnapshot)) return@launch
                 if (more.isEmpty()) {
                     fallbackWrapAround(player)
                     return@launch
@@ -1764,7 +1676,6 @@ class PlayerViewModel(
                     emptyList()
                 }
                 if (gen != playGen) return@launch
-                if (sessionSourceSnapshot != null && !isSessionSourceCurrent(sessionSnapshot, sessionSourceSnapshot)) return@launch
                 if (resolved.isEmpty()) {
                     fallbackWrapAround(player)
                     return@launch
@@ -1976,12 +1887,7 @@ class PlayerViewModel(
     private fun applyPlaybackModePreference(mode: PlaybackQueueMode, persist: Boolean) {
         val previousMode = state.playbackMode
         preferredPlaybackMode = mode
-        installContinuationSource(mode, explicitSource = null, plan = null)
-        if (mode == PlaybackQueueMode.OrderOnce) {
-            pauseActiveContinuation()
-        } else if (mode == PlaybackQueueMode.AiRadio && activeSessionSource == null) {
-            installContinuationSource(mode, explicitSource = sessionSourceForManualAiRadio(forceCurrentQueueSession = false), plan = null)
-        }
+        continuousSource = continuousSourceForMode(mode, explicitSource = lastAgentContinuousSource)
         state = state.copy(playbackMode = mode)
         controller?.let(::applyPlaybackMode)
         // 用户在播放中切到随机播放,把当前曲后面的队列实际打乱 ——
@@ -2043,103 +1949,21 @@ class PlayerViewModel(
         )
     }
 
-    private fun modeForNewQueue(
-        plan: CommittedQueuePlan?,
-        explicitSource: ContinuousQueueSource?,
-    ): PlaybackQueueMode {
-        if (plan?.operation == QueueOperation.InsertNext) return state.playbackMode
-        return if (explicitSource is SessionContinuousSource && explicitSource.policy.enabled) {
-            PlaybackQueueMode.AiRadio
-        } else {
-            preferredPlaybackMode
-        }
+    @Suppress("UNUSED_PARAMETER")
+    private fun modeForNewQueue(explicitSource: ContinuousQueueSource?): PlaybackQueueMode {
+        // Agent 有 explicitSource 只说明“这个队列具备同要求续播能力”，不代表强行切到 AiRadio。
+        // 是否续播必须尊重用户当前列表设置：OrderOnce 就播完停，ShufflePlay 就按列表/随机，AiRadio 才按 Agent session 续。
+        return preferredPlaybackMode
     }
 
-    private fun installContinuationSource(
+    private fun continuousSourceForMode(
         mode: PlaybackQueueMode,
         explicitSource: ContinuousQueueSource?,
-        plan: CommittedQueuePlan?,
-    ) {
-        if (mode != PlaybackQueueMode.AiRadio) {
-            activeIntentSession = null
-            activeSessionSource = null
-            continuousSource = null
-            return
-        }
-
-        val sessionSource = explicitSource as? SessionContinuousSource
-        activeSessionSource = sessionSource
-        activeIntentSession = sessionSource?.let { source ->
-            runCatching { PipoGraph.playbackIntentSessionStore.active() }.getOrNull()
-                ?.takeIf { session ->
-                    session.sessionId == source.sessionId &&
-                        session.generation == source.generation &&
-                        session.activeIntentHash == source.activeIntentHash &&
-                        session.isActive()
-                }
-        }
-        if (plan != null && sessionSource == null && plan.sessionId.isNotBlank()) {
-            activeIntentSession = runCatching { PipoGraph.playbackIntentSessionStore.active() }.getOrNull()
-                ?.takeIf { it.sessionId == plan.sessionId && it.generation == plan.generation && it.activeIntentHash == plan.activeIntentHash }
-        }
-        continuousSource = sessionSource ?: explicitSource?.takeIf { plan == null } ?: defaultContinuousSource.takeIf { activeSessionSource == null }
-    }
-
-    private fun pauseActiveContinuation() {
-        runCatching { PipoGraph.playbackIntentSessionStore.pauseActive() }
-        activeIntentSession = null
-        activeSessionSource = null
-        continuousSource = null
-    }
-
-    private fun sessionSourceForManualAiRadio(forceCurrentQueueSession: Boolean = false): ContinuousQueueSource? {
-        val store = runCatching { PipoGraph.playbackIntentSessionStore }.getOrNull() ?: return null
-        val current = if (forceCurrentQueueSession) null else store.active()?.takeIf { it.continuationPolicy.enabled }
-        val session = current ?: run {
-            val queue = state.queue
-            if (queue.isEmpty()) return null
-            val style = StyleCapsuleBuilder.fromQueue(queue) ?: StyleCapsuleBuilder.fromTrack(queue.getOrNull(state.currentIndex))
-            val styleTerms = style?.asSearchTerms().orEmpty()
-            val intent = MusicIntent(
-                queryText = styleTerms.joinToString(" ").ifBlank { "当前队列风格" },
-                refStyles = styleTerms,
-                aiMainStyles = style?.genres.orEmpty(),
-                softMoods = style?.moods.orEmpty(),
-                softScenes = style?.scenes.orEmpty(),
-                softTextures = style?.textures.orEmpty(),
-                softEnergy = style?.energy ?: "any",
-                softTempoFeel = style?.tempoFeel ?: "any",
-                desiredCount = 8,
-                source = if (style?.trackId != null) IntentSource.CurrentTrackStyle else IntentSource.CurrentQueueStyle,
-            )
-            store.create(
-                origin = if (style?.trackId != null) SessionOrigin.CurrentTrackStyle else SessionOrigin.CurrentQueueStyle,
-                rootUserText = "manual_ai_radio",
-                lastUserText = "manual_ai_radio",
-                activeIntent = intent,
-                continuationPolicy = ContinuationPolicy(enabled = true, mode = ContinuationMode.CurrentQueueStyle),
-                queuePolicy = QueuePolicy(defaultDesiredCount = 8),
-                mixPolicy = MixPolicy(),
-                hardConstraints = QueueHardConstraints(),
-                softPreferences = QueueSoftPreferences(
-                    preferredMoods = style?.moods.orEmpty(),
-                    preferredGenres = style?.genres.orEmpty(),
-                ),
-                styleAnchor = style,
-                trackAnchor = state.queue.getOrNull(state.currentIndex),
-                queueAnchorIds = queue.map { it.id },
-            )
-        }
-        return MusicIntentSessionContinuousSource(
-            sessionId = session.sessionId,
-            generation = session.generation,
-            activeIntentHash = session.activeIntentHash,
-            origin = session.origin,
-            intent = session.activeIntent,
-            policy = session.continuationPolicy,
-            store = store,
-        ) { _, excludeIds, _ ->
-            defaultContinuousSource.fetchMore(excludeIds)
+    ): ContinuousQueueSource? {
+        return if (mode == PlaybackQueueMode.AiRadio) {
+            explicitSource ?: lastAgentContinuousSource ?: defaultContinuousSource
+        } else {
+            null
         }
     }
 
@@ -2573,10 +2397,7 @@ class PlayerViewModel(
 
     private fun maybeExtendQueue() {
         if (fetchingMore) return
-        val sessionSourceSnapshot = activeSessionSource
-        val sessionSnapshot = activeIntentSession
-        val sourceSnapshot = sessionSourceSnapshot ?: continuousSource ?: return
-        if (sessionSourceSnapshot != null && !isSessionSourceCurrent(sessionSnapshot, sessionSourceSnapshot)) return
+        val sourceSnapshot = continuousSource ?: return
         val now = SystemClock.elapsedRealtime()
         if (now < queueExtendBackoffUntilMs) return
         val queueSnapshot = state.queue
@@ -2590,20 +2411,7 @@ class PlayerViewModel(
             try {
                 val excludeIds = queueSnapshot.mapNotNull { it.neteaseId }.toSet()
                 val more = try {
-                    if (sessionSourceSnapshot != null && sessionSnapshot != null) {
-                        sessionSourceSnapshot.fetchMore(
-                            ContinuationContext(
-                                activeSession = sessionSnapshot,
-                                currentTrack = queueSnapshot.getOrNull(state.currentIndex),
-                                currentQueue = queueSnapshot,
-                                excludeIds = excludeIds,
-                                excludeSongKeys = queueSnapshot.mapTo(HashSet()) { TrackDedupe.songKey(it) },
-                                reason = ContinuationReason.LowRemaining,
-                            ),
-                        ).tracks
-                    } else {
-                        sourceSnapshot.fetchMore(excludeIds)
-                    }
+                    sourceSnapshot.fetchMore(excludeIds)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -2611,7 +2419,6 @@ class PlayerViewModel(
                     return@launch
                 }
                 if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) return@launch
-                if (sessionSourceSnapshot != null && !isSessionSourceCurrent(sessionSnapshot, sessionSourceSnapshot)) return@launch
                 if (more.isEmpty()) {
                     // source 跑空了 —— 不关闭循环。
                     // 之前这里关闭循环，导致：当前队列播完
@@ -2622,9 +2429,8 @@ class PlayerViewModel(
                     if (continuousSource === sourceSnapshot) {
                         continuousSource = null
                     }
-                    if (activeSessionSource === sessionSourceSnapshot) {
-                        activeSessionSource = null
-                        activeIntentSession = null
+                    if (lastAgentContinuousSource === sourceSnapshot) {
+                        lastAgentContinuousSource = null
                     }
                     resetQueueExtendBackoff()
                     return@launch
@@ -2638,7 +2444,6 @@ class PlayerViewModel(
                     return@launch
                 }
                 if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) return@launch
-                if (sessionSourceSnapshot != null && !isSessionSourceCurrent(sessionSnapshot, sessionSourceSnapshot)) return@launch
                 if (resolved.isEmpty()) {
                     armQueueExtendBackoff()
                     return@launch
@@ -2735,28 +2540,6 @@ class PlayerViewModel(
         return gen == playGen &&
             continuousSource === sourceSnapshot &&
             sameQueueOrder(queueSnapshot, state.queue)
-    }
-
-    private fun isSessionSourceCurrent(
-        sessionSnapshot: PlaybackIntentSession?,
-        sourceSnapshot: SessionContinuousSource,
-    ): Boolean {
-        if (state.playbackMode != PlaybackQueueMode.AiRadio) return false
-        if (sessionSnapshot == null || !sessionSnapshot.isActive()) return false
-        if (activeIntentSession?.sessionId != sessionSnapshot.sessionId) return false
-        if (activeIntentSession?.generation != sessionSnapshot.generation) return false
-        if (activeIntentSession?.activeIntentHash != sessionSnapshot.activeIntentHash) return false
-        if (activeSessionSource !== sourceSnapshot) return false
-        return sourceSnapshot.sessionId == sessionSnapshot.sessionId &&
-            sourceSnapshot.generation == sessionSnapshot.generation &&
-            sourceSnapshot.activeIntentHash == sessionSnapshot.activeIntentHash &&
-            runCatching {
-                PipoGraph.playbackIntentSessionStore.isCurrent(
-                    sourceSnapshot.sessionId,
-                    sourceSnapshot.generation,
-                    sourceSnapshot.activeIntentHash,
-                )
-            }.getOrDefault(false)
     }
 
     private fun sameQueueOrder(left: List<NativeTrack>, right: List<NativeTrack>): Boolean {

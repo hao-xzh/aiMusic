@@ -23,10 +23,6 @@ class LocalSettingsStore(context: Context) {
             .putBoolean(KEY_LYRIC_TRANSLATION, next.lyricTranslation)
             .putBoolean(KEY_AI_NARRATION, next.aiNarration)
             .putString(KEY_PLAYBACK_MODE, next.playbackMode)
-            .putBoolean(KEY_AI_AUTO_CONTINUE, next.aiAutoContinueEnabled)
-            .putString(KEY_DEFAULT_CONTINUATION_MODE, next.defaultContinuationMode)
-            .putBoolean(KEY_INHERIT_AGENT_INTENT, next.inheritAgentIntentWhenAvailable)
-            .putBoolean(KEY_INFER_MANUAL_QUEUE_STYLE, next.inferManualQueueStyleWhenNoAgentIntent)
             .putString(KEY_USER_FACTS, next.userFacts)
             .putString(KEY_PERSONA_ID, next.personaId)
             .commit()
@@ -40,11 +36,6 @@ class LocalSettingsStore(context: Context) {
             aiNarration = prefs.getBoolean(KEY_AI_NARRATION, false),
             playbackMode = prefs.getString(KEY_PLAYBACK_MODE, "PlaylistLoop").orEmpty()
                 .ifBlank { "PlaylistLoop" },
-            aiAutoContinueEnabled = prefs.getBoolean(KEY_AI_AUTO_CONTINUE, false),
-            defaultContinuationMode = prefs.getString(KEY_DEFAULT_CONTINUATION_MODE, "SameIntent").orEmpty()
-                .ifBlank { "SameIntent" },
-            inheritAgentIntentWhenAvailable = prefs.getBoolean(KEY_INHERIT_AGENT_INTENT, true),
-            inferManualQueueStyleWhenNoAgentIntent = prefs.getBoolean(KEY_INFER_MANUAL_QUEUE_STYLE, true),
             userFacts = prefs.getString(KEY_USER_FACTS, "").orEmpty(),
             personaId = prefs.getString(KEY_PERSONA_ID, PetPersona.DEFAULT.id).orEmpty()
                 .ifBlank { PetPersona.DEFAULT.id },
@@ -56,10 +47,6 @@ class LocalSettingsStore(context: Context) {
         const val KEY_LYRIC_TRANSLATION = "lyric-translation"
         const val KEY_AI_NARRATION = "ai-narration"
         const val KEY_PLAYBACK_MODE = "playback-mode"
-        const val KEY_AI_AUTO_CONTINUE = "ai-auto-continue"
-        const val KEY_DEFAULT_CONTINUATION_MODE = "default-continuation-mode"
-        const val KEY_INHERIT_AGENT_INTENT = "inherit-agent-intent"
-        const val KEY_INFER_MANUAL_QUEUE_STYLE = "infer-manual-queue-style"
         const val KEY_USER_FACTS = "user-facts"
         const val KEY_PERSONA_ID = "persona-id"
     }

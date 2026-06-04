@@ -24,12 +24,6 @@ class ReplyGrounder(
         if (plan.actions.size == 1 && plan.actions.first() is PlannedAction.Clarify) {
             return (plan.actions.first() as PlannedAction.Clarify).question.ifBlank { "你想听哪首？" }.take(420)
         }
-        if (plan.actions.size == 1 && plan.actions.first() is PlannedAction.AnswerStyle) {
-            return results.firstOrNull()?.message
-                ?.takeIf { it.isNotBlank() }
-                ?.take(420)
-                ?: "这首的风格我记下来了。"
-        }
         val facts = ReplyFactsBuilder.from(plan, validation, results, persona)
         val drafted = runCatching { copywriter?.write(facts, persona) }
             .getOrNull()

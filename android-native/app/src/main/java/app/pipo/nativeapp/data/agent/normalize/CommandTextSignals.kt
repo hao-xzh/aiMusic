@@ -3,7 +3,6 @@ package app.pipo.nativeapp.data.agent.normalize
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
 import app.pipo.nativeapp.data.agent.domain.TrackPlacement
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
-import app.pipo.nativeapp.data.agent.intent.MusicDescriptorLexicon
 
 data class PlaylistScopedRequest(
     val playlistName: String,
@@ -49,44 +48,42 @@ object CommandTextSignals {
         for (pattern in patterns) {
             val match = pattern.find(text) ?: continue
             val title = sanitizeTitle(match.groupValues.lastOrNull().orEmpty())
-            if (title.isNotBlank()) return title
+            if (title.isNotBlank() && !isGenericMusicNoun(title) && !isCatalogDescriptor(title) && !normalizeCommandText(title).endsWith("的歌")) return title
         }
         return null
     }
 
     fun includedTrackRequirement(text: String): TrackRequirement? {
-        val placement = includedPlacement(text)
-        val index = includedIndex(text)
         val artistPattern = Regex(
             "(?:包含|包括|带上|要有|有|加一首|加首|插一首|插首|顺便加|再加一首|再加|加个|插个)\\s*([^，。,.!！?？]{1,24})\\s*的\\s*([^，。,.!！?？]{1,32})",
         )
         artistPattern.find(text)?.let { match ->
             val artist = match.groupValues.getOrNull(1).orEmpty().trim()
             val title = sanitizeTitle(match.groupValues.getOrNull(2).orEmpty())
-            if (artist.isNotBlank() && title.isNotBlank()) {
-                return TrackRequirement(title = title, artist = artist, placement = placement, index = index)
+            if (artist.isNotBlank() && title.isNotBlank() && !isGenericMusicNoun(title) && !isCatalogDescriptor(title)) {
+                return TrackRequirement(title = title, artist = artist, placement = TrackPlacement.MustInclude)
             }
         }
-        return includedTrackTitle(text)?.let { TrackRequirement(title = it, placement = placement, index = index) }
+        return includedTrackTitle(text)?.let { TrackRequirement(title = it, placement = TrackPlacement.MustInclude) }
     }
 
-    private fun includedPlacement(text: String): TrackPlacement {
-        val key = normalizeCommandText(text)
-        return when {
-            listOf("中间加", "中间插", "中间放", "放中间", "插中间").any { it in key } -> TrackPlacement.Middle
-            Regex("第([0-9]{1,2}|[一二两三四五六七八九十]{1,4})首").containsMatchIn(key) -> TrackPlacement.AtIndex
-            listOf("当前这首后", "这首后", "放完这首", "等这首完").any { it in key } -> TrackPlacement.AfterCurrent
-            else -> TrackPlacement.MustInclude
+    fun includedArtistHints(text: String): List<String> {
+        val patterns = listOf(
+            Regex("(?:中间|后面|顺便|另外|再|也|穿插|夹|带上|加|插)(?:加|插|带|来)?(?:一首|几首|首|点|一点)?\\s*([^，。,.!！?？、]{1,24})\\s*(?:的歌|歌曲|音乐)"),
+            Regex("(?:中间|后面|顺便|另外|再|也|穿插|夹)(?:加|插|带|来)?(?:一首|几首|首|点|一点)?\\s*([^，。,.!！?？、]{2,24})"),
+        )
+        val out = ArrayList<String>()
+        val seen = HashSet<String>()
+        for (pattern in patterns) {
+            for (match in pattern.findAll(text)) {
+                val artist = sanitizeArtistHint(match.groupValues.getOrNull(1).orEmpty()) ?: continue
+                val key = normalizeForMatch(artist)
+                if ("的" in artist) continue
+                if (key in setOf("别的", "别的歌", "其他", "另一个", "另外", "一首", "几首")) continue
+                if (seen.add(key)) out.add(artist)
+            }
         }
-    }
-
-    private fun includedIndex(text: String): Int? {
-        val raw = Regex("第([0-9]{1,2}|[一二两三四五六七八九十]{1,4})首")
-            .find(text)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?: return null
-        return parseSmallCount(raw)?.minus(1)?.coerceAtLeast(0)
+        return out
     }
 
     fun explicitTrackList(text: String): List<TrackRequirement> {
@@ -167,12 +164,16 @@ object CommandTextSignals {
     fun insertNextTrack(text: String): TrackRequirement? {
         val patterns = listOf(
             Regex("(?:下一首插|插到下一首|放完接|等这首完(?:了)?放)\\s*([^，。,.!！?？]{1,32})"),
+            Regex("(?:下一首|接下来)\\s*(?:我)?(?:想听|要听|放|播放|听|来一首|来首)?\\s*([^，。,.!！?？]{1,32})"),
             Regex("(?:下一首|接下来)[^《「“\"]{0,12}[《「“\"]([^》」”\"]{1,32})[》」”\"]"),
         )
         for (pattern in patterns) {
             val match = pattern.find(text) ?: continue
             val title = sanitizeTitle(match.groupValues.lastOrNull().orEmpty())
-            if (title.isNotBlank()) return TrackRequirement(title = title, placement = TrackPlacement.Next)
+                .replace(Regex("^(我)?(?:想听|要听|放|播放|听|来点|来一首|来首)"), "")
+                .replace(Regex("(一点|一些|的)$"), "")
+                .trim()
+            if (title.isNotBlank() && !isCatalogDescriptor(title)) return TrackRequirement(title = title, placement = TrackPlacement.Next)
         }
         return null
     }
@@ -239,7 +240,6 @@ object CommandTextSignals {
     private fun rawPrimaryArtistHint(text: String): String? {
         val patterns = listOf(
             Regex("(?:想听|听点|听|放点|放|播放|先放|来点|来些|播)\\s*([^，。,.!！?？]{1,24})\\s*的\\s*(?:经典|老歌|金曲|热门|好听|流行|摇滚|民谣|爵士|电子|嘻哈|安静|舒缓|放松|嗨|高能|燃|动感)?\\s*(?:歌|歌曲|音乐)"),
-            Regex("(?:想听|听点|听|放点|放|播放|先放|来点|来些|播)\\s*([^，。,.!！?？]{1,36})"),
             Regex("^\\s*(?:类似|像|接近|来点类似|放点类似)\\s*([^，。,.!！?？的]{2,24})"),
             Regex("^\\s*([^，。,.!！?？]{2,24})\\s*(?:的歌|那种|这种|风格|为主|主打)"),
         )
@@ -269,17 +269,19 @@ object CommandTextSignals {
 
     fun genericSimilarRequest(text: String): Boolean {
         val key = normalizeCommandText(text)
+        val semantic = MusicSemanticSignals.extract(text)
         return looksLikeSimilarRequest(text) &&
             primaryArtistHints(text).isEmpty() &&
             artistTrackTarget(text) == null &&
             connectiveLeadTrack(text) == null &&
             explicitTrackList(text).isEmpty() &&
-            listOf("类似歌曲", "类似的歌", "类似音乐", "继续播放类似", "继续类似", "接着类似", "继续放类似")
-                .any { it in key }
+            (semantic.wantsCurrentStyle || semantic.wantsMoreLikeCurrent ||
+                listOf("类似歌曲", "类似的歌", "类似音乐", "继续播放类似", "继续类似", "接着类似", "继续放类似")
+                    .any { it in key })
     }
 
     fun genericCatalogRequest(text: String): Boolean =
-        isCatalogDescriptor(text) &&
+        (isCatalogDescriptor(text) || MusicSemanticSignals.looksLikeFuzzyMusicRequest(text)) &&
             primaryArtistHints(text).isEmpty() &&
             artistTrackTarget(text) == null &&
             explicitTrackList(text).isEmpty()
@@ -287,19 +289,22 @@ object CommandTextSignals {
     fun isCatalogDescriptor(value: String): Boolean {
         val key = normalizeCommandText(value)
         if (key.isBlank()) return false
-        if (MusicDescriptorLexicon.isDescriptorOnly(key)) return true
+        val semantic = MusicSemanticSignals.extract(value)
+        if (semantic.playableSignal && !semantic.wantsCurrentStyle) return true
         val stripped = key
             .replace(Regex("^(一些|一点|几首|几首歌|歌曲|音乐)"), "")
-            .replace(Regex("(一点|一些|的歌|的音乐|的歌曲|的|歌曲|音乐|歌)$"), "")
+            .replace(Regex("(一点|一些|的歌|歌曲|音乐|歌)$"), "")
         if (key in setOf("歌", "歌曲", "音乐", "一些歌", "一些歌曲", "几首歌", "类似歌曲")) return true
         val languageCue = listOf("华语", "中文", "国语", "粤语", "英文", "日语", "韩语").any { it in key }
         val styleCue = listOf(
             "经典", "老歌", "金曲", "怀旧", "流行", "摇滚", "民谣", "爵士", "电子", "嘻哈",
-            "夜晚", "深夜", "热门", "好听",
+            "安静", "夜晚", "深夜", "舒缓", "放松", "热门", "好听", "嗨", "高能", "燃", "动感",
+            "忧郁", "emo", "伤感", "失恋", "开车", "通勤", "学习", "工作", "写代码", "专注", "治愈", "氛围",
         ).any { it in key }
         val compactStyleOnly = stripped in setOf(
             "经典", "老歌", "金曲", "怀旧", "流行", "安静", "夜晚", "深夜", "舒缓", "放松",
-            "热门", "好听", "华语经典", "中文经典",
+            "热门", "好听", "嗨", "高能", "燃", "动感",
+            "忧郁", "emo", "伤感", "治愈", "华语经典", "中文经典",
         )
         val musicNoun = listOf("歌", "歌曲", "音乐", "曲").any { it in key }
         return compactStyleOnly || ((languageCue || styleCue) && musicNoun)
@@ -385,68 +390,22 @@ object CommandTextSignals {
     }
 
     fun energyHint(text: String): String {
+        val semantic = MusicSemanticSignals.extract(text)
+        if (semantic.energy != "any") return semantic.energy
         val key = normalizeCommandText(text)
         return when {
             listOf("低能量", "低能", "安静", "轻柔", "深夜", "想睡", "放松", "降一点", "别太吵", "不要太吵").any { it in key } -> "low"
-            listOf("高能量", "高能", "燃", "嗨", "动感", "派对", "提神", "拉满").any { it in key } -> "high"
-            listOf("中等", "稳一点", "别太闹", "别太炸", "不要太炸").any { it in key } -> "mid"
+            listOf("高能量", "高能", "燃", "嗨", "动感", "派对", "提神", "拉满", "节奏强", "鼓点", "运动", "健身", "跑步").any { it in key } -> "high"
+            listOf("中等", "稳一点", "别太闹", "别太炸", "不要太炸", "别太猛", "不要太猛").any { it in key } -> "mid"
             else -> "any"
         }
     }
 
-    fun genreHints(text: String): List<String> {
-        val key = normalizeCommandText(text)
-        val out = mutableListOf<String>()
-        fun add(term: String, vararg cues: String) {
-            if (cues.any { it in key }) out.add(term)
-        }
-        add("folk", "民谣")
-        add("rock", "摇滚")
-        add("pop", "流行")
-        add("rnb", "r&b", "rnb")
-        add("jazz", "爵士", "jazz")
-        add("electronic", "电子")
-        add("hiphop", "说唱", "嘻哈", "rap", "hiphop")
-        add("citypop", "citypop", "city pop")
-        add("indie", "独立")
-        add("ballad", "抒情")
-        return out.distinct()
-    }
-
-    fun currentStyleRequest(text: String): Boolean {
-        val key = normalizeCommandText(text)
-        return listOf("当前风格", "这种风格", "这个风格", "当前这种", "这种感觉", "这个感觉", "像这首", "刚才那个感觉", "刚才那个风格")
-            .any { it in key }
-    }
-
-    fun styleQuestion(text: String): Boolean {
-        val key = normalizeCommandText(text)
-        return listOf("什么风格", "啥风格", "哪种风格", "是什么类型", "什么类型", "这首歌是什么感觉", "这首是什么感觉")
-            .any { it in key }
-    }
-
-    fun wantsMoreFromStyle(text: String): Boolean {
-        val key = normalizeCommandText(text)
-        return currentStyleRequest(text) &&
-            listOf("多来", "再来", "继续", "来几首", "接着", "排几首", "多放").any { it in key }
-    }
-
-    fun enableContinuation(text: String): Boolean {
-        val key = normalizeCommandText(text)
-        return listOf("自动续播", "播完继续", "续同要求", "继续按这个要求", "排完继续", "ai续播", "ai 自动续播")
-            .any { it in key }
-    }
-
-    fun disableContinuation(text: String): Boolean {
-        val key = normalizeCommandText(text)
-        return listOf("不要续", "别续", "不续播", "播完停", "只播这几首", "播完停止", "只听这几首")
-            .any { it in key }
-    }
-
     fun looksLikeSimilarRequest(text: String): Boolean {
         val key = normalizeCommandText(text)
-        return listOf("类似", "同味", "同类型", "那种", "风格", "像", "接几首", "再放几首", "来几首", "换点")
-            .any { it in key }
+        return MusicSemanticSignals.extract(text).wantsCurrentStyle ||
+            listOf("类似", "同味", "同类型", "那种", "风格", "像", "接几首", "再放几首", "来几首", "换点", "当前风格", "这种感觉", "这个感觉", "这个调调")
+                .any { it in key }
     }
 
     fun existingPlaylistQuery(text: String): String? {
@@ -499,8 +458,10 @@ object CommandTextSignals {
 
     fun looksLikeReplaceRequest(text: String): Boolean {
         val key = normalizeCommandText(text)
-        return listOf("想听", "听点", "放点", "播放列表", "歌单", "排一组", "换一组", "来点", "包含", "带上", "最后", "不要", "别", "不想听")
-            .any { it in key } || isCatalogDescriptor(text) || primaryArtistHints(text).isNotEmpty() || connectiveLeadTrack(text) != null
+        return listOf("想听", "听点", "听", "放点", "放", "播放", "播放列表", "歌单", "排一组", "换一组", "来点", "来首", "多来", "再来", "继续", "包含", "带上", "最后", "不要", "别", "不想听")
+            .any { it in key } ||
+            MusicSemanticSignals.looksLikeFuzzyMusicRequest(text) ||
+            isCatalogDescriptor(text) || primaryArtistHints(text).isNotEmpty() || connectiveLeadTrack(text) != null
     }
 
     fun normalizeCommandText(value: String): String =

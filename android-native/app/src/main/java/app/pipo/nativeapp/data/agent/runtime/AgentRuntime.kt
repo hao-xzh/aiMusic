@@ -40,11 +40,11 @@ class AgentRuntime(
         plan: app.pipo.nativeapp.data.agent.domain.MusicTurnPlan,
         source: String,
     ): TurnOutcome {
-        val normalized = normalizer.normalize(plan).copy(referenceBindings = input.referenceBindings)
+        val normalized = normalizer.normalize(plan)
         val resolution = resolver.resolve(normalized, input)
         val resolvedPlan = resolution.plan
         val queuePlan = queuePlanner.plan(resolvedPlan)
-        val results = execute(queuePlan, executor, input, input.referenceBindings)
+        val results = execute(queuePlan, executor)
         val reply = replyGrounder.ground(
             plan = resolvedPlan.copy(actions = queuePlan.actions),
             validation = queuePlan.validation,
@@ -73,10 +73,6 @@ class AgentRuntime(
                 "actionCount" to queuePlan.actions.size,
                 "success" to results.all { it.success },
                 "validationPassed" to queuePlan.validation.passed,
-                "sessionMutation" to resolvedPlan.sessionMutation.name,
-                "continuationMode" to (resolvedPlan.continuationPolicy?.mode?.name.orEmpty()),
-                "activeIntentHash" to (resolvedPlan.activeIntent?.stableHash().orEmpty()),
-                "referenceBindings" to input.referenceBindings.joinToString("|") { "${it.phrase}:${it.refType}:${it.refId}" }.take(160),
                 "replyLen" to reply.length,
                 "plannerRaw" to trace.plannerRaw.take(160),
                 "normalizedPlan" to trace.normalizedPlan.take(160),
@@ -99,8 +95,6 @@ class AgentRuntime(
     private suspend fun execute(
         queuePlan: QueuePlan,
         executor: AgentActionExecutor,
-        input: AgentTurnInput,
-        referenceBindings: List<app.pipo.nativeapp.data.agent.context.ReferenceBinding>,
     ): List<ActionExecutionResult> {
         val results = ArrayList<ActionExecutionResult>()
         for (action in queuePlan.actions) {
@@ -136,25 +130,6 @@ class AgentRuntime(
                             primaryGoal = action.primaryGoal,
                             target = action.target,
                             similar = action.similar,
-                            musicIntent = action.musicIntent,
-                            continuationPolicy = action.continuationPolicy,
-                            sessionMutation = action.sessionMutation,
-                            styleCapsule = action.styleCapsule,
-                            referenceBindings = referenceBindings,
-                        )
-                        action.mode == PlayMode.PreserveCurrentThenReplace -> executor.playQueue(
-                            actionId = action.actionId,
-                            mode = action.mode,
-                            tracks = action.tracks,
-                            continuous = action.continuous,
-                            primaryGoal = action.primaryGoal,
-                            target = action.target,
-                            similar = action.similar,
-                            musicIntent = action.musicIntent,
-                            continuationPolicy = action.continuationPolicy,
-                            sessionMutation = action.sessionMutation,
-                            styleCapsule = action.styleCapsule,
-                            referenceBindings = referenceBindings,
                         )
                         else -> executor.insertNext(
                             actionId = action.actionId,
@@ -182,11 +157,6 @@ class AgentRuntime(
                             primaryGoal = app.pipo.nativeapp.data.agent.domain.MusicGoal(),
                             target = null,
                             similar = false,
-                            musicIntent = null,
-                            continuationPolicy = null,
-                            sessionMutation = app.pipo.nativeapp.data.agent.session.SessionMutation.CreateNewSession,
-                            styleCapsule = null,
-                            referenceBindings = referenceBindings,
                         )
                     }
                 }
@@ -199,32 +169,6 @@ class AgentRuntime(
                     success = true,
                     message = action.text,
                 )
-                is PlannedAction.AnswerStyle -> ActionExecutionResult(
-                    actionId = action.actionId,
-                    type = "answer_style",
-                    success = true,
-                    message = action.text.ifBlank { styleAnswer(action.capsule) },
-                    referenceBindings = referenceBindings,
-                )
-                is PlannedAction.UpdatePreference -> ActionExecutionResult(
-                    actionId = action.actionId,
-                    type = "preference",
-                    success = true,
-                    message = "记住了，你喜欢这种感觉。",
-                    referenceBindings = referenceBindings,
-                )
-                is PlannedAction.UpdateContinuation -> executor.updateContinuation(
-                    actionId = action.actionId,
-                    policy = action.policy,
-                    currentQueue = queuePlan.actions
-                        .filterIsInstance<PlannedAction.PlayTracks>()
-                        .firstOrNull()
-                        ?.tracks
-                        ?: input.currentQueue,
-                    currentTrack = input.currentTrack,
-                    styleCapsule = input.resolvedStyleReference ?: input.currentTrackStyle ?: input.currentQueueStyle,
-                    referenceBindings = referenceBindings,
-                )
                 is PlannedAction.Clarify -> ActionExecutionResult(
                     actionId = action.actionId,
                     type = "clarify",
@@ -235,19 +179,6 @@ class AgentRuntime(
             results.add(result)
         }
         return results
-    }
-
-    private fun styleAnswer(capsule: app.pipo.nativeapp.data.agent.context.StyleCapsule): String {
-        val terms = (capsule.genres + capsule.moods + capsule.textures)
-            .filter { it.isNotBlank() }
-            .distinct()
-            .take(5)
-        val head = if (capsule.title.isNotBlank()) "这首「${capsule.title}」" else "这一组"
-        return if (terms.isEmpty()) {
-            "$head 的风格更像 ${capsule.summary.ifBlank { "当前这种氛围" }}。"
-        } else {
-            "$head 偏 ${terms.joinToString("、")}。"
-        }
     }
 
     private fun validationFailureMessage(messages: List<String>): String {
@@ -302,9 +233,6 @@ class AgentRuntime(
             is PlannedAction.ModifyPlaylist -> "playlistModify:${action.playlistName}"
             is PlannedAction.SkipCurrent -> "skip"
             is PlannedAction.Say -> "say"
-            is PlannedAction.AnswerStyle -> "answerStyle"
-            is PlannedAction.UpdatePreference -> "preference"
-            is PlannedAction.UpdateContinuation -> "continuation:${action.policy.mode}"
             is PlannedAction.Clarify -> "clarify"
         }
 

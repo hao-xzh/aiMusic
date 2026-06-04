@@ -5,19 +5,21 @@ import app.pipo.nativeapp.data.PetMemory
 import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
+import app.pipo.nativeapp.data.agent.domain.ContinuationMode
+import app.pipo.nativeapp.data.agent.domain.ContinuationPolicy
 import app.pipo.nativeapp.data.agent.domain.MusicGoal
+import app.pipo.nativeapp.data.agent.domain.MusicStyleProfile
 import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
 import app.pipo.nativeapp.data.agent.domain.PlayMode
+import app.pipo.nativeapp.data.agent.domain.ReferenceContext
 import app.pipo.nativeapp.data.agent.domain.TrackPlacement
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
-import app.pipo.nativeapp.data.agent.intent.MusicIntentCompiler
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 import app.pipo.nativeapp.data.agent.normalize.ContextReferenceResolver
-import app.pipo.nativeapp.data.agent.session.ContinuationMode
-import app.pipo.nativeapp.data.agent.session.ContinuationPolicy
-import app.pipo.nativeapp.data.agent.session.SessionMutation
+import app.pipo.nativeapp.data.agent.normalize.MusicUnderstanding
+import app.pipo.nativeapp.data.agent.normalize.PlaylistScopedRequest
 import org.json.JSONObject
 import java.util.UUID
 
@@ -37,7 +39,7 @@ class MusicCommandPlanner(
                 maxTokens = 900,
             )
         }.getOrNull().orEmpty()
-        val parsed = parsePlannerJson(turnId, input, raw)
+        val parsed = parsePlannerJson(turnId, input.userText, raw)
         val plan = attachRepairTarget(parsed ?: deterministicPlan(turnId, input))
         DiagnosticsLogStore.record(
             area = "ai_agent",
@@ -70,32 +72,6 @@ class MusicCommandPlanner(
                 appendLine("${index + 1}. ${track.artist} - ${track.title}")
             }
         }
-        input.activeSession?.let { session ->
-            appendLine("当前活跃音乐意图 session：id=${session.sessionId}; generation=${session.generation}; origin=${session.origin}; intentHash=${session.activeIntentHash}; continuation=${session.continuationPolicy.mode}/${session.continuationPolicy.enabled}")
-            appendLine("session 主要求：artists=${session.activeIntent.primaryArtists.joinToString("/")}; styles=${(session.activeIntent.refStyles + session.activeIntent.aiMainStyles).take(8).joinToString("/")}; root=${session.rootUserText.take(120)}")
-        }
-        input.currentTrackStyle?.let { style ->
-            appendLine("当前曲风格：${style.asSearchTerms().take(10).joinToString("、")}; summary=${style.summary.take(160)}")
-        }
-        input.currentQueueStyle?.let { style ->
-            appendLine("当前队列风格：${style.asSearchTerms().take(10).joinToString("、")}; summary=${style.summary.take(160)}")
-        }
-        if (input.references.isNotEmpty()) {
-            appendLine("typed references：")
-            input.references.takeLast(8).forEach { ref ->
-                appendLine("- ${ref::class.simpleName}:${ref.refId}:${ref.label}")
-            }
-        }
-        if (input.referenceBindings.isNotEmpty()) {
-            appendLine("本轮已解析指代：${input.referenceBindings.joinToString(";") { "${it.phrase}->${it.refType}:${it.refId}" }}")
-        }
-        input.resolvedTrackReference?.let { track ->
-            appendLine("本轮已解析歌曲引用：${track.artist.orEmpty()} - ${track.title}; placement=${track.placement}")
-        }
-        input.resolvedArtistReference?.takeIf { it.isNotBlank() }?.let { artist ->
-            appendLine("本轮已解析歌手引用：$artist")
-        }
-        appendLine("续播设置：aiAutoContinue=${input.aiAutoContinueEnabled}; defaultContinuationMode=${input.defaultContinuationMode}; inheritAgentIntent=${input.inheritAgentIntentWhenAvailable}")
         if (input.historySummary.isNotBlank()) {
             appendLine("早前对话摘要：${input.historySummary.take(500)}")
         }
@@ -118,81 +94,56 @@ class MusicCommandPlanner(
         appendLine("只输出 JSON。")
     }
 
-    private fun parsePlannerJson(turnId: String, input: AgentTurnInput, raw: String): MusicTurnPlan? {
+    private fun parsePlannerJson(turnId: String, userText: String, raw: String): MusicTurnPlan? {
         val json = extractJsonObject(raw) ?: return null
         val obj = runCatching { JSONObject(json) }.getOrNull() ?: return null
         val actionsArr = obj.optJSONArray("actions") ?: return null
         val actions = mutableListOf<PlannedAction>()
         for (i in 0 until actionsArr.length()) {
             val actionObj = actionsArr.optJSONObject(i) ?: continue
-            parseAction("a${i + 1}", actionObj, input)?.let { actions.add(it) }
+            parseAction("a${i + 1}", actionObj, userText)?.let { actions.add(it) }
         }
         if (actions.isEmpty()) return null
         return MusicTurnPlan(
             turnId = obj.optString("turnId").takeIf { it.isNotBlank() && it != "auto" } ?: turnId,
-            userText = obj.optString("userText").ifBlank { input.userText },
+            userText = obj.optString("userText").ifBlank { userText },
             actions = actions,
-            isRepair = obj.optBoolean("isRepair", CommandTextSignals.isRepair(input.userText)),
+            isRepair = obj.optBoolean("isRepair", CommandTextSignals.isRepair(userText)),
             repairTargetTurnId = obj.optString("repairTargetTurnId").takeIf { it.isNotBlank() },
             confidence = obj.optDouble("confidence", 0.75).coerceIn(0.0, 1.0),
             plannerRaw = raw.take(1200),
             musicReferences = parseMusicReferences(obj),
-            sessionMutation = sessionMutationFromString(obj.optString("sessionMutation")),
-            continuationPolicy = parseContinuationPolicy(obj.optJSONObject("continuationPolicy")),
-            referenceBindings = input.referenceBindings,
         )
     }
 
-    private fun parseAction(actionId: String, obj: JSONObject, input: AgentTurnInput): PlannedAction? {
-        val userText = input.userText
+    private fun parseAction(actionId: String, obj: JSONObject, userText: String): PlannedAction? {
         val type = obj.optString("type").trim().lowercase()
         val scoped = CommandTextSignals.playlistScopedRequest(userText)
         val explicitTracks = CommandTextSignals.explicitTrackList(userText)
+        val understood = MusicUnderstanding.analyze(userText)
+        val goal = musicGoalFromJson(obj, userText, scoped, explicitTracks, understood)
         return when (type) {
             "replace_queue" -> PlannedAction.PlayRequest(
                 actionId = actionId,
                 mode = PlayMode.ReplaceQueue,
-                primaryGoal = MusicGoal(
-                    primaryArtists = stringArray(obj.optJSONObject("primaryGoal"), "artists")
-                        .filterNot(CommandTextSignals::isCatalogDescriptor)
-                        .ifEmpty { scoped?.primaryArtists.orEmpty() }
-                        .ifEmpty { input.resolvedArtistReference?.let(::listOf).orEmpty() },
-                    artistScope = artistScopeFromJson(
-                        obj.optJSONObject("primaryGoal")?.optString("artistScope").orEmpty(),
-                        CommandTextSignals.artistScope(userText),
-                    ),
-                    playlistName = obj.optString("playlistName")
-                        .ifBlank { obj.optJSONObject("primaryGoal")?.optString("playlistName").orEmpty() }
-                        .ifBlank { scoped?.playlistName.orEmpty() },
-                    primaryTracks = trackRequirements(obj.optJSONObject("primaryGoal"), "primaryTracks", TrackPlacement.MustInclude)
-                        .ifEmpty { explicitTracks },
-                    mustInclude = mustIncludeRequirements(obj, userText),
-                    closer = closerRequirement(obj, userText),
-                    excludeTerms = stringArray(obj.optJSONObject("constraints"), "excludeTerms") +
-                        stringArray(obj.optJSONObject("constraints"), "excludeLanguages") +
-                        stringArray(obj.optJSONObject("constraints"), "excludeArtists") +
-                        stringArray(obj.optJSONObject("constraints"), "avoidWords"),
-                ),
-                desiredCount = desiredCountFor(obj, userText, explicitTracks, fallback = 12, min = 1, max = 60),
-                continuationPolicy = parseContinuationPolicy(obj.optJSONObject("continuationPolicy")),
-                sessionMutation = sessionMutationFromString(obj.optString("sessionMutation")).takeIf { it != SessionMutation.None }
-                    ?: SessionMutation.CreateNewSession,
+                primaryGoal = goal,
+                desiredCount = desiredCountFor(obj, userText, explicitTracks, fallback = understood.desiredCount ?: 12, min = 1, max = 60),
+                similar = goal.referenceContext != ReferenceContext.None || CommandTextSignals.looksLikeSimilarRequest(userText),
             )
             "play_now" -> PlannedAction.PlayRequest(
                 actionId = actionId,
                 mode = PlayMode.PlayNow,
-                target = trackRequirement(obj.optJSONObject("target"), TrackPlacement.Now)
-                    ?: input.resolvedTrackReference?.copy(placement = TrackPlacement.Now),
+                primaryGoal = goal,
+                target = trackRequirement(obj.optJSONObject("target"), TrackPlacement.Now),
                 desiredCount = 1,
             )
             "insert_next" -> PlannedAction.PlayRequest(
                 actionId = actionId,
                 mode = PlayMode.InsertNext,
-                target = trackRequirement(obj.optJSONObject("target"), TrackPlacement.Next)
-                    ?: input.resolvedTrackReference?.copy(placement = TrackPlacement.Next),
+                primaryGoal = goal,
+                target = trackRequirement(obj.optJSONObject("target"), TrackPlacement.Next),
                 desiredCount = 1,
                 jumpToInserted = false,
-                sessionMutation = SessionMutation.KeepCurrentSession,
             )
             "play_playlist" -> PlannedAction.PlayPlaylist(
                 actionId = actionId,
@@ -201,31 +152,10 @@ class MusicCommandPlanner(
             )
             "play_similar" -> PlannedAction.PlayRequest(
                 actionId = actionId,
-                mode = if (CommandTextSignals.currentStyleRequest(userText)) PlayMode.PreserveCurrentThenReplace else PlayMode.ReplaceQueue,
-                primaryGoal = MusicGoal(
-                    primaryArtists = stringArray(obj.optJSONObject("primaryGoal"), "artists")
-                        .filterNot(CommandTextSignals::isCatalogDescriptor)
-                        .ifEmpty { CommandTextSignals.primaryArtistHints(userText) }
-                        .ifEmpty { input.resolvedArtistReference?.let(::listOf).orEmpty() },
-                    artistScope = ArtistScope.Similar,
-                    playlistName = scoped?.playlistName.orEmpty(),
-                ),
-                desiredCount = desiredCountFor(obj, userText, emptyList(), fallback = 12, min = 1, max = 30),
+                mode = PlayMode.ReplaceQueue,
+                primaryGoal = goal.copy(artistScope = ArtistScope.Similar),
+                desiredCount = desiredCountFor(obj, userText, emptyList(), fallback = understood.desiredCount ?: 12, min = 1, max = 30),
                 similar = true,
-                styleCapsule = input.resolvedStyleReference
-                    ?: input.currentTrackStyle.takeIf { CommandTextSignals.currentStyleRequest(userText) }
-                    ?: input.currentQueueStyle.takeIf { CommandTextSignals.currentStyleRequest(userText) },
-                sessionMutation = SessionMutation.CreateNewSession,
-            )
-            "answer_style" -> {
-                val capsule = input.resolvedStyleReference ?: input.currentTrackStyle ?: input.currentQueueStyle
-                if (capsule != null) PlannedAction.AnswerStyle(actionId, capsule, obj.optString("text").ifBlank { obj.optString("reply") })
-                else PlannedAction.Clarify(actionId, "现在没有正在播放的歌，我没法判断风格。")
-            }
-            "update_continuation" -> PlannedAction.UpdateContinuation(
-                actionId = actionId,
-                policy = parseContinuationPolicy(obj.optJSONObject("continuationPolicy"))
-                    ?: ContinuationPolicy(enabled = !CommandTextSignals.disableContinuation(userText), mode = continuationModeFor(userText)),
             )
             "skip" -> PlannedAction.SkipCurrent(actionId)
             "like" -> PlannedAction.LikeCurrent(actionId, like = true)
@@ -238,34 +168,104 @@ class MusicCommandPlanner(
         }
     }
 
+    private fun musicGoalFromJson(
+        obj: JSONObject,
+        userText: String,
+        scoped: PlaylistScopedRequest?,
+        explicitTracks: List<TrackRequirement>,
+        understood: MusicUnderstanding.Result,
+    ): MusicGoal {
+        val primaryObj = obj.optJSONObject("primaryGoal")
+        val constraintsObj = obj.optJSONObject("constraints")
+        val artists = stringArray(primaryObj, "artists")
+            .filterNot(CommandTextSignals::isCatalogDescriptor)
+            .ifEmpty { scoped?.primaryArtists.orEmpty() }
+        val styleJson = primaryObj?.optJSONObject("styleProfile") ?: obj.optJSONObject("styleProfile")
+        val parsedStyle = styleProfileFromJson(styleJson, understood.styleProfile)
+        val reference = referenceContextFromJson(
+            primaryObj?.optString("referenceContext").orEmpty().ifBlank { obj.optString("referenceContext") },
+            understood.referenceContext,
+        )
+        return MusicGoal(
+            primaryArtists = artists,
+            artistScope = artistScopeFromJson(
+                primaryObj?.optString("artistScope").orEmpty(),
+                CommandTextSignals.artistScope(userText),
+            ),
+            playlistName = obj.optString("playlistName")
+                .ifBlank { primaryObj?.optString("playlistName").orEmpty() }
+                .ifBlank { scoped?.playlistName.orEmpty() },
+            primaryTracks = trackRequirements(primaryObj, "primaryTracks", TrackPlacement.MustInclude)
+                .ifEmpty { explicitTracks },
+            mustInclude = mustIncludeRequirements(obj, userText),
+            closer = closerRequirement(obj, userText),
+            excludeTerms = stringArray(constraintsObj, "excludeTerms") +
+                stringArray(constraintsObj, "excludeLanguages") +
+                stringArray(constraintsObj, "excludeArtists") +
+                stringArray(constraintsObj, "avoidWords"),
+            hardGenres = parsedStyle.genres,
+            hardLanguages = parsedStyle.languages,
+            hardVocalTypes = parsedStyle.vocalTypes,
+            softMoods = parsedStyle.moods,
+            softScenes = parsedStyle.scenes,
+            softTextures = parsedStyle.textures,
+            softQualityWords = parsedStyle.qualityWords,
+            softEnergy = parsedStyle.energy,
+            refStyles = parsedStyle.refStyles,
+            aiMainStyles = parsedStyle.genres + parsedStyle.moods + parsedStyle.scenes + parsedStyle.textures,
+            aiAvoidStyles = parsedStyle.avoidTags,
+            includeArtists = CommandTextSignals.includedArtistHints(userText),
+            searchSeeds = listOf(parsedStyle.semanticQuery).filter { it.isNotBlank() },
+            useCurrentStyleAnchor = reference == ReferenceContext.CurrentStyle,
+            continuationKey = parsedStyle.semanticQuery.ifBlank { userText },
+            styleProfile = parsedStyle,
+            referenceContext = reference,
+            continuationPolicy = continuationPolicyFromJson(
+                obj.optJSONObject("continuationPolicy") ?: primaryObj?.optJSONObject("continuationPolicy"),
+                understood.continuationPolicy,
+            ),
+        )
+    }
+
     private fun deterministicPlan(turnId: String, input: AgentTurnInput): MusicTurnPlan {
         val text = input.userText
         val key = CommandTextSignals.normalizeCommandText(text)
         val explicitTracks = CommandTextSignals.explicitTrackList(text)
         val explicitCount = CommandTextSignals.explicitDesiredCount(text)
+        val understood = MusicUnderstanding.analyze(text, input.currentTrack, input.currentQueue, input.historySummary)
+        fun understoodGoal(extraArtists: List<String> = emptyList(), scope: ArtistScope = CommandTextSignals.artistScope(text)): MusicGoal = MusicGoal(
+            primaryArtists = (extraArtists + CommandTextSignals.primaryArtistHints(text)).distinctBy { CommandTextSignals.normalizeForMatch(it) },
+            artistScope = scope,
+            primaryTracks = explicitTracks,
+            mustInclude = CommandTextSignals.includedTrackTitle(text)?.let {
+                listOf(TrackRequirement(title = it, placement = TrackPlacement.MustInclude))
+            }.orEmpty(),
+            closer = CommandTextSignals.closerTrackTitle(text)?.let {
+                TrackRequirement(title = it, placement = TrackPlacement.Closer)
+            },
+            excludeTerms = CommandTextSignals.excludeTerms(text),
+            hardGenres = understood.styleProfile.genres,
+            hardLanguages = understood.styleProfile.languages,
+            hardVocalTypes = understood.styleProfile.vocalTypes,
+            softMoods = understood.styleProfile.moods,
+            softScenes = understood.styleProfile.scenes,
+            softTextures = understood.styleProfile.textures,
+            softQualityWords = understood.styleProfile.qualityWords,
+            softEnergy = understood.styleProfile.energy,
+            refStyles = understood.styleProfile.refStyles,
+            aiMainStyles = understood.styleProfile.genres + understood.styleProfile.moods + understood.styleProfile.scenes + understood.styleProfile.textures,
+            aiAvoidStyles = understood.styleProfile.avoidTags,
+            includeArtists = CommandTextSignals.includedArtistHints(text),
+            searchSeeds = listOf(understood.styleProfile.semanticQuery).filter { it.isNotBlank() },
+            useCurrentStyleAnchor = understood.referenceContext == ReferenceContext.CurrentStyle,
+            continuationKey = understood.styleProfile.semanticQuery.ifBlank { text },
+            styleProfile = understood.styleProfile,
+            referenceContext = understood.referenceContext,
+            continuationPolicy = understood.continuationPolicy,
+        )
         val actions = when {
-            CommandTextSignals.styleQuestion(text) -> {
-                val capsule = input.resolvedStyleReference ?: input.currentTrackStyle ?: input.currentQueueStyle
-                listOf(
-                    if (capsule != null) PlannedAction.AnswerStyle("a1", capsule)
-                    else PlannedAction.Clarify("a1", "现在没有正在播放的歌，我没法判断风格。"),
-                )
-            }
-            CommandTextSignals.wantsMoreFromStyle(text) -> {
-                val style = input.resolvedStyleReference ?: input.currentTrackStyle ?: input.currentQueueStyle
-                listOf(
-                    PlannedAction.PlayRequest(
-                        actionId = "a1",
-                        mode = PlayMode.PreserveCurrentThenReplace,
-                        primaryGoal = MusicGoal(artistScope = ArtistScope.Similar),
-                        desiredCount = explicitCount ?: 12,
-                        similar = true,
-                        styleCapsule = style,
-                        sessionMutation = if (input.activeSession?.isActive() == true) SessionMutation.UpdateCurrentSession else SessionMutation.CreateNewSession,
-                        continuationPolicy = ContinuationPolicy(enabled = true, mode = ContinuationMode.CurrentTrackStyle),
-                    ),
-                )
-            }
+            understood.wantsStyleExplanation ->
+                listOf(PlannedAction.Say("a1", text = MusicUnderstanding.styleExplanation(text, input.currentTrack)))
             CommandTextSignals.playlistScopedRequest(text) != null -> {
                 val scoped = CommandTextSignals.playlistScopedRequest(text)!!
                 if (scoped.target == null && scoped.primaryArtists.isEmpty()) {
@@ -281,14 +281,12 @@ class MusicCommandPlanner(
                         PlannedAction.PlayRequest(
                             actionId = "a1",
                             mode = if (scoped.target != null) PlayMode.PlayNow else PlayMode.ReplaceQueue,
-                            primaryGoal = MusicGoal(
-                                primaryArtists = scoped.primaryArtists.ifEmpty { input.resolvedArtistReference?.let(::listOf).orEmpty() },
-                                artistScope = CommandTextSignals.artistScope(text),
+                            primaryGoal = understoodGoal(scoped.primaryArtists, CommandTextSignals.artistScope(text)).copy(
+                                primaryArtists = scoped.primaryArtists,
                                 playlistName = scoped.playlistName,
                             ),
                             target = scoped.target?.copy(placement = TrackPlacement.Now),
                             desiredCount = explicitCount ?: if (scoped.target != null) 1 else 12,
-                            sessionMutation = if (scoped.target != null) SessionMutation.None else SessionMutation.CreateNewSession,
                         ),
                     )
                 }
@@ -305,14 +303,10 @@ class MusicCommandPlanner(
                 listOf(
                     PlannedAction.PlayRequest(
                         actionId = "a1",
-                        mode = if (CommandTextSignals.currentStyleRequest(text)) PlayMode.PreserveCurrentThenReplace else PlayMode.ReplaceQueue,
-                        primaryGoal = MusicGoal(artistScope = ArtistScope.Similar),
-                        desiredCount = explicitCount ?: 12,
+                        mode = PlayMode.ReplaceQueue,
+                        primaryGoal = understoodGoal(scope = ArtistScope.Similar),
+                        desiredCount = explicitCount ?: understood.desiredCount ?: 12,
                         similar = true,
-                        styleCapsule = input.resolvedStyleReference
-                            ?: input.currentTrackStyle.takeIf { CommandTextSignals.currentStyleRequest(text) }
-                            ?: input.currentQueueStyle.takeIf { CommandTextSignals.currentStyleRequest(text) },
-                        sessionMutation = SessionMutation.CreateNewSession,
                     ),
                 )
             CommandTextSignals.genericCatalogRequest(text) ->
@@ -320,26 +314,29 @@ class MusicCommandPlanner(
                     PlannedAction.PlayRequest(
                         actionId = "a1",
                         mode = PlayMode.ReplaceQueue,
-                        primaryGoal = MusicGoal(artistScope = ArtistScope.Focus),
-                        desiredCount = explicitCount ?: 12,
-                        sessionMutation = SessionMutation.CreateNewSession,
+                        primaryGoal = understoodGoal(scope = ArtistScope.Focus),
+                        desiredCount = explicitCount ?: understood.desiredCount ?: 12,
                     ),
                 )
             listOf("取消收藏", "不喜欢这首", "取消加心").any { it in key } ->
                 listOf(PlannedAction.LikeCurrent("a1", like = false))
             listOf("收藏这首", "加心", "喜欢这首").any { it in key } ->
                 listOf(PlannedAction.LikeCurrent("a1", like = true))
-            listOf("跳过", "换一首", "下一首").any { it in key } && !listOf("下一首插", "插到下一首").any { it in key } ->
+            listOf("跳过", "换一首", "下一首").any { it in key } &&
+                !understood.wantsInsertNext &&
+                !understood.wantsPlayback &&
+                !listOf("下一首插", "插到下一首").any { it in key } ->
                 listOf(PlannedAction.SkipCurrent("a1"))
-            looksLikeInsertNext(key) ->
+            looksLikeInsertNext(key) || understood.wantsInsertNext ->
                 listOf(
                     PlannedAction.PlayRequest(
                         actionId = "a1",
                         mode = PlayMode.InsertNext,
-                        target = TrackRequirement(
+                        primaryGoal = understoodGoal(),
+                        target = CommandTextSignals.insertNextTrack(text) ?: TrackRequirement(
                             title = CommandTextSignals.includedTrackTitle(text) ?: trailingTarget(text).ifBlank { text },
                             placement = TrackPlacement.Next,
-                        ),
+                        ).takeUnless { understood.styleProfile.hasSignal },
                         desiredCount = 1,
                         jumpToInserted = !CommandTextSignals.noInterrupt(text),
                     ),
@@ -353,27 +350,13 @@ class MusicCommandPlanner(
                         desiredCount = 1,
                     ),
                 )
-            input.resolvedTrackReference != null && looksLikePlayRequest(key) ->
-                listOf(
-                    PlannedAction.PlayRequest(
-                        actionId = "a1",
-                        mode = PlayMode.PlayNow,
-                        target = input.resolvedTrackReference.copy(placement = TrackPlacement.Now),
-                        desiredCount = 1,
-                    ),
-                )
             explicitTracks.isNotEmpty() ->
                 listOf(
                     PlannedAction.PlayRequest(
                         actionId = "a1",
                         mode = PlayMode.ReplaceQueue,
-                        primaryGoal = MusicGoal(primaryTracks = explicitTracks),
+                        primaryGoal = understoodGoal().copy(primaryTracks = explicitTracks),
                         desiredCount = explicitCount ?: explicitTracks.size,
-                        continuationPolicy = ContinuationPolicy(
-                            enabled = !CommandTextSignals.disableContinuation(text) && CommandTextSignals.enableContinuation(text),
-                            mode = continuationModeFor(text),
-                        ),
-                        sessionMutation = if (CommandTextSignals.disableContinuation(text)) SessionMutation.PauseCurrentSession else SessionMutation.CreateNewSession,
                     ),
                 )
             CommandTextSignals.artistTrackTarget(text) != null -> {
@@ -384,7 +367,6 @@ class MusicCommandPlanner(
                         mode = PlayMode.PlayNow,
                         target = target.copy(placement = TrackPlacement.Now),
                         desiredCount = 1,
-                        sessionMutation = SessionMutation.CreateNewSession,
                     ),
                 )
             }
@@ -396,34 +378,28 @@ class MusicCommandPlanner(
                         mode = PlayMode.PlayNow,
                         target = target.copy(placement = TrackPlacement.Now),
                         desiredCount = explicitCount ?: 12,
-                        sessionMutation = SessionMutation.CreateNewSession,
                     ),
                 )
             }
+            understood.wantsPlayback ->
+                listOf(
+                    PlannedAction.PlayRequest(
+                        actionId = "a1",
+                        mode = if (understood.wantsInsertNext && understood.styleProfile.hasSignal) PlayMode.InsertNext else PlayMode.ReplaceQueue,
+                        primaryGoal = understoodGoal(),
+                        target = null,
+                        desiredCount = if (understood.wantsInsertNext) 1 else explicitCount ?: understood.desiredCount ?: 12,
+                        similar = understood.referenceContext != ReferenceContext.None || understood.styleProfile.hasSignal,
+                        jumpToInserted = !CommandTextSignals.noInterrupt(text),
+                    ),
+                )
             looksLikePlayRequest(key) ->
                 listOf(
                     PlannedAction.PlayRequest(
                         actionId = "a1",
                         mode = PlayMode.ReplaceQueue,
-                        primaryGoal = MusicGoal(
-                            primaryArtists = CommandTextSignals.primaryArtistHints(text)
-                                .ifEmpty { input.resolvedArtistReference?.let(::listOf).orEmpty() },
-                            artistScope = CommandTextSignals.artistScope(text),
-                            primaryTracks = explicitTracks,
-                            mustInclude = CommandTextSignals.includedTrackTitle(text)?.let {
-                                listOf(TrackRequirement(title = it, placement = TrackPlacement.MustInclude))
-                            }.orEmpty(),
-                            closer = CommandTextSignals.closerTrackTitle(text)?.let {
-                                TrackRequirement(title = it, placement = TrackPlacement.Closer)
-                            },
-                            excludeTerms = CommandTextSignals.excludeTerms(text),
-                        ),
-                        desiredCount = explicitCount ?: explicitTracks.takeIf { it.isNotEmpty() }?.size ?: 12,
-                        continuationPolicy = ContinuationPolicy(
-                            enabled = input.aiAutoContinueEnabled || CommandTextSignals.enableContinuation(text),
-                            mode = continuationModeFor(text),
-                        ),
-                        sessionMutation = SessionMutation.CreateNewSession,
+                        primaryGoal = understoodGoal(),
+                        desiredCount = explicitCount ?: understood.desiredCount ?: explicitTracks.takeIf { it.isNotEmpty() }?.size ?: 12,
                     ),
                 )
             else -> listOf(PlannedAction.Say("a1", text = "嗯。"))
@@ -451,6 +427,52 @@ class MusicCommandPlanner(
         return out
     }
 
+
+    private fun styleProfileFromJson(obj: JSONObject?, fallback: MusicStyleProfile): MusicStyleProfile {
+        if (obj == null) return fallback
+        val parsed = MusicStyleProfile(
+            semanticQuery = obj.optString("semanticQuery").ifBlank { fallback.semanticQuery },
+            energy = obj.optString("energy").ifBlank { fallback.energy },
+            moods = stringArray(obj, "moods").ifEmpty { fallback.moods },
+            scenes = stringArray(obj, "scenes").ifEmpty { fallback.scenes },
+            genres = stringArray(obj, "genres").ifEmpty { fallback.genres },
+            textures = stringArray(obj, "textures").ifEmpty { fallback.textures },
+            qualityWords = stringArray(obj, "qualityWords").ifEmpty { fallback.qualityWords },
+            languages = stringArray(obj, "languages").ifEmpty { fallback.languages },
+            vocalTypes = stringArray(obj, "vocalTypes").ifEmpty { fallback.vocalTypes },
+            refStyles = stringArray(obj, "refStyles").ifEmpty { fallback.refStyles },
+            avoidTags = stringArray(obj, "avoidTags").ifEmpty { fallback.avoidTags },
+            transitionStyle = obj.optString("transitionStyle").ifBlank { fallback.transitionStyle },
+            exploration = obj.optString("exploration").ifBlank { fallback.exploration },
+        )
+        return parsed.mergedWith(fallback)
+    }
+
+    private fun referenceContextFromJson(raw: String, fallback: ReferenceContext): ReferenceContext = when (raw.trim().lowercase()) {
+        "currenttrack", "current_track", "track", "这首", "当前歌曲" -> ReferenceContext.CurrentTrack
+        "currentstyle", "current_style", "style", "当前风格", "这个风格" -> ReferenceContext.CurrentStyle
+        "currentqueue", "current_queue", "queue", "当前队列" -> ReferenceContext.CurrentQueue
+        "previousintent", "previous_intent", "last", "刚才", "之前" -> ReferenceContext.PreviousIntent
+        "mentionedtrack", "mentioned_track", "mentioned" -> ReferenceContext.MentionedTrack
+        "none", "" -> fallback
+        else -> fallback
+    }
+
+    private fun continuationPolicyFromJson(obj: JSONObject?, fallback: ContinuationPolicy): ContinuationPolicy {
+        if (obj == null) return fallback
+        return ContinuationPolicy(
+            mode = when (obj.optString("mode").trim().lowercase()) {
+                "disabled", "off", "none", "播完停" -> ContinuationMode.Disabled
+                "sameintent", "same_intent", "intent" -> ContinuationMode.SameIntent
+                "samestyle", "same_style", "style" -> ContinuationMode.SameStyle
+                "samequeue", "same_queue", "queue" -> ContinuationMode.SameQueue
+                else -> fallback.mode
+            },
+            preserveWhenInserting = obj.optBoolean("preserveWhenInserting", fallback.preserveWhenInserting),
+            invalidatePreviousOnReplace = obj.optBoolean("invalidatePreviousOnReplace", fallback.invalidatePreviousOnReplace),
+        )
+    }
+
     private fun desiredCountFor(
         obj: JSONObject,
         userText: String,
@@ -476,7 +498,7 @@ class MusicCommandPlanner(
                 parsed.placement == TrackPlacement.Closer &&
                 titleMatches(parsed.title, explicitCloserTitle)
             if (!isExplicitCloser) {
-                out.add(parsed)
+                out.add(parsed.copy(placement = TrackPlacement.MustInclude))
             }
         }
         return out
@@ -498,7 +520,6 @@ class MusicCommandPlanner(
             title = title,
             artist = obj.optString("artistHint").ifBlank { obj.optString("artist") }.takeIf { it.isNotBlank() },
             placement = placementFromString(obj.optString("placement"), fallbackPlacement),
-            index = obj.optInt("index").takeIf { obj.has("index") && it >= 0 },
         )
     }
 
@@ -507,51 +528,10 @@ class MusicCommandPlanner(
         return when {
             value.contains("now") || value.contains("first") -> TrackPlacement.Now
             value.contains("next") -> TrackPlacement.Next
-            value.contains("aftercurrent") || value.contains("after_current") || value.contains("接当前") -> TrackPlacement.AfterCurrent
-            value.contains("middle") || value.contains("中间") -> TrackPlacement.Middle
-            value.contains("atindex") || value.contains("at_index") -> TrackPlacement.AtIndex
             value.contains("end") || value.contains("closer") || value.contains("最后") -> TrackPlacement.Closer
             else -> fallback
         }
     }
-
-    private fun parseContinuationPolicy(obj: JSONObject?): ContinuationPolicy? {
-        if (obj == null) return null
-        val enabled = obj.optBoolean("enabled", true)
-        return ContinuationPolicy(
-            enabled = enabled,
-            mode = if (enabled) continuationModeFromString(obj.optString("mode")) else ContinuationMode.Off,
-            desiredBatchSize = obj.optInt("desiredBatchSize", 8).coerceIn(1, 30),
-        )
-    }
-
-    private fun continuationModeFor(text: String): ContinuationMode = when {
-        CommandTextSignals.disableContinuation(text) -> ContinuationMode.Off
-        CommandTextSignals.currentStyleRequest(text) -> ContinuationMode.CurrentTrackStyle
-        else -> ContinuationMode.SameIntent
-    }
-
-    private fun continuationModeFromString(raw: String): ContinuationMode =
-        when (raw.trim().lowercase()) {
-            "sameintent", "same_intent", "intent", "同要求" -> ContinuationMode.SameIntent
-            "currenttrackstyle", "current_track_style", "style", "当前风格" -> ContinuationMode.CurrentTrackStyle
-            "currentqueuestyle", "current_queue_style" -> ContinuationMode.CurrentQueueStyle
-            "manualplayliststyle", "manual_playlist_style" -> ContinuationMode.ManualPlaylistStyle
-            "defaultairadio", "default_ai_radio" -> ContinuationMode.DefaultAiRadio
-            "off", "disabled", "false" -> ContinuationMode.Off
-            else -> ContinuationMode.SameIntent
-        }
-
-    private fun sessionMutationFromString(raw: String): SessionMutation =
-        when (raw.trim().lowercase()) {
-            "keepcurrentsession", "keep_current_session", "keep" -> SessionMutation.KeepCurrentSession
-            "createnewsession", "create_new_session", "create", "new" -> SessionMutation.CreateNewSession
-            "updatecurrentsession", "update_current_session", "update" -> SessionMutation.UpdateCurrentSession
-            "supersedecurrentsession", "supersede_current_session", "supersede" -> SessionMutation.SupersedeCurrentSession
-            "pausecurrentsession", "pause_current_session", "pause" -> SessionMutation.PauseCurrentSession
-            "disablecontinuation", "disable_continuation", "disable" -> SessionMutation.DisableContinuation
-            else -> SessionMutation.None
-        }
 
     private fun titleMatches(left: String, right: String): Boolean {
         val leftKey = CommandTextSignals.normalizeForMatch(left)
@@ -605,13 +585,13 @@ class MusicCommandPlanner(
     }
 
     private fun looksLikeInsertNext(key: String): Boolean =
-        listOf("下一首插", "插到下一首", "等这首完", "不要打断", "别打断", "放完接").any { it in key }
+        listOf("下一首插", "插到下一首", "等这首完", "不要打断", "别打断", "放完接", "下一首想听", "下一首放", "下一首听", "下一首播放", "接下来想听", "接下来放").any { it in key }
 
     private fun looksLikePlayRequest(key: String): Boolean =
-        listOf("想听", "听点", "听首", "放点", "放首", "播放", "来点", "来一首", "再来", "排一组", "换一组", "播放列表", "歌单", "包含", "带上", "最后", "不要", "接").any { it in key }
+        listOf("想听", "听点", "听首", "放点", "放首", "播放", "来点", "来一首", "排一组", "换一组", "播放列表", "歌单", "包含", "带上", "最后", "不要", "接").any { it in key }
 
     private fun trailingTarget(text: String): String =
-        text.replace(Regex(".*(?:下一首插|插到下一首|放完接|等这首完了放)"), "").trim()
+        text.replace(Regex(".*(?:下一首插|插到下一首|下一首(?:我)?(?:想听|放|听|播放)?|接下来(?:想听|放|听)?|放完接|等这首完了放)"), "").trim()
 
     private companion object {
         val PLANNER_SYSTEM: String = """
@@ -624,16 +604,16 @@ class MusicCommandPlanner(
 4. “播放/放/听 + 歌手的 + 歌名”默认 type=play_now。
 5. “下一首/插到下一首/等这首完了/不要打断”才是 type=insert_next。
 6. “最后/收住/结尾”对应 placement=End。
-7. “不要/别/不想听”进入 constraints。
+7. “不要/别/不想听”进入 constraints，同时“别太吵/别太炸/不要太苦”要进 styleProfile.avoidTags。
 8. 用户纠错时标记 isRepair=true。
 	9. 只有“打开/播放 我的/已有/收藏/具体某个歌单”才是 type=play_playlist；“换一个播放列表，包含某歌”是 replace_queue + mustInclude。
-10. “这首什么风格 / 什么类型”必须 type=answer_style，不改队列。
-11. “当前风格 / 这种感觉 / 像这首，多来几首”必须 type=play_similar，sessionMutation=UpdateCurrentSession 或 CreateNewSession，continuationPolicy.enabled=true。
-12. “下一首插 X，不要打断”必须 type=insert_next，sessionMutation=KeepCurrentSession，不能污染当前主续播要求。
-13. 用户要求“自动续播 / 播完继续 / 续同要求”必须输出 continuationPolicy.enabled=true；“只播这几首 / 播完停 / 不要续”必须 enabled=false。
+10. “放嗨一点/燃一点/忧郁一点/开车听/工作听/别太吵”都必须是 replace_queue，并填 styleProfile；不能输出 say。
+11. “当前风格/这个感觉/刚才那个味道/多来几首”必须保留 referenceContext 和 styleProfile，用 current track/queue 作为上下文。
+12. 用户只是“下一首插/不要打断”时用 insert_next；不要改变主队列续播意图。
+13. artists 只能写真正的歌手/乐队名；“欢快的/嗨一点/开心点/轻快点/忧郁点/适合开车/适合工作”这类需求是风格、情绪或场景，必须放进 styleProfile，不能放进 artists。
 
 	艺人作用域规则：
-	- 用户说“我想听 X / 放点 X / 来点 X / 播 X / X 的歌”，默认 primaryGoal.artistScope="Strict"。
+	- 用户说“我想听 X / 放点 X / 来点 X / 播 X / X 的歌”，只有 X 是真实歌手/乐队名时才放进 artists，并默认 primaryGoal.artistScope="Strict"。
 	- 用户说“类似 X / X 那种 / X 风格 / 像 X”，primaryGoal.artistScope="Similar"。
 	- 用户说“X 为主 / 主打 X / X 混一点别的”，primaryGoal.artistScope="Focus"。
 	- Strict 时不得主动混入其他艺人，除非 mustInclude 里有用户显式点名的具体歌。
@@ -644,15 +624,12 @@ class MusicCommandPlanner(
   "userText":"原文",
   "isRepair":false,
   "confidence":0.0-1.0,
-  "sessionMutation":"KeepCurrentSession|CreateNewSession|UpdateCurrentSession|PauseCurrentSession|DisableContinuation|None",
-  "continuationPolicy":{"enabled":true,"mode":"SameIntent|CurrentTrackStyle|CurrentQueueStyle|ManualPlaylistStyle|DefaultAiRadio|Off","desiredBatchSize":8},
   "musicReferences":[{"title":"七里香","artist":"周杰伦","reason":"刚才介绍/推荐过的可播放歌曲"}],
   "actions":[
-	    {"type":"replace_queue","sessionMutation":"CreateNewSession","continuationPolicy":{"enabled":true,"mode":"SameIntent"},"primaryGoal":{"artists":["陈奕迅"],"artistScope":"Strict","playlistName":"可选：只在某个歌单/我的网盘内找"},"mustInclude":[{"title":"暗号","artistHint":null,"placement":"AfterCurrent|Middle|End"}],"constraints":{"excludeTerms":[]},"desiredCount":12},
+	    {"type":"replace_queue","primaryGoal":{"artists":["陈奕迅"],"artistScope":"Strict","playlistName":"可选：只在某个歌单/我的网盘内找","styleProfile":{"semanticQuery":"燃一点但不要吵","energy":"mid_high","moods":["energetic"],"scenes":["party"],"genres":[],"textures":["rhythmic"],"qualityWords":[],"languages":[],"vocalTypes":[],"refStyles":[],"avoidTags":["loud"],"transitionStyle":"energy_up","exploration":"balanced"},"referenceContext":"None"},"mustInclude":[{"title":"暗号","artistHint":null,"placement":"AfterPrimaryAnchor"}],"constraints":{"excludeTerms":[]},"continuationPolicy":{"mode":"SameIntent"},"desiredCount":12},
+	    {"type":"replace_queue","primaryGoal":{"artists":[],"artistScope":"Focus","styleProfile":{"semanticQuery":"欢快一点的流行歌","energy":"mid_high","moods":["happy","bright","uplifting"],"scenes":[],"genres":[],"textures":["bouncy"],"qualityWords":["catchy"],"languages":[],"vocalTypes":[],"refStyles":[],"avoidTags":[],"transitionStyle":"energy_up","exploration":"balanced"},"referenceContext":"None"},"constraints":{"excludeTerms":[]},"continuationPolicy":{"mode":"SameIntent"},"desiredCount":12},
     {"type":"play_now","target":{"title":"然后怎样","artistHint":"陈奕迅","placement":"Now"}},
-    {"type":"insert_next","sessionMutation":"KeepCurrentSession","target":{"title":"暗号","artistHint":"周杰伦","placement":"Next"}},
-    {"type":"answer_style","text":"只在你需要补充口语解释时填写"},
-    {"type":"update_continuation","continuationPolicy":{"enabled":false,"mode":"Off"}},
+    {"type":"insert_next","target":{"title":"暗号","artistHint":"周杰伦","placement":"Next"}},
     {"type":"play_playlist","playlistName":"我的歌单名"},
     {"type":"like"},
     {"type":"unlike"},

@@ -105,8 +105,7 @@ class QueueValidator(
         val target: TrackRequirement? = when (play.mode) {
             PlayMode.PlayNow -> CommandTextSignals.artistTrackTarget(userText) ?: CommandTextSignals.connectiveLeadTrack(userText)
             PlayMode.InsertNext -> CommandTextSignals.insertNextTrack(userText)
-            PlayMode.ReplaceQueue,
-            PlayMode.PreserveCurrentThenReplace -> null
+            PlayMode.ReplaceQueue -> null
         }
         val first = play.tracks.firstOrNull()
         if (target != null && first?.let { titleMatches(it, target.title) } != true) {

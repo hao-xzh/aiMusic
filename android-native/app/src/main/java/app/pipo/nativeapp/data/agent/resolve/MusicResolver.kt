@@ -16,14 +16,8 @@ import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
 import app.pipo.nativeapp.data.agent.domain.PlayMode
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
-import app.pipo.nativeapp.data.agent.intent.ArtistDistribution
-import app.pipo.nativeapp.data.agent.intent.MusicIntent
-import app.pipo.nativeapp.data.agent.intent.MusicIntentCompiler
 import app.pipo.nativeapp.data.agent.normalize.CatalogLexicon
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
-import app.pipo.nativeapp.data.agent.session.ContinuationMode
-import app.pipo.nativeapp.data.agent.session.ContinuationPolicy
-import app.pipo.nativeapp.data.agent.session.SessionMutation
 import kotlinx.coroutines.flow.first
 
 class MusicResolver(
@@ -51,14 +45,8 @@ class MusicResolver(
                 "summary" to summary.take(220),
             ),
         )
-        val primaryResolved = resolvedActions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull()
         return ResolutionResult(
-            plan = plan.copy(
-                actions = resolvedActions,
-                sessionMutation = primaryResolved?.sessionMutation ?: plan.sessionMutation,
-                continuationPolicy = primaryResolved?.continuationPolicy ?: plan.continuationPolicy,
-                activeIntent = primaryResolved?.musicIntent ?: plan.activeIntent,
-            ),
+            plan = plan.copy(actions = resolvedActions),
             summary = summary,
             missingRequirements = missingRequirements(plan, resolvedActions),
         )
@@ -98,7 +86,7 @@ class MusicResolver(
                 else mergeUnique(
                     listOf(head),
                     rankForIntent(
-                        petIntentFor(action, plan, input, scopedTracks),
+                        intentFor(action, plan, scopedTracks),
                         input,
                         scopedTracks,
                         action.desiredCount.coerceAtLeast(8),
@@ -108,14 +96,21 @@ class MusicResolver(
                 )
             }
             PlayMode.InsertNext -> {
-                action.target?.let { trackResolver.resolve(it, scopedTracks, allowOnline = allowOnline).track }?.let(::listOf).orEmpty()
+                action.target?.let { trackResolver.resolve(it, scopedTracks, allowOnline = allowOnline).track }?.let(::listOf)
+                    ?: rankForIntent(
+                        intentFor(action, plan, scopedTracks),
+                        input,
+                        scopedTracks,
+                        desired = 1,
+                        artistScope = action.primaryGoal.artistScope,
+                        allowOnline = allowOnline,
+                    ).take(1)
             }
-            PlayMode.ReplaceQueue,
-            PlayMode.PreserveCurrentThenReplace -> {
+            PlayMode.ReplaceQueue -> {
                 val explicitCount = CommandTextSignals.explicitDesiredCount(plan.userText)
                 val minDesired = if (action.primaryGoal.primaryTracks.isNotEmpty() || explicitCount != null) 1 else 6
                 val desired = action.desiredCount.coerceIn(minDesired, 60)
-                val intent = petIntentFor(action, plan, input, scopedTracks)
+                val intent = intentFor(action, plan, scopedTracks)
                 val artistScope = action.primaryGoal.artistScope
                 val ranked = rankForIntent(intent, input, scopedTracks, desired, artistScope, allowOnline = allowOnline)
                 val primaryResolved = action.primaryGoal.primaryTracks
@@ -130,6 +125,12 @@ class MusicResolver(
                             ResolvedRequirement(requirement, it)
                         }
                     }
+                val includedArtistTracks = resolveIncludedArtistTracks(
+                    includeArtists = action.primaryGoal.includeArtists,
+                    ranked = ranked,
+                    scopedTracks = scopedTracks,
+                    allowOnline = allowOnline,
+                )
                 val base = if (ranked.isNotEmpty()) {
                     ranked
                 } else if (allowOnline) {
@@ -138,46 +139,26 @@ class MusicResolver(
                     emptyList()
                 }
                 val seeded = if (primaryResolved.isNotEmpty()) injectPrimaryTracks(base, primaryResolved, desired) else base
-                val merged = injectRequired(seeded, required, desired)
-                val finalTracks = if (merged.isNotEmpty()) {
+                val withRequiredTracks = injectRequired(seeded, required, desired)
+                val merged = injectIncludedArtistTracks(withRequiredTracks, includedArtistTracks, desired)
+                if (merged.isNotEmpty()) {
                     merged
                 } else if (allowOnline) {
                     onlineBackfill(intent, desired, artistScope)
                 } else {
                     emptyList()
                 }
-                if (action.mode == PlayMode.PreserveCurrentThenReplace && input.currentTrack != null) {
-                    mergeUnique(listOf(input.currentTrack), finalTracks).take(desired.coerceAtLeast(2))
-                } else {
-                    finalTracks
-                }
             }
         }
-        val musicIntent = musicIntentFor(action, plan, input, scopedTracks)
-        val continuationPolicy = continuationPolicyFor(action, plan, input)
-        val sessionMutation = sessionMutationFor(action, plan, input, continuationPolicy)
         return PlannedAction.PlayTracks(
             actionId = action.actionId,
             mode = action.mode,
             tracks = tracks,
-            continuous = if (
-                action.mode in setOf(PlayMode.ReplaceQueue, PlayMode.PreserveCurrentThenReplace) &&
-                continuationPolicy.enabled
-            ) {
-                continuousSourceFor(musicIntent, action, plan, scopedTracks)
-            } else {
-                null
-            },
+            continuous = if (action.mode == PlayMode.ReplaceQueue) continuousSourceFor(action, plan, scopedTracks) else null,
             primaryGoal = action.primaryGoal,
             target = action.target,
             similar = action.similar,
             jumpToInserted = action.jumpToInserted,
-            musicIntent = musicIntent,
-            continuationPolicy = continuationPolicy,
-            sessionMutation = sessionMutation,
-            styleCapsule = input.resolvedStyleReference
-                ?: input.currentTrackStyle.takeIf { CommandTextSignals.currentStyleRequest(plan.userText) }
-                ?: input.currentQueueStyle.takeIf { CommandTextSignals.currentStyleRequest(plan.userText) },
         )
     }
 
@@ -191,22 +172,11 @@ class MusicResolver(
         return runCatching { repository.tracksForPlaylist(resolved.playlist.id) }.getOrDefault(emptyList())
     }
 
-    private fun petIntentFor(
+    private fun intentFor(
         action: PlannedAction.PlayRequest,
         plan: MusicTurnPlan,
-        input: AgentTurnInput,
         localTracks: List<NativeTrack>,
     ): PetIntent {
-        return musicIntentFor(action, plan, input, localTracks).toPetIntent()
-    }
-
-    private fun musicIntentFor(
-        action: PlannedAction.PlayRequest,
-        plan: MusicTurnPlan,
-        input: AgentTurnInput,
-        localTracks: List<NativeTrack>,
-    ): MusicIntent {
-        val compiled = MusicIntentCompiler.fromAction(action, plan.userText, input)
         val target = action.target
         val primaryTracks = action.primaryGoal.primaryTracks
         val mustInclude = action.primaryGoal.mustInclude
@@ -219,38 +189,80 @@ class MusicResolver(
             trackMentions.map { it.title },
         )
         val rawPrimaryArtists = action.primaryGoal.primaryArtists
+        val includeArtists = action.primaryGoal.includeArtists
         val rawArtistHints = mergeTextHints(
-            rawPrimaryArtists + listOfNotNull(target?.artist) +
+            rawPrimaryArtists + includeArtists + listOfNotNull(target?.artist) +
                 primaryTracks.mapNotNull { it.artist } + mustInclude.mapNotNull { it.artist } + listOfNotNull(closer?.artist),
             artistMentions.map { it.name } + trackMentions.map { it.artist },
         )
         val artistResolver = ArtistResolver(localTracks)
         val primaryArtists = canonicalArtists(rawPrimaryArtists, artistResolver)
         val artistHints = canonicalArtists(rawArtistHints, artistResolver)
-        val excludeTerms = action.primaryGoal.excludeTerms
-        val genres = genreHints(plan.userText)
-        val languages = CommandTextSignals.languageIncludes(plan.userText, excludeTerms)
-        val energy = CommandTextSignals.energyHint(plan.userText)
-        return compiled.copy(
-            primaryArtists = if (action.mode in setOf(PlayMode.ReplaceQueue, PlayMode.PreserveCurrentThenReplace)) {
-                primaryArtists.ifEmpty { compiled.primaryArtists }
-            } else {
-                artistHints.ifEmpty { compiled.primaryArtists }
+        val goal = action.primaryGoal
+        val style = goal.styleProfile
+        val styleAvoid = mergeTextHints(style.avoidTags, goal.aiAvoidStyles)
+        val excludeTerms = mergeTextHints(goal.excludeTerms, styleAvoid)
+        val genres = mergeTextHints(
+            genreHints(plan.userText),
+            style.genres,
+            goal.hardGenres,
+            goal.aiMainStyles,
+        )
+        val languages = mergeTextHints(
+            CommandTextSignals.languageIncludes(plan.userText, excludeTerms),
+            style.languages,
+            goal.hardLanguages,
+        )
+        val vocalTypes = mergeTextHints(style.vocalTypes, goal.hardVocalTypes)
+        val softMoods = mergeTextHints(style.moods, goal.softMoods)
+        val softScenes = mergeTextHints(style.scenes, goal.softScenes)
+        val softTextures = mergeTextHints(style.textures, goal.softTextures)
+        val softQualityWords = mergeTextHints(style.qualityWords, goal.softQualityWords)
+        val refStyles = mergeTextHints(style.refStyles, goal.refStyles)
+        val energy = when {
+            style.energy.isNotBlank() && style.energy != "any" -> style.energy
+            goal.softEnergy.isNotBlank() && goal.softEnergy != "any" -> goal.softEnergy
+            else -> CommandTextSignals.energyHint(plan.userText)
+        }
+        val semanticQuery = style.semanticQuery
+            .ifBlank { goal.searchSeeds.firstOrNull().orEmpty() }
+            .ifBlank { plan.userText }
+        val styleTerms = mergeTextHints(softMoods, softScenes, softTextures, softQualityWords, refStyles)
+        return PetIntent(
+            queryText = semanticQuery,
+            hardArtists = if (action.mode == PlayMode.ReplaceQueue) primaryArtists else artistHints,
+            hardGenres = genres,
+            hardLanguages = languages,
+            hardVocalTypes = vocalTypes,
+            textArtists = artistHints,
+            hardTracks = if (action.mode == PlayMode.PlayNow || action.mode == PlayMode.InsertNext) trackHints else emptyList(),
+            textTracks = trackHints,
+            excludeArtists = excludeTerms.filterNot(::looksLikeLanguage),
+            excludeLanguages = CommandTextSignals.languageExcludes(plan.userText),
+            excludeTags = excludeTerms.filterNot(::looksLikeLanguage),
+            avoidWords = excludeTerms,
+            softMoods = softMoods,
+            softScenes = softScenes,
+            softTextures = softTextures,
+            softQualityWords = softQualityWords,
+            softEnergy = energy,
+            softTempoFeel = goal.softTempoFeel,
+            musicHintsMoods = softMoods,
+            musicHintsScenes = softScenes,
+            musicHintsGenres = genres,
+            musicHintsEnergy = energy,
+            musicHintsTransitionStyle = style.transitionStyle,
+            refStyles = refStyles,
+            aiMainStyles = mergeTextHints(genres, styleTerms, goal.aiMainStyles),
+            aiAdjacentStyles = goal.aiAdjacentStyles,
+            aiAvoidStyles = styleAvoid,
+            aiExploration = style.exploration,
+            emotionalDirection = softMoods.firstOrNull(),
+            orderStyle = when (energy) {
+                "high", "mid_high" -> "energy_up"
+                "low" -> "smooth_down"
+                else -> "smooth"
             },
-            artistDistribution = if (primaryArtists.size > 1 || artistHints.size > 1) {
-                ArtistDistribution.BalancedInterleave
-            } else {
-                compiled.artistDistribution
-            },
-            primaryTracks = if (action.mode == PlayMode.PlayNow || action.mode == PlayMode.InsertNext) {
-                trackHints.map { TrackRequirement(title = it) }.ifEmpty { compiled.primaryTracks }
-            } else {
-                primaryTracks.ifEmpty { compiled.primaryTracks }
-            },
-            mustIncludeTracks = (mustInclude + listOfNotNull(closer)).ifEmpty { compiled.mustIncludeTracks },
-            excludeTerms = (excludeTerms + compiled.excludeTerms).distinct(),
-            softEnergy = energy.takeIf { it != "any" } ?: compiled.softEnergy,
-            aiMainStyles = (genres + compiled.aiMainStyles).distinct(),
             desiredCount = action.desiredCount,
         )
     }
@@ -267,10 +279,10 @@ class MusicResolver(
         val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
         val behaviorPreference = runCatching { PipoGraph.behaviorPreference.current() }
             .getOrDefault(BehaviorPreferenceSnapshot.Empty)
-        val queryVector = runCatching {
-            val query = buildEmbeddingQuery(intent)
-            if (query.isBlank()) null else PipoGraph.embeddingIndexer.embedQuery(query)
-        }.getOrNull()
+        val queryVector = queryVectorFor(intent)
+        val embeddingStore = queryVector?.let {
+            runCatching { PipoGraph.embeddingStore.takeIf { store -> store.count() > 0 } }.getOrNull()
+        }
         val candidates = CandidateRecall.recall(
             intent = intent,
             library = localTracks,
@@ -283,7 +295,7 @@ class MusicResolver(
             currentTrack = input.currentTrack,
             limit = 220,
             queryVector = queryVector,
-            embeddingStore = runCatching { PipoGraph.embeddingStore }.getOrNull(),
+            embeddingStore = embeddingStore,
         )
         val ranked = CandidateRanker.rank(
             candidates = candidates,
@@ -311,20 +323,14 @@ class MusicResolver(
                 "requiredArtists" to intent.hardArtists.joinToString(","),
                 "rankedBefore" to ranked.size,
                 "scopedAfter" to scoped.size,
-                "queryVector" to (queryVector != null),
             ),
         )
-        val distributed = if (intent.artistDistribution == ArtistDistribution.BalancedInterleave.name && artistKeys.size > 1) {
-            balanceInterleaveByArtists(scoped, artistKeys)
-        } else {
-            scoped
-        }
         val localResult = when (artistScope) {
-            ArtistScope.Strict -> TrackDedupe.capSameTitle(distributed).take(desired)
+            ArtistScope.Strict -> TrackDedupe.capSameTitle(scoped).take(desired)
             ArtistScope.Focus -> TrackDedupe.capSameTitle(
-                diversifyByArtistButPreserveFocus(distributed, artistKeys),
+                diversifyByArtistButPreserveFocus(scoped, artistKeys),
             ).take(desired)
-            ArtistScope.Similar -> TrackDedupe.capSameTitle(diversifyByArtist(distributed)).take(desired)
+            ArtistScope.Similar -> TrackDedupe.capSameTitle(diversifyByArtist(scoped)).take(desired)
         }
         return if (localResult.isNotEmpty()) {
             localResult
@@ -333,6 +339,22 @@ class MusicResolver(
         } else {
             emptyList()
         }
+    }
+
+    private suspend fun queryVectorFor(intent: PetIntent): FloatArray? {
+        val query = intent.queryText.trim()
+        if (query.isBlank()) return null
+        val hasSemanticNeed = intent.softMoods.isNotEmpty() ||
+            intent.softScenes.isNotEmpty() ||
+            intent.softTextures.isNotEmpty() ||
+            intent.softQualityWords.isNotEmpty() ||
+            intent.refStyles.isNotEmpty() ||
+            intent.aiMainStyles.isNotEmpty() ||
+            intent.softEnergy != "any"
+        if (!hasSemanticNeed) return null
+        val hasIndexedVectors = runCatching { PipoGraph.embeddingStore.count() > 0 }.getOrDefault(false)
+        if (!hasIndexedVectors) return null
+        return runCatching { PipoGraph.embeddingIndexer.embedQuery(query) }.getOrNull()
     }
 
     private suspend fun onlineBackfill(
@@ -365,12 +387,11 @@ class MusicResolver(
     }
 
     private fun continuousSourceFor(
-        musicIntent: MusicIntent,
         action: PlannedAction.PlayRequest,
         plan: MusicTurnPlan,
         localTracks: List<NativeTrack>,
     ): ContinuousQueueSource {
-        val intent = musicIntent.toPetIntent()
+        val intent = intentFor(action, plan, localTracks)
         val artistKeys = intent.hardArtists
             .map(CommandTextSignals::normalizeForMatch)
             .filter { it.isNotBlank() }
@@ -412,66 +433,28 @@ class MusicResolver(
         }
     }
 
-    private fun continuationPolicyFor(
-        action: PlannedAction.PlayRequest,
-        plan: MusicTurnPlan,
-        input: AgentTurnInput,
-    ): ContinuationPolicy {
-        if (CommandTextSignals.disableContinuation(plan.userText)) {
-            return ContinuationPolicy(enabled = false, mode = ContinuationMode.Off)
-        }
-        val enabled = action.continuationPolicy?.enabled
-            ?: (input.aiAutoContinueEnabled || CommandTextSignals.enableContinuation(plan.userText) || CommandTextSignals.wantsMoreFromStyle(plan.userText))
-        val mode = when {
-            !enabled -> ContinuationMode.Off
-            CommandTextSignals.currentStyleRequest(plan.userText) -> ContinuationMode.CurrentTrackStyle
-            action.primaryGoal.playlistName.isNotBlank() -> ContinuationMode.ManualPlaylistStyle
-            else -> ContinuationMode.SameIntent
-        }
-        return action.continuationPolicy ?: ContinuationPolicy(
-            enabled = enabled,
-            mode = mode,
-            desiredBatchSize = 8,
-        )
-    }
-
-    private fun sessionMutationFor(
-        action: PlannedAction.PlayRequest,
-        plan: MusicTurnPlan,
-        input: AgentTurnInput,
-        policy: ContinuationPolicy,
-    ): SessionMutation {
-        if (action.mode == PlayMode.InsertNext) return SessionMutation.KeepCurrentSession
-        if (CommandTextSignals.disableContinuation(plan.userText)) return SessionMutation.PauseCurrentSession
-        if (action.sessionMutation != SessionMutation.None) return action.sessionMutation
-        if (action.mode == PlayMode.PreserveCurrentThenReplace || CommandTextSignals.wantsMoreFromStyle(plan.userText)) {
-            return if (input.activeSession?.isActive() == true) SessionMutation.UpdateCurrentSession else SessionMutation.CreateNewSession
-        }
-        if (action.mode == PlayMode.ReplaceQueue || action.mode == PlayMode.PlayNow) return SessionMutation.CreateNewSession
-        return if (policy.enabled) SessionMutation.UpdateCurrentSession else SessionMutation.None
-    }
-
-    private fun buildEmbeddingQuery(intent: PetIntent): String =
-        (listOf(intent.queryText) + intent.refStyles + intent.aiMainStyles + intent.aiAdjacentStyles +
-            intent.softMoods + intent.softScenes + intent.softTextures)
-            .filter { it.isNotBlank() && it != "any" }
-            .distinct()
-            .take(12)
-            .joinToString(" ")
-
     private fun buildSearchQueries(intent: PetIntent): List<String> {
         val out = mutableListOf<String>()
         for (track in intent.textTracks + intent.hardTracks) {
             val artist = (intent.textArtists + intent.hardArtists).firstOrNull().orEmpty()
             out.add(listOf(artist, track).filter { it.isNotBlank() }.joinToString(" "))
         }
+        out.add(intent.queryText)
         out.addAll(intent.hardArtists)
         out.addAll(intent.textArtists)
         out.addAll(intent.hardGenres)
         out.addAll(intent.musicHintsGenres)
-        out.addAll(intent.aiAdjacentStyles)
-        if (out.isEmpty() && intent.queryText.isNotBlank()) out.add(intent.queryText)
-        return out.map { it.trim() }.filter { it.isNotBlank() }.distinct().take(8)
+        out.addAll(intent.softMoods)
+        out.addAll(intent.softScenes)
+        out.addAll(intent.softTextures)
+        out.addAll(intent.softQualityWords)
+        out.addAll(intent.refStyles)
+        val artistPrefix = (intent.hardArtists + intent.textArtists).firstOrNull().orEmpty()
+        val styleQuery = (intent.softMoods + intent.softScenes + intent.softTextures + intent.hardGenres)
+            .filter { it.isNotBlank() }
+            .joinToString(" ")
+        if (styleQuery.isNotBlank()) out.add(listOf(artistPrefix, styleQuery).filter { it.isNotBlank() }.joinToString(" "))
+        return out.map { it.trim() }.filter { it.isNotBlank() }.distinct().take(10)
     }
 
     private fun mergeUnique(first: List<NativeTrack>, second: List<NativeTrack>): List<NativeTrack> {
@@ -481,6 +464,53 @@ class MusicResolver(
             if (seen.add(TrackDedupe.songKey(track))) out.add(track)
         }
         return out
+    }
+
+    private suspend fun resolveIncludedArtistTracks(
+        includeArtists: List<String>,
+        ranked: List<NativeTrack>,
+        scopedTracks: List<NativeTrack>,
+        allowOnline: Boolean,
+    ): List<NativeTrack> {
+        if (includeArtists.isEmpty()) return emptyList()
+        val resolver = ArtistResolver(scopedTracks)
+        val canonical = canonicalArtists(includeArtists, resolver).ifEmpty { includeArtists }
+        val out = ArrayList<NativeTrack>()
+        val seen = HashSet<String>()
+        val localPool = ranked + scopedTracks
+        for (artist in canonical) {
+            val key = CommandTextSignals.normalizeForMatch(artist)
+            if (key.isBlank()) continue
+            val local = localPool.firstOrNull { track ->
+                TrackDedupe.songKey(track) !in seen && artistMatchesAny(track.artist, listOf(key))
+            }
+            val picked = local ?: if (allowOnline) {
+                runCatching { repository.searchTracks(artist, limit = 12) }
+                    .getOrDefault(emptyList())
+                    .firstOrNull { track -> artistMatchesAny(track.artist, listOf(key)) && TrackDedupe.songKey(track) !in seen }
+            } else {
+                null
+            }
+            if (picked != null && seen.add(TrackDedupe.songKey(picked))) out.add(picked)
+        }
+        return out
+    }
+
+    private fun injectIncludedArtistTracks(
+        base: List<NativeTrack>,
+        artistTracks: List<NativeTrack>,
+        desired: Int,
+    ): List<NativeTrack> {
+        if (artistTracks.isEmpty()) return base.take(desired)
+        val out = base.toMutableList()
+        val seen = out.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+        artistTracks.forEachIndexed { index, track ->
+            val key = TrackDedupe.songKey(track)
+            if (!seen.add(key)) return@forEachIndexed
+            val insertion = (3 + index * 2).coerceIn(0, out.size)
+            out.add(insertion, track)
+        }
+        return out.take(desired.coerceAtLeast(artistTracks.size + 1))
     }
 
     private fun injectRequired(
@@ -494,29 +524,15 @@ class MusicResolver(
         val out = base.filter { TrackDedupe.songKey(it) !in requiredKeys }
             .take(room)
             .toMutableList()
-        for (item in required.filterNot {
-            it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.Closer ||
-                it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.End
-        }) {
-            val placement = item.requirement.placement
-            val insertion = when (placement) {
-                app.pipo.nativeapp.data.agent.domain.TrackPlacement.Next,
-                app.pipo.nativeapp.data.agent.domain.TrackPlacement.AfterCurrent -> 1.coerceAtMost(out.size)
-                app.pipo.nativeapp.data.agent.domain.TrackPlacement.Middle -> (out.size / 2).coerceIn(0, out.size)
-                app.pipo.nativeapp.data.agent.domain.TrackPlacement.AtIndex -> (item.requirement.index ?: 0).coerceIn(0, out.size)
-                app.pipo.nativeapp.data.agent.domain.TrackPlacement.Now -> 0
-                else -> when {
-                    out.isEmpty() -> 0
-                    out.size >= 3 -> 3
-                    else -> out.size
-                }
+        for (item in required.filterNot { it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.Closer }) {
+            val insertion = when {
+                out.isEmpty() -> 0
+                out.size >= 3 -> 3
+                else -> out.size
             }
             out.add(insertion.coerceIn(0, out.size), item.track)
         }
-        for (item in required.filter {
-            it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.Closer ||
-                it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.End
-        }) {
+        for (item in required.filter { it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.Closer }) {
             out.removeAll { TrackDedupe.songKey(it) == TrackDedupe.songKey(item.track) }
             out.add(item.track)
         }
@@ -549,8 +565,10 @@ class MusicResolver(
             append(";playActions=").append(play.size)
             append(";tracks=").append(play.sumOf { it.tracks.size })
             val includeTitle = CommandTextSignals.includedTrackTitle(plan.userText)
+            val includeArtists = CommandTextSignals.includedArtistHints(plan.userText)
             val closerTitle = CommandTextSignals.closerTrackTitle(plan.userText)
             if (!includeTitle.isNullOrBlank()) append(";mustInclude=").append(includeTitle)
+            if (includeArtists.isNotEmpty()) append(";includeArtists=").append(includeArtists.joinToString("/"))
             if (!closerTitle.isNullOrBlank()) append(";closer=").append(closerTitle)
         }
     }
@@ -559,9 +577,16 @@ class MusicResolver(
         val tracks = actions.filterIsInstance<PlannedAction.PlayTracks>().flatMap { it.tracks }
         val missing = mutableListOf<String>()
         val includeTitle = CommandTextSignals.includedTrackTitle(plan.userText)
+        val includeArtists = CommandTextSignals.includedArtistHints(plan.userText)
         val closerTitle = CommandTextSignals.closerTrackTitle(plan.userText)
         if (!includeTitle.isNullOrBlank() && tracks.none { titleMatches(it.title, includeTitle) }) {
             missing.add("mustInclude:$includeTitle")
+        }
+        includeArtists.forEach { artist ->
+            val key = CommandTextSignals.normalizeForMatch(artist)
+            if (key.isNotBlank() && tracks.none { artistMatchesAny(it.artist, listOf(key)) }) {
+                missing.add("includeArtist:$artist")
+            }
         }
         if (!closerTitle.isNullOrBlank() && tracks.none { titleMatches(it.title, closerTitle) }) {
             missing.add("closer:$closerTitle")
@@ -613,48 +638,6 @@ class MusicResolver(
         return head + tail
     }
 
-    private fun balanceInterleaveByArtists(
-        tracks: List<NativeTrack>,
-        artistKeys: List<String>,
-    ): List<NativeTrack> {
-        if (tracks.isEmpty() || artistKeys.size <= 1) return tracks
-        val buckets = artistKeys.associateWith { ArrayDeque<NativeTrack>() }.toMutableMap()
-        val unmatched = ArrayDeque<NativeTrack>()
-        for (track in tracks) {
-            val matchedKey = artistKeys.firstOrNull { key -> artistMatchesAny(track.artist, listOf(key)) }
-            if (matchedKey == null) {
-                unmatched.addLast(track)
-            } else {
-                buckets.getOrPut(matchedKey) { ArrayDeque() }.addLast(track)
-            }
-        }
-        val out = ArrayList<NativeTrack>(tracks.size)
-        val seen = HashSet<String>()
-        var advanced: Boolean
-        do {
-            advanced = false
-            for (key in artistKeys) {
-                val bucket = buckets[key] ?: continue
-                while (bucket.isNotEmpty()) {
-                    val next = bucket.removeFirst()
-                    if (seen.add(TrackDedupe.songKey(next))) {
-                        out.add(next)
-                        advanced = true
-                        break
-                    }
-                }
-            }
-        } while (advanced)
-        while (unmatched.isNotEmpty()) {
-            val next = unmatched.removeFirst()
-            if (seen.add(TrackDedupe.songKey(next))) out.add(next)
-        }
-        for (track in tracks) {
-            if (seen.add(TrackDedupe.songKey(track))) out.add(track)
-        }
-        return out
-    }
-
     private fun artistMatchesAny(actualRaw: String, artistKeys: List<String>): Boolean =
         actualRaw.split("/", "&", ",", "、")
             .map { CommandTextSignals.normalizeForMatch(it) }
@@ -687,13 +670,15 @@ class MusicResolver(
         return out
     }
 
-    private fun mergeTextHints(first: List<String>, second: List<String>): List<String> {
+    private fun mergeTextHints(vararg groups: List<String>): List<String> {
         val out = ArrayList<String>()
         val seen = HashSet<String>()
-        for (value in first + second) {
-            val trimmed = value.trim()
-            if (trimmed.isNotBlank() && seen.add(CommandTextSignals.normalizeForMatch(trimmed))) {
-                out.add(trimmed)
+        for (group in groups) {
+            for (value in group) {
+                val trimmed = value.trim()
+                if (trimmed.isNotBlank() && seen.add(CommandTextSignals.normalizeForMatch(trimmed))) {
+                    out.add(trimmed)
+                }
             }
         }
         return out
@@ -706,8 +691,12 @@ class MusicResolver(
         if ("摇滚" in text || "rock" in lower) out.add("rock")
         if ("民谣" in text || "folk" in lower) out.add("folk")
         if ("爵士" in text || "jazz" in lower) out.add("jazz")
-        if ("电子" in text || "electronic" in lower) out.add("electronic")
-        if ("嘻哈" in text || "hiphop" in lower || "hip-hop" in lower || "rap" in lower) out.add("hip-hop")
+        if ("电子" in text || "电音" in text || "electronic" in lower || "edm" in lower || "dance" in lower) out.add("electronic")
+        if ("嘻哈" in text || "说唱" in text || "hiphop" in lower || "hip-hop" in lower || "rap" in lower) out.add("hip-hop")
+        if ("流行" in text || "pop" in lower) out.add("pop")
+        if ("citypop" in lower || "city pop" in lower || "城市流行" in text) out.add("city pop")
+        if ("独立" in text || "indie" in lower) out.add("indie")
+        if ("粤语" in text || "cantopop" in lower) out.add("cantopop")
         return out.distinct()
     }
 

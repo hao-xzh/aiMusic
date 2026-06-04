@@ -41,8 +41,7 @@ import app.pipo.nativeapp.data.AiPetCommandBus
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeSettings
 import app.pipo.nativeapp.data.PipoGraph
-import app.pipo.nativeapp.data.agent.context.AgentContextAssembler
-import app.pipo.nativeapp.data.agent.context.AgentReference
+import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
 import app.pipo.nativeapp.data.agent.domain.AgentUiCard
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.execute.PlayerAgentExecutor
@@ -157,12 +156,6 @@ fun NativeAiPet(
         AgentRuntime(
             repository = repository,
             ledger = AgentLedgerStore(context),
-        )
-    }
-    val contextAssembler = remember(context) {
-        AgentContextAssembler(
-            sessionStore = PipoGraph.playbackIntentSessionStore,
-            referenceProvider = { PipoGraph.agentReferenceStore.recent() },
         )
     }
 
@@ -556,21 +549,21 @@ fun NativeAiPet(
                             val executor = PlayerAgentExecutor(
                                 repository = repository,
                                 currentTrackProvider = { currentTrackSnapshot },
-                                currentQueueProvider = { currentQueue },
                                 sourceUserText = text,
                                 onApplyAgentQueueRequest = onApplyAgentQueueRequest,
                                 onSkip = onSkipFromAgent,
                             )
-                            val agentInput = contextAssembler.assemble(
-                                userText = text,
-                                promptContext = promptContext,
-                                currentTrack = currentTrackSnapshot,
-                                currentQueue = currentQueue,
-                                settings = settings,
-                                persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
-                            )
                             val outcome = agentRuntime.handle(
-                                input = agentInput,
+                                input = AgentTurnInput(
+                                    userText = text,
+                                    history = promptContext.turns,
+                                    historySummary = promptContext.summary,
+                                    musicReferences = promptContext.musicReferences,
+                                    currentTrack = currentTrackSnapshot,
+                                    currentQueue = currentQueue,
+                                    userFacts = settings.userFacts,
+                                    persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
+                                ),
                                 executor = executor,
                             )
                             messages += PetMessage(fromUser = false, text = outcome.reply)
@@ -589,68 +582,6 @@ fun NativeAiPet(
                                 PipoGraph.petMemory.recordMusicReferences(outcome.musicReferences)
                             } catch (_: Exception) {
                                 // 可执行指代记忆失败不能影响 UI/播放动作。
-                            }
-                            try {
-                                val refs = mutableListOf<AgentReference>()
-                                currentTrackSnapshot?.let { track ->
-                                    refs += AgentReference.TrackRef(
-                                        refId = "track:${track.id}",
-                                        label = listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" - "),
-                                        track = track,
-                                        reason = "current_track",
-                                    )
-                                }
-                                if (currentQueue.isNotEmpty()) {
-                                    refs += AgentReference.QueueRef(
-                                        refId = "queue:${currentQueue.joinToString("|") { it.id }.hashCode().toUInt().toString(16)}",
-                                        label = "当前队列",
-                                        trackIds = currentQueue.map { it.id },
-                                        reason = "current_queue",
-                                    )
-                                }
-                                if (
-                                    app.pipo.nativeapp.data.agent.normalize.CommandTextSignals.styleQuestion(text) ||
-                                    app.pipo.nativeapp.data.agent.normalize.CommandTextSignals.currentStyleRequest(text)
-                                ) {
-                                    (agentInput.resolvedStyleReference ?: agentInput.currentTrackStyle ?: agentInput.currentQueueStyle)?.let { style ->
-                                        refs += AgentReference.StyleRef(
-                                            refId = style.capsuleId,
-                                            label = style.summary.ifBlank { "当前风格" },
-                                            capsule = style,
-                                            reason = "answer_style",
-                                        )
-                                    }
-                                }
-                                PipoGraph.playbackIntentSessionStore.active()?.let { session ->
-                                    refs += AgentReference.IntentRef(
-                                        refId = session.sessionId,
-                                        label = session.rootUserText.ifBlank { "当前音乐要求" }.take(80),
-                                        intent = session.activeIntent,
-                                        intentHash = session.activeIntentHash,
-                                        reason = "active_session",
-                                    )
-                                    session.activeIntent.primaryArtists.forEach { artist ->
-                                        if (artist.isNotBlank()) {
-                                            refs += AgentReference.ArtistRef(
-                                                refId = "artist:${artist.hashCode().toUInt().toString(16)}",
-                                                label = artist,
-                                                artist = artist,
-                                                reason = "active_session_artist",
-                                            )
-                                        }
-                                    }
-                                    session.styleAnchor?.let { style ->
-                                        refs += AgentReference.StyleRef(
-                                            refId = style.capsuleId,
-                                            label = style.summary.ifBlank { "当前风格" },
-                                            capsule = style,
-                                            reason = "active_session_style",
-                                        )
-                                    }
-                                }
-                                if (refs.isNotEmpty()) PipoGraph.agentReferenceStore.record(refs)
-                            } catch (_: Exception) {
-                                // typed reference 只辅助连续对话，失败不影响播放。
                             }
                             latestReply = outcome.reply
                             AiCaptionBus.show(outcome.reply)

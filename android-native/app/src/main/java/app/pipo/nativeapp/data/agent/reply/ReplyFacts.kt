@@ -60,7 +60,6 @@ object ReplyFactsBuilder {
             primaryPlay?.mode == PlayMode.InsertNext -> "insert_next"
             primaryPlay?.mode == PlayMode.PlayNow -> "play_now"
             primaryPlay?.mode == PlayMode.ReplaceQueue -> "replace_queue"
-            primaryPlay?.mode == PlayMode.PreserveCurrentThenReplace -> "preserve_current_then_replace"
             else -> plan.actions.firstOrNull()?.javaClass?.simpleName.orEmpty()
         }
         val warnings = (validation.messages + results.flatMap { it.warnings }).distinct()

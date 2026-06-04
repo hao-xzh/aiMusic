@@ -28,12 +28,6 @@ class AgentLedgerStore(context: Context) {
                     firstTracks = readTracks(obj.optJSONArray("firstTracks")),
                     validation = obj.optString("validation"),
                     execution = obj.optString("execution"),
-                    sessionId = obj.optString("sessionId"),
-                    generation = obj.optLong("generation"),
-                    sessionMutation = obj.optString("sessionMutation"),
-                    continuationMode = obj.optString("continuationMode"),
-                    activeIntentHash = obj.optString("activeIntentHash"),
-                    referenceBindings = obj.optString("referenceBindings"),
                     tsMs = obj.optLong("tsMs"),
                 ),
             )
@@ -58,12 +52,6 @@ class AgentLedgerStore(context: Context) {
             .put("success", results.all { it.success })
             .put("validation", validation.messages.joinToString("|").take(240))
             .put("execution", describeExecution(results).take(360))
-            .put("sessionId", results.firstNotNullOfOrNull { it.sessionId.takeIf(String::isNotBlank) }.orEmpty())
-            .put("generation", results.firstOrNull { it.generation > 0L }?.generation ?: 0L)
-            .put("sessionMutation", results.firstNotNullOfOrNull { it.sessionMutation.takeIf(String::isNotBlank) }.orEmpty())
-            .put("continuationMode", results.firstNotNullOfOrNull { it.continuationMode.takeIf(String::isNotBlank) }.orEmpty())
-            .put("activeIntentHash", results.firstNotNullOfOrNull { it.activeIntentHash.takeIf(String::isNotBlank) }.orEmpty())
-            .put("referenceBindings", results.flatMap { it.referenceBindings }.joinToString("|") { "${it.phrase}:${it.refType}:${it.refId}" }.take(240))
             .put("firstTracks", writeTracks(firstTracks))
             .put("tsMs", System.currentTimeMillis())
         arr.put(obj)
@@ -82,12 +70,6 @@ class AgentLedgerStore(context: Context) {
         val firstTracks: List<String>,
         val validation: String,
         val execution: String,
-        val sessionId: String,
-        val generation: Long,
-        val sessionMutation: String,
-        val continuationMode: String,
-        val activeIntentHash: String,
-        val referenceBindings: String,
         val tsMs: Long,
     )
 
@@ -101,9 +83,6 @@ class AgentLedgerStore(context: Context) {
                 is PlannedAction.ModifyPlaylist -> "playlistModify:${action.playlistName}:${action.add}"
                 is PlannedAction.SkipCurrent -> "skip"
                 is PlannedAction.Say -> "say"
-                is PlannedAction.AnswerStyle -> "answerStyle:${action.capsule.capsuleId}"
-                is PlannedAction.UpdatePreference -> "preference"
-                is PlannedAction.UpdateContinuation -> "continuation:${action.policy.mode}:${action.policy.enabled}"
                 is PlannedAction.Clarify -> "clarify"
             }
         }
