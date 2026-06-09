@@ -127,7 +127,7 @@ export const MusicIntentSchema = z.object({
   /** 希望的歌单长度。默认 30。专辑/精选场景可能更小，电台连播更大 */
   desiredCount: z.number().int().min(1).max(60).default(30),
   /**
-   * Claudio 自己说的一句话 —— 永远要有，无论 action 是 chat 还是 play。
+   * Pipo 自己说的一句话 —— 永远要有，无论 action 是 chat 还是 play。
    * 这段是用户在 UI 上看到的回复。要有人格、幽默抽象、贴当下的语境。
    * 不要客服腔、不要鸡汤、不要解释选歌原因。
    * 例：「打工是吧。来点能把电量充满的。」「老天爷在哭。我换情绪。」「行，点火。」
@@ -156,7 +156,7 @@ export type IntentParseContext = {
   history?: { role: "user" | "assistant"; text: string }[];
   /**
    * 跨 session 记忆 digest —— 用户偏好/跳过率/上次说过的话/总播放数。
-   * 让 Claudio 不再每次启动失忆,能说"上次你提过累"或"你不爱 X 艺人,放别的"。
+   * 让 Pipo 不再每次启动失忆,能说"上次你提过累"或"你不爱 X 艺人,放别的"。
    */
   memoryDigest?: string;
 };
@@ -178,7 +178,7 @@ export async function parseMusicIntent(
   const aiPromise = callAi(trimmed, ctx);
   const timeoutPromise = new Promise<MusicIntent>((resolve) => {
     timeoutId = setTimeout(() => {
-      console.warn(`[claudio] AI 超时 (${INTENT_TIMEOUT_MS}ms)，本地兜底`);
+      console.warn(`[pipo] AI 超时 (${INTENT_TIMEOUT_MS}ms)，本地兜底`);
       resolve(offlineFallbackIntent(
         looksLikeImperativePlay(trimmed) ? "play" : "chat",
         trimmed,
@@ -196,7 +196,7 @@ export async function parseMusicIntent(
     return normalizeIntent(result, trimmed);
   } catch (e) {
     if (timeoutId) clearTimeout(timeoutId);
-    console.warn("[claudio] AI 调用抛错", e);
+    console.warn("[pipo] AI 调用抛错", e);
     return offlineFallbackIntent(
       looksLikeImperativePlay(trimmed) ? "play" : "chat",
       trimmed,
@@ -253,7 +253,7 @@ function looksLikeImperativePlay(text: string): boolean {
  * USER 部分只放真正变化的：用户输入 + 时段 + 在播曲目 + 最近对话。
  * 旧版把 1.5k 字示例都拼在 user 里，每次重新计费、缓存永远失效，又慢又贵。
  */
-const SYSTEM_PROMPT = `你是 Claudio —— 一只幽默抽象的音乐宠物。你既会接话，也会顺手放歌；这两件事不是互斥的。
+const SYSTEM_PROMPT = `你是 Pipo —— 一只幽默抽象的音乐宠物。你既会接话，也会顺手放歌；这两件事不是互斥的。
 
 # 任务
 用户每说一句话，你输出一个 JSON。reply 是你以人格说出来的话；其他字段告诉本地音乐引擎要不要放歌、放什么。
@@ -305,7 +305,7 @@ USER 部分会带"时段"、可能含"明天就周末"/"再 3 天就国庆"/"今
 {"reply":"那你需要点猛的。","action":"play","queryText":"我刚分手了","softPreferences":{"moods":["cathartic","defiant"],"energy":"high"},"queueIntent":{"orderStyle":"energy_up","transitionStyle":"tight"}}
 
 4) "你叫什么" →
-{"reply":"Claudio。一只放歌的。","action":"chat","queryText":"你叫什么"}
+{"reply":"Pipo。一只放歌的。","action":"chat","queryText":"你叫什么"}
 
 5) "你知道火星哥吗" →
 {"reply":"Bruno Mars。给你来一组。","action":"play","queryText":"你知道火星哥吗","textHints":{"artists":["Bruno Mars"]},"hardConstraints":{"artists":["Bruno Mars"]}}
@@ -360,7 +360,7 @@ async function callAi(
 
   const json = extractJsonObject(raw);
   if (!json) {
-    console.warn("[claudio] AI 返回无法解析为 JSON。原始文本:", raw);
+    console.warn("[pipo] AI 返回无法解析为 JSON。原始文本:", raw);
     return offlineFallbackIntent(
       looksLikeImperativePlay(userText) ? "play" : "chat",
       userText,
@@ -370,12 +370,12 @@ async function callAi(
   const result = MusicIntentSchema.safeParse(json);
   if (!result.success) {
     console.warn(
-      "[claudio] AI JSON zod 校验失败",
+      "[pipo] AI JSON zod 校验失败",
       result.error.flatten(),
       "raw=",
       raw,
     );
-    // zod 失败时尝试抢救 reply / action —— 至少别让用户彻底听不到 Claudio 的话
+    // zod 失败时尝试抢救 reply / action —— 至少别让用户彻底听不到 Pipo 的话
     const salvaged = trySalvageReply(json, userText);
     if (salvaged) return normalizeIntent(salvaged, userText);
     return offlineFallbackIntent(

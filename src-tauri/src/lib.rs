@@ -1,4 +1,4 @@
-//! Claudio 主入口。
+//! Pipo 主入口。
 //!
 //! 架构决定：**不嵌入网易云网页播放器**。
 //! 音乐源通过 `netease` 模块走官方私有 API（二维码登录 + weapi 拿直链），
@@ -130,7 +130,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async {
                 let url = url::Url::parse("https://music.163.com/").unwrap();
                 if let Err(e) = crate::cdn::cdn_get(&url, None, None, None).await {
-                    log::debug!("[claudio] TLS warmup skipped: {e}");
+                    log::debug!("[pipo] TLS warmup skipped: {e}");
                 }
             });
 

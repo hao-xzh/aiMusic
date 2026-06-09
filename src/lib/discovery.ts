@@ -129,7 +129,7 @@ export async function discoverBeyondLibrary(
         });
       }
     } catch (e) {
-      console.warn(`[claudio] discovery seed search failed: ${seed.query}`, e);
+      console.warn(`[pipo] discovery seed search failed: ${seed.query}`, e);
     }
   }
   const candidateList = [...candidates.values()];
@@ -212,7 +212,7 @@ async function generateSeeds(
 
   const raw = await ai.chat({
     system:
-      "你是 Claudio 的库外探索器。听过比客人多的曲库,目标是让 TA 听到符合口味的好歌 —— " +
+      "你是 Pipo 的库外探索器。听过比客人多的曲库,目标是让 TA 听到符合口味的好歌 —— " +
       "用户库里已有的就别 seed 了,但风格相邻的邻居艺人是首选。冷门不是目标,贴口味才是。只输出 JSON。",
     user,
     temperature: 0.7, // 0.85 → 0.7:保留一些发散度,但不再特意往冷门偏
@@ -272,7 +272,7 @@ async function rankCandidates(
 
   const raw = await ai.chat({
     system:
-      "你是 Claudio 的口味匹配器。从候选池里挑最贴气质的 ≤N 首。只输出 JSON，不要解释。",
+      "你是 Pipo 的口味匹配器。从候选池里挑最贴气质的 ≤N 首。只输出 JSON，不要解释。",
     user,
     temperature: 0.5,
     maxTokens: 1400,
@@ -339,7 +339,7 @@ function parseJsonObject(raw: string): unknown {
   try {
     return JSON.parse(s.slice(first, last + 1));
   } catch (e) {
-    console.warn("[claudio] discovery JSON 解析失败", e, s.slice(0, 200));
+    console.warn("[pipo] discovery JSON 解析失败", e, s.slice(0, 200));
     return null;
   }
 }

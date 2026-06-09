@@ -100,7 +100,7 @@ export function markGreeted(): void {
  */
 // SYSTEM 模块级常量 —— 让招呼语的规则/示例进 DeepSeek 缓存。
 // 一天最多触发一次；这里独立成一个缓存条目，反复几天命中，省一点是一点。
-const GREETING_SYSTEM = `你是 Claudio —— TA 熟到不用客气的音乐宠物。
+const GREETING_SYSTEM = `你是 Pipo —— TA 熟到不用客气的音乐宠物。
 打开 app 时由你说一句**进门招呼**(不是问候,是熟人语气的一句话陈述)。
 
 # 要求
@@ -155,7 +155,7 @@ export async function generateDailyGreeting(): Promise<string> {
     const cleaned = raw.trim().replace(/^[「『"']+|[」』"']+$/g, "").slice(0, 80);
     if (cleaned) return cleaned;
   } catch (e) {
-    console.debug("[claudio] pet greeting AI 失败,用兜底", e);
+    console.debug("[pipo] pet greeting AI 失败,用兜底", e);
   }
 
   // 兜底也尽量带上锚点
@@ -252,7 +252,7 @@ export type AgentResponse = {
  *   userText
  *     │
  *     ▼  parseMusicIntent —— 一次 LLM 调用同时产出 { reply, action, intent...}
- *     │  reply 是 Claudio 以人格说出来的话（永远要有）
+ *     │  reply 是 Pipo 以人格说出来的话（永远要有）
  *     │  action=chat：到此结束
  *     │  action=play：继续走召回
  *     ▼
@@ -271,7 +271,7 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
   // 让"下雨/晴/冷/热"成为人格回复可以借力的锚点之一。
   const weather = await getWeather().catch(() => null);
   // 跨 session 记忆: 偏好艺人 / 跳过率 / 上次说过什么 / 听过多少首
-  // 让 Claudio 不再每次启动都失忆。
+  // 让 Pipo 不再每次启动都失忆。
   const memoryDigest = await getMemoryDigest().catch(() => "");
 
   // 用户说话先写入跨 session 记忆(在 AI 调用前 fire-and-forget,
@@ -660,9 +660,9 @@ function buildContinuousSource(args: {
       const fresh = ranked.map((c) => c.track);
       // refilled pool 只放还没被 consume 的,fetchMore 内 drainPool 还会再过一遍
       pool = fresh.filter((t) => !consumed.has(songKey(t)));
-      console.debug("[claudio] 续杯 refill", { freshCount: pool.length });
+      console.debug("[pipo] 续杯 refill", { freshCount: pool.length });
     } catch (e) {
-      console.debug("[claudio] 续杯 refill 失败", e);
+      console.debug("[pipo] 续杯 refill 失败", e);
       pool = [];
     }
   };
@@ -781,7 +781,7 @@ async function maybeDiscoverExtra(args: {
       sourceScores: { explore: 0.70, profile_tags: 0.70 },
     }));
   } catch (e) {
-    console.debug("[claudio] discovery 注入失败", e);
+    console.debug("[pipo] discovery 注入失败", e);
     return [];
   }
 }

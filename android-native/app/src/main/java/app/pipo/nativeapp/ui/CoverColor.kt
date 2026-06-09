@@ -29,6 +29,9 @@ data class EdgeColors(
     val bottom: IntArray?,
     val right: IntArray?,
     val left: IntArray? = null,
+    // 封面主色调（最鲜艳的一簇颜色）—— 用来给歌词扫描交界处染"随歌曲变化的微光"。
+    // 灰度封面提不出主色时为 null（此时歌词不染色，保持纯白/黑）。
+    val accent: IntArray? = null,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -103,8 +106,47 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
     val bottom = avg(h - 5, h)
     val right = avg(0, h, w - 5, w)
     val left = avg(0, h, 0, 5)
+    val accent = extractVibrant(pixels)
     if (small !== bitmap) small.recycle()
-    return EdgeColors(top, bottom, right, left)
+    return EdgeColors(top, bottom, right, left, accent)
+}
+
+/**
+ * 从缩略图里提取"最鲜艳的一簇颜色"作为封面主色调。
+ *   - 跳过太灰（饱和度低）、太暗、太亮的像素，按饱和度加权平均剩下的。
+ *   - 灰度封面（几乎没有彩色像素）→ 返回 null（歌词不染色）。
+ */
+private fun extractVibrant(pixels: IntArray): IntArray? {
+    val hsv = FloatArray(3)
+    var rSum = 0.0; var gSum = 0.0; var bSum = 0.0; var wSum = 0.0
+    for (c in pixels) {
+        val r = (c shr 16) and 0xFF
+        val g = (c shr 8) and 0xFF
+        val b = c and 0xFF
+        android.graphics.Color.RGBToHSV(r, g, b, hsv)
+        val s = hsv[1]
+        val v = hsv[2]
+        if (s < 0.35f || v < 0.25f || v > 0.96f) continue
+        // 权重偏向高饱和 + 中等明度，避开发白/发黑的像素。
+        val w = (s * (1f - kotlin.math.abs(v - 0.62f))).toDouble()
+        rSum += r * w; gSum += g * w; bSum += b * w; wSum += w
+    }
+    if (wSum < 0.5) return null
+    return intArrayOf((rSum / wSum).toInt(), (gSum / wSum).toInt(), (bSum / wSum).toInt())
+}
+
+/**
+ * 歌词扫描交界处的"封面色微光"。把主色调拉到统一的鲜艳度/明度，深浅主题下都看得见；
+ * 灰度封面没有可采样 accent 时回落到品牌薄荷色，保证中间色不会消失。
+ */
+fun lyricAccent(accent: IntArray?): Color {
+    if (accent == null || accent.size < 3) return PipoColors.Accent
+    val hsv = FloatArray(3)
+    android.graphics.Color.RGBToHSV(accent[0], accent[1], accent[2], hsv)
+    // 提饱和、定明度，让交界处的微光是一抹明确的彩色，而不是灰扑扑的。
+    hsv[1] = (hsv[1] * 1.15f).coerceIn(0.55f, 1f)
+    hsv[2] = hsv[2].coerceIn(0.70f, 0.92f)
+    return Color(android.graphics.Color.HSVToColor(hsv))
 }
 
 fun computeTone(rgb: IntArray?): Tone {

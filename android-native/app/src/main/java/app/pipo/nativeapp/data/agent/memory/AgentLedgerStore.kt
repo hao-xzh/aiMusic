@@ -80,6 +80,7 @@ class AgentLedgerStore(context: Context) {
                 is PlannedAction.PlayTracks -> "${action.mode}:tracks:${action.tracks.take(4).joinToString("/") { it.title }}"
                 is PlannedAction.PlayPlaylist -> "playlist:${action.name}"
                 is PlannedAction.LikeCurrent -> "like:${action.like}"
+                is PlannedAction.LikeTrack -> "likeTrack:${action.target.artist.orEmpty()}-${action.target.title}:${action.like}"
                 is PlannedAction.ModifyPlaylist -> "playlistModify:${action.playlistName}:${action.add}"
                 is PlannedAction.SkipCurrent -> "skip"
                 is PlannedAction.Say -> "say"

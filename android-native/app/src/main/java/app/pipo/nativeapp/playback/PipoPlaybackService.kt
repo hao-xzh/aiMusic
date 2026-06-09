@@ -6,6 +6,8 @@ import android.content.Intent
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -78,6 +80,7 @@ class PipoPlaybackService : MediaLibraryService() {
     // 清零重试计数 → 永不升级、无限重踢(Good Days 日志里 attempt 一直=1 的根因)。
     private var maxReachedPositionMs: Long = -1L
     private var lastProgressAtMs: Long = 0L
+    private var lastTransientNetworkErrorAtMs: Long = 0L
     private var badSourceRefreshJob: Job? = null
     private var audioFocusResumeJob: Job? = null
     private var audioFocusPauseJob: Job? = null
@@ -411,6 +414,9 @@ class PipoPlaybackService : MediaLibraryService() {
                         )
                         smartAutoMixer?.onMainPlayerError()
                         notificationPlayer?.armRecoveryWindow()
+                        if (isLikelyTransientNetworkError(error)) {
+                            lastTransientNetworkErrorAtMs = SystemClock.elapsedRealtime()
+                        }
                         if (isLikelyBadSource(error)) {
                             recoverBadSourceOrSkip(this@apply, error)
                         } else {
@@ -617,14 +623,14 @@ class PipoPlaybackService : MediaLibraryService() {
     private fun libraryRootItem(): MediaItem {
         return browserFolder(
             mediaId = LIBRARY_ROOT_ID,
-            title = "PIPO",
+            title = "Pipo",
             mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_MIXED,
         )
     }
 
     private fun currentQueueFolder(player: Player): MediaItem {
         val count = player.mediaItemCount
-        val title = if (count > 0) "当前播放列表" else "PIPO 音乐"
+        val title = if (count > 0) "当前播放列表" else "Pipo 音乐"
         return browserFolder(
             mediaId = CURRENT_QUEUE_ID,
             title = title,
@@ -1557,13 +1563,21 @@ class PipoPlaybackService : MediaLibraryService() {
         val mediaItem = player.currentMediaItem ?: return
         val mediaId = mediaItem.mediaId.takeIf { it.isNotBlank() } ?: return
         val neteaseId = mediaId.toLongOrNull()
-        if (neteaseId == null || !serviceUrlRefreshTried.add(mediaId)) {
-            // 不能重签(非数字 id)/ 已重签过还卡 → 跳过烂源
-            skipStalledToNext(player, if (neteaseId == null) "non-numeric-id" else "already-refreshed")
+        val startPositionMs = player.currentPosition.coerceAtLeast(0L)
+        if (neteaseId == null) {
+            skipStalledToNext(player, "non-numeric-id")
+            return
+        }
+        if (!serviceUrlRefreshTried.add(mediaId)) {
+            // 已重签过但近期是网络错误/网络未验证时,保留当前歌等待恢复；否则才认定这首源坏了。
+            if (shouldWaitForNetworkBeforeSkipping()) {
+                holdStalledTrackForNetwork(player, "already-refreshed", startPositionMs)
+            } else {
+                skipStalledToNext(player, "already-refreshed")
+            }
             return
         }
         val token = ++badSourceSkipToken
-        val startPositionMs = player.currentPosition.coerceAtLeast(0L)
         badSourceRecoveryMediaId = mediaId
         badSourceRecoveryUntilMs = SystemClock.elapsedRealtime() + BAD_SOURCE_SERVICE_REFRESH_GRACE_MS
         DiagnosticsLogStore.record(
@@ -1581,7 +1595,11 @@ class PipoPlaybackService : MediaLibraryService() {
             }
             if (fresh == null) {
                 clearBadSourceRecovery(mediaId)
-                skipStalledToNext(player, "refresh-empty")
+                if (shouldWaitForNetworkBeforeSkipping()) {
+                    holdStalledTrackForNetwork(player, "refresh-empty", startPositionMs)
+                } else {
+                    skipStalledToNext(player, "refresh-empty")
+                }
                 return@launch
             }
             runCatching {
@@ -1624,6 +1642,40 @@ class PipoPlaybackService : MediaLibraryService() {
             player.prepare()
             player.play()
         }
+    }
+
+    private fun holdStalledTrackForNetwork(player: Player, reason: String, resumePositionMs: Long) {
+        val now = SystemClock.elapsedRealtime()
+        lastProgressAtMs = now
+        bufferStallAttemptMediaId = player.currentMediaItem?.mediaId
+        bufferStallAttempts = 0
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "silent_stall_wait_network",
+            fields = playerFields(player) + mapOf(
+                "reason" to reason,
+                "resumePositionMs" to resumePositionMs,
+                "recentTransientNetworkError" to hasRecentTransientNetworkError(now),
+                "networkReady" to isActiveNetworkReady(),
+            ),
+        )
+    }
+
+    private fun shouldWaitForNetworkBeforeSkipping(): Boolean {
+        return hasRecentTransientNetworkError() || !isActiveNetworkReady()
+    }
+
+    private fun hasRecentTransientNetworkError(now: Long = SystemClock.elapsedRealtime()): Boolean {
+        return lastTransientNetworkErrorAtMs > 0L &&
+            now - lastTransientNetworkErrorAtMs <= TRANSIENT_NETWORK_SKIP_DEFER_MS
+    }
+
+    private fun isActiveNetworkReady(): Boolean {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return true
+        val network = manager.activeNetwork ?: return false
+        val caps = manager.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     private fun updateNotificationSafely(
@@ -1747,6 +1799,7 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val PROGRESS_STALL_THRESHOLD_MS = 4_000L
         // 先轻量重踢这么多次(原地 seek+prepare);还卡就升级到 URL 重签/跳过(源/URL 问题,重踢无用)。
         private const val PROGRESS_STALL_REKICK_LIMIT = 2
+        private const val TRANSIENT_NETWORK_SKIP_DEFER_MS = 60_000L
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
         private const val AUDIO_FOCUS_PAUSE_CONFIRM_MS = 350L
         private const val EXTERNAL_AUDIO_PAUSE_FLAG_CLEAR_MS = 500L
@@ -1765,6 +1818,12 @@ private fun isLikelyBadSource(error: PlaybackException): Boolean = when (error.e
     PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
     PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
     PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE -> true
+    else -> false
+}
+
+private fun isLikelyTransientNetworkError(error: PlaybackException): Boolean = when (error.errorCode) {
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+    PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> true
     else -> false
 }
 

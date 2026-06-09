@@ -893,7 +893,10 @@ private class QueueValidator {
                 messages.add("用户要求保序，但队列顺序被改变")
             }
         }
-        return if (messages.isEmpty()) QueueValidationResult.Passed else QueueValidationResult(false, messages)
+        return QueueValidationResult(
+            passed = messages.none(::isBlockingMessage),
+            messages = messages,
+        )
     }
 
     private fun validateArtistScope(
@@ -933,10 +936,8 @@ private class QueueValidator {
                 illegalCount = (scopedTracks.size - hit).coerceAtLeast(0)
                 if (ratio < 0.7) {
                     messages.add("focus_artist_ratio_low:$hit/${scopedTracks.size}")
-                    false
-                } else {
-                    true
                 }
+                true
             }
             ArtistScope.Similar -> true
         }
@@ -955,6 +956,13 @@ private class QueueValidator {
         )
         return passed
     }
+
+    private fun isBlockingMessage(message: String): Boolean =
+        when {
+            message.startsWith("focus_artist_ratio_low") -> false
+            message.startsWith("无缝优化移动") -> false
+            else -> true
+        }
 
     private fun artistMatches(actualRaw: String, expectedRaw: String): Boolean {
         val expected = CommandTextSignals.normalizeForMatch(expectedRaw)

@@ -161,6 +161,6 @@ class AmllLyricsSource(private val context: Context) {
         private const val CACHE_SUBDIR = "amll-lyrics"
         private const val CONNECT_TIMEOUT_MS = 4_000
         private const val READ_TIMEOUT_MS = 6_000
-        private const val USER_AGENT = "Claudio-Android/AMLL-fetch"
+        private const val USER_AGENT = "Pipo-Android/AMLL-fetch"
     }
 }

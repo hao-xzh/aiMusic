@@ -24,6 +24,7 @@ import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoLyricLine
+import app.pipo.nativeapp.data.RecommendationLog
 import app.pipo.nativeapp.data.SmoothQueue
 import app.pipo.nativeapp.data.TrackDedupe
 import app.pipo.nativeapp.data.TransitionScore
@@ -110,6 +111,14 @@ class PlayerViewModel(
     }
 
     private var pendingAgentPlayback: PendingAgentPlayback? = null
+
+    private data class QueueRecommendationExclusions(
+        val trackIds: Set<Long>,
+        val songKeys: Set<String>,
+    )
+
+    private val queueRecommendationAvoidIds = LinkedHashSet<Long>()
+    private val queueRecommendationAvoidSongKeys = LinkedHashSet<String>()
 
     // 真正的播放权威仍是 MediaSessionService 里的主 ExoPlayer。Service 侧的 SmartAutoMixer
     // 只在 TransitionScore 高置信度时做单播放器智能切换；这里负责把队列排到更容易接。
@@ -1173,8 +1182,10 @@ class PlayerViewModel(
         val player = controller ?: return
         val stateIdx = state.queue.indexOfFirst { it.id == trackId }
         if (stateIdx < 0) return
+        val removedTrack = state.queue[stateIdx]
         val queueVersion = PlaybackSessionClock.bump("remove_track")
         CommittedQueuePlanStore.clear()
+        rememberQueueRecommendationAvoidance(listOf(removedTrack))
         
         val playerIdx = player.indexOfMediaId(trackId)
         if (playerIdx != null) {
@@ -1197,6 +1208,10 @@ class PlayerViewModel(
             event = "remove_track",
             fields = mapOf(
                 "trackId" to trackId,
+                "neteaseId" to removedTrack.neteaseId,
+                "title" to removedTrack.title,
+                "artist" to removedTrack.artist,
+                "blockedFromRecommendation" to true,
                 "queueVersion" to queueVersion,
                 "queueSize" to newQueue.size,
             ),
@@ -1293,6 +1308,8 @@ class PlayerViewModel(
             fields = mapOf(
                 "count" to initialBatch.size,
                 "hasContinuousSource" to (source != null),
+                "queueMode" to modeForNewQueue(source).name,
+                "preferredPlaybackMode" to preferredPlaybackMode.name,
                 "queueVersion" to committedQueueVersion,
             ) + trackFields(initialBatch.first()),
         )
@@ -1462,15 +1479,9 @@ class PlayerViewModel(
                 add(track)
                 contextQueue.filterTo(this) { it.id != track.id }
             }
-            applyAgentQueueRequest(
-                AgentQueueRequest(
-                    requestId = manualRequestId("manual-play-track"),
-                    sourceUserText = if (smooth) "manual_play_track_smooth" else "manual_play_track_preserve",
-                    operation = QueueOperation.PlayNow,
-                    tracks = tracks,
-                    desiredCount = tracks.size,
-                ),
-            )
+            val manualQueueVersion = PlaybackSessionClock.bump("manual_play_track")
+            CommittedQueuePlanStore.clear()
+            playTrack(track, tracks, smooth, queueVersion = manualQueueVersion)
             return
         }
         val committedQueueVersion = queueVersion
@@ -1659,9 +1670,9 @@ class PlayerViewModel(
                         currentIndex = currentQueueIndexFor(player, queueSnapshot),
                     )
                 }
-                val excludeIds = queueSnapshot.mapNotNull { it.neteaseId }.toSet()
+                val exclusions = queueRecommendationExclusions(queueSnapshot)
                 val more = try {
-                    sourceSnapshot.fetchMore(excludeIds)
+                    sourceSnapshot.fetchMore(exclusions.trackIds)
                 } catch (_: Exception) {
                     emptyList()
                 }
@@ -1680,8 +1691,7 @@ class PlayerViewModel(
                     fallbackWrapAround(player)
                     return@launch
                 }
-                val existingSongKeys = queueSnapshot.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-                val append = resolved.filter { existingSongKeys.add(TrackDedupe.songKey(it)) }
+                val append = filterQueueRecommendationCandidates(resolved, exclusions)
                 if (append.isEmpty() || gen != playGen) {
                     fallbackWrapAround(player)
                     return@launch
@@ -1691,6 +1701,7 @@ class PlayerViewModel(
                 val plannedQueue = queueSnapshot + append
                 state = state.copy(queue = plannedQueue)
                 live.addMediaItems(append.map(::toMediaItem))
+                rememberQueueRecommendations(append)
 
                 live.seekTo(insertIdx, 0L)
                 ensurePlayerLive(live)
@@ -1713,7 +1724,7 @@ class PlayerViewModel(
                         "accepted" to true,
                         "reordered" to false,
                         "appendCount" to append.size,
-                    ),
+                    ) + appendedTrackFields(append),
                 )
                 scheduleTransitionPrepare(
                     CommittedQueuePlan.snapshot(
@@ -1951,9 +1962,10 @@ class PlayerViewModel(
 
     @Suppress("UNUSED_PARAMETER")
     private fun modeForNewQueue(explicitSource: ContinuousQueueSource?): PlaybackQueueMode {
-        // Agent 有 explicitSource 只说明“这个队列具备同要求续播能力”，不代表强行切到 AiRadio。
-        // 是否续播必须尊重用户当前列表设置：OrderOnce 就播完停，ShufflePlay 就按列表/随机，AiRadio 才按 Agent session 续。
-        return preferredPlaybackMode
+        // Agent 主队列带 continuous source 时，它的语义就是“按这次需求继续推”。
+        // 这里临时进入 AiRadio 以启用 maybeExtendQueue；不写 preferredPlaybackMode，
+        // 所以不会改掉用户在设置里选的默认播放模式。手动歌单/插下一首仍走原偏好。
+        return if (explicitSource != null) PlaybackQueueMode.AiRadio else preferredPlaybackMode
     }
 
     private fun continuousSourceForMode(
@@ -2056,6 +2068,10 @@ class PlayerViewModel(
                             "lastLineDurationMs" to lines.lastOrNull()?.durationMs,
                             "focusLeadMs" to LyricTiming.focusLeadMs(lines),
                             "companionLineCount" to lines.sumOf { it.companionLines.size },
+                            // 慢词诊断：有多少主词 ≥1s（可能触发 emphasis 辉光）+ 最长词时长。
+                            // 若 maxTokenDurationMs 远低于 1000，则这首歌本就没有慢词、看不到辉光属正常。
+                            "longTokenCountGte1000" to lines.sumOf { line -> line.chars.count { it.durationMs >= 1000L } },
+                            "maxTokenDurationMs" to (lines.flatMap { it.chars }.maxOfOrNull { it.durationMs } ?: 0L),
                         ),
                     )
                     state = state.copy(lyrics = lines)
@@ -2309,6 +2325,8 @@ class PlayerViewModel(
                                 "bpmConfidence" to "%.2f".format(features.bpmConfidence),
                                 "headSilenceS" to "%.2f".format(features.headSilenceS),
                                 "tailSilenceS" to "%.2f".format(features.tailSilenceS),
+                                "featureDurationMs" to (features.durationS * 1000).toLong(),
+                                "metadataDurationMs" to target.durationMs,
                             ),
                         )
                     } else {
@@ -2409,9 +2427,9 @@ class PlayerViewModel(
         fetchingMore = true
         viewModelScope.launch {
             try {
-                val excludeIds = queueSnapshot.mapNotNull { it.neteaseId }.toSet()
+                val initialExclusions = queueRecommendationExclusions(queueSnapshot)
                 val more = try {
-                    sourceSnapshot.fetchMore(excludeIds)
+                    sourceSnapshot.fetchMore(initialExclusions.trackIds)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -2449,8 +2467,8 @@ class PlayerViewModel(
                     return@launch
                 }
                 val currentQueue = state.queue
-                val existingSongKeys = currentQueue.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-                val append = resolved.filter { existingSongKeys.add(TrackDedupe.songKey(it)) }
+                val liveExclusions = queueRecommendationExclusions(currentQueue)
+                val append = filterQueueRecommendationCandidates(resolved, liveExclusions)
                 if (append.isEmpty()) {
                     armQueueExtendBackoff()
                     return@launch
@@ -2462,6 +2480,7 @@ class PlayerViewModel(
                 val queueVersion = PlaybackSessionClock.bump("queue_extend_append")
                 state = state.copy(queue = plannedQueue)
                 live.addMediaItems(toMediaItems(smartAppend, plannedQueue))
+                rememberQueueRecommendations(smartAppend)
                 DiagnosticsLogStore.record(
                     area = "playback_orchestrator",
                     event = "queue_commit",
@@ -2478,7 +2497,7 @@ class PlayerViewModel(
                         "accepted" to true,
                         "reordered" to (smartAppend.map { it.id } != append.map { it.id }),
                         "appendCount" to smartAppend.size,
-                    ),
+                    ) + appendedTrackFields(smartAppend),
                 )
                 scheduleTransitionPrepare(
                     CommittedQueuePlan.snapshot(
@@ -2545,6 +2564,77 @@ class PlayerViewModel(
     private fun sameQueueOrder(left: List<NativeTrack>, right: List<NativeTrack>): Boolean {
         if (left.size != right.size) return false
         return left.indices.all { idx -> left[idx].id == right[idx].id }
+    }
+
+    private fun queueRecommendationExclusions(queue: List<NativeTrack>): QueueRecommendationExclusions {
+        val trackIds = LinkedHashSet<Long>()
+        queue.mapNotNullTo(trackIds) { it.neteaseId }
+        trackIds.addAll(queueRecommendationAvoidIds)
+        runCatching { PipoGraph.recommendationLog.recentContext().last24hTrackIds }
+            .getOrNull()
+            ?.let(trackIds::addAll)
+
+        val songKeys = LinkedHashSet<String>()
+        queue.mapTo(songKeys) { TrackDedupe.songKey(it) }
+        songKeys.addAll(queueRecommendationAvoidSongKeys)
+        return QueueRecommendationExclusions(trackIds = trackIds, songKeys = songKeys)
+    }
+
+    private fun filterQueueRecommendationCandidates(
+        candidates: List<NativeTrack>,
+        exclusions: QueueRecommendationExclusions,
+    ): List<NativeTrack> {
+        val seenSongKeys = exclusions.songKeys.toMutableSet()
+        return candidates.filter { track ->
+            val neteaseId = track.neteaseId
+            (neteaseId == null || neteaseId !in exclusions.trackIds) &&
+                seenSongKeys.add(TrackDedupe.songKey(track))
+        }
+    }
+
+    private fun rememberQueueRecommendations(
+        tracks: List<NativeTrack>,
+        source: RecommendationLog.Source = RecommendationLog.Source.Radio,
+    ) {
+        rememberQueueRecommendationAvoidance(tracks)
+        runCatching { PipoGraph.recommendationLog.logTracks(tracks, source) }
+    }
+
+    private fun rememberQueueRecommendationAvoidance(tracks: List<NativeTrack>) {
+        if (tracks.isEmpty()) return
+        tracks.forEach { track ->
+            track.neteaseId?.let(queueRecommendationAvoidIds::add)
+            queueRecommendationAvoidSongKeys.add(TrackDedupe.songKey(track))
+        }
+        trimQueueRecommendationAvoidSets()
+    }
+
+    private fun trimQueueRecommendationAvoidSets() {
+        while (queueRecommendationAvoidIds.size > QUEUE_RECOMMENDATION_AVOID_MAX) {
+            val iterator = queueRecommendationAvoidIds.iterator()
+            if (!iterator.hasNext()) break
+            iterator.next()
+            iterator.remove()
+        }
+        while (queueRecommendationAvoidSongKeys.size > QUEUE_RECOMMENDATION_AVOID_MAX) {
+            val iterator = queueRecommendationAvoidSongKeys.iterator()
+            if (!iterator.hasNext()) break
+            iterator.next()
+            iterator.remove()
+        }
+    }
+
+    private fun appendedTrackFields(tracks: List<NativeTrack>): Map<String, Any?> {
+        if (tracks.isEmpty()) return emptyMap()
+        return mapOf(
+            "appendIds" to tracks.take(12).joinToString(",") { it.neteaseId?.toString() ?: it.id },
+            "appendTitles" to tracks.take(8).joinToString(" | ") { track ->
+                listOf(track.title, track.artist)
+                    .filter { it.isNotBlank() }
+                    .joinToString(" - ")
+                    .take(96)
+            },
+        )
     }
 
     private fun queueMatchingPlayerTimeline(
@@ -2773,6 +2863,7 @@ class PlayerViewModel(
         private const val AUTO_MIX_FEATURE_FAILURE_BACKOFF_MS = 5 * 60_000L
         private const val QUEUE_EXTEND_BACKOFF_BASE_MS = 30_000L
         private const val QUEUE_EXTEND_BACKOFF_MAX_MS = 5 * 60_000L
+        private const val QUEUE_RECOMMENDATION_AVOID_MAX = 512
         private const val PLAYLIST_APPEND_RESOLVE_CHUNK_SIZE = 40
         private const val INITIAL_APPEND_RESOLVE_CHUNK_SIZE = 8
         private const val AGENT_SMART_ORDER_WINDOW = 10

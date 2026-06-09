@@ -112,7 +112,7 @@ export async function indexTrackSemantics(
     await saveTrackSemanticProfile(profile);
     return profile;
   } catch (e) {
-    console.debug("[claudio] semantic LLM 标注失败，使用规则档案", track.id, e);
+    console.debug("[pipo] semantic LLM 标注失败，使用规则档案", track.id, e);
     await saveTrackSemanticProfile(base);
     return base;
   }
@@ -138,7 +138,7 @@ export async function indexLibrarySemantics(
         progress.done = tracks.length;
         progress.skipped = tracks.length;
         options.onProgress?.({ ...progress });
-        console.debug("[claudio] semantic index skipped：需要显式传 allowAi=true");
+        console.debug("[pipo] semantic index skipped：需要显式传 allowAi=true");
         return progress;
       }
 
@@ -161,7 +161,7 @@ export async function indexLibrarySemantics(
             try {
               await indexTrackSemantics(track);
             } catch (e) {
-              console.debug("[claudio] semantic index 单首失败", track.id, e);
+              console.debug("[pipo] semantic index 单首失败", track.id, e);
               progress.failed++;
             }
             progress.done++;
@@ -230,7 +230,7 @@ async function callSemanticLlm(
 
   const raw = await ai.chat({
     system:
-      `你是 Claudio 的单曲语义标注器。只输出 JSON，不要解释。当前歌曲：${track.name} - ${artist}`,
+      `你是 Pipo 的单曲语义标注器。只输出 JSON，不要解释。当前歌曲：${track.name} - ${artist}`,
     user,
     temperature: 0.2,
     maxTokens: 900,

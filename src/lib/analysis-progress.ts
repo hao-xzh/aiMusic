@@ -109,7 +109,7 @@ export async function startBackgroundAnalysis(
     });
     setState({ running: false, lastFinishedAt: Date.now() });
   } catch (e) {
-    console.warn("[claudio] 库音频分析中断", e);
+    console.warn("[pipo] 库音频分析中断", e);
     setState({ running: false });
   }
 }

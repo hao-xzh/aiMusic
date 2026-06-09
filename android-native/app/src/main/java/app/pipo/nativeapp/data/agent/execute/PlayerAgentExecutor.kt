@@ -6,8 +6,10 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoPlaylist
 import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
+import app.pipo.nativeapp.data.agent.domain.ArtistScope
 import app.pipo.nativeapp.data.agent.domain.MusicGoal
 import app.pipo.nativeapp.data.agent.domain.PlayMode
+import app.pipo.nativeapp.data.agent.domain.TrackPlacement
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
@@ -62,6 +64,9 @@ class PlayerAgentExecutor(
             continuous = null,
             jumpToInserted = jumpToInserted,
             desiredCount = 1,
+            hardConstraints = QueueHardConstraints(
+                nextTrack = TrackRequirement(title = track.title, artist = track.artist, placement = TrackPlacement.Next),
+            ),
         )
         return resultForCommit(actionId, "insert_next", request, onApplyAgentQueueRequest(request), similar = false)
     }
@@ -93,6 +98,58 @@ class PlayerAgentExecutor(
                         tracks = listOf(currentTrack),
                         currentTrack = currentTrack,
                         likedTrack = currentTrack,
+                    )
+                },
+                onFailure = { err ->
+                    ActionExecutionResult(
+                        actionId = actionId,
+                        type = "like",
+                        success = false,
+                        message = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
+                    )
+                },
+            )
+    }
+
+    override suspend fun likeTrack(
+        actionId: String,
+        like: Boolean,
+        target: TrackRequirement,
+    ): ActionExecutionResult {
+        val track = resolveTrackForLike(target)
+        val tid = track?.neteaseId
+        if (track == null || tid == null) {
+            val label = listOfNotNull(target.artist, target.title).joinToString(" - ")
+            return ActionExecutionResult(
+                actionId = actionId,
+                type = "like",
+                success = false,
+                message = "没找到可${if (like) "收藏" else "取消收藏"}的「$label」。",
+            )
+        }
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "like_track_invoke",
+            fields = mapOf(
+                "neteaseId" to tid,
+                "like" to like,
+                "title" to track.title,
+                "artist" to track.artist,
+                "targetTitle" to target.title,
+                "targetArtist" to target.artist,
+            ),
+        )
+        return runCatching { repository.likeSong(tid, like) }
+            .fold(
+                onSuccess = {
+                    ActionExecutionResult(
+                        actionId = actionId,
+                        type = "like",
+                        success = true,
+                        message = if (like) "收藏好了：${trackLabel(track)}" else "取消收藏了：${trackLabel(track)}",
+                        tracks = listOf(track),
+                        currentTrack = track,
+                        likedTrack = track,
                     )
                 },
                 onFailure = { err ->
@@ -151,36 +208,86 @@ class PlayerAgentExecutor(
             ?: playlists.firstOrNull { q.contains(it.name.lowercase()) }
     }
 
+    private suspend fun resolveTrackForLike(target: TrackRequirement): NativeTrack? {
+        currentTrackProvider()?.takeIf { matchesTarget(it, target) }?.let { return it }
+        val query = listOfNotNull(target.artist, target.title).joinToString(" ").trim()
+        if (query.isBlank()) return null
+        val candidates = runCatching { repository.searchTracks(query, limit = 10) }.getOrDefault(emptyList())
+        return candidates
+            .filter { titleLooksCompatible(it, target) }
+            .minByOrNull { likeCandidateScore(it, target) }
+    }
+
+    private fun matchesTarget(track: NativeTrack, target: TrackRequirement): Boolean =
+        titleLooksCompatible(track, target) &&
+            (target.artist.isNullOrBlank() || artistMatches(track.artist, target.artist))
+
+    private fun titleLooksCompatible(track: NativeTrack, target: TrackRequirement): Boolean {
+        val left = CommandTextSignals.normalizeForMatch(track.title)
+        val right = CommandTextSignals.normalizeForMatch(target.title)
+        return right.isNotBlank() && left.isNotBlank() && (left == right || left.contains(right) || right.contains(left))
+    }
+
+    private fun artistMatches(leftRaw: String, rightRaw: String?): Boolean {
+        if (rightRaw.isNullOrBlank()) return true
+        val left = CommandTextSignals.normalizeForMatch(leftRaw)
+        val right = CommandTextSignals.normalizeForMatch(rightRaw)
+        return right.isNotBlank() && left.isNotBlank() && (left == right || left.contains(right) || right.contains(left))
+    }
+
+    private fun likeCandidateScore(track: NativeTrack, target: TrackRequirement): Int {
+        val title = CommandTextSignals.normalizeForMatch(track.title)
+        val targetTitle = CommandTextSignals.normalizeForMatch(target.title)
+        val titleScore = when {
+            title == targetTitle -> 0
+            title.contains(targetTitle) || targetTitle.contains(title) -> 50
+            else -> 1000
+        }
+        val artistScore = if (target.artist.isNullOrBlank() || artistMatches(track.artist, target.artist)) 0 else 500
+        return titleScore + artistScore + variantWeight(track.title)
+    }
+
+    private fun variantWeight(title: String): Int {
+        val lower = title.lowercase()
+        var weight = title.length
+        if ("live" in lower || "现场" in lower || "演唱会" in lower) weight += 1000
+        if ("伴奏" in lower || "instrumental" in lower || "karaoke" in lower) weight += 1000
+        if ("cover" in lower || "翻唱" in lower) weight += 800
+        if ("remix" in lower || "混音" in lower) weight += 700
+        return weight
+    }
+
+    private fun trackLabel(track: NativeTrack): String =
+        listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" - ").ifBlank { track.title }
+
     private fun hardConstraintsFor(
         primaryGoal: MusicGoal,
         target: TrackRequirement?,
         operation: QueueOperation,
     ): QueueHardConstraints {
-        val textConstraints = QueueHardConstraints.fromGoal(primaryGoal, sourceUserText)
         val firstTrack = when {
             operation == QueueOperation.PlayNow && target != null -> target
-            else -> textConstraints.firstTrack
+            else -> null
         }
         val mustInclude = mergeRequirements(
-            textConstraints.mustIncludeTracks +
-                primaryGoal.primaryTracks +
+            primaryGoal.primaryTracks +
                 primaryGoal.mustInclude +
                 listOfNotNull(primaryGoal.closer),
         )
         val excludeLanguages = primaryGoal.excludeTerms.filter(::looksLikeLanguage)
         val excludeArtists = primaryGoal.excludeTerms.filterNot(::looksLikeLanguage)
-        return textConstraints.copy(
+        return QueueHardConstraints(
             firstTrack = firstTrack,
-            endingTrack = textConstraints.endingTrack ?: primaryGoal.closer,
+            endingTrack = primaryGoal.closer,
             mustIncludeTracks = mustInclude,
-            requiredArtists = mergeStrings(textConstraints.requiredArtists + primaryGoal.primaryArtists),
+            requiredArtists = mergeStrings(primaryGoal.primaryArtists),
             artistScope = if (primaryGoal.primaryArtists.any { it.isNotBlank() }) {
                 primaryGoal.artistScope
             } else {
-                textConstraints.artistScope
+                ArtistScope.Focus
             },
-            excludedArtists = mergeStrings(textConstraints.excludedArtists + excludeArtists),
-            excludedLanguages = mergeStrings(textConstraints.excludedLanguages + excludeLanguages),
+            excludedArtists = mergeStrings(excludeArtists),
+            excludedLanguages = mergeStrings(excludeLanguages),
         )
     }
 

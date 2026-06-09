@@ -11,14 +11,19 @@ class AgentQueuePlanner(
     private val validator: QueueValidator = QueueValidator(),
 ) {
     fun plan(turnPlan: MusicTurnPlan): QueuePlan {
+        val llmStructured = turnPlan.plannerRaw.startsWith("tool_loop")
         val actions = turnPlan.actions.map { action ->
-            if (action is PlannedAction.PlayTracks && action.mode == PlayMode.ReplaceQueue) {
+            if (!llmStructured && action is PlannedAction.PlayTracks && action.mode == PlayMode.ReplaceQueue) {
                 action.copy(tracks = placementEngine.reorderReplaceQueue(turnPlan.userText, action.tracks))
             } else {
                 action
             }
         }
-        val validation = validator.validate(turnPlan.userText, actions)
+        val validation = if (llmStructured) {
+            validator.validateStructured(actions)
+        } else {
+            validator.validate(turnPlan.userText, actions)
+        }
         DiagnosticsLogStore.record(
             area = "ai_agent",
             event = "queue_plan",

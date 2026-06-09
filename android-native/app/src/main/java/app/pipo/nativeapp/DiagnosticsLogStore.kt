@@ -96,7 +96,7 @@ object DiagnosticsLogStore {
             val dir = diagnosticsDir(app).apply { mkdirs() }
             rotateIfNeeded(dir)
             buildString {
-                appendLine("PIPO diagnostic log")
+                appendLine("Pipo diagnostic log")
                 appendLine("generated=${timestamp()}")
                 appendLine("app=${appVersion(app)}")
                 appendLine("device=${deviceName()}")

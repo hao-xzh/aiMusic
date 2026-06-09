@@ -12,6 +12,72 @@ import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 class QueueValidator(
     private val constraintScorer: ConstraintScorer = ConstraintScorer(),
 ) {
+    fun validateStructured(actions: List<PlannedAction>): QueueValidation {
+        val play = actions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull()
+        val tracks = play?.tracks.orEmpty()
+        val goal = play?.primaryGoal
+        val includeRequirements = goal?.mustInclude.orEmpty()
+        val closer = goal?.closer
+        val requiredArtists = goal?.primaryArtists.orEmpty()
+        val artistScope = goal?.artistScope ?: ArtistScope.Focus
+        val excludeTerms = goal?.excludeTerms.orEmpty() + goal?.styleProfile?.avoidTags.orEmpty() + goal?.aiAvoidStyles.orEmpty()
+        val messages = mutableListOf<String>()
+        var primarySatisfied = true
+        var mustIncludeSatisfied = true
+        var closerSatisfied = true
+
+        validateStructuredTarget(play, messages)
+
+        val primaryTracks = goal?.primaryTracks.orEmpty()
+        if (primaryTracks.isNotEmpty() && play != null) {
+            val missing = primaryTracks.filter { requirement ->
+                tracks.none { titleMatches(it, requirement.title) }
+            }
+            if (missing.isNotEmpty()) {
+                messages.add("primary_tracks_missed:" + missing.take(3).joinToString("|") { it.title })
+                primarySatisfied = false
+            }
+        }
+
+        if (requiredArtists.isNotEmpty() && play?.mode == PlayMode.ReplaceQueue) {
+            val exceptionTitles = (includeRequirements + listOfNotNull(closer))
+                .map { CommandTextSignals.normalizeForMatch(it.title) }
+                .toSet()
+            primarySatisfied = validateArtistScope(
+                tracks = tracks,
+                requiredArtists = requiredArtists,
+                artistScope = artistScope,
+                exceptionTitles = exceptionTitles,
+                messages = messages,
+            )
+        }
+        includeRequirements.forEach { requirement ->
+            val hit = tracks.any { titleMatches(it, requirement.title) }
+            if (!hit) {
+                messages.add("must_include_missed")
+                mustIncludeSatisfied = false
+            }
+        }
+        if (closer != null && play?.mode == PlayMode.ReplaceQueue && tracks.isNotEmpty()) {
+            closerSatisfied = tracks.takeLast(2).any { titleMatches(it, closer.title) }
+            if (!closerSatisfied) messages.add("closer_missed")
+        }
+        if (excludeTerms.isNotEmpty() && tracks.any { constraintScorer.hitsAvoidTerm(it, excludeTerms) }) {
+            messages.add("exclude_term_hit")
+        }
+        if (goal?.styleProfile?.energy == "low" && openingTooHighEnergy(tracks.firstOrNull())) {
+            messages.add("opening_energy_too_high")
+        }
+        return QueueValidation(
+            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied &&
+                messages.none(::isBlockingMessage),
+            messages = messages.distinct(),
+            primarySatisfied = primarySatisfied,
+            mustIncludeSatisfied = mustIncludeSatisfied,
+            closerSatisfied = closerSatisfied,
+        )
+    }
+
     fun validate(userText: String, actions: List<PlannedAction>): QueueValidation {
         val play = actions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull()
         val tracks = play?.tracks.orEmpty()
@@ -60,7 +126,6 @@ class QueueValidator(
             if (!mustIncludeSatisfied) messages.add("must_include_missed")
             if (mustIncludeSatisfied && play.mode == PlayMode.ReplaceQueue && tracks.firstOrNull()?.let { titleMatches(it, includeTitle) } == true) {
                 messages.add("must_include_at_head")
-                mustIncludeSatisfied = false
             }
         }
         if (!closerTitle.isNullOrBlank() && play?.mode == PlayMode.ReplaceQueue && tracks.isNotEmpty()) {
@@ -83,12 +148,7 @@ class QueueValidator(
         }
         return QueueValidation(
             passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied &&
-                "direct_target_missed" !in messages &&
-                "insert_target_missed" !in messages &&
-                "exclude_term_hit" !in messages &&
-                "exclude_language_hit" !in messages &&
-                "opening_energy_too_high" !in messages &&
-                "language_interleave_weak" !in messages,
+                messages.none(::isBlockingMessage),
             messages = messages,
             primarySatisfied = primarySatisfied,
             mustIncludeSatisfied = mustIncludeSatisfied,
@@ -107,6 +167,18 @@ class QueueValidator(
             PlayMode.InsertNext -> CommandTextSignals.insertNextTrack(userText)
             PlayMode.ReplaceQueue -> null
         }
+        val first = play.tracks.firstOrNull()
+        if (target != null && first?.let { titleMatches(it, target.title) } != true) {
+            messages.add(if (play.mode == PlayMode.InsertNext) "insert_target_missed" else "direct_target_missed")
+        }
+    }
+
+    private fun validateStructuredTarget(
+        play: PlannedAction.PlayTracks?,
+        messages: MutableList<String>,
+    ) {
+        if (play == null) return
+        val target = play.target
         val first = play.tracks.firstOrNull()
         if (target != null && first?.let { titleMatches(it, target.title) } != true) {
             messages.add(if (play.mode == PlayMode.InsertNext) "insert_target_missed" else "direct_target_missed")
@@ -152,14 +224,21 @@ class QueueValidator(
                 val ratio = hit.toDouble() / scopedTracks.size.coerceAtLeast(1).toDouble()
                 if (ratio < 0.7) {
                     messages.add("focus_artist_ratio_low:$hit/${scopedTracks.size}")
-                    false
-                } else {
-                    true
                 }
+                true
             }
             ArtistScope.Similar -> true
         }
     }
+
+    private fun isBlockingMessage(message: String): Boolean =
+        when {
+            message == "must_include_at_head" -> false
+            message == "opening_energy_too_high" -> false
+            message == "language_interleave_weak" -> false
+            message.startsWith("focus_artist_ratio_low") -> false
+            else -> true
+        }
 
     private fun artistMatchesAny(actualRaw: String, artistKeys: List<String>): Boolean {
         return actualRaw.split("/", "&", ",", "、")

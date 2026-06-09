@@ -33,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,6 +73,7 @@ import app.pipo.nativeapp.playback.PlayerViewModel
 import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
+import app.pipo.nativeapp.runtime.AppForeground
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -85,7 +87,12 @@ import kotlinx.coroutines.launch
  *   - PlayerScreen 的 compact 封面 / nav 图标 hide
  */
 @Composable
-fun PipoNativeApp() {
+fun PipoNativeApp(
+    lyricSandbox: Boolean = false,
+    lyricSandboxPositionMs: Long = 0L,
+    lyricSandboxPlaying: Boolean = true,
+    lyricSandboxProbe: Boolean = false,
+) {
     val pipoColors = darkColorScheme(
         background = PipoColors.Bg0,
         surface = PipoColors.Bg1,
@@ -97,6 +104,14 @@ fun PipoNativeApp() {
         onPrimary = Color(0xFF062014),
     )
     MaterialTheme(colorScheme = pipoColors) {
+        if (lyricSandbox) {
+            LyricSandboxScreen(
+                initialPositionMs = lyricSandboxPositionMs,
+                isPlaying = lyricSandboxPlaying,
+                probeEnabled = lyricSandboxProbe,
+            )
+            return@MaterialTheme
+        }
         var route by remember { mutableStateOf<Route>(Route.Player) }
         var immersive by remember { mutableStateOf(false) }
         val viewModel: PlayerViewModel = viewModel()
@@ -122,7 +137,9 @@ fun PipoNativeApp() {
         val hasLyricTranslation by remember(playerState.lyrics) {
             derivedStateOf {
                 playerState.lyrics.any { line ->
-                    line.companionLines.any { it.role == PipoLyricRole.Translation }
+                    line.companionLines.any {
+                        it.role == PipoLyricRole.Translation || it.role == PipoLyricRole.Romaji
+                    }
                 }
             }
         }
@@ -306,11 +323,7 @@ fun PipoNativeApp() {
                         )
 
                         // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
-                        // 歌词时钟只使用歌词源自己的时间轴：YRC 逐字、LRC 行级、offset 按解析层修正。
-                        val lyricClock = LyricTiming.resolve(
-                            positionMs = viewModel.positionMs,
-                            lines = viewModel.state.lyrics,
-                        )
+                        val lyricPositionProvider = remember(viewModel) { { viewModel.positionMs } }
                         ImmersiveLyricsOverlay(
                             progress = coverProgress,
                             contentProgress = contentProgress,
@@ -319,8 +332,7 @@ fun PipoNativeApp() {
                             artist = viewModel.state.artist,
                             trackId = viewModel.state.currentTrackId,
                             lyrics = viewModel.state.lyrics,
-                            activeLyricIndex = lyricClock.activeIndex,
-                            positionMs = lyricClock.positionMs,
+                            positionProvider = lyricPositionProvider,
                             isPlaying = viewModel.state.isPlaying,
                             showTranslation = showLyricTranslation && hasLyricTranslation,
                             hasTranslation = hasLyricTranslation,
@@ -458,22 +470,57 @@ private fun SkipCorrectionEffect(
             ledger = AgentLedgerStore(context),
         )
     }
+    val appInForeground by AppForeground.isForeground.collectAsState()
+    val queueSignature = remember(playerState.queue) { skipCorrectionQueueSignature(playerState.queue) }
     var lastTriggerTs by remember { mutableStateOf(0L) }
+    var queueStartedAtMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    val latestSettings by rememberUpdatedState(settings)
+    val latestPlayerState by rememberUpdatedState(playerState)
+    val latestAppInForeground by rememberUpdatedState(appInForeground)
+    val latestQueueStartedAtMs by rememberUpdatedState(queueStartedAtMs)
+
+    LaunchedEffect(queueSignature) {
+        queueStartedAtMs = System.currentTimeMillis()
+    }
+
     LaunchedEffect(route, immersive, isLandscape) {
         while (route == Route.Player && !immersive && !isLandscape) {
             delay(20_000)
+            val activeQueueStartedAtMs = latestQueueStartedAtMs
             val events = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
             val skipped = events
-                .filter { it.type == BehaviorType.Skipped }
+                .filter { it.type == BehaviorType.Skipped && it.tsMs >= activeQueueStartedAtMs }
                 .sortedBy { it.tsMs }
                 .takeLast(3)
             if (skipped.size < 3) continue
             val newest = skipped.last()
             val oldest = skipped.first()
             // 15 分钟窗口内连跳 3 首
-            if (newest.tsMs - oldest.tsMs > 15L * 60 * 1000) continue
+            if (newest.tsMs - oldest.tsMs > SKIP_CORRECTION_WINDOW_MS) continue
+            if (!latestAppInForeground) {
+                DiagnosticsLogStore.record(
+                    area = "skip_correction",
+                    event = "suppressed",
+                    fields = mapOf(
+                        "reason" to "background",
+                        "skipCount" to skipped.size,
+                    ),
+                )
+                continue
+            }
+            if (System.currentTimeMillis() - activeQueueStartedAtMs < SKIP_CORRECTION_FRESH_QUEUE_GRACE_MS) {
+                DiagnosticsLogStore.record(
+                    area = "skip_correction",
+                    event = "suppressed",
+                    fields = mapOf(
+                        "reason" to "fresh_queue",
+                        "skipCount" to skipped.size,
+                    ),
+                )
+                continue
+            }
             // 30 分钟冷却防循环
-            if (newest.tsMs - lastTriggerTs < 30L * 60 * 1000) continue
+            if (newest.tsMs - lastTriggerTs < SKIP_CORRECTION_COOLDOWN_MS) continue
 
             lastTriggerTs = newest.tsMs
 
@@ -583,6 +630,13 @@ private fun SkipCorrectionEffect(
                     override suspend fun likeCurrent(actionId: String, like: Boolean): ActionExecutionResult =
                         ActionExecutionResult(actionId, "like", success = false, message = "后台纠偏不执行收藏。")
 
+                    override suspend fun likeTrack(
+                        actionId: String,
+                        like: Boolean,
+                        target: TrackRequirement,
+                    ): ActionExecutionResult =
+                        ActionExecutionResult(actionId, "like", success = false, message = "后台纠偏不执行收藏。")
+
                     override suspend fun modifyPlaylist(
                         actionId: String,
                         add: Boolean,
@@ -597,9 +651,9 @@ private fun SkipCorrectionEffect(
                         historySummary = "",
                         musicReferences = emptyList(),
                         currentTrack = null,
-                        currentQueue = playerState.queue,
-                        userFacts = settings.userFacts,
-                        persona = PetPersona.fromId(settings.personaId),
+                        currentQueue = latestPlayerState.queue,
+                        userFacts = latestSettings.userFacts,
+                        persona = PetPersona.fromId(latestSettings.personaId),
                     ),
                     executor = executor,
                 )
@@ -626,6 +680,15 @@ private fun SkipCorrectionEffect(
                 )
                 AiCaptionBus.show(outcome.reply.ifBlank { "这队不对，我换一组。" })
             }
-	        }
+        }
     }
 }
+
+private fun skipCorrectionQueueSignature(queue: List<NativeTrack>): String =
+    queue.joinToString(separator = "|") { track ->
+        track.neteaseId?.toString() ?: track.id
+    }
+
+private const val SKIP_CORRECTION_WINDOW_MS = 15L * 60 * 1000
+private const val SKIP_CORRECTION_COOLDOWN_MS = 30L * 60 * 1000
+private const val SKIP_CORRECTION_FRESH_QUEUE_GRACE_MS = 30_000L

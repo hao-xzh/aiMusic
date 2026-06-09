@@ -85,7 +85,7 @@ export function useCoverEdgeColors(url: string | null): EdgeColors {
         if (cancelled) return;
         setColors({ top, bottom, left, right });
       } catch (e) {
-        console.debug("[claudio] cover edge color sample failed", e);
+        console.debug("[pipo] cover edge color sample failed", e);
       }
     };
     img.onerror = () => {};

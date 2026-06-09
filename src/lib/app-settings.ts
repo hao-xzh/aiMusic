@@ -18,7 +18,7 @@ export type AppSettings = {
   hideDotPattern: boolean;
   /** 隐藏右下角 AI 宠物圆球 / 绳子，仅保留封面短提示 */
   hideAiPetOrb: boolean;
-  /** 允许 Claudio 主动给短旁白 / 封面提示 */
+  /** 允许 Pipo 主动给短旁白 / 封面提示 */
   aiNarration: boolean;
   /** 启动后按当下时段主动规划一段播放 session */
   smartSessionPlanner: boolean;

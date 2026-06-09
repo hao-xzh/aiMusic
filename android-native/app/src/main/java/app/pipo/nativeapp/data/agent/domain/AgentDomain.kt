@@ -38,7 +38,7 @@ sealed class PlannedAction {
         val target: TrackRequirement? = null,
         val desiredCount: Int = 12,
         val similar: Boolean = false,
-        val jumpToInserted: Boolean = true,
+        val jumpToInserted: Boolean = false,
     ) : PlannedAction()
 
     data class PlayTracks(
@@ -49,7 +49,7 @@ sealed class PlannedAction {
         val primaryGoal: MusicGoal = MusicGoal(),
         val target: TrackRequirement? = null,
         val similar: Boolean = false,
-        val jumpToInserted: Boolean = true,
+        val jumpToInserted: Boolean = false,
     ) : PlannedAction()
 
     data class PlayPlaylist(
@@ -61,6 +61,12 @@ sealed class PlannedAction {
     data class LikeCurrent(
         override val actionId: String,
         val like: Boolean,
+    ) : PlannedAction()
+
+    data class LikeTrack(
+        override val actionId: String,
+        val like: Boolean,
+        val target: TrackRequirement,
     ) : PlannedAction()
 
     data class ModifyPlaylist(

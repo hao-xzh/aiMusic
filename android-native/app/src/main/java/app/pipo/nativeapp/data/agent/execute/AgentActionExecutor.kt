@@ -28,6 +28,12 @@ interface AgentActionExecutor {
 
     suspend fun likeCurrent(actionId: String, like: Boolean): ActionExecutionResult
 
+    suspend fun likeTrack(
+        actionId: String,
+        like: Boolean,
+        target: TrackRequirement,
+    ): ActionExecutionResult
+
     suspend fun modifyPlaylist(
         actionId: String,
         add: Boolean,

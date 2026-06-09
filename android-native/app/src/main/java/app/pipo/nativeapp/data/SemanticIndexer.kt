@@ -154,7 +154,7 @@ class SemanticIndexer(
         }
         val systemArtists = artistsList.joinToString(" / ").ifBlank { "未知" }
         val raw = repository.aiChat(
-            system = "你是 Claudio 的单曲语义标注器。只输出 JSON，不要解释。当前歌曲：${track.title} - $systemArtists",
+            system = "你是 Pipo 的单曲语义标注器。只输出 JSON，不要解释。当前歌曲：${track.title} - $systemArtists",
             user = user,
             temperature = 0.2f,
             maxTokens = 900,

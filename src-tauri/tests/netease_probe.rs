@@ -2,7 +2,7 @@
 //! 手动跑：`cargo test --test netease_probe -- --ignored --nocapture`
 //!
 //! 用这个快速迭代 -462 风控绕过方案 + 验证 cmds.rs 序列化 shape，
-//! 不用每次 Claudio 窗口点一遍。
+//! 不用每次 Pipo 窗口点一遍。
 
 use claudio_lib as _;
 use serde_json::Value;

@@ -13,7 +13,7 @@ export async function invoke<T = unknown>(
 ): Promise<T> {
   if (!isTauri()) {
     throw new Error(
-      `[claudio] "${cmd}" 只能在 Tauri 桌面壳里运行。当前是浏览器预览。`,
+      `[pipo] "${cmd}" 只能在 Tauri 桌面壳里运行。当前是浏览器预览。`,
     );
   }
   const { invoke } = await import("@tauri-apps/api/core");

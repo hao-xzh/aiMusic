@@ -68,15 +68,18 @@ object YrcParser {
             val text = if (mergedChars.isNotEmpty()) mergedChars.joinToString("") { it.text } else ""
             if (mergedChars.isEmpty() && text.isEmpty()) continue
 
-            lines.add(
-                PipoLyricLine(
-                    startMs = lineStart,
-                    durationMs = lineDur,
-                    text = text,
-                    chars = mergedChars,
-                    timing = PipoLyricTiming.Word,
-                )
+            val builtLine = PipoLyricLine(
+                startMs = lineStart,
+                durationMs = lineDur,
+                text = text,
+                chars = mergedChars,
+                timing = PipoLyricTiming.Word,
             )
+            // 行尾括号和声（"主体 (oh baby)"）切成独立括号行，主体留在主行；
+            // 切出的括号行随后被 mergeSimultaneousYrcLines 当 ad-lib 归到主行的 companionLines。
+            val (mainLine, adlib) = splitTrailingAdlib(builtLine)
+            lines.add(mainLine)
+            if (adlib != null) lines.add(adlib)
         }
         lines.sortBy { it.startMs }
 
@@ -94,6 +97,7 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
     if (lines.size <= 1) return lines
 
     val primaryLines = mutableListOf<PipoLyricLine>()
+    val duetLines = mutableListOf<PipoLyricLine>()
     val companionCandidates = mutableListOf<PipoLyricLine>()
     for (line in lines) {
         if (isParentheticalLine(line.text)) {
@@ -108,11 +112,9 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
                 primaryLines.add(line)
             } else if (!sameLyricText(line.text, previousPrimary.text)) {
                 // 同一时间戳附近出现第二条不同文本，网易 YRC 通常是在标副唱 / 对唱。
-                // 之前这里直接跳过，导致非括号副词丢失；重复同文本仍按去重处理。
-                // 标记 alignment=End 让对唱 companion 在 ImmersiveLyrics 里靠右展示，
-                // 视觉上跟 AMLL 的 ttm:agent="v2" 对唱行一致（右对齐），避免"同样的合唱
-                // 在 AMLL 数据下右对齐、YRC 数据下又挤在左边"的不一致体验。
-                companionCandidates.add(line.copy(alignment = PipoLyricAlignment.End))
+                // 这类不是小号背景人声，而是第二演唱者主旋律：按 AMLL 的 duet line 处理，
+                // 保持完整字号并靠右；括号 ad-lib 才继续作为 Companion 小字显示。
+                duetLines.add(line.copy(alignment = PipoLyricAlignment.End))
             }
         }
     }
@@ -135,7 +137,7 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
             .take(MAX_COMPANION_LYRIC_LINES)
             .map { it.copy(role = PipoLyricRole.Companion) }
         if (companions.isEmpty()) line else line.copy(companionLines = line.companionLines + companions)
-    } + orphans).sortedBy { it.startMs }
+    } + duetLines + orphans).sortedBy { it.startMs }
 }
 
 private fun findCompanionHostIndex(
@@ -257,6 +259,95 @@ private fun estimateSungTokenDurationMs(text: String): Long {
     return raw.coerceIn(MIN_LAST_TOKEN_VISUAL_MS, MAX_LAST_TOKEN_VISUAL_MS)
 }
 
+/**
+ * 把"主体 (和声)"形式的行,在行尾括号处切成 [主行, 括号行]。
+ *
+ * 仅处理**行尾**的单个括号段、且括号前确有主体内容的安全情形：
+ *   - 整行括号（"(oh)"）→ open==0，不切，仍由 isParentheticalLine 当整行 ad-lib。
+ *   - 行中括号（"la (la) la"）→ 右括号后还有内容，不切。
+ * 网易云 yrc 的括号符号往往附着在邻字上,故按 text 字符下标定位、必要时把跨界 char
+ * 按文本比例切分时间（括号符号不发音,时间误差忽略不计）。返回 companion 仍以 Primary 标记,
+ * 由 mergeSimultaneousYrcLines 按括号识别后统一改成 Companion 并就近挂载。
+ */
+private fun splitTrailingAdlib(line: PipoLyricLine): Pair<PipoLyricLine, PipoLyricLine?> {
+    val text = line.text
+    if (line.chars.isEmpty() || text.length < 4) return line to null
+    val open = maxOf(text.lastIndexOf('('), text.lastIndexOf('（'))
+    if (open <= 0) return line to null
+    val close = maxOf(text.lastIndexOf(')'), text.lastIndexOf('）'))
+    if (close <= open) return line to null
+    // 右括号之后只允许空白，否则属于行中括号，不切。
+    if (text.substring(close + 1).isNotBlank()) return line to null
+    if (text.substring(0, open).isBlank()) return line to null
+    if (text.substring(open).trim().length < 3) return line to null // 至少 "(x)"
+
+    val mainChars = mutableListOf<PipoLyricChar>()
+    val compChars = mutableListOf<PipoLyricChar>()
+    var acc = 0
+    for (ch in line.chars) {
+        val start = acc
+        val end = acc + ch.text.length
+        when {
+            end <= open -> mainChars.add(ch)
+            start >= open -> compChars.add(ch)
+            else -> {
+                // 跨界 char（含 '(' 的那个，如 "你 ("）：前半归主体、后半（'(' 起）归括号行。
+                val cut = (open - start).coerceIn(0, ch.text.length)
+                val head = ch.text.substring(0, cut)
+                val tail = ch.text.substring(cut)
+                val headDur = if (ch.text.isNotEmpty()) {
+                    (ch.durationMs * head.length / ch.text.length).coerceAtLeast(0L)
+                } else {
+                    0L
+                }
+                if (head.isNotEmpty()) {
+                    val d = headDur.coerceAtLeast(1L)
+                    mainChars.add(
+                        ch.copy(
+                            text = head,
+                            durationMs = d,
+                            timingParts = listOf(PipoLyricTimingPart(ch.startMs, d, head)),
+                        ),
+                    )
+                }
+                if (tail.isNotEmpty()) {
+                    val tStart = ch.startMs + headDur
+                    val tDur = (ch.durationMs - headDur).coerceAtLeast(1L)
+                    compChars.add(
+                        ch.copy(
+                            startMs = tStart,
+                            text = tail,
+                            durationMs = tDur,
+                            timingParts = listOf(PipoLyricTimingPart(tStart, tDur, tail)),
+                        ),
+                    )
+                }
+            }
+        }
+        acc = end
+    }
+    if (mainChars.isEmpty() || compChars.isEmpty()) return line to null
+
+    val mainMerged = mergeAdjacentAsciiLyricChars(mainChars)
+    val compMerged = mergeAdjacentAsciiLyricChars(compChars)
+    val mainText = mainMerged.joinToString("") { it.text }
+    val compText = compMerged.joinToString("") { it.text }
+    if (mainText.isBlank() || compText.isBlank()) return line to null
+
+    val compStart = compMerged.first().startMs
+    val compEnd = compMerged.maxOf { it.startMs + it.durationMs }
+    val main = line.copy(text = mainText, chars = mainMerged)
+    val companion = PipoLyricLine(
+        startMs = compStart,
+        durationMs = (compEnd - compStart).coerceAtLeast(1L),
+        text = compText,
+        chars = compMerged,
+        timing = PipoLyricTiming.Word,
+        role = PipoLyricRole.Primary,
+    )
+    return main to companion
+}
+
 private fun isParentheticalLine(text: String): Boolean {
     val s = text.trim()
     if (s.length < 2) return false
@@ -273,14 +364,19 @@ private fun sameLyricText(left: String, right: String): Boolean {
         .equals(right.replace(Regex("\\s+"), " ").trim(), ignoreCase = true)
 }
 
-private fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoLyricChar> {
+internal fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoLyricChar> {
     if (chars.size <= 1) return chars
     val merged = ArrayList<PipoLyricChar>(chars.size)
     for (char in chars) {
         val prev = merged.lastOrNull()
         if (prev != null && shouldAttachTrailingPunctuation(prev.text, char.text)) {
+            val start = minOf(prev.startMs, char.startMs)
+            val end = maxOf(prev.startMs + prev.durationMs, char.startMs + char.durationMs)
             merged[merged.lastIndex] = prev.copy(
+                startMs = start,
+                durationMs = (end - start).coerceAtLeast(1L),
                 text = prev.text + char.text,
+                timingParts = prev.timingPartsOrSelf() + char.timingPartsOrSelf(),
             )
         } else if (prev != null && shouldMergeAsciiFragments(prev.text, char.text)) {
             val start = minOf(prev.startMs, char.startMs)
@@ -291,13 +387,7 @@ private fun mergeAdjacentAsciiLyricChars(chars: List<PipoLyricChar>): List<PipoL
                 startMs = start,
                 durationMs = mergedDurationMs,
                 text = mergedText,
-                timingParts = listOf(
-                    PipoLyricTimingPart(
-                        startMs = start,
-                        durationMs = mergedDurationMs,
-                        text = mergedText,
-                    ),
-                ),
+                timingParts = prev.timingPartsOrSelf() + char.timingPartsOrSelf(),
             )
         } else {
             merged.add(char)
@@ -402,14 +492,27 @@ private fun isAsciiInlineWordJoiner(c: Char): Boolean {
  *   - 正在唱 → 0..1
  */
 fun PipoLyricChar.progress(positionMs: Long): Float {
+    val linear = linearTokenProgress(positionMs)
     val parts = timingPartsForProgress()
-    if (parts.size <= 1) {
-        if (positionMs <= startMs) return 0f
-        if (positionMs >= startMs + durationMs) return 1f
-        if (durationMs <= 0L) return 1f
-        return ((positionMs - startMs).toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
-    }
+    if (parts.size <= 1) return linear
 
+    // 音节必须参与，但不能 100% 接管视觉进度。否则 ha-ha / 长词这类 token
+    // 会在每个 timingPart 边界改变速度，看起来像横向一截一截卡。
+    // 这里用整词线性进度做底，再叠加一部分音节进度修正：音节会影响快慢，
+    // 但扫色/上浮仍是一条连续曲线。
+    val syllable = timingPartProgress(parts, positionMs)
+    val influence = syllableProgressInfluence(text, parts)
+    return (linear + (syllable - linear) * influence).coerceIn(0f, 1f)
+}
+
+private fun PipoLyricChar.linearTokenProgress(positionMs: Long): Float {
+    if (positionMs <= startMs) return 0f
+    if (positionMs >= startMs + durationMs) return 1f
+    if (durationMs <= 0L) return 1f
+    return ((positionMs - startMs).toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+}
+
+private fun timingPartProgress(parts: List<PipoLyricTimingPart>, positionMs: Long): Float {
     val totalTextLength = parts.sumOf { it.text.length }.coerceAtLeast(1)
     var consumed = 0
     var progress = 0f
@@ -433,6 +536,23 @@ fun PipoLyricChar.progress(positionMs: Long): Float {
         consumed += partLength
     }
     return progress.coerceIn(0f, 1f)
+}
+
+private fun syllableProgressInfluence(
+    tokenText: String,
+    parts: List<PipoLyricTimingPart>,
+): Float {
+    val visibleGlyphs = tokenText.count(::isWordLikeChar).coerceAtLeast(1)
+    val partDensity = parts.size.toFloat() / visibleGlyphs.toFloat()
+    // 音节进度按“字符数”分配区间，但各音节时长不均：短时长却覆盖多字母的音节会让进度陡增，
+    // 表现为扫色“跳一段”。这里大幅压低音节影响、以整词线性进度为主，保证扫色从头到尾连续丝滑，
+    // 音节仅作极轻微的快慢修正，不再造成可见跳变。（想完全线性可全部设 0f。）
+    return when {
+        // 很密的 parts ≈ 逐字母碎片，直接纯线性最丝滑。
+        partDensity >= 0.75f -> 0.0f
+        parts.size >= 6 -> 0.10f
+        else -> 0.15f
+    }
 }
 
 fun PipoLyricChar.timingPartsForProgress(): List<PipoLyricTimingPart> {

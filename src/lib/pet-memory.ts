@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * 跨 session 宠物记忆 —— Claudio 不再每次启动都失忆。
+ * 跨 session 宠物记忆 —— Pipo 不再每次启动都失忆。
  *
  * 设计原则(很重要,以后改的人请读):
  *
@@ -34,7 +34,7 @@ const UTTERANCE_TTL_DAYS = 30; // 30 天没更新的彻底过期
 
 type PersistedMemory = {
   version: 1;
-  /** 用户跟 Claudio 说过的有意义的话(过滤掉招呼/感谢/单字) */
+  /** 用户跟 Pipo 说过的有意义的话(过滤掉招呼/感谢/单字) */
   utterances: { ts: number; text: string }[];
   /** 第一次见到 TA 的时间(unix sec) */
   firstSeenAt: number;
@@ -79,7 +79,7 @@ async function saveMemory(): Promise<void> {
   try {
     await cache.setState(MEM_KEY, JSON.stringify(memo));
   } catch (e) {
-    console.debug("[claudio] pet-memory 落盘失败", e);
+    console.debug("[pipo] pet-memory 落盘失败", e);
   }
 }
 
@@ -118,7 +118,7 @@ export async function getMemoryDigest(): Promise<string> {
     parts.push(`听过 ${events.length} 首`);
   }
 
-  // 最近一句有意义的话 —— 这是真正能让 Claudio 显得"记得"的信号
+  // 最近一句有意义的话 —— 这是真正能让 Pipo 显得"记得"的信号
   const lastUtt = m.utterances[m.utterances.length - 1];
   if (lastUtt) {
     const ageMin = Math.floor((Date.now() / 1000 - lastUtt.ts) / 60);

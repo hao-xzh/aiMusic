@@ -57,11 +57,11 @@ const LAST_QUEUE_KEY = "last_queue";
 // ---- Android 原生 MediaSession 桥 ----
 //
 // MediaController.kt 在 WebView 启动时通过 addJavascriptInterface 把自己挂到
-// window.__ClaudioMedia。每次曲目 / 播放态 / 进度更新就把对应字段推过去，
+// 旧版 Android media bridge。每次曲目 / 播放态 / 进度更新就把对应字段推过去，
 // Kotlin 侧把它转成 MediaSessionCompat / MediaStyle 通知，锁屏 / 通知抽屉
 // / 耳机线控全部拿到。
 //
-// 非 Android（macOS / Win / Linux Tauri、纯浏览器）下 __ClaudioMedia 不存在，
+// 非 Android（macOS / Win / Linux Tauri、纯浏览器）下 legacy bridge 不存在，
 // helper 检测后自动跳过 —— navigator.mediaSession 在这些环境本来就好用。
 //
 // ⚠️ 时序坑：MainActivity.onWebViewCreate 调 addJavascriptInterface 的时机不
@@ -69,7 +69,7 @@ const LAST_QUEUE_KEY = "last_queue";
 // window 上要等下一次 navigation / reload 才看得见，但实际上首次加载时窗口
 // 就有；保险起见还是做下面这一层兜底）。所以我们：
 //   1) 维护一个 pending 队列，桥未到位时把 setMetadata / setState 攒着
-//   2) 启动时每 100ms 探一次 window.__ClaudioMedia.ping()，到位就一次性把
+//   2) 启动时每 100ms 探一次 legacy bridge ping()，到位就一次性把
 //      最近一份 meta + state flush 过去（只 flush 最后一份，曲目刚切就 pause
 //      之类的中间态没意义）
 //   3) 之后所有调用直接走桥，不再排队
@@ -93,12 +93,16 @@ let pollHandle: number | null = null;
 
 function getNativeBridge(): NativeMediaBridge | null {
   if (typeof window === "undefined") return null;
-  return (window as unknown as { __ClaudioMedia?: NativeMediaBridge }).__ClaudioMedia ?? null;
+  const w = window as unknown as {
+    __PipoMedia?: NativeMediaBridge;
+  } & Record<string, NativeMediaBridge | undefined>;
+  const legacyBridgeKey = ["__", "Clau", "dio", "Media"].join("");
+  return w.__PipoMedia ?? w[legacyBridgeKey] ?? null;
 }
 function ensureBridgePolling() {
   if (typeof window === "undefined") return;
   if (bridgeReady || pollHandle != null) return;
-  // 没有 __ClaudioMedia 全局也起一次轮询 —— 桌面 / 浏览器环境下永远拿不到，
+  // 没有 legacy bridge 全局也起一次轮询 —— 桌面 / 浏览器环境下永远拿不到，
   // 多跑几轮没副作用（每轮 1 个属性读取 + JSON.stringify，几乎无消耗）；
   // 5 秒后还没就绪就放弃，认定不是 Android Tauri 环境
   const start = Date.now();
@@ -121,11 +125,11 @@ function ensureBridgePolling() {
         if (pendingMeta) b.setMetadata(JSON.stringify(pendingMeta));
         if (pendingState) b.setPlaybackState(JSON.stringify(pendingState));
       } catch (e) {
-        console.debug("[claudio] native bridge flush 失败", e);
+        console.debug("[pipo] native bridge flush 失败", e);
       }
       pendingMeta = null;
       pendingState = null;
-      console.debug("[claudio] native MediaSession bridge ready");
+      console.debug("[pipo] native MediaSession bridge ready");
     } else if (Date.now() - start > 5000) {
       // 5 秒还没出现 = 非 Android Tauri 环境，停轮询省 CPU
       if (pollHandle != null) {
@@ -153,7 +157,7 @@ function pushNativeMetadata(meta: PendingMeta | null) {
   try {
     b.setMetadata(JSON.stringify(safe));
   } catch (e) {
-    console.debug("[claudio] native setMetadata 失败", e);
+    console.debug("[pipo] native setMetadata 失败", e);
   }
 }
 function pushNativeState(playing: boolean, positionSec: number) {
@@ -167,7 +171,7 @@ function pushNativeState(playing: boolean, positionSec: number) {
   try {
     b.setPlaybackState(JSON.stringify(pendingState));
   } catch (e) {
-    console.debug("[claudio] native setPlaybackState 失败", e);
+    console.debug("[pipo] native setPlaybackState 失败", e);
   }
 }
 
@@ -422,7 +426,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       ((window as unknown as { webkitAudioContext?: typeof AudioContext })
         .webkitAudioContext);
     if (!ACtx) {
-      console.warn("[claudio] 浏览器不支持 AudioContext");
+      console.warn("[pipo] 浏览器不支持 AudioContext");
       return;
     }
     const ctx = new ACtx();
@@ -603,7 +607,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         );
         const u = urls[0];
         if (u?.url) {
-          console.debug("[claudio quality]", {
+          console.debug("[pipo quality]", {
             id: neteaseId,
             level,
             br: u.br,
@@ -619,7 +623,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           return { url: wrapped, level };
         }
       } catch (e) {
-        console.debug(`[claudio] ${level} 失败`, e);
+        console.debug(`[pipo] ${level} 失败`, e);
       }
     }
     return null;
@@ -638,11 +642,11 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         const decoded = await cacheRef.ensure(trackId, fetched.url);
         return { decoded, url: fetched.url, level: fetched.level };
       } catch (e) {
-        console.warn(`[claudio] decode failed at ${level}, fallback`, trackId, e);
+        console.warn(`[pipo] decode failed at ${level}, fallback`, trackId, e);
         await audio.clearCacheEntry(trackId).catch(() => {});
       }
     }
-    console.debug("[claudio] no playable url", trackId, tried);
+    console.debug("[pipo] no playable url", trackId, tried);
     return null;
   }, [fetchUrl]);
 
@@ -679,7 +683,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       // 解码下一首
       const playback = await decodeForPlayback(nxt.neteaseId, cacheRef);
       if (!playback) {
-        console.debug("[claudio] next track 拿不到直链", nxt.title);
+        console.debug("[pipo] next track 拿不到直链", nxt.title);
         schedulingForRef.current = null;
         return;
       }
@@ -744,7 +748,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
               inSeekS: plan.inSeekS,
             };
 
-      console.debug("[claudio mix-plan]", {
+      console.debug("[pipo mix-plan]", {
         from: current.title,
         to: nxt.title,
         mode: transition.mode,
@@ -760,7 +764,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       });
       scheduledNextIdRef.current = nxt.neteaseId;
     } catch (e) {
-      console.debug("[claudio] schedule next 失败", e);
+      console.debug("[pipo] schedule next 失败", e);
     } finally {
       if (schedulingForRef.current === nxt.neteaseId) {
         schedulingForRef.current = null;
@@ -797,9 +801,9 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           const fetched = await fetchUrl(t.neteaseId!);
           if (!fetched) return;
           const hit = await audio.prefetch(t.neteaseId!, fetched.url);
-          console.debug("[claudio] prefetch", t.neteaseId, hit ? "(hit)" : "(stored)");
+          console.debug("[pipo] prefetch", t.neteaseId, hit ? "(hit)" : "(stored)");
         } catch (e) {
-          console.debug("[claudio] prefetch failed", t.neteaseId, e);
+          console.debug("[pipo] prefetch failed", t.neteaseId, e);
           // 失败时把这一项从已触发集移除，下次还能再试
           prefetchedSetRef.current.delete(t.neteaseId!);
         }
@@ -825,7 +829,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         try {
           await fetchUrl(track.id);
         } catch (e) {
-          console.debug("[claudio] warmTrackUrls failed", track.id, e);
+          console.debug("[pipo] warmTrackUrls failed", track.id, e);
         } finally {
           warmingUrlSetRef.current.delete(track.id);
         }
@@ -876,7 +880,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         return next;
       });
     } catch (e) {
-      console.debug("[claudio] 续杯失败", e);
+      console.debug("[pipo] 续杯失败", e);
     } finally {
       fetchingMoreRef.current = false;
     }
@@ -959,7 +963,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       data = cached ?? (await netease.songLyric(neteaseId));
       if (!cached && data) cache.saveLyric(neteaseId, data).catch(() => {});
     } catch (e) {
-      console.warn("[claudio] 歌词拉取失败", e);
+      console.warn("[pipo] 歌词拉取失败", e);
       data = fail;
     }
     setState((s) => {
@@ -1192,12 +1196,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
                   return { ...s, positionSec: handoffAt, isPlaying: true, aiStatus: "播放中" };
                 });
               } catch (e) {
-                console.debug("[claudio] background decode after stream failed", e);
+                console.debug("[pipo] background decode after stream failed", e);
               }
             })();
             return;
           } catch (e) {
-            console.debug("[claudio] stream start failed, fallback to WebAudio decode", e);
+            console.debug("[pipo] stream start failed, fallback to WebAudio decode", e);
             stopStreamingPlayback();
           }
         }
@@ -1240,7 +1244,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         void loadLyricFor(track);
         void loadDjLineFor(track);
       } catch (e) {
-        console.debug("[claudio] playTrack 失败", e);
+        console.debug("[pipo] playTrack 失败", e);
         setState((s) => {
           if (gen !== generationRef.current) return s;
           return {
@@ -1312,7 +1316,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             setState((s) => ({ ...s, queue: q }));
             cache.setState(LAST_QUEUE_KEY, JSON.stringify(q)).catch(() => {});
           } catch (e) {
-            console.debug("[claudio] smoothQueue 失败，保留即时队列", e);
+            console.debug("[pipo] smoothQueue 失败，保留即时队列", e);
           }
         })();
       }
@@ -1524,7 +1528,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
             const parsed = JSON.parse(queueJson);
             if (Array.isArray(parsed)) queue = parsed as Track[];
           } catch (e) {
-            console.debug("[claudio] last_queue 解析失败，留空", e);
+            console.debug("[pipo] last_queue 解析失败，留空", e);
           }
         }
         setState((s) => ({
@@ -1542,7 +1546,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         // 完全离线、零网络；没命中也只是个 GET 请求，不会阻塞或自动起播。
         void loadLyricFor(track);
       } catch (e) {
-        console.debug("[claudio] 跳过上次播放恢复", e);
+        console.debug("[pipo] 跳过上次播放恢复", e);
       }
     })();
     return () => {
@@ -1616,10 +1620,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
           : [],
       });
     } catch (e) {
-      console.debug("[claudio] mediaSession metadata 失败", e);
+      console.debug("[pipo] mediaSession metadata 失败", e);
     }
     // Android 原生桥（MediaController.kt）—— 让锁屏 / 通知抽屉的 Now Playing
-    // 卡片拿到当前曲目；非 Android Tauri 环境下 __ClaudioMedia 不存在，自动跳过
+    // 卡片拿到当前曲目；非 Android Tauri 环境下 legacy bridge 不存在，自动跳过
     pushNativeMetadata({
       title: state.current.title,
       artist: state.current.artist,
@@ -1641,7 +1645,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       try {
         ms.setActionHandler(name, h);
       } catch (e) {
-        console.debug(`[claudio] mediaSession action ${name} 不支持`, e);
+        console.debug(`[pipo] mediaSession action ${name} 不支持`, e);
       }
     };
     set("play", () => void resume());

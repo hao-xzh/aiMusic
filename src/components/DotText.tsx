@@ -29,7 +29,7 @@ export function DotText({
   fontSize = 96,
   grid = 6,
   dotRadius = 2.4,
-  color = "#9be3c6", // Claudio 招牌薄荷绿
+  color = "#9be3c6", // Pipo 招牌薄荷绿
   glow = true,
   font = '"SF Pro Display", "Inter", "Helvetica Neue", Arial, sans-serif',
   hoverRipple = true,

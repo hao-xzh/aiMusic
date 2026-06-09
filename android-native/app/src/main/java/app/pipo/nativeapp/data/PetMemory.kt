@@ -324,10 +324,10 @@ class PetMemory(context: Context) {
                 ROLE_ASSISTANT -> {
                     val u = pendingUser
                     if (!u.isNullOrBlank()) {
-                        lines.add("用户:${u.take(54)} / Claudio:${turn.text.take(54)}")
+                        lines.add("用户:${u.take(54)} / Pipo:${turn.text.take(54)}")
                         pendingUser = null
                     } else {
-                        lines.add("Claudio:${turn.text.take(70)}")
+                        lines.add("Pipo:${turn.text.take(70)}")
                     }
                 }
             }

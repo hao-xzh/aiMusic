@@ -44,7 +44,7 @@ export async function getWeather(): Promise<Weather | null> {
     memo = { at: Date.now(), data };
     return data;
   } catch (e) {
-    console.debug("[claudio] 天气拉取失败，跳过", e);
+    console.debug("[pipo] 天气拉取失败，跳过", e);
     memo = { at: Date.now(), data: null };
     return null;
   }

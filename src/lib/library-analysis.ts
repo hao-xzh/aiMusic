@@ -92,7 +92,7 @@ export async function analyzeLibrary(
             }
           }
         } catch (e) {
-          console.debug("[claudio] batch songUrls 失败", e);
+          console.debug("[pipo] batch songUrls 失败", e);
         }
       }
 
@@ -123,7 +123,7 @@ export async function analyzeLibrary(
                     const a = await getOrAnalyze(t.id, url);
                     return !!a;
                   } catch (e) {
-                    console.debug("[claudio] JS analyze 失败", t.id, e);
+                    console.debug("[pipo] JS analyze 失败", t.id, e);
                     return false;
                   }
                 })(),
@@ -133,7 +133,7 @@ export async function analyzeLibrary(
                     await audio.getFeatures(t.id, rawUrl, false);
                     return true;
                   } catch (e) {
-                    console.debug("[claudio] native features 失败", t.id, e);
+                    console.debug("[pipo] native features 失败", t.id, e);
                     return false;
                   }
                 })(),

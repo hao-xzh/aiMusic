@@ -120,11 +120,11 @@ export default function DistillPage() {
         try {
           const lib = await loadLibrary();
           if (lib.length === 0) return;
-          console.debug(`[claudio] 启动后台音频分析：${lib.length} 首`);
+          console.debug(`[pipo] 启动后台音频分析：${lib.length} 首`);
           await startBackgroundAnalysis(lib);
-          console.debug(`[claudio] 后台分析完成`);
+          console.debug(`[pipo] 后台分析完成`);
         } catch (e) {
-          console.debug("[claudio] 后台分析挂了，跳过", e);
+          console.debug("[pipo] 后台分析挂了，跳过", e);
         }
       })();
       router.push("/taste");
@@ -194,7 +194,7 @@ export default function DistillPage() {
               message: e instanceof Error ? e.message : String(e),
             });
           } else {
-            console.warn("[claudio] 后台刷新歌单失败，用缓存继续", e);
+            console.warn("[pipo] 后台刷新歌单失败，用缓存继续", e);
           }
         } finally {
           if (alive) setRefreshing(false);
@@ -268,7 +268,7 @@ export default function DistillPage() {
           if (!hasCachedTracks) {
             setTracksError(e instanceof Error ? e.message : String(e));
           } else {
-            console.warn("[claudio] 歌单详情后台刷新失败，用缓存继续", e);
+            console.warn("[pipo] 歌单详情后台刷新失败，用缓存继续", e);
           }
         }
       } catch (e) {
@@ -645,7 +645,7 @@ function FloatingTopBar({
 
 const TRACK_ROW_HEIGHT = 58;
 const TRACK_ROW_OVERSCAN = 8;
-const PIPO_MINT = "#9BE3C6";
+const pipoMint = "#9BE3C6";
 
 function ImmersiveLayout({
   playlists,
@@ -1306,7 +1306,7 @@ function TrackRow({
       <div style={{ flex: 1, minWidth: 0 }}>
         <div
           style={{
-            color: visuallyActive && androidDensity ? PIPO_MINT : fg,
+            color: visuallyActive && androidDensity ? pipoMint : fg,
             fontSize: 14,
             fontWeight: 500,
             overflow: "hidden",
@@ -1338,13 +1338,13 @@ function TrackRow({
         title={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
         disabled={pending}
         style={{
-          ...playBtn(androidDensity && visuallyActive ? PIPO_MINT : fg),
+          ...playBtn(androidDensity && visuallyActive ? pipoMint : fg),
           flexShrink: 0,
           opacity: pending ? 0.62 : 1,
         }}
       >
         {showIndicator ? (
-          <PlayingMark fg={androidDensity ? PIPO_MINT : fg} playing={isPlayingThis || pending} />
+          <PlayingMark fg={androidDensity ? pipoMint : fg} playing={isPlayingThis || pending} />
         ) : (
           <PlayIcon />
         )}

@@ -55,7 +55,7 @@ export function WindowResizer() {
       const win = tauri.window.getCurrentWindow();
       await win.startResizeDragging(DIR_MAP[edge]);
     } catch (err) {
-      console.warn("[claudio] resize failed", err);
+      console.warn("[pipo] resize failed", err);
     }
   };
 
