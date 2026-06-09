@@ -127,7 +127,7 @@ export async function smoothQueue(
     const [next] = remaining.splice(bestIndex, 1);
     if (ordered.length <= 30) {
       const fit = transitionFitScore(current, next);
-      console.debug("[claudio] transition-aware pick", {
+      console.debug("[pipo] transition-aware pick", {
         from: current.track.name,
         to: next.track.name,
         fit: Number(fit.score.toFixed(3)),

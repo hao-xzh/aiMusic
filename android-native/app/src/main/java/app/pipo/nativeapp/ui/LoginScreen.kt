@@ -90,7 +90,7 @@ fun LoginScreen(onBack: () -> Unit) {
 
     ScreenScaffold(title = "LOGIN") {
         Text(
-            "登录网易云，把歌单和云盘接进 Claudio。",
+            "登录网易云，把歌单和云盘接进 Pipo。",
             color = PipoColors.TextDim,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(bottom = 12.dp),

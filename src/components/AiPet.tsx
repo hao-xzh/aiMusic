@@ -421,7 +421,7 @@ export function AiPet() {
         markGreeted();
         showHint(message, 5500);
       } catch (e) {
-        console.debug("[claudio] pet daily greeting 失败", e);
+        console.debug("[pipo] pet daily greeting 失败", e);
       }
     })();
     // showHint 是稳定 callback —— 这里就是 once-on-mount，不订阅依赖
@@ -483,7 +483,7 @@ export function AiPet() {
           });
         }
       } catch (e) {
-        console.warn("[claudio] pet send failed", e);
+        console.warn("[pipo] pet send failed", e);
         setMessages([
           ...next,
           { role: "assistant", text: "我这边卡了一下，再说一次？" },
@@ -520,7 +520,7 @@ export function AiPet() {
           ref={panelRef}
           className={`claudio-pet-panel${closing ? " is-closing" : ""}`}
           role="dialog"
-          aria-label="Claudio 聊天"
+          aria-label="Pipo 聊天"
           style={
             {
               "--orb-rgb": `${orbRgb[0]}, ${orbRgb[1]}, ${orbRgb[2]}`,
@@ -531,7 +531,7 @@ export function AiPet() {
           <div style={panelHeader}>
             <span style={panelHeaderCore} aria-hidden />
             <div style={panelHeaderText}>
-              <div style={panelHeaderTitle}>Claudio</div>
+              <div style={panelHeaderTitle}>Pipo</div>
               <div style={panelHeaderSubtitle}>
                 {pending
                   ? "想想看…"
@@ -621,7 +621,7 @@ export function AiPet() {
               setOpen(true);
             }
           }}
-          aria-label={open ? "关闭 Claudio" : "打开 Claudio"}
+          aria-label={open ? "关闭 Pipo" : "打开 Pipo"}
         >
           <span className="claudio-pet__core" aria-hidden>
             {/* logo 直接做球面：morph 形状裁，叠 specular 高光 + 内阴影做液感 */}

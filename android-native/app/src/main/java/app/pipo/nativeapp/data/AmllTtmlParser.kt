@@ -35,7 +35,7 @@ import java.io.StringReader
  *   · `<span ttm:role="x-translation">` → 一条 `role = Translation` 的 companion
  *   · `<span ttm:role="x-bg">` → 一条 `role = Companion` 的副词（"和声 / backing vocal"），
  *     附在所在 `<p>` 的 companionLines 上，由渲染层走小字浮入通道。
- *   · `<span ttm:role="x-roman">` → 暂不消费（保留位置，未来要展示罗马音再加）
+ *   · `<span ttm:role="x-roman">` → 一条 `role = Romaji`（音译）的小字行，显示在主词与翻译之间
  *
  * 时间格式支持 `HH:MM:SS.fff`、`MM:SS.fff`、`SS.fff`、纯整数毫秒。
  */
@@ -48,32 +48,56 @@ object AmllTtmlParser {
             setInput(StringReader(ttml))
         }
         val primaries = mutableListOf<PipoLyricLine>()
+        val agents = mutableMapOf<String, AgentInfo>()
+        // 第一位出场的非 group 演唱者作为基准（左对齐）；与之不同的演唱者整行右对齐。
+        // 这与 AMLL / Apple 官方对唱排版一致，且不依赖 ttm:type（大量 TTML 并不写 type）。
+        var baseAgentId: String? = null
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
-            if (event == XmlPullParser.START_TAG && parser.name == "p") {
-                val parsed = parseP(parser)
-                if (parsed != null) {
-                    // 所有 <p> 都作为独立 Primary：
-                    //   · agent="v1" / 缺省 → 主唱，左对齐
-                    //   · agent="v2" / "v3" / ... → 其他演唱者（对唱 / 合唱主旋律），右对齐
-                    //     之前把它们一律塞进上一条 v1 的 companionLines 会得到
-                    //     "一行主歌词 + 多行小字副词" 的别扭排版（对唱整段被压成副词）。
-                    // 真正的 "和声 / 副词" 只通过 <span ttm:role="x-bg"> 表达，
-                    // 在 parseP 内部已挂到当前 <p> 的 companions 上，仍按副词通道渲染。
-                    val isPrimaryAgent = parsed.agent == null || parsed.agent == "v1"
-                    val alignment = if (isPrimaryAgent) {
-                        PipoLyricAlignment.Start
-                    } else {
-                        PipoLyricAlignment.End
+            if (event == XmlPullParser.START_TAG) {
+                when (parser.name) {
+                    "agent" -> parseAgent(parser)?.let { agents[it.id] = it }
+                    "p" -> {
+                        val parsed = parseP(parser)
+                        if (parsed != null) {
+                            // 所有 <p> 都作为独立 Primary；对唱右对齐规则：
+                            // group（多人合唱）不右对齐；其余演唱者中第一位出场者左对齐、其余一律右对齐。
+                            // 真正的背景人声 / 副词仍只通过 <span ttm:role="x-bg"> 进入 companionLines。
+                            val agentId = parsed.agent ?: DEFAULT_AGENT_ID
+                            val agent = agents[agentId]
+                            val isGroup = agent?.type == AGENT_TYPE_GROUP
+                            val isDuet = if (isGroup) {
+                                false
+                            } else {
+                                if (baseAgentId == null) baseAgentId = agentId
+                                agentId != baseAgentId
+                            }
+                            val alignment = if (isDuet) {
+                                PipoLyricAlignment.End
+                            } else {
+                                PipoLyricAlignment.Start
+                            }
+                            primaries.add(
+                                parsed.toPipoLine(role = PipoLyricRole.Primary, alignment = alignment)
+                            )
+                        }
                     }
-                    primaries.add(
-                        parsed.toPipoLine(role = PipoLyricRole.Primary, alignment = alignment)
-                    )
                 }
             }
             event = parser.next()
         }
         return primaries.sortedBy { it.startMs }
+    }
+
+    private fun parseAgent(parser: XmlPullParser): AgentInfo? {
+        val id = parser.getAttributeValue(XML_NS, "id")
+            ?: parser.getAttributeValue(null, "xml:id")
+            ?: parser.getAttributeValue(null, "id")
+            ?: return null
+        val type = parser.getAttributeValue(null, "type")
+            ?: parser.getAttributeValue(TTM_NS, "type")
+            ?: parser.getAttributeValue(null, "ttm:type")
+        return AgentInfo(id = id, type = type)
     }
 
     /** 解析单个 `<p>` 元素 —— 返回 null 表示该 p 没拿到有效 begin/end，直接跳过。 */
@@ -112,8 +136,18 @@ object AmllTtmlParser {
                                 }
                             }
                             "x-roman" -> {
-                                // 暂不消费罗马音 —— 跳过 span 内容
-                                skipElement(parser)
+                                val text = readSpanText(parser).trim()
+                                if (text.isNotEmpty()) {
+                                    companions.add(
+                                        PipoLyricLine(
+                                            startMs = pBegin,
+                                            durationMs = (pEnd - pBegin).coerceAtLeast(1L),
+                                            text = text,
+                                            timing = PipoLyricTiming.Line,
+                                            role = PipoLyricRole.Romaji,
+                                        )
+                                    )
+                                }
                             }
                             "x-bg" -> {
                                 // 背景人声 / 合唱：x-bg span 自己带 begin/end，内部嵌套字级 <span> 子节点。
@@ -169,12 +203,13 @@ object AmllTtmlParser {
             }
             event = parser.next()
         }
+        val mergedChars = mergeAdjacentAsciiLyricChars(chars)
         return ParsedP(
             beginMs = pBegin,
             endMs = pEnd,
             agent = pAgent,
             text = mainTextBuilder.toString(),
-            chars = chars,
+            chars = mergedChars,
             companions = companions,
         )
     }
@@ -245,12 +280,13 @@ object AmllTtmlParser {
             bgChars.joinToString("") { it.text }
         }
         if (finalText.isBlank()) return null
+        val mergedBgChars = mergeAdjacentAsciiLyricChars(bgChars)
         return PipoLyricLine(
             startMs = bgBegin,
             durationMs = (bgEnd - bgBegin).coerceAtLeast(1L),
             text = finalText,
-            chars = bgChars,
-            timing = if (bgChars.isNotEmpty()) PipoLyricTiming.Word else PipoLyricTiming.Line,
+            chars = mergedBgChars,
+            timing = if (mergedBgChars.isNotEmpty()) PipoLyricTiming.Word else PipoLyricTiming.Line,
             role = PipoLyricRole.Companion,
         )
     }
@@ -358,4 +394,12 @@ object AmllTtmlParser {
     }
 
     private const val TTM_NS = "http://www.w3.org/ns/ttml#metadata"
+    private const val XML_NS = "http://www.w3.org/XML/1998/namespace"
+    private const val DEFAULT_AGENT_ID = "v1"
+    private const val AGENT_TYPE_GROUP = "group"
+
+    private data class AgentInfo(
+        val id: String,
+        val type: String?,
+    )
 }

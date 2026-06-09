@@ -1,5 +1,5 @@
 [package]
-name = "claudio"
+name = "pipo"
 version = "0.1.30"
 description = "An AI radio distilled from your own playlists."
 edition = "2021"

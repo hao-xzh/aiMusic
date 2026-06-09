@@ -145,7 +145,7 @@ class DistillEngine(
         onProgress(DistillProgress.CallingAi)
         val raw = runCatching {
             repository.aiChat(
-                system = "你是 Claudio 的口味蒸馏器。听过比客人多的曲库 + 像独立唱片店老板。只输出 JSON，不要解释。",
+                system = "你是 Pipo 的口味蒸馏器。听过比客人多的曲库 + 像独立唱片店老板。只输出 JSON，不要解释。",
                 user = user,
                 temperature = temperature,
                 maxTokens = 1400,

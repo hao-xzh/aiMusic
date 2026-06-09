@@ -110,6 +110,7 @@ enum class PipoLyricRole {
     Primary,
     Companion,
     Translation,
+    Romaji,
 }
 
 /**

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Claudio 主播放卡片 v6 —— Apple Music / Shopify 极简风 + 沉浸式歌词覆盖层。
+ * Pipo 主播放卡片 v6 —— Apple Music / Shopify 极简风 + 沉浸式歌词覆盖层。
  *
  * 设计原则：
  *   - 默认（compact）布局完全保持 v5 的样子 —— 单列、海报、控制条、3 行歌词带。

@@ -177,13 +177,14 @@ class MusicResolver(
         plan: MusicTurnPlan,
         localTracks: List<NativeTrack>,
     ): PetIntent {
+        val useTextSignals = !plan.plannerRaw.startsWith("tool_loop")
         val target = action.target
         val primaryTracks = action.primaryGoal.primaryTracks
         val mustInclude = action.primaryGoal.mustInclude
         val closer = action.primaryGoal.closer
         val lexicon = CatalogLexicon(localTracks)
-        val trackMentions = lexicon.findTrackMentions(plan.userText).take(4)
-        val artistMentions = lexicon.findArtistMentions(plan.userText).take(4)
+        val trackMentions = if (useTextSignals) lexicon.findTrackMentions(plan.userText).take(4) else emptyList()
+        val artistMentions = if (useTextSignals) lexicon.findArtistMentions(plan.userText).take(4) else emptyList()
         val trackHints = mergeTextHints(
             (listOfNotNull(target) + primaryTracks + mustInclude + listOfNotNull(closer)).map { it.title },
             trackMentions.map { it.title },
@@ -203,13 +204,13 @@ class MusicResolver(
         val styleAvoid = mergeTextHints(style.avoidTags, goal.aiAvoidStyles)
         val excludeTerms = mergeTextHints(goal.excludeTerms, styleAvoid)
         val genres = mergeTextHints(
-            genreHints(plan.userText),
+            if (useTextSignals) genreHints(plan.userText) else emptyList(),
             style.genres,
             goal.hardGenres,
             goal.aiMainStyles,
         )
         val languages = mergeTextHints(
-            CommandTextSignals.languageIncludes(plan.userText, excludeTerms),
+            if (useTextSignals) CommandTextSignals.languageIncludes(plan.userText, excludeTerms) else emptyList(),
             style.languages,
             goal.hardLanguages,
         )
@@ -222,11 +223,12 @@ class MusicResolver(
         val energy = when {
             style.energy.isNotBlank() && style.energy != "any" -> style.energy
             goal.softEnergy.isNotBlank() && goal.softEnergy != "any" -> goal.softEnergy
-            else -> CommandTextSignals.energyHint(plan.userText)
+            useTextSignals -> CommandTextSignals.energyHint(plan.userText)
+            else -> "any"
         }
         val semanticQuery = style.semanticQuery
             .ifBlank { goal.searchSeeds.firstOrNull().orEmpty() }
-            .ifBlank { plan.userText }
+            .ifBlank { if (useTextSignals) plan.userText else structuredSearchQuery(action) }
         val styleTerms = mergeTextHints(softMoods, softScenes, softTextures, softQualityWords, refStyles)
         return PetIntent(
             queryText = semanticQuery,
@@ -238,7 +240,7 @@ class MusicResolver(
             hardTracks = if (action.mode == PlayMode.PlayNow || action.mode == PlayMode.InsertNext) trackHints else emptyList(),
             textTracks = trackHints,
             excludeArtists = excludeTerms.filterNot(::looksLikeLanguage),
-            excludeLanguages = CommandTextSignals.languageExcludes(plan.userText),
+            excludeLanguages = if (useTextSignals) CommandTextSignals.languageExcludes(plan.userText) else emptyList(),
             excludeTags = excludeTerms.filterNot(::looksLikeLanguage),
             avoidWords = excludeTerms,
             softMoods = softMoods,
@@ -564,9 +566,23 @@ class MusicResolver(
             append("actions=").append(actions.size)
             append(";playActions=").append(play.size)
             append(";tracks=").append(play.sumOf { it.tracks.size })
-            val includeTitle = CommandTextSignals.includedTrackTitle(plan.userText)
-            val includeArtists = CommandTextSignals.includedArtistHints(plan.userText)
-            val closerTitle = CommandTextSignals.closerTrackTitle(plan.userText)
+            val structured = plan.plannerRaw.startsWith("tool_loop")
+            val firstPlay = play.firstOrNull()
+            val includeTitle = if (structured) {
+                firstPlay?.primaryGoal?.mustInclude?.firstOrNull()?.title
+            } else {
+                CommandTextSignals.includedTrackTitle(plan.userText)
+            }
+            val includeArtists = if (structured) {
+                firstPlay?.primaryGoal?.includeArtists.orEmpty()
+            } else {
+                CommandTextSignals.includedArtistHints(plan.userText)
+            }
+            val closerTitle = if (structured) {
+                firstPlay?.primaryGoal?.closer?.title
+            } else {
+                CommandTextSignals.closerTrackTitle(plan.userText)
+            }
             if (!includeTitle.isNullOrBlank()) append(";mustInclude=").append(includeTitle)
             if (includeArtists.isNotEmpty()) append(";includeArtists=").append(includeArtists.joinToString("/"))
             if (!closerTitle.isNullOrBlank()) append(";closer=").append(closerTitle)
@@ -575,10 +591,24 @@ class MusicResolver(
 
     private fun missingRequirements(plan: MusicTurnPlan, actions: List<PlannedAction>): List<String> {
         val tracks = actions.filterIsInstance<PlannedAction.PlayTracks>().flatMap { it.tracks }
+        val play = actions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull()
         val missing = mutableListOf<String>()
-        val includeTitle = CommandTextSignals.includedTrackTitle(plan.userText)
-        val includeArtists = CommandTextSignals.includedArtistHints(plan.userText)
-        val closerTitle = CommandTextSignals.closerTrackTitle(plan.userText)
+        val structured = plan.plannerRaw.startsWith("tool_loop")
+        val includeTitle = if (structured) {
+            play?.primaryGoal?.mustInclude?.firstOrNull()?.title
+        } else {
+            CommandTextSignals.includedTrackTitle(plan.userText)
+        }
+        val includeArtists = if (structured) {
+            play?.primaryGoal?.includeArtists.orEmpty()
+        } else {
+            CommandTextSignals.includedArtistHints(plan.userText)
+        }
+        val closerTitle = if (structured) {
+            play?.primaryGoal?.closer?.title
+        } else {
+            CommandTextSignals.closerTrackTitle(plan.userText)
+        }
         if (!includeTitle.isNullOrBlank() && tracks.none { titleMatches(it.title, includeTitle) }) {
             missing.add("mustInclude:$includeTitle")
         }
@@ -592,6 +622,18 @@ class MusicResolver(
             missing.add("closer:$closerTitle")
         }
         return missing
+    }
+
+    private fun structuredSearchQuery(action: PlannedAction.PlayRequest): String {
+        val goal = action.primaryGoal
+        return listOf(
+            action.target?.let { listOfNotNull(it.artist, it.title).joinToString(" ") },
+            goal.primaryTracks.firstOrNull()?.let { listOfNotNull(it.artist, it.title).joinToString(" ") },
+            goal.primaryArtists.joinToString(" ").takeIf { it.isNotBlank() },
+            goal.hardGenres.joinToString(" ").takeIf { it.isNotBlank() },
+            goal.softMoods.joinToString(" ").takeIf { it.isNotBlank() },
+            goal.softScenes.joinToString(" ").takeIf { it.isNotBlank() },
+        ).firstOrNull { !it.isNullOrBlank() }.orEmpty()
     }
 
     private fun diversifyByArtist(tracks: List<NativeTrack>, cap: Int = 3): List<NativeTrack> {

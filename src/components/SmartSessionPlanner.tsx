@@ -3,7 +3,7 @@
 /**
  * 主动 Session Planner。
  *
- * 只在启动后一小会儿、用户还没播放时尝试一次：让 Claudio 根据当前时段和设置
+ * 只在启动后一小会儿、用户还没播放时尝试一次：让 Pipo 根据当前时段和设置
  * 排一段短队列。AI 只负责理解场景和一句短回复，选歌仍走 pet-agent 的本地召回
  * / rank / smoothQueue 流水线，避免让模型直接编曲目。
  */
@@ -205,7 +205,7 @@ async function makeSmartSession(
       continuous: response.continuous ?? null,
     };
   } catch (e) {
-    console.debug("[claudio] smart session failed", e);
+    console.debug("[pipo] smart session failed", e);
     return null;
   }
 }
@@ -261,7 +261,7 @@ function buildSessionBrief(
 
 function buildSessionPrompt(brief: SessionBrief, refresh: boolean, extraIntent?: string): string {
   return [
-    refresh ? "给我换一版 Claudio 电台，不要重复刚才那版。" : "你现在替我安排一段 Claudio 电台。",
+    refresh ? "给我换一版 Pipo 电台，不要重复刚才那版。" : "你现在替我安排一段 Pipo 电台。",
     `当下：${brief.contextLine}`,
     `规则：${brief.mode}`,
     extraIntent ? `临时纠偏：${extraIntent}` : "",

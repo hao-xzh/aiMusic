@@ -115,29 +115,33 @@ internal fun LandscapePlayerLyricsScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    AppleMusicLyricColumn(
-                        lines = lyrics,
-                        sessionId = trackId,
-                        activeLyricIndex = activeLyricIndex,
-                        positionMs = positionMs,
-                        isPlaying = isPlaying,
-                        fg = fg,
-                        fgDim = fgDim,
-                        fgUnsung = fgUnsung,
-                        showTranslation = showTranslation,
-                        onSeekToMs = onSeekToMs,
-                        horizontalPadding = 0.dp,
-                        rowMinHeight = 52.dp,
-                        rowVerticalPadding = 6.dp,
-                        lyricFontSize = 25.sp,
-                        lyricLineHeight = 39.sp,
-                        lyricFontWeight = FontWeight.ExtraBold,
-                        bottomFadeStart = 0.90f,
-                        bottomFadeSoftEnd = 0.98f,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
-                    )
+                    androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides landscapeAccent) {
+                        AppleMusicLyricColumn(
+                            lines = lyrics,
+                            sessionId = trackId,
+                            activeLyricIndex = activeLyricIndex,
+                            positionMs = positionMs,
+                            isPlaying = isPlaying,
+                            fg = fg,
+                            fgDim = fgDim,
+                            fgUnsung = fgUnsung,
+                            showTranslation = showTranslation,
+                            onSeekToMs = onSeekToMs,
+                            horizontalPadding = 0.dp,
+                            rowMinHeight = 52.dp,
+                            rowVerticalPadding = 6.dp,
+                            lyricFontSize = 25.sp,
+                            lyricLineHeight = 39.sp,
+                            lyricFontWeight = FontWeight.ExtraBold,
+                            bottomFadeStart = 0.90f,
+                            bottomFadeSoftEnd = 0.98f,
+                            // 横屏把固定歌词位置整体下移 80dp（竖屏 ImmersiveLyrics 不传，保持不变）。
+                            anchorBiasDp = 80.dp,
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                        )
+                    }
 
                     LandscapeBottomControls(
                         progress = progress,

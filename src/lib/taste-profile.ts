@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * 口味画像 —— Claudio AI 推荐的"地基"。
+ * 口味画像 —— Pipo AI 推荐的"地基"。
  *
  * 设计要点：
  *   - 整张 profile 是一个 plain JSON，存到 cache.setState(KEY, JSON)。
@@ -94,7 +94,7 @@ export async function loadTasteProfile(): Promise<TasteProfile | null> {
     if (!parsed || parsed.version !== 1) return null;
     return parsed;
   } catch (e) {
-    console.warn("[claudio] taste profile 解析失败", e);
+    console.warn("[pipo] taste profile 解析失败", e);
     return null;
   }
 }
@@ -278,7 +278,7 @@ export async function distillTaste(
       acousticPersist = { analyzed: acoustic.analyzed, metrics: acoustic.metrics };
     }
   } catch (e) {
-    console.debug("[claudio] acoustic aggregate failed", e);
+    console.debug("[pipo] acoustic aggregate failed", e);
   }
 
   const playlistList = details
@@ -326,7 +326,7 @@ export async function distillTaste(
   onProgress({ phase: "calling-ai" });
   const raw = await ai.chat({
     system:
-      "你是 Claudio 的口味蒸馏器。听过比客人多的曲库 + 像独立唱片店老板。只输出 JSON，不要解释。",
+      "你是 Pipo 的口味蒸馏器。听过比客人多的曲库 + 像独立唱片店老板。只输出 JSON，不要解释。",
     user,
     temperature,
     maxTokens: 1400,
@@ -336,7 +336,7 @@ export async function distillTaste(
   const aiParsed = parseProfileBody(raw);
   const parsed = aiParsed ?? buildFallbackProfile(sample, details);
   if (!aiParsed) {
-    console.warn("[claudio] AI 画像 JSON 不可用，已使用本地统计画像兜底");
+    console.warn("[pipo] AI 画像 JSON 不可用，已使用本地统计画像兜底");
   }
 
   const profile: TasteProfile = {
@@ -372,7 +372,7 @@ function parseProfileBody(raw: string): Omit<
   const record = obj as Record<string, unknown>;
   const summary = asString(record.summary);
   if (!summary) {
-    console.warn("[claudio] taste profile JSON 缺少 summary", raw.slice(0, 200));
+    console.warn("[pipo] taste profile JSON 缺少 summary", raw.slice(0, 200));
     return null;
   }
   return {

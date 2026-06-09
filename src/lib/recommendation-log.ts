@@ -69,7 +69,7 @@ function scheduleFlush() {
     const trimmed = buffer.slice(-MAX_EVENTS);
     if (trimmed.length !== buffer.length) buffer = trimmed;
     cache.setState(KEY, JSON.stringify(buffer)).catch((e) => {
-      console.debug("[claudio] recommendation_log 落盘失败", e);
+      console.debug("[pipo] recommendation_log 落盘失败", e);
     });
   }, 50);
 }

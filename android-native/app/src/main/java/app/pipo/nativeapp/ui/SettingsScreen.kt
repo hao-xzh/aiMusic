@@ -373,12 +373,12 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
         // 03 / PREFERENCES
         SettingsSectionHeader("03", "PREFERENCES")
 
-        // Claudio 性格：5 选 1 改成下拉，体感跟其它一行设置项一致，不再撑满半屏。
+        // Pipo 性格：5 选 1 改成下拉，体感跟其它一行设置项一致，不再撑满半屏。
         // 当前人格作为 trigger 文案，点开 Popup 在原位置弹出全部选项；选中即写
         // settings.personaId。视觉对齐 PipoButton（透明底 + GlassStroke 边框 + Ink 文字）。
         val currentPersona = PetPersona.fromId(settings.personaId)
         PipoRow(
-            title = "Claudio 性格",
+            title = "Pipo 性格",
             subtitle = "TA 跟你说话的语气。切换立即生效；下次开 app 用新人格打招呼。",
         ) {
             PipoPersonaDropdown(
@@ -392,7 +392,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository) {
 
         PipoToggleRow(
             title = "隐藏 AI 圆球",
-            subtitle = "在播放页隐藏 Claudio Pet 的物理实体悬浮球",
+            subtitle = "在播放页隐藏 Pipo Pet 的物理实体悬浮球",
             checked = settings.hideAiPetOrb,
             onCheckedChange = {
                 logSettingToggle("hideAiPetOrb", it)
@@ -481,7 +481,7 @@ private suspend fun copyDiagnosticsToClipboard(context: Context) {
         DiagnosticsLogStore.snapshotText(context, maxBytes = 360_000)
     }
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    clipboard.setPrimaryClip(ClipData.newPlainText("PIPO diagnostic log", text))
+    clipboard.setPrimaryClip(ClipData.newPlainText("Pipo diagnostic log", text))
     DiagnosticsLogStore.record("diagnostics", "copied", mapOf("chars" to text.length))
     Toast.makeText(context, "诊断日志已复制", Toast.LENGTH_SHORT).show()
 }
@@ -502,8 +502,8 @@ private suspend fun shareDiagnosticsTxt(context: Context) {
     )
     val sendIntent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
-        putExtra(Intent.EXTRA_SUBJECT, "PIPO diagnostic log")
-        putExtra(Intent.EXTRA_TEXT, "PIPO 诊断日志")
+        putExtra(Intent.EXTRA_SUBJECT, "Pipo diagnostic log")
+        putExtra(Intent.EXTRA_TEXT, "Pipo 诊断日志")
         putExtra(Intent.EXTRA_STREAM, uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }

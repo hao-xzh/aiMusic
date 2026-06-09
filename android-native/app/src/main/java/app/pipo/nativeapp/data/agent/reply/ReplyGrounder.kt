@@ -12,6 +12,20 @@ class ReplyGrounder(
     private val templates: GroundedReplyTemplates = GroundedReplyTemplates(),
     private val copywriter: PersonaActionCopywriter? = TemplatePersonaActionCopywriter(templates),
 ) {
+    companion object {
+        /**
+         * 让回复由 LLM 按人格现写（不再用模板）：[aiChat] 通常接 `repository.aiChat`。
+         * 仍走 [ReplyVerifier] 校验 + 模板兜底，言行一致不打折。
+         */
+        fun withLlmCopywriter(aiChat: suspend (system: String, user: String) -> String): ReplyGrounder {
+            val templates = GroundedReplyTemplates()
+            return ReplyGrounder(
+                templates = templates,
+                copywriter = LlmPersonaActionCopywriter(aiChat, templates),
+            )
+        }
+    }
+
     suspend fun ground(
         plan: MusicTurnPlan,
         validation: QueueValidation,

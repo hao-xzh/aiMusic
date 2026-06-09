@@ -27,7 +27,7 @@ export function AnalysisAutoResume() {
         if (!alive || lib.length === 0) return;
         void startBackgroundAnalysis(lib);
       } catch (e) {
-        console.debug("[claudio] 自动续跑分析失败", e);
+        console.debug("[pipo] 自动续跑分析失败", e);
       }
     }, START_DELAY_MS);
     return () => {
