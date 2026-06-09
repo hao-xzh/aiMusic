@@ -1835,7 +1835,7 @@ private fun DrawScope.drawNativeSlowSegmentText(
         val liftPx = -fontPx * (baseLiftEm * sung + slow.amount * NATIVE_SLOW_LIFT_EM_GAIN * wave) * mScale
         val glyphScale = 1f + slow.amount * NATIVE_SLOW_SCALE_GAIN * wave * mScale
         val glyphText = ch.toString()
-        val glyphLayout = glyphLayoutCache.getOrPut(glyphText) {
+        val glyphLayout = glyphLayoutCache.getOrPut("$i:$glyphText") {
             glyphMeasurer.measure(
                 text = AnnotatedString(glyphText),
                 style = glyphStyle,
