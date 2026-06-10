@@ -16,6 +16,7 @@ import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
 import app.pipo.nativeapp.playback.orchestrator.QueueHardConstraints
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
+import app.pipo.nativeapp.playback.PlaybackUrlResolver
 import kotlinx.coroutines.flow.first
 
 class PlayerAgentExecutor(
@@ -25,6 +26,12 @@ class PlayerAgentExecutor(
     private val onApplyAgentQueueRequest: suspend (AgentQueueRequest) -> QueueCommitResult,
     private val onSkip: () -> Unit,
 ) : AgentActionExecutor {
+    private val playbackUrlResolver = PlaybackUrlResolver(
+        repository = repository,
+        streamLevelFallbacks = STREAM_LEVEL_FALLBACKS,
+        streamUrlTimeoutMs = STREAM_URL_TIMEOUT_MS,
+    )
+
     override suspend fun playQueue(
         actionId: String,
         mode: PlayMode,
@@ -39,13 +46,24 @@ class PlayerAgentExecutor(
             mode == PlayMode.PlayNow -> QueueOperation.PlayNow
             else -> QueueOperation.ReplaceQueue
         }
+        val requestTracks = when (operation) {
+            QueueOperation.PlayNow,
+            QueueOperation.ReplaceQueue,
+            QueueOperation.PlaySimilar -> {
+                val first = tracks.firstOrNull() ?: return noPlayableSource(actionId, "play_queue", null)
+                val resolvedFirst = resolvePlayableTarget(actionId, operation, first)
+                    ?: return noPlayableSource(actionId, "play_queue", first)
+                listOf(resolvedFirst) + tracks.drop(1)
+            }
+            else -> tracks
+        }
         val request = AgentQueueRequest(
             requestId = actionId,
             sourceUserText = sourceUserText,
             operation = operation,
-            tracks = tracks,
+            tracks = requestTracks,
             continuous = continuous,
-            desiredCount = tracks.size,
+            desiredCount = requestTracks.size,
             hardConstraints = hardConstraintsFor(primaryGoal, target, operation),
         )
         return resultForCommit(actionId, "play_queue", request, onApplyAgentQueueRequest(request), similar)
@@ -56,16 +74,18 @@ class PlayerAgentExecutor(
         track: NativeTrack,
         jumpToInserted: Boolean,
     ): ActionExecutionResult {
+        val resolvedTrack = resolvePlayableTarget(actionId, QueueOperation.InsertNext, track)
+            ?: return noPlayableSource(actionId, "insert_next", track)
         val request = AgentQueueRequest(
             requestId = actionId,
             sourceUserText = sourceUserText,
             operation = QueueOperation.InsertNext,
-            tracks = listOf(track),
+            tracks = listOf(resolvedTrack),
             continuous = null,
             jumpToInserted = jumpToInserted,
             desiredCount = 1,
             hardConstraints = QueueHardConstraints(
-                nextTrack = TrackRequirement(title = track.title, artist = track.artist, placement = TrackPlacement.Next),
+                nextTrack = TrackRequirement(title = resolvedTrack.title, artist = resolvedTrack.artist, placement = TrackPlacement.Next),
             ),
         )
         return resultForCommit(actionId, "insert_next", request, onApplyAgentQueueRequest(request), similar = false)
@@ -260,6 +280,45 @@ class PlayerAgentExecutor(
     private fun trackLabel(track: NativeTrack): String =
         listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" - ").ifBlank { track.title }
 
+    private suspend fun resolvePlayableTarget(
+        actionId: String,
+        operation: QueueOperation,
+        track: NativeTrack,
+    ): NativeTrack? {
+        val resolved = playbackUrlResolver.resolveSinglePlayable(track)
+        if (resolved == null) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "playback_preflight_no_source",
+                fields = mapOf(
+                    "actionId" to actionId,
+                    "operation" to operation.name,
+                    "trackId" to track.id,
+                    "neteaseId" to track.neteaseId,
+                    "title" to track.title,
+                    "artist" to track.artist,
+                ),
+            )
+        }
+        return resolved
+    }
+
+    private fun noPlayableSource(
+        actionId: String,
+        type: String,
+        track: NativeTrack?,
+    ): ActionExecutionResult =
+        ActionExecutionResult(
+            actionId = actionId,
+            type = type,
+            success = false,
+            message = NO_PLAYABLE_SOURCE_MESSAGE,
+            tracks = listOfNotNull(track),
+            acceptedByPlayer = false,
+            errorMessage = NO_PLAYABLE_SOURCE_MESSAGE,
+            warnings = listOf(NO_PLAYABLE_SOURCE_MESSAGE),
+        )
+
     private fun hardConstraintsFor(
         primaryGoal: MusicGoal,
         target: TrackRequirement?,
@@ -365,5 +424,11 @@ class PlayerAgentExecutor(
                 )
             }
         }
+    }
+
+    private companion object {
+        private const val STREAM_URL_TIMEOUT_MS = 15_000L
+        private const val NO_PLAYABLE_SOURCE_MESSAGE = "很抱歉，没有找到可播放的音源。"
+        private val STREAM_LEVEL_FALLBACKS = listOf("lossless", "exhigh", "higher", "standard")
     }
 }

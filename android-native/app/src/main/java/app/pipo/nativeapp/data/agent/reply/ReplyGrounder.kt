@@ -13,6 +13,8 @@ class ReplyGrounder(
     private val copywriter: PersonaActionCopywriter? = TemplatePersonaActionCopywriter(templates),
 ) {
     companion object {
+        private const val NO_PLAYABLE_SOURCE_MESSAGE = "很抱歉，没有找到可播放的音源。"
+
         /**
          * 让回复由 LLM 按人格现写（不再用模板）：[aiChat] 通常接 `repository.aiChat`。
          * 仍走 [ReplyVerifier] 校验 + 模板兜底，言行一致不打折。
@@ -39,6 +41,10 @@ class ReplyGrounder(
             return (plan.actions.first() as PlannedAction.Clarify).question.ifBlank { "你想听哪首？" }.take(420)
         }
         val facts = ReplyFactsBuilder.from(plan, validation, results, persona)
+        if (!facts.success && facts.errorMessage.contains(NO_PLAYABLE_SOURCE_MESSAGE)) {
+            logPersonaReply(persona, facts, NO_PLAYABLE_SOURCE_MESSAGE, usedCopywriter = false, verified = true)
+            return NO_PLAYABLE_SOURCE_MESSAGE
+        }
         val drafted = runCatching { copywriter?.write(facts, persona) }
             .getOrNull()
             ?.trim()

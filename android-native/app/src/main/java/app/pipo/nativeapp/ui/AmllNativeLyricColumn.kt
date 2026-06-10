@@ -31,6 +31,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -176,31 +177,23 @@ internal fun AppleMusicLyricColumn(
         )
     }
     val transProgress = transAnim.value.coerceAtLeast(0f)
+    val transProgressState = rememberUpdatedState(transProgress)
+    val rowMetrics by remember(sessionKey, lines.size, estimatedRowHeightPx) {
+        derivedStateOf {
+            nativeRowMetrics(
+                lineCount = lines.size,
+                estimatedRowHeightPx = estimatedRowHeightPx,
+                transProgress = transProgressState.value,
+                mainRowHeights = mainRowHeights,
+                transFullHeights = transFullHeights,
+            )
+        }
+    }
 
-    fun mainHeight(index: Int): Int = mainRowHeights[index]?.coerceAtLeast(1) ?: estimatedRowHeightPx
-    fun transFull(index: Int): Int = transFullHeights[index]?.coerceAtLeast(0) ?: 0
-    // 与各行 reveal 的 collapsedHeight 同源取整，保证 renderTop 与 transUpTo 逐像素一致。
-    fun transContribution(index: Int): Int =
-        (transFull(index) * transProgress).roundToInt().coerceAtLeast(0)
-    fun rowHeight(index: Int): Int = mainHeight(index) + transContribution(index)
-    // 渲染坐标：含译文展开（整行实际高度累加）。
-    fun renderTop(index: Int): Float {
-        var top = 0f
-        for (i in 0 until index.coerceIn(0, lines.lastIndex + 1)) {
-            top += rowHeight(i)
-        }
-        return top
-    }
-    // 译文在某行之上累计撑开的高度（同步随 transProgress 变化）。
-    fun transUpTo(index: Int): Float {
-        var sum = 0f
-        for (i in 0 until index.coerceIn(0, lines.lastIndex + 1)) {
-            sum += transContribution(i)
-        }
-        return sum
-    }
+    fun rowHeight(index: Int): Int = rowMetrics.rowHeight(index)
+    fun renderTop(index: Int): Float = rowMetrics.renderTop(index)
     // 基准坐标：剔除译文展开，仅由主体高度累加，scrollSpring 全程工作在此坐标系。
-    fun rowTopBase(index: Int): Float = renderTop(index) - transUpTo(index)
+    fun rowTopBase(index: Int): Float = rowMetrics.rowTopBase(index)
     fun rowAnchor(index: Int): Float {
         val safeIndex = index.coerceIn(lines.indices)
         return rowTopBase(safeIndex)
@@ -208,41 +201,9 @@ internal fun AppleMusicLyricColumn(
     // 基准坐标位置 → 需叠加的译文累计量：随基准位置连续累加每行译文高度，
     // 跨越某行时按比例计入。这样「切行滚动」与「译文展开」都连续无跳变
     // （切行时译文高度随 spring 平滑分摊，而非整段瞬跳）。
-    fun transOffsetForBase(basePos: Float): Float {
-        var baseTop = 0f
-        var sum = 0f
-        for (i in lines.indices) {
-            val h = mainHeight(i).toFloat()
-            val t = transContribution(i).toFloat()
-            if (basePos >= baseTop + h) {
-                sum += t
-                baseTop += h
-            } else {
-                if (basePos > baseTop && h > 0f) sum += t * ((basePos - baseTop) / h)
-                break
-            }
-        }
-        return sum
-    }
+    fun transOffsetForBase(basePos: Float): Float = rowMetrics.transOffsetForBase(basePos)
     // 渲染坐标 → 基准坐标：手动拖动以 1:1 手感工作在渲染坐标，松手时换算回基准交给 spring。
-    fun baseForRenderCenter(renderPos: Float): Float {
-        var renderTopAcc = 0f
-        var baseTopAcc = 0f
-        for (i in lines.indices) {
-            val h = mainHeight(i).toFloat()
-            val rowRender = h + transContribution(i).toFloat()
-            if (renderPos >= renderTopAcc + rowRender) {
-                renderTopAcc += rowRender
-                baseTopAcc += h
-            } else {
-                if (renderPos > renderTopAcc && rowRender > 0f) {
-                    baseTopAcc += h * ((renderPos - renderTopAcc) / rowRender)
-                }
-                break
-            }
-        }
-        return baseTopAcc
-    }
+    fun baseForRenderCenter(renderPos: Float): Float = rowMetrics.baseForRenderCenter(renderPos)
 
     val timelineSnapshot by remember(lines, hasWordTiming, focusLeadMs, isPlaying, clockState) {
         derivedStateOf {
@@ -262,7 +223,13 @@ internal fun AppleMusicLyricColumn(
     val singingAnchorIdx = (timelineSnapshot.activeIndices.minOrNull() ?: playbackActiveIdx)
         .coerceIn(lines.indices)
     val latestActiveIdx = timelineSnapshot.latestIndex
-    val interlude: NativeInterlude? = null
+    // 间奏/前奏空档 ≥4s 时的 Apple 式三点呼吸指示。配合数据层 LyricCredits 把开头
+    // 制作人信息行剥掉后，每首歌前奏从 0ms 起就是这三个点，而不是干等第一句。
+    val interlude: NativeInterlude? = rememberNativeVisibleInterlude(
+        interlude = timelineSnapshot.interlude,
+        currentTimeMs = { clockState.value.toLong() },
+        sessionKey = sessionKey,
+    )
     val activeLineTopLiftPx = estimatedRowHeightPx.toFloat() * NATIVE_ACTIVE_LINE_TOP_UPSHIFT_ROWS
     val activeLineExtraLiftPx = with(density) { NATIVE_ACTIVE_LINE_EXTRA_UPSHIFT_DP.dp.toPx() }
     val anchorBiasPx = with(density) { anchorBiasDp.toPx() }
@@ -439,7 +406,7 @@ internal fun AppleMusicLyricColumn(
             if (!m.isFinite()) {
                 pa
             } else {
-                lines.indices.minByOrNull { kotlin.math.abs(renderTop(it) - m) } ?: pa
+                rowMetrics.nearestRenderIndex(m)
             }
         }
     }
@@ -449,11 +416,11 @@ internal fun AppleMusicLyricColumn(
     } else {
         NATIVE_INITIAL_RENDER_RADIUS_LINES
     }
+    val visibleStartIndex = (visualActiveIdx - renderRadiusRows).coerceAtLeast(0)
+    val visibleEndIndex = (visualActiveIdx + renderRadiusRows).coerceAtMost(lines.lastIndex)
     val initialWindowMeasured = if (containerHeightPx > 0 && lines.isNotEmpty()) {
-        val start = (visualActiveIdx - renderRadiusRows).coerceAtLeast(0)
-        val end = (visualActiveIdx + renderRadiusRows).coerceAtMost(lines.lastIndex)
         var ready = true
-        for (idx in start..end) {
+        for (idx in visibleStartIndex..visibleEndIndex) {
             if (!mainRowHeights.containsKey(idx)) ready = false
             if (
                 showTranslation &&
@@ -563,7 +530,7 @@ internal fun AppleMusicLyricColumn(
                                     current = currentCenter - dragAmount.y,
                                     anchorY = anchorYPx,
                                     // manualScrollCenterPx 工作在渲染坐标，用含译文的整行高度合计夹取边界。
-                                    totalHeight = (0 until lines.size).sumOf { rowHeight(it) }.toFloat(),
+                                    totalHeight = rowMetrics.totalRenderHeight,
                                     viewportHeight = containerHeightPx.toFloat(),
                                 )
                                 manualScrollCenterPx = next
@@ -577,162 +544,164 @@ internal fun AppleMusicLyricColumn(
     ) {
         // 渲染窗口按「行号」裁剪（基于 visualActiveIdx），不再依赖每帧 rowY：
         // 用最小行高估算半径（高估行数→多渲染几行，保证滚动时不漏、不空白）。
-        lines.forEachIndexed { idx, line ->
-            val distance = kotlin.math.abs(idx - visualActiveIdx)
-            if (distance > renderRadiusRows) {
-                return@forEachIndexed
-            }
-            val rowEnter = nativeRowEnterProgress(calibratedEnterProgress, distance)
-            val isActive = idx in timelineSnapshot.activeIndices
-            // 焦点统一为一个 composition 稳定的布尔（仅切句/越行才变）；缩放/上浮/透明度/虚化
-            // 都在行内用 tween 平滑驱动，滚动期间不再每帧重组（流畅度关键）。
-            val isFocused = idx == pendingSeekIdx || if (manualScrollActive) {
-                idx == visualActiveIdx
-            } else {
-                idx == playbackActiveIdx ||
-                    idx == lastScrollTargetIdx ||
-                    (idx == singingAnchorIdx && isActive)
-            }
-            val isPast = idx < playbackActiveIdx && !isActive
-            val isCompactLayout = with(density) { containerWidthPx.toDp().value <= NATIVE_COMPACT_LAYOUT_DP }
-            val blurTarget = nativeLineBlur(
-                itemIndex = idx,
-                scrollToIndex = playbackActiveIdx,
-                latestIndex = latestActiveIdx,
-                isActive = isFocused,
-                isUserDragging = isUserDragging,
-                isCompact = isCompactLayout,
-            )
-            val opacityTarget = nativeLineOpacity(
-                isActive = isFocused,
-            )
-            val itemAlignment = if (line.alignment == PipoLyricAlignment.End) Alignment.TopEnd else Alignment.TopStart
-            val lineWidthPx = nativeLineWidthPx(
-                containerWidthPx = containerWidthPx,
-                horizontalPaddingPx = horizontalPaddingPx,
-                compactWidthPx = compactWidthPx,
-                aspect = lineWidthAspectState.value,
-            )
-            val lineWidthDp = with(density) { lineWidthPx.toDp() }
-            val duetInsetDp = with(density) {
-                (lineWidthPx * NATIVE_DUET_INSET_ASPECT).toDp()
-            }
-            val duetStartPadding = if (hasDuetLine && line.alignment == PipoLyricAlignment.End) duetInsetDp else 0.dp
-            val duetEndPadding = if (hasDuetLine && line.alignment != PipoLyricAlignment.End) duetInsetDp else 0.dp
-            val lineContentWidthPx = (
-                lineWidthPx - if (hasDuetLine) lineWidthPx * NATIVE_DUET_INSET_ASPECT else 0f
-                ).coerceAtLeast(1f)
-            val rowScaleAnchor = rowAnchor(idx)
-            val rowScaleSpanPx = estimatedRowHeightPx.toFloat() * NATIVE_ROW_SCALE_FOCUS_SPAN_ROWS
-            val rowFocusProvider: () -> Float = {
-                nativePositionFocus(
-                    rowAnchor = rowScaleAnchor,
-                    focusAnchor = focusCenterBaseNow(),
-                    spanPx = rowScaleSpanPx,
+        for (idx in visibleStartIndex..visibleEndIndex) {
+            val line = lines[idx]
+            key(idx, line.startMs, line.text) {
+                val distance = kotlin.math.abs(idx - visualActiveIdx)
+                val rowEnter = nativeRowEnterProgress(calibratedEnterProgress, distance)
+                val isActive = idx in timelineSnapshot.activeIndices
+                val isManualFocus = manualScrollActive && idx == visualActiveIdx
+                // 焦点统一为一个 composition 稳定的布尔（仅切句/越行才变）；缩放/上浮/透明度/虚化
+                // 都在行内用 tween 平滑驱动，滚动期间不再每帧重组（流畅度关键）。
+                val isFocused = idx == pendingSeekIdx || if (manualScrollActive) {
+                    idx == visualActiveIdx
+                } else {
+                    idx == playbackActiveIdx ||
+                        idx == lastScrollTargetIdx ||
+                        (idx == singingAnchorIdx && isActive)
+                }
+                val isPast = idx < playbackActiveIdx && !isActive
+                val isCompactLayout = with(density) { containerWidthPx.toDp().value <= NATIVE_COMPACT_LAYOUT_DP }
+                val blurTarget = nativeLineBlur(
+                    itemIndex = idx,
+                    scrollToIndex = playbackActiveIdx,
+                    latestIndex = latestActiveIdx,
+                    isActive = isFocused,
+                    isUserDragging = isUserDragging,
+                    isCompact = isCompactLayout,
                 )
-            }
-            // 渲染窗口内的行才会被组合，屏外 buffer 行用户点不到，所以不再按 rowY 判定可点击。
-            val rowVisibleForClick = interactionReady &&
-                rowEnter > NATIVE_ROW_CLICK_MIN_ALPHA
+                val opacityTarget = nativeLineOpacity(
+                    isActive = isFocused,
+                )
+                val itemAlignment = if (line.alignment == PipoLyricAlignment.End) Alignment.TopEnd else Alignment.TopStart
+                val lineWidthPx = nativeLineWidthPx(
+                    containerWidthPx = containerWidthPx,
+                    horizontalPaddingPx = horizontalPaddingPx,
+                    compactWidthPx = compactWidthPx,
+                    aspect = lineWidthAspectState.value,
+                )
+                val lineWidthDp = with(density) { lineWidthPx.toDp() }
+                val duetInsetDp = with(density) {
+                    (lineWidthPx * NATIVE_DUET_INSET_ASPECT).toDp()
+                }
+                val duetStartPadding = if (hasDuetLine && line.alignment == PipoLyricAlignment.End) duetInsetDp else 0.dp
+                val duetEndPadding = if (hasDuetLine && line.alignment != PipoLyricAlignment.End) duetInsetDp else 0.dp
+                val lineContentWidthPx = (
+                    lineWidthPx - if (hasDuetLine) lineWidthPx * NATIVE_DUET_INSET_ASPECT else 0f
+                    ).coerceAtLeast(1f)
+                val rowScaleAnchor = rowAnchor(idx)
+                val rowScaleSpanPx = estimatedRowHeightPx.toFloat() * NATIVE_ROW_SCALE_FOCUS_SPAN_ROWS
+                val rowFocusProvider: () -> Float = {
+                    nativePositionFocus(
+                        rowAnchor = rowScaleAnchor,
+                        focusAnchor = focusCenterBaseNow(),
+                        spanPx = rowScaleSpanPx,
+                    )
+                }
+                // 渲染窗口内的行才会被组合，屏外 buffer 行用户点不到，所以不再按 rowY 判定可点击。
+                val rowVisibleForClick = interactionReady &&
+                    rowEnter > NATIVE_ROW_CLICK_MIN_ALPHA
 
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = horizontalPadding)
-                    // 行位置在 layout 阶段计算：读取滚动中心只触发重新布局、不触发重组，滚动因此流畅。
-                    .offset {
-                        IntOffset(0, (renderTop(idx) + anchorYPx - rowScrollCenterNow(idx)).roundToInt())
-                    },
-                contentAlignment = itemAlignment,
-            ) {
                 Box(
                     modifier = Modifier
-                        .width(lineWidthDp)
-                        .padding(start = duetStartPadding, end = duetEndPadding)
-                        .then(
-                            if (rowVisibleForClick) {
-                                // 两段式跳转（防误触）：第一击固定/高亮该行并暂停自动跟随；
-                                // 确认窗口内再点同一行才真正 seek。点其它行则改为固定那一行。
-                                Modifier.pointerInput(line.startMs, line.text) {
-                                    detectTapGestures(
-                                        onTap = {
-                                            val nowMs = SystemClock.elapsedRealtime()
-                                            if (pendingSeekIdx == idx && nowMs <= pendingSeekUntilMs) {
-                                                pendingSeekIdx = -1
-                                                pendingSeekUntilMs = 0L
-                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                                manualHoldUntilMs = 0L
-                                                isUserDragging = false
-                                                val seekCenter = rowAnchor(idx)
-                                                manualScrollCenterPx = Float.NaN
-                                                gestureScope.launch {
-                                                    scrollSpring.stop()
-                                                    // 处于手动态时渲染坐标≠基准坐标，先无缝接续，避免点击瞬跳。
-                                                    scrollSpring.snapTo(baseForRenderCenter(renderCenterNow()))
-                                                    motionFromCenter = scrollSpring.value
-                                                    motionFromIdx = visualActiveIdx
-                                                    motionTargetIdx = idx
-                                                    scrollSpring.animateTo(
-                                                        targetValue = seekCenter,
-                                                        animationSpec = nativeSeekSpringSpec(),
-                                                    )
-                                                }
-                                                onSeekToMs(LyricTiming.audioStartMs(line).coerceAtLeast(0L))
-                                            } else {
-                                                pendingSeekIdx = idx
-                                                pendingSeekUntilMs = nowMs + NATIVE_TAP_CONFIRM_WINDOW_MS
-                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                                // “固定”：确认窗口内暂停自动跟随滚动。
-                                                manualHoldUntilMs = maxOf(manualHoldUntilMs, pendingSeekUntilMs)
-                                                gestureScope.launch {
-                                                    delay(NATIVE_TAP_CONFIRM_WINDOW_MS)
-                                                    if (
-                                                        pendingSeekIdx == idx &&
-                                                        SystemClock.elapsedRealtime() >= pendingSeekUntilMs
-                                                    ) {
-                                                        pendingSeekIdx = -1
-                                                    }
-                                                }
-                                            }
-                                        },
-                                    )
-                                }
-                            } else {
-                                Modifier
-                            },
-                        ),
+                        .fillMaxWidth()
+                        .padding(horizontal = horizontalPadding)
+                        // 行位置在 layout 阶段计算：读取滚动中心只触发重新布局、不触发重组，滚动因此流畅。
+                        .offset {
+                            IntOffset(0, (renderTop(idx) + anchorYPx - rowScrollCenterNow(idx)).roundToInt())
+                        },
                     contentAlignment = itemAlignment,
                 ) {
-                    NativeAmllLyricRow(
-                        line = line,
-                        isActive = isActive,
-                        isFocused = isFocused,
-                        isPast = isPast,
-                        // 关键性能点：不再把 30Hz 变化的 positionMs 作为参数穿透行树
-                        // （那会让每个可见行每 tick 全量重组）；改传稳定的 State，
-                        // 时间相关判定在行内用 derivedStateOf / draw 阶段读取。
-                        timeState = rawPositionState,
-                        clockState = clockState,
-                        fg = fg,
-                        fgDim = fgDim,
-                        fgUnsung = fgUnsung,
-                        transProgress = transProgress,
-                        enterAlpha = rowEnter,
-                        onMainHeight = { h -> if (mainRowHeights[idx] != h) mainRowHeights[idx] = h },
-                        onTransFullHeight = { h -> if (transFullHeights[idx] != h) transFullHeights[idx] = h },
-                        rowMinHeight = rowMinHeight,
-                        isUserDragging = isUserDragging,
-                        isPlaying = isPlaying,
-                        targetOpacity = opacityTarget,
-                        targetBlur = blurTarget,
-                        rowFocusProvider = rowFocusProvider,
-                        fontSize = lyricFontSize,
-                        lineHeight = lyricLineHeight,
-                        fontWeight = lyricFontWeight,
-                        verticalPadding = rowVerticalPadding,
-                        lineWidthPx = lineContentWidthPx,
-                        effectsEnabled = effectsSettled,
-                    )
+                    Box(
+                        modifier = Modifier
+                            .width(lineWidthDp)
+                            .padding(start = duetStartPadding, end = duetEndPadding)
+                            .then(
+                                if (rowVisibleForClick) {
+                                    // 两段式跳转（防误触）：第一击固定/高亮该行并暂停自动跟随；
+                                    // 确认窗口内再点同一行才真正 seek。点其它行则改为固定那一行。
+                                    Modifier.pointerInput(line.startMs, line.text) {
+                                        detectTapGestures(
+                                            onTap = {
+                                                val nowMs = SystemClock.elapsedRealtime()
+                                                if (pendingSeekIdx == idx && nowMs <= pendingSeekUntilMs) {
+                                                    pendingSeekIdx = -1
+                                                    pendingSeekUntilMs = 0L
+                                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                    manualHoldUntilMs = 0L
+                                                    isUserDragging = false
+                                                    val seekCenter = rowAnchor(idx)
+                                                    manualScrollCenterPx = Float.NaN
+                                                    gestureScope.launch {
+                                                        scrollSpring.stop()
+                                                        // 处于手动态时渲染坐标≠基准坐标，先无缝接续，避免点击瞬跳。
+                                                        scrollSpring.snapTo(baseForRenderCenter(renderCenterNow()))
+                                                        motionFromCenter = scrollSpring.value
+                                                        motionFromIdx = visualActiveIdx
+                                                        motionTargetIdx = idx
+                                                        scrollSpring.animateTo(
+                                                            targetValue = seekCenter,
+                                                            animationSpec = nativeSeekSpringSpec(),
+                                                        )
+                                                    }
+                                                    onSeekToMs(LyricTiming.audioStartMs(line).coerceAtLeast(0L))
+                                                } else {
+                                                    pendingSeekIdx = idx
+                                                    pendingSeekUntilMs = nowMs + NATIVE_TAP_CONFIRM_WINDOW_MS
+                                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                    // “固定”：确认窗口内暂停自动跟随滚动。
+                                                    manualHoldUntilMs = maxOf(manualHoldUntilMs, pendingSeekUntilMs)
+                                                    gestureScope.launch {
+                                                        delay(NATIVE_TAP_CONFIRM_WINDOW_MS)
+                                                        if (
+                                                            pendingSeekIdx == idx &&
+                                                            SystemClock.elapsedRealtime() >= pendingSeekUntilMs
+                                                        ) {
+                                                            pendingSeekIdx = -1
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        )
+                                    }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                        contentAlignment = itemAlignment,
+                    ) {
+                        NativeAmllLyricRow(
+                            line = line,
+                            isActive = isActive,
+                            isFocused = isFocused,
+                            isPast = isPast,
+                            // 关键性能点：不再把 30Hz 变化的 positionMs 作为参数穿透行树
+                            // （那会让每个可见行每 tick 全量重组）；改传稳定的 State，
+                            // 时间相关判定在行内用 derivedStateOf / draw 阶段读取。
+                            timeState = rawPositionState,
+                            clockState = clockState,
+                            fg = fg,
+                            fgDim = fgDim,
+                            fgUnsung = fgUnsung,
+                            transProgress = transProgress,
+                            enterAlpha = rowEnter,
+                            onMainHeight = { h -> if (mainRowHeights[idx] != h) mainRowHeights[idx] = h },
+                            onTransFullHeight = { h -> if (transFullHeights[idx] != h) transFullHeights[idx] = h },
+                            rowMinHeight = rowMinHeight,
+                            isUserDragging = isUserDragging,
+                            isPlaying = isPlaying,
+                            targetOpacity = opacityTarget,
+                            targetBlur = blurTarget,
+                            isManualFocus = isManualFocus,
+                            rowFocusProvider = rowFocusProvider,
+                            fontSize = lyricFontSize,
+                            lineHeight = lyricLineHeight,
+                            fontWeight = lyricFontWeight,
+                            verticalPadding = rowVerticalPadding,
+                            lineWidthPx = lineContentWidthPx,
+                            effectsEnabled = effectsSettled,
+                        )
+                    }
                 }
             }
         }
@@ -751,15 +720,18 @@ internal fun AppleMusicLyricColumn(
             val dotGapPx = dotSizePx * NATIVE_INTERLUDE_DOT_GAP_EM
             val dotsWidthPx = dotSizePx * 3f + dotGapPx * 2f
             val dotMarginPx = fontPx * NATIVE_INTERLUDE_MARGIN_EM
-            val nextRowTop = renderTop(nextIndex) + anchorYPx - renderCenterNow()
-            val dotsY = nextRowTop - dotMarginPx - dotSizePx
             val alignEnd = nextLine.alignment == PipoLyricAlignment.End
 
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = horizontalPadding)
-                    .graphicsLayer { translationY = dotsY },
+                    // 滚动中心在 graphicsLayer 内逐帧读取（与歌词行同规），
+                    // 点位跟随滚动但不触发整列重组。
+                    .graphicsLayer {
+                        val nextRowTop = renderTop(nextIndex) + anchorYPx - renderCenterNow()
+                        translationY = nextRowTop - dotMarginPx - dotSizePx
+                    },
                 contentAlignment = if (alignEnd) Alignment.TopEnd else Alignment.TopStart,
             ) {
                 Box(
@@ -801,6 +773,7 @@ private fun NativeAmllLyricRow(
     isPlaying: Boolean,
     targetOpacity: Float,
     targetBlur: Float,
+    isManualFocus: Boolean,
     rowFocusProvider: () -> Float,
     fontSize: TextUnit,
     lineHeight: TextUnit,
@@ -887,23 +860,25 @@ private fun NativeAmllLyricRow(
                 verticalArrangement = Arrangement.spacedBy(1.dp),
             ) {
         leadingCompanions.forEach { companion ->
-            NativeAmllCompanionLine(
-                companion = companion,
-                hostActive = isActive,
-                itemAlignment = itemAlignment,
-                timeState = timeState,
-                clockState = clockState,
-                fg = fg,
-                fgUnsung = fgUnsung,
-                fontSize = fontSize,
-                lineHeight = lineHeight,
-                maskAlpha = maskAlpha,
-                isPlaying = isPlaying,
-                isBeforeMain = true,
-                ease = ease,
-                lineWidthPx = lineWidthPx,
-                effectsEnabled = effectsEnabled,
-            )
+            key("lead", companion.startMs, companion.text) {
+                NativeAmllCompanionLine(
+                    companion = companion,
+                    hostActive = isActive,
+                    itemAlignment = itemAlignment,
+                    timeState = timeState,
+                    clockState = clockState,
+                    fg = fg,
+                    fgUnsung = fgUnsung,
+                    fontSize = fontSize,
+                    lineHeight = lineHeight,
+                    maskAlpha = maskAlpha,
+                    isPlaying = isPlaying,
+                    isBeforeMain = true,
+                    ease = ease,
+                    lineWidthPx = lineWidthPx,
+                    effectsEnabled = effectsEnabled,
+                )
+            }
         }
 
         Box(modifier = Modifier.align(itemAlignment)) {
@@ -918,6 +893,7 @@ private fun NativeAmllLyricRow(
                 motionFocusProvider = rowFocusProvider,
                 fg = fg,
                 fgUnsung = fgUnsung,
+                keepFocusGradient = isManualFocus,
                 fontSize = fontSize,
                 lineHeight = lineHeight,
                 fontWeight = fontWeight,
@@ -928,23 +904,25 @@ private fun NativeAmllLyricRow(
         }
 
         trailingCompanions.forEach { companion ->
-            NativeAmllCompanionLine(
-                companion = companion,
-                hostActive = isActive,
-                itemAlignment = itemAlignment,
-                timeState = timeState,
-                clockState = clockState,
-                fg = fg,
-                fgUnsung = fgUnsung,
-                fontSize = fontSize,
-                lineHeight = lineHeight,
-                maskAlpha = maskAlpha,
-                isPlaying = isPlaying,
-                isBeforeMain = false,
-                ease = ease,
-                lineWidthPx = lineWidthPx,
-                effectsEnabled = effectsEnabled,
-            )
+            key("trail", companion.startMs, companion.text) {
+                NativeAmllCompanionLine(
+                    companion = companion,
+                    hostActive = isActive,
+                    itemAlignment = itemAlignment,
+                    timeState = timeState,
+                    clockState = clockState,
+                    fg = fg,
+                    fgUnsung = fgUnsung,
+                    fontSize = fontSize,
+                    lineHeight = lineHeight,
+                    maskAlpha = maskAlpha,
+                    isPlaying = isPlaying,
+                    isBeforeMain = false,
+                    ease = ease,
+                    lineWidthPx = lineWidthPx,
+                    effectsEnabled = effectsEnabled,
+                )
+            }
         }
 
             }
@@ -957,15 +935,17 @@ private fun NativeAmllLyricRow(
                     verticalArrangement = Arrangement.spacedBy(1.dp),
                 ) {
                     translations.forEach { translation ->
-                        NativeAmllTranslationLine(
-                            translation = translation,
-                            progress = transProgress,
-                            itemAlignment = itemAlignment,
-                            textAlign = textAlign,
-                            fg = fg,
-                            fontSize = fontSize,
-                            lineHeight = lineHeight,
-                        )
+                        key("sub", translation.role, translation.startMs, translation.text) {
+                            NativeAmllTranslationLine(
+                                translation = translation,
+                                progress = transProgress,
+                                itemAlignment = itemAlignment,
+                                textAlign = textAlign,
+                                fg = fg,
+                                fontSize = fontSize,
+                                lineHeight = lineHeight,
+                            )
+                        }
                     }
                 }
             }
@@ -1171,6 +1151,7 @@ private fun NativeAmllLyricText(
     motionFocusProvider: (() -> Float)? = null,
     fg: Color,
     fgUnsung: Color,
+    keepFocusGradient: Boolean = false,
     fontSize: TextUnit,
     lineHeight: TextUnit,
     fontWeight: FontWeight,
@@ -1192,16 +1173,35 @@ private fun NativeAmllLyricText(
         derivedStateOf { timeState.value - lineEndMs < NATIVE_WORD_EXIT_FLOAT_MS }
     }
     val exitFloatActive = !isActive && isPast && inExitFloatWindow
+    val canUseFocusGradient = !isPast || keepFocusGradient
     val focusMotion = if (isFocused && !isPast) motionFocus.coerceIn(0f, 1f) else 0f
     val isPreActiveFocus = !isActive && focusMotion > 0.001f
-    val shouldDrawTimed = line.chars.isNotEmpty() && (isActive || isPreActiveFocus || exitFloatActive)
+    // 手动拖动到非当前播放行时，视觉焦点应该保留行色渐变；如果继续走 timed 自绘，
+    // 它会用真实播放时钟计算这个远处句子的 sweep，结果常常是 0 或已结束，焦点渐变被透明文本路径盖掉。
+    val manualStaticFocus = keepFocusGradient && !isActive && !exitFloatActive
+    val shouldDrawTimed = line.chars.isNotEmpty() &&
+        !manualStaticFocus &&
+        (isActive || isPreActiveFocus || exitFloatActive)
     val useFrameClockForDraw = clockState != null && (isActive || isPreActiveFocus)
-    val baseColor = when {
-        shouldDrawTimed -> Color.Transparent
-        isActive -> fg
-        isFocused && !isPast -> fg
-        isPast -> nativeSolidLineColor(fg)
-        else -> fgUnsung
+    // 静态文本色不再离散跳变（旧的 when 分支在 fgUnsung→fg→已唱色之间瞬切，就是
+    // “切句时颜色跳一下/闪一下”的来源之一）。改成 focus / past 两个通道各自 tween、
+    // 连续插值：激活增亮、唱过变暗都有 Apple 式渐变；边界值与逐字自绘路径两端严格一致
+    // （未来=fgUnsung、唱过=nativeSolidLineColor），LRC 整行歌词从此也有亮度过渡。
+    val focusColorAnim by animateFloatAsState(
+        targetValue = if ((isActive || isFocused) && canUseFocusGradient) 1f else 0f,
+        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_LINE_SWITCH_EASE),
+        label = "nativeLyricFocusColor",
+    )
+    val pastColorAnim by animateFloatAsState(
+        targetValue = if (isPast) 1f else 0f,
+        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_LINE_SWITCH_EASE),
+        label = "nativeLyricPastColor",
+    )
+    val timedPlanReady = timedPlan?.segments?.isNotEmpty() == true
+    val baseColor = if (shouldDrawTimed && timedPlanReady) {
+        Color.Transparent
+    } else {
+        lerp(lerp(fgUnsung, nativeSolidLineColor(fg), pastColorAnim), fg, focusColorAnim)
     }
 
     Text(
@@ -1225,7 +1225,7 @@ private fun NativeAmllLyricText(
             Modifier.fillMaxWidth().drawWithContent {
                 val result = layout
                 val plan = timedPlan
-                if (result == null || plan == null || plan.layout !== result) {
+                if (result == null || plan == null || plan.layout !== result || plan.segments.isEmpty()) {
                     drawContent()
                 } else {
                     val drawPositionMs = if (useFrameClockForDraw) {
@@ -1258,6 +1258,9 @@ private fun NativeAmllLyricText(
                         isBackgroundVocal = isBackgroundVocal,
                         maskAlpha = maskAlpha,
                         motionScale = drawMotionScale,
+                        // 出场上浮窗口内把已唱色渐变到静态已唱色：窗口结束的那一帧颜色与
+                        // 静态路径完全相等，消除旧实现 100%→40% 亮度直切的“闪一下”。
+                        pastFade = if (isActive || isPreActiveFocus) 0f else 1f - drawMotionScale,
                         effectsEnabled = effectsEnabled,
                         accent = lyricAccent,
                     )
@@ -1545,6 +1548,7 @@ private fun DrawScope.drawNativeTimedLyric(
     isBackgroundVocal: Boolean,
     maskAlpha: NativeMaskAlpha,
     motionScale: Float,
+    pastFade: Float = 0f,
     effectsEnabled: Boolean,
     accent: Color,
 ) {
@@ -1555,7 +1559,8 @@ private fun DrawScope.drawNativeTimedLyric(
         return
     }
     val activeUnsung = if (isPast) nativeSolidLineColor(fg) else fgUnsung
-    val activeSung = fg
+    // pastFade：行唱完后的出场窗口里从满亮已唱色渐变到静态已唱色（与静态路径无缝衔接）。
+    val activeSung = lerp(fg, nativeSolidLineColor(fg), pastFade.coerceIn(0f, 1f))
     val fadeWidth = nativeWordFadeWidth(layout)
     val front = nativeLyricFront(segments, positionMs, fadeWidth)
         drawNativeSegmentSweepText(
@@ -2696,7 +2701,7 @@ private fun nativeLineAudioEndMs(line: PipoLyricLine): Long {
 @Composable
 private fun rememberNativeVisibleInterlude(
     interlude: NativeInterlude?,
-    currentTimeMs: Long,
+    currentTimeMs: () -> Long,
     sessionKey: String,
 ): NativeInterlude? {
     var activeKey by remember(sessionKey) { mutableStateOf<String?>(null) }
@@ -2711,7 +2716,9 @@ private fun rememberNativeVisibleInterlude(
             visibleStartMs = 0L
         } else {
             activeKey = interludeKey
-            visibleStartMs = maxOf(interlude.startMs, currentTimeMs)
+            // 时钟作为 provider 只在间奏边界读一次：拿到“此刻”做点亮起点，
+            // 不把每帧时钟当 composition 参数传（否则整列逐帧重组）。
+            visibleStartMs = maxOf(interlude.startMs, currentTimeMs())
         }
     }
 
@@ -2785,13 +2792,22 @@ private fun rememberNativeLyricClockMs(
                     smoothed = latestRawMs.floatValue
                 }
                 if (!canExtrapolate.value) {
-                    // 起播保护：位置尚不稳定时不外插，只单调跟随报告值。
+                    // 起播保护（位置尚不稳定，0ms 附近还在缓冲）：仍按墙钟 1x 外插——速度从
+                    // 第一帧就是正确的，只是封顶在「最新报告 + 小余量」。报告停着不动（还没真正
+                    // 出声）时，时钟最多走到余量处冻结等待；出声后立刻贴住数据继续。
+                    // 旧实现只在报告到达时跳步，而起播恰是主线程最忙、报告最稀疏的时刻，
+                    // 用户看到的就是“开头一小段快进式卡跳的校准过程”。
                     val rawTarget = latestRawMs.floatValue
-                    val rawDiff = rawTarget - smoothed
                     smoothed = when {
-                        rawDiff < -NATIVE_CLOCK_BACKWARD_RESET_MS -> rawTarget
-                        rawDiff > 0f -> rawTarget
-                        else -> smoothed
+                        // 远落后（边放边加载后位置已跑远）→ 一次对齐。
+                        rawTarget - smoothed > NATIVE_CLOCK_FRAME_RESET_MS -> rawTarget
+                        // 明显回退（起播重定位/回跳 seek）→ 一次对齐，不做慢动作。
+                        rawTarget < smoothed - NATIVE_CLOCK_BACKWARD_RESET_MS -> rawTarget
+                        // 常规：1x 前进，封顶 raw+余量；轻微回退时冻结在原地等数据追上，不回扫。
+                        else -> maxOf(
+                            smoothed,
+                            minOf(smoothed + dtMs, rawTarget + NATIVE_CLOCK_START_HEADROOM_MS),
+                        )
                     }
                     out.floatValue = smoothed
                     return@withFrameNanos
@@ -2799,11 +2815,12 @@ private fun rememberNativeLyricClockMs(
                 val target = (frame / 1e6 + baseMs.doubleValue).toFloat().coerceAtLeast(0f)
                 val diff = target - smoothed
                 smoothed = when {
-                    // 大偏差直接跟数据。
-                    kotlin.math.abs(diff) > NATIVE_CLOCK_FRAME_RESET_MS -> target
                     // 目标在前 → 直接采用（target 本身已平滑，不再做追赶滤波引入滞后）。
                     diff >= 0f -> target
-                    // 轻微超前（base 被向下校正）→ 降速滑行等数据追上：不回跳、不冻结。
+                    // 明显回退（数据权威向下校正较多）→ 一次性对齐。旧的 0.4x 降速滑行在
+                    // 回退几百毫秒时要拖 1-2 秒的“慢动作”，用户感知为速度不对/像在重放。
+                    diff < -NATIVE_CLOCK_BACKWARD_SNAP_MS -> target
+                    // 轻微超前（≤120ms 的向下校正）→ 降速滑行 ≤0.3s 消化：不回跳、不冻结。
                     else -> smoothed + dtMs * NATIVE_CLOCK_OVERRUN_GLIDE_SPEED
                 }
                 out.floatValue = smoothed
@@ -2870,6 +2887,139 @@ private fun nativeDampingRatio(
 ): Float {
     val root = kotlin.math.sqrt(stiffness.coerceAtLeast(0.0001f))
     return (damping / (2f * root)).coerceAtLeast(0.01f)
+}
+
+private class NativeRowMetrics(
+    private val mainHeights: IntArray,
+    private val transHeights: IntArray,
+    private val mainPrefix: FloatArray,
+    private val transPrefix: FloatArray,
+    private val renderPrefix: FloatArray,
+) {
+    private val lineCount: Int = mainHeights.size
+
+    val totalRenderHeight: Float
+        get() = renderPrefix[lineCount]
+
+    fun rowHeight(index: Int): Int {
+        if (lineCount <= 0) return 0
+        val safeIndex = index.coerceIn(0, lineCount - 1)
+        return mainHeights[safeIndex] + transHeights[safeIndex]
+    }
+
+    fun renderTop(index: Int): Float {
+        return renderPrefix[index.coerceIn(0, lineCount)]
+    }
+
+    fun rowTopBase(index: Int): Float {
+        return mainPrefix[index.coerceIn(0, lineCount)]
+    }
+
+    fun transOffsetForBase(basePos: Float): Float {
+        if (lineCount <= 0 || basePos <= 0f) return 0f
+        val totalMainHeight = mainPrefix[lineCount]
+        if (basePos >= totalMainHeight) return transPrefix[lineCount]
+        val row = (nativeUpperBound(mainPrefix, basePos, lineCount + 1) - 1)
+            .coerceIn(0, lineCount - 1)
+        val rowStart = mainPrefix[row]
+        val rowHeight = mainHeights[row].toFloat()
+        val partial = if (basePos > rowStart && rowHeight > 0f) {
+            transHeights[row].toFloat() * ((basePos - rowStart) / rowHeight)
+        } else {
+            0f
+        }
+        return transPrefix[row] + partial
+    }
+
+    fun baseForRenderCenter(renderPos: Float): Float {
+        if (lineCount <= 0 || renderPos <= 0f) return 0f
+        if (renderPos >= renderPrefix[lineCount]) return mainPrefix[lineCount]
+        val row = (nativeUpperBound(renderPrefix, renderPos, lineCount + 1) - 1)
+            .coerceIn(0, lineCount - 1)
+        val rowRenderStart = renderPrefix[row]
+        val rowRenderHeight = (mainHeights[row] + transHeights[row]).toFloat()
+        val partial = if (renderPos > rowRenderStart && rowRenderHeight > 0f) {
+            mainHeights[row].toFloat() * ((renderPos - rowRenderStart) / rowRenderHeight)
+        } else {
+            0f
+        }
+        return mainPrefix[row] + partial
+    }
+
+    fun nearestRenderIndex(renderPos: Float): Int {
+        if (lineCount <= 1) return 0
+        if (renderPos <= renderPrefix[0]) return 0
+        if (renderPos >= renderPrefix[lineCount - 1]) return lineCount - 1
+        val upper = nativeLowerBound(renderPrefix, renderPos, lineCount)
+            .coerceIn(1, lineCount - 1)
+        val lower = upper - 1
+        val lowerDistance = kotlin.math.abs(renderPos - renderPrefix[lower])
+        val upperDistance = kotlin.math.abs(renderPrefix[upper] - renderPos)
+        return if (lowerDistance <= upperDistance) lower else upper
+    }
+}
+
+private fun nativeRowMetrics(
+    lineCount: Int,
+    estimatedRowHeightPx: Int,
+    transProgress: Float,
+    mainRowHeights: Map<Int, Int>,
+    transFullHeights: Map<Int, Int>,
+): NativeRowMetrics {
+    val safeLineCount = lineCount.coerceAtLeast(0)
+    val mainHeights = IntArray(safeLineCount)
+    val transHeights = IntArray(safeLineCount)
+    val mainPrefix = FloatArray(safeLineCount + 1)
+    val transPrefix = FloatArray(safeLineCount + 1)
+    val renderPrefix = FloatArray(safeLineCount + 1)
+    val safeEstimated = estimatedRowHeightPx.coerceAtLeast(1)
+    val safeTransProgress = transProgress.coerceAtLeast(0f)
+    for (idx in 0 until safeLineCount) {
+        val mainHeight = (mainRowHeights[idx] ?: safeEstimated).coerceAtLeast(1)
+        val transHeight = ((transFullHeights[idx] ?: 0).coerceAtLeast(0) * safeTransProgress)
+            .roundToInt()
+            .coerceAtLeast(0)
+        mainHeights[idx] = mainHeight
+        transHeights[idx] = transHeight
+        mainPrefix[idx + 1] = mainPrefix[idx] + mainHeight
+        transPrefix[idx + 1] = transPrefix[idx] + transHeight
+        renderPrefix[idx + 1] = renderPrefix[idx] + mainHeight + transHeight
+    }
+    return NativeRowMetrics(
+        mainHeights = mainHeights,
+        transHeights = transHeights,
+        mainPrefix = mainPrefix,
+        transPrefix = transPrefix,
+        renderPrefix = renderPrefix,
+    )
+}
+
+private fun nativeUpperBound(values: FloatArray, value: Float, size: Int): Int {
+    var low = 0
+    var high = size.coerceIn(0, values.size)
+    while (low < high) {
+        val mid = (low + high) ushr 1
+        if (value < values[mid]) {
+            high = mid
+        } else {
+            low = mid + 1
+        }
+    }
+    return low
+}
+
+private fun nativeLowerBound(values: FloatArray, value: Float, size: Int): Int {
+    var low = 0
+    var high = size.coerceIn(0, values.size)
+    while (low < high) {
+        val mid = (low + high) ushr 1
+        if (values[mid] < value) {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+    return low
 }
 
 private fun nativeClampScrollCenter(
@@ -2972,15 +3122,19 @@ private const val NATIVE_EFFECTS_ENABLE_ENTER_PROGRESS = 0.985f
 private const val NATIVE_ROW_CLICK_ENTER_PROGRESS = 0.995f
 private const val NATIVE_ROW_CLICK_MIN_ALPHA = 0.05f
 private const val NATIVE_INACTIVE_SCALE = 0.952f
-private const val NATIVE_LINE_SWITCH_MS = 100
+// 行透明度切换：100ms 观感是“啪”一下，Apple 的行亮度交接 ≈220ms 柔和但不拖。
+private const val NATIVE_LINE_SWITCH_MS = 220
+
+/** 静态文本色 focus/past 通道的渐变时长（激活增亮、唱过变暗），与切句滚动节奏匹配。 */
+private const val NATIVE_LINE_COLOR_FADE_MS = 280
 private const val NATIVE_INITIAL_REVEAL_MS = 90
 private const val NATIVE_ROW_SCALE_FOCUS_SPAN_ROWS = 1.15f
 private const val NATIVE_LINE_WIDTH_ASPECT = 0.8f
 private const val NATIVE_COMPACT_WIDTH_DP = 768f
 private const val NATIVE_INITIAL_RENDER_RADIUS_LINES = 10
-// 渲染窗口缓冲行数：窗口外的行不组合。4 行缓冲在快速拖动下仍够用
-//（visualActiveIdx 每越过一行就更新窗口），从 7 收窄后少挂载约 6 行的文本布局与层。
-private const val NATIVE_RENDER_WINDOW_BUFFER_ROWS = 4
+// 渲染窗口缓冲行数保持原安全宽度：后续行提前拿到 text layout / timed plan，
+// 避免窗口滑过初始 10 行后才临时挂载，切句扫色、间接色和慢词光效丢首帧。
+private const val NATIVE_RENDER_WINDOW_BUFFER_ROWS = 7
 private const val NATIVE_RENDER_WINDOW_BUFFER_VIEWPORT_FRACTION = 0.45f
 private const val NATIVE_WORD_FADE_WIDTH_RATIO = 1.0f
 // 交接带宽度以行高为基准恒定（≈0.7×行高），不随词宽变化：
@@ -3078,6 +3232,12 @@ private const val NATIVE_RENDER_PIPELINE_LEAD_MS = 45f
 private const val NATIVE_CLOCK_FRAME_RESET_MS = 1_500f
 private const val NATIVE_CLOCK_BACKWARD_RESET_MS = 300f
 private const val NATIVE_CLOCK_START_GUARD_MS = 900L
+
+/** 起播保护期内允许时钟超前最新报告的余量：缓冲不出声时最多多走这么多就冻结等待。 */
+private const val NATIVE_CLOCK_START_HEADROOM_MS = 120f
+
+/** 回退校正超过该值就一次性对齐（不再慢动作滑行）——保证任何时刻速度都是 1x。 */
+private const val NATIVE_CLOCK_BACKWARD_SNAP_MS = 120f
 // 数据锚定时钟：|偏差| 超过 SNAP 直接重锚（seek/卡顿）；否则每次报告把 base 拉近 SLEW 比例。
 // 视觉轻微超前时按 GLIDE 速度降速滑行（0.4×）等数据追上，不回跳不冻结。
 private const val NATIVE_CLOCK_BASE_SNAP_MS = 280.0

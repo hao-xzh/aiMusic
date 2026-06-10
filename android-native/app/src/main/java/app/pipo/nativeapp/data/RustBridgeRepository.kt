@@ -361,8 +361,13 @@ class RustBridgeRepository(
         // 优先走 AMLL TTML 数据库（字级时间戳，质量明显高于 netease yrc）；
         // 命中失败（404 / 网络错误 / 非数字 trackId / 解析空）才回落到 Rust bridge。
         // AmllLyricsSource 内部已经做了本地永久缓存 + 404 哨兵，重复播同一首不会反复打网络。
-        amllSource?.lyricsForTrack(trackId)?.takeIf { it.isNotEmpty() }?.let { return it }
-        return safe({ bridge.neteaseSongLyric(trackId) }, { fallback.lyricsForTrack(trackId) })
+        // 两条来源统一过 LyricCredits：开头的作词/作曲/制作人信息行不当歌词展示，
+        // 留出的前奏空档由歌词列的间奏三点指示接管（对齐 Apple Music）。
+        amllSource?.lyricsForTrack(trackId)?.takeIf { it.isNotEmpty() }
+            ?.let { return LyricCredits.stripLeading(it) }
+        return LyricCredits.stripLeading(
+            safe({ bridge.neteaseSongLyric(trackId) }, { fallback.lyricsForTrack(trackId) }),
+        )
     }
 
     override suspend fun likeSong(id: Long, like: Boolean) {
