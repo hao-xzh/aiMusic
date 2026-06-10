@@ -160,7 +160,6 @@ internal fun AppleMusicLyricColumn(
     val estimatedRowHeightPx = with(density) { rowMinHeight.toPx().toInt().coerceAtLeast(1) }
     val horizontalPaddingPx = with(density) { horizontalPadding.toPx() }
     val compactWidthPx = with(density) { NATIVE_COMPACT_WIDTH_DP.dp.toPx() }
-    val effectsSettled = enterProgress >= NATIVE_EFFECTS_ENABLE_ENTER_PROGRESS
 
     // 全列共享单一译文展开进度：切换译文时整列同相，避免逐行各自 spring 的相位差与取整漂移。
     val transAnim = remember(sessionKey) { Animatable(if (showTranslation) 1f else 0f) }
@@ -445,6 +444,54 @@ internal fun AppleMusicLyricColumn(
         }
     }
 
+    val renderRadiusRows = if (containerHeightPx > 0) {
+        containerHeightPx / estimatedRowHeightPx.coerceAtLeast(1) + NATIVE_RENDER_WINDOW_BUFFER_ROWS
+    } else {
+        NATIVE_INITIAL_RENDER_RADIUS_LINES
+    }
+    val initialWindowMeasured = if (containerHeightPx > 0 && lines.isNotEmpty()) {
+        val start = (visualActiveIdx - renderRadiusRows).coerceAtLeast(0)
+        val end = (visualActiveIdx + renderRadiusRows).coerceAtMost(lines.lastIndex)
+        var ready = true
+        for (idx in start..end) {
+            if (!mainRowHeights.containsKey(idx)) ready = false
+            if (
+                showTranslation &&
+                nativeHasStaticSubline(lines[idx]) &&
+                !transFullHeights.containsKey(idx)
+            ) {
+                ready = false
+            }
+        }
+        ready
+    } else {
+        false
+    }
+    var initialRevealReady by remember(sessionKey) { mutableStateOf(false) }
+    LaunchedEffect(
+        sessionKey,
+        initialLayoutSettled,
+        initialWindowMeasured,
+        playbackActiveIdx,
+        showTranslation,
+    ) {
+        if (initialRevealReady) return@LaunchedEffect
+        if (!initialLayoutSettled || !initialWindowMeasured) return@LaunchedEffect
+        // Let the measure callbacks and the initial scroll snap land before the first visible frame.
+        withFrameNanos { }
+        withFrameNanos { }
+        initialRevealReady = true
+    }
+    val initialRevealAlpha by animateFloatAsState(
+        targetValue = if (initialRevealReady) 1f else 0f,
+        animationSpec = tween(durationMillis = NATIVE_INITIAL_REVEAL_MS, easing = NATIVE_LINE_SWITCH_EASE),
+        label = "nativeLyricInitialReveal",
+    )
+    val calibratedEnterProgress = enterProgress * initialRevealAlpha
+    val effectsSettled = calibratedEnterProgress >= NATIVE_EFFECTS_ENABLE_ENTER_PROGRESS
+    val interactionReady = initialRevealReady &&
+        calibratedEnterProgress >= NATIVE_ROW_CLICK_ENTER_PROGRESS
+
     val lineWidthAspectState = rememberUpdatedState(lineWidthAspect.coerceIn(0.2f, 1f))
     val topFadeEnd = 0.16f
     val bottomSolidStop = bottomFadeStart.coerceIn(0.60f, 0.96f)
@@ -482,59 +529,60 @@ internal fun AppleMusicLyricColumn(
                     blendMode = androidx.compose.ui.graphics.BlendMode.DstIn,
                 )
             }
-            .pointerInput(sessionKey) {
-                detectDragGestures(
-	                    onDragStart = {
-	                        isUserDragging = true
-	                        pendingSeekIdx = -1
-	                        manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
-	                        // 拖动工作在渲染坐标（1:1 手感），以当前渲染中心为起点。
-	                        manualScrollCenterPx = renderCenterNow()
-	                        gestureScope.launch {
-	                            scrollSpring.stop()
-	                        }
-	                    },
-                    onDragEnd = {
-                        isUserDragging = false
-                        manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
-                    },
-                    onDragCancel = {
-                        isUserDragging = false
-                        manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
-                    },
-                    onDrag = { change, dragAmount ->
-                        change.consume()
-                        manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
-                        val currentCenter = if (manualScrollCenterPx.isFinite()) {
-                            manualScrollCenterPx
-                        } else {
-                            renderCenterNow()
-                        }
-                        val next = nativeClampScrollCenter(
-                            current = currentCenter - dragAmount.y,
-                            anchorY = anchorYPx,
-                            // manualScrollCenterPx 工作在渲染坐标，用含译文的整行高度合计夹取边界。
-                            totalHeight = (0 until lines.size).sumOf { rowHeight(it) }.toFloat(),
-                            viewportHeight = containerHeightPx.toFloat(),
+            .then(
+                if (interactionReady) {
+                    Modifier.pointerInput(sessionKey) {
+                        detectDragGestures(
+                            onDragStart = {
+                                isUserDragging = true
+                                pendingSeekIdx = -1
+                                manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
+                                // 拖动工作在渲染坐标（1:1 手感），以当前渲染中心为起点。
+                                manualScrollCenterPx = renderCenterNow()
+                                gestureScope.launch {
+                                    scrollSpring.stop()
+                                }
+                            },
+                            onDragEnd = {
+                                isUserDragging = false
+                                manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
+                            },
+                            onDragCancel = {
+                                isUserDragging = false
+                                manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
+                            },
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
+                                val currentCenter = if (manualScrollCenterPx.isFinite()) {
+                                    manualScrollCenterPx
+                                } else {
+                                    renderCenterNow()
+                                }
+                                val next = nativeClampScrollCenter(
+                                    current = currentCenter - dragAmount.y,
+                                    anchorY = anchorYPx,
+                                    // manualScrollCenterPx 工作在渲染坐标，用含译文的整行高度合计夹取边界。
+                                    totalHeight = (0 until lines.size).sumOf { rowHeight(it) }.toFloat(),
+                                    viewportHeight = containerHeightPx.toFloat(),
+                                )
+                                manualScrollCenterPx = next
+                            },
                         )
-                        manualScrollCenterPx = next
-                    },
-                )
-            },
+                    }
+                } else {
+                    Modifier
+                },
+            ),
     ) {
         // 渲染窗口按「行号」裁剪（基于 visualActiveIdx），不再依赖每帧 rowY：
         // 用最小行高估算半径（高估行数→多渲染几行，保证滚动时不漏、不空白）。
-        val renderRadiusRows = if (containerHeightPx > 0) {
-            containerHeightPx / estimatedRowHeightPx.coerceAtLeast(1) + NATIVE_RENDER_WINDOW_BUFFER_ROWS
-        } else {
-            NATIVE_INITIAL_RENDER_RADIUS_LINES
-        }
         lines.forEachIndexed { idx, line ->
             val distance = kotlin.math.abs(idx - visualActiveIdx)
             if (distance > renderRadiusRows) {
                 return@forEachIndexed
             }
-            val rowEnter = nativeRowEnterProgress(enterProgress, distance)
+            val rowEnter = nativeRowEnterProgress(calibratedEnterProgress, distance)
             val isActive = idx in timelineSnapshot.activeIndices
             // 焦点统一为一个 composition 稳定的布尔（仅切句/越行才变）；缩放/上浮/透明度/虚化
             // 都在行内用 tween 平滑驱动，滚动期间不再每帧重组（流畅度关键）。
@@ -584,7 +632,7 @@ internal fun AppleMusicLyricColumn(
                 )
             }
             // 渲染窗口内的行才会被组合，屏外 buffer 行用户点不到，所以不再按 rowY 判定可点击。
-            val rowVisibleForClick = enterProgress >= NATIVE_ROW_CLICK_ENTER_PROGRESS &&
+            val rowVisibleForClick = interactionReady &&
                 rowEnter > NATIVE_ROW_CLICK_MIN_ALPHA
 
             Box(
@@ -993,6 +1041,9 @@ private fun NativeAmllCompanionLine(
         )
     }
     val appear = if (isPlaying) ease.transform(appearAnim.value.coerceIn(0f, 1f)) else 1f
+    val companionHeldByHost = hostActive && hasAppeared
+    val visualCompanionActive = companionActive || companionHeldByHost
+    val visualCompanionPast = companionPast && !hostActive
     val companionAlignment = if (companion.alignment == PipoLyricAlignment.End) Alignment.End else itemAlignment
     val companionTextAlign = if (companionAlignment == Alignment.End) TextAlign.End else TextAlign.Start
     val boxAlignment = if (companionAlignment == Alignment.End) Alignment.CenterEnd else Alignment.CenterStart
@@ -1030,8 +1081,8 @@ private fun NativeAmllCompanionLine(
     ) {
         NativeAmllLyricText(
             line = displayCompanion,
-            isActive = companionActive,
-            isPast = companionPast,
+            isActive = visualCompanionActive,
+            isPast = visualCompanionPast,
             timeState = timeState,
             clockState = if (companion.chars.isNotEmpty()) clockState else null,
             fg = fg,
@@ -2488,6 +2539,12 @@ private fun nativeTranslationColor(fg: Color): Color {
     return fg.copy(alpha = NATIVE_SUBLINE_OPACITY)
 }
 
+private fun nativeHasStaticSubline(line: PipoLyricLine): Boolean {
+    return line.companionLines.any {
+        it.role == PipoLyricRole.Translation || it.role == PipoLyricRole.Romaji
+    }
+}
+
 private fun nativeIsCompanionActive(line: PipoLyricLine, positionMs: Long): Boolean {
     return positionMs >= LyricTiming.audioStartMs(line) && positionMs < nativeCompanionEndMs(line)
 }
@@ -2916,6 +2973,7 @@ private const val NATIVE_ROW_CLICK_ENTER_PROGRESS = 0.995f
 private const val NATIVE_ROW_CLICK_MIN_ALPHA = 0.05f
 private const val NATIVE_INACTIVE_SCALE = 0.952f
 private const val NATIVE_LINE_SWITCH_MS = 100
+private const val NATIVE_INITIAL_REVEAL_MS = 90
 private const val NATIVE_ROW_SCALE_FOCUS_SPAN_ROWS = 1.15f
 private const val NATIVE_LINE_WIDTH_ASPECT = 0.8f
 private const val NATIVE_COMPACT_WIDTH_DP = 768f

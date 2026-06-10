@@ -213,6 +213,8 @@ class PlayerViewModel(
     private val urlRefreshTried = HashSet<String>()
     /** 当前正在刷新 URL 的 trackId —— 错误风暴里只让一个刷新协程在飞 */
     private var refreshingUrlForTrack: String? = null
+    /** 这次 PLAYLIST_CHANGED 是否只是我们用新 URL 替换了同一首，而不是用户换队列 */
+    private var urlRefreshReplacementTrackId: String? = null
     /** 弱网类错误的原地恢复计数；超过上限再重签 URL。 */
     private var transientRetryForTrack: String? = null
     private var transientRetryCount = 0
@@ -303,14 +305,7 @@ class PlayerViewModel(
                     "title" to mediaItem?.mediaMetadata?.title?.toString(),
                 ),
             )
-            // 切到新一首 = 之前那首已经播过去了（自然结束 / 用户切 / 重签后跳过来），
-            // 把当前这首从"已尝试重签"集合里清出来，等若干小时后这首 URL 又过期时还能重签一次。
-            // PLAYLIST_CHANGED（playFromAgent/playTrack/setMediaItems）→ 整张表清空。
-            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
-                urlRefreshTried.clear()
-            } else {
-                mediaItem?.mediaId?.let { urlRefreshTried.remove(it) }
-            }
+            updateUrlRefreshTriedOnTransition(mediaItem?.mediaId, reason)
             transientRetryForTrack = null
             transientRetryCount = 0
             transientRetryJob?.cancel()
@@ -413,8 +408,9 @@ class PlayerViewModel(
                 val livePlayer = controller ?: return@launch
                 val targetIdx = livePlayer.indexOfMediaId(targetTrackId) ?: return@launch
                 if (currentTrackFor(livePlayer)?.id != targetTrackId) return@launch
+                val latestResumePosMs = maxOf(resumePosMs, livePlayer.currentPosition.coerceAtLeast(0L))
                 applyPlaybackMode(livePlayer)
-                livePlayer.seekTo(targetIdx, resumePosMs)
+                livePlayer.seekTo(targetIdx, latestResumePosMs)
                 livePlayer.prepare()
                 livePlayer.play()
                 DiagnosticsLogStore.record(
@@ -423,7 +419,7 @@ class PlayerViewModel(
                     fields = trackFields(track) + mapOf(
                         "attempt" to attempt,
                         "code" to error.errorCodeName,
-                        "resumePosMs" to resumePosMs,
+                        "resumePosMs" to latestResumePosMs,
                     ),
                 )
             } finally {
@@ -436,6 +432,24 @@ class PlayerViewModel(
         val player = controller ?: return
         val track = currentTrackFor(player) ?: return
         refreshTrackUrlAndResume(player, track, reason)
+    }
+
+    private fun markUrlRefreshReplacement(trackId: String) {
+        urlRefreshReplacementTrackId = trackId
+    }
+
+    private fun updateUrlRefreshTriedOnTransition(mediaId: String?, reason: Int) {
+        val isRefreshReplacement = mediaId != null && mediaId == urlRefreshReplacementTrackId
+        if (isRefreshReplacement) {
+            urlRefreshReplacementTrackId = null
+        }
+        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
+            if (!isRefreshReplacement) {
+                urlRefreshTried.clear()
+            }
+        } else {
+            mediaId?.let { urlRefreshTried.remove(it) }
+        }
     }
 
     private fun refreshTrackUrlAndResume(
@@ -518,7 +532,13 @@ class PlayerViewModel(
                     // 手动恢复 / service 重建时，player 里可能已经没有 media items，
                     // 但 ViewModel 还保留着最后队列。此时直接重建播放器，避免 play 按钮 no-op。
                     if (force) {
-                        val startPosition = resumePosMs.takeIf { it > 1000L } ?: 0L
+                        val liveCurrentPosMs = if (livePlayer.currentMediaItem?.mediaId == targetTrackId) {
+                            livePlayer.currentPosition.coerceAtLeast(0L)
+                        } else {
+                            0L
+                        }
+                        val startPosition = maxOf(resumePosMs, liveCurrentPosMs).takeIf { it > 1000L } ?: 0L
+                        markUrlRefreshReplacement(targetTrackId)
                         livePlayer.setMediaItems(listOf(toMediaItem(updated)), 0, startPosition)
                         applyPlaybackMode(livePlayer)
                         livePlayer.prepare()
@@ -528,6 +548,7 @@ class PlayerViewModel(
                     return@launch
                 }
                 val updatedQueueIndex = state.queue.indexOfFirst { it.id == targetTrackId }
+                markUrlRefreshReplacement(targetTrackId)
                 livePlayer.replaceMediaItem(
                     updatedIdx,
                     if (updatedQueueIndex >= 0) toMediaItem(updated, state.queue, updatedQueueIndex) else toMediaItem(updated),
@@ -536,8 +557,14 @@ class PlayerViewModel(
                 // 已经在播下一首时不去打断 —— replaceMediaItem 已把 URL 更新,
                 // 下次 wraparound / 用户手动回来时直接是新 URL。
                 if (resumeAsCurrent || livePlayer.currentMediaItemIndex == updatedIdx) {
-                    if (resumePosMs > 1000L) {
-                        livePlayer.seekTo(updatedIdx, resumePosMs)
+                    val liveCurrentPosMs = if (livePlayer.currentMediaItemIndex == updatedIdx) {
+                        livePlayer.currentPosition.coerceAtLeast(0L)
+                    } else {
+                        0L
+                    }
+                    val latestResumePosMs = maxOf(resumePosMs, liveCurrentPosMs)
+                    if (latestResumePosMs > 1000L) {
+                        livePlayer.seekTo(updatedIdx, latestResumePosMs)
                     } else {
                         livePlayer.seekTo(updatedIdx, 0L)
                     }

@@ -260,23 +260,23 @@ fun ImmersiveLyricsOverlay(
         // 歌词列 —— 固定在封面终态底部下方 28dp。封面 FLIP 期间整列 translateY 抬起 24dp，
         // 内部各行按距 active 行的索引差 stagger 入场（cascade 焦点感）。
         val lyricsRiseDp = 24.dp
-        if (cp > 0.001f) {
-            ImmersiveLyricsColumnLayer(
-                lyrics = lyrics,
-                trackId = trackId,
-                positionProvider = positionProvider,
-                isPlaying = isPlaying,
-                fg = fg,
-                fgDim = fgDim,
-                fgUnsung = fgUnsung,
-                lyricAccentColor = lyricAccentColor,
-                showTranslation = showTranslation,
-                onSeekToMs = onSeekToMs,
-                enterProgress = cp,
-                lyricsTopPadding = lyricsTopPadding,
-                lyricsRiseDp = lyricsRiseDp,
-            )
-        }
+        // 内容淡入前就挂载歌词列：它会先用 alpha=0 完成行高/锚点校准，
+        // 等校准完成后才随 contentProgress 淡入，避免首屏可见跳动。
+        ImmersiveLyricsColumnLayer(
+            lyrics = lyrics,
+            trackId = trackId,
+            positionProvider = positionProvider,
+            isPlaying = isPlaying,
+            fg = fg,
+            fgDim = fgDim,
+            fgUnsung = fgUnsung,
+            lyricAccentColor = lyricAccentColor,
+            showTranslation = showTranslation,
+            onSeekToMs = onSeekToMs,
+            enterProgress = cp,
+            lyricsTopPadding = lyricsTopPadding,
+            lyricsRiseDp = lyricsRiseDp,
+        )
     }
 }
 

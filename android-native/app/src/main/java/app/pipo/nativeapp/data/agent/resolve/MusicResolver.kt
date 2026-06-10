@@ -26,6 +26,12 @@ import kotlinx.coroutines.flow.first
 class MusicResolver(
     private val repository: PipoRepository,
 ) {
+    private companion object {
+        const val CONTINUATION_WANT_COUNT = 12
+        const val CONTINUATION_SEARCH_LIMIT = 50
+        const val CONTINUATION_MAX_SEARCH_QUERIES = 16
+    }
+
     private val trackResolver = TrackResolver(repository)
     private val playlistResolver = PlaylistResolver()
 
@@ -422,13 +428,31 @@ class MusicResolver(
                     .take(12)
             }
         }
-        val seedQueries = buildSearchQueries(intent).ifEmpty { listOf(plan.userText) }
+        val seedQueries = buildContinuationSearchQueries(intent).ifEmpty { listOf(plan.userText) }
         return ContinuousQueueSource { excludeIds ->
-            val out = ArrayList<NativeTrack>()
-            val seen = HashSet<String>()
-            for (query in seedQueries) {
-                if (out.size >= 12) break
-                val hits = runCatching { repository.searchTracks(query, limit = 10) }.getOrDefault(emptyList())
+            searchContinuation(seedQueries, artistScope, artistKeys, excludeIds)
+        }
+    }
+
+    private suspend fun searchContinuation(
+        seedQueries: List<String>,
+        artistScope: ArtistScope,
+        artistKeys: List<String>,
+        excludeIds: Set<Long>,
+    ): List<NativeTrack> {
+        val out = ArrayList<NativeTrack>()
+        val seen = HashSet<String>()
+        for (batch in seedQueries.chunked(3)) {
+            if (out.size >= CONTINUATION_WANT_COUNT * 2) break
+            val hitsPerQuery = coroutineScope {
+                batch.map { query ->
+                    async {
+                        runCatching { repository.searchTracks(query, limit = CONTINUATION_SEARCH_LIMIT) }
+                            .getOrDefault(emptyList())
+                    }
+                }.awaitAll()
+            }
+            for (hits in hitsPerQuery) {
                 val scopedHits = when {
                     artistScope == ArtistScope.Strict && artistKeys.isNotEmpty() ->
                         hits.filter { artistMatchesAny(it.artist, artistKeys) }
@@ -440,11 +464,44 @@ class MusicResolver(
                     val id = track.neteaseId
                     if (id != null && id in excludeIds) continue
                     if (seen.add(TrackDedupe.songKey(track))) out.add(track)
-                    if (out.size >= 12) break
+                    if (out.size >= CONTINUATION_WANT_COUNT * 2) break
                 }
             }
-            out
         }
+        val deduped = TrackDedupe.capSameTitle(out)
+        return when (artistScope) {
+            ArtistScope.Strict -> deduped
+            ArtistScope.Focus -> diversifyByArtistButPreserveFocus(deduped, artistKeys)
+            ArtistScope.Similar -> diversifyByArtist(deduped)
+        }.take(CONTINUATION_WANT_COUNT)
+    }
+
+    private fun buildContinuationSearchQueries(intent: PetIntent): List<String> {
+        val out = buildSearchQueries(intent).toMutableList()
+        val artists = (intent.hardArtists + intent.textArtists)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy(CommandTextSignals::normalizeForMatch)
+        val styleTerms = mergeTextHints(
+            intent.hardGenres,
+            intent.musicHintsGenres,
+            intent.softMoods,
+            intent.softScenes,
+            intent.softTextures,
+            intent.softQualityWords,
+            intent.refStyles,
+        )
+        for (artist in artists.take(2)) {
+            for (style in styleTerms.take(4)) {
+                out.add("$artist $style")
+            }
+            intent.queryText.takeIf { it.isNotBlank() }?.let { out.add("$artist $it") }
+        }
+        return out
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy(CommandTextSignals::normalizeForMatch)
+            .take(CONTINUATION_MAX_SEARCH_QUERIES)
     }
 
     private fun buildSearchQueries(intent: PetIntent): List<String> {

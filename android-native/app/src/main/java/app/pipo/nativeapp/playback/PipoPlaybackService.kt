@@ -45,6 +45,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 /**
  * 镜像 src/lib/player-state.tsx 里的播放器配置：
@@ -110,6 +111,7 @@ class PipoPlaybackService : MediaLibraryService() {
         }
     }
     private val serviceUrlRefreshTried = LinkedHashSet<String>()
+    private var serviceUrlRefreshReplacementMediaId: String? = null
     private val urlResolver by lazy {
         PlaybackUrlResolver(PipoGraph.repository, STREAM_LEVEL_FALLBACKS, STREAM_URL_TIMEOUT_MS)
     }
@@ -250,9 +252,66 @@ class PipoPlaybackService : MediaLibraryService() {
                         "controller" to controller.packageName,
                         "requestedCount" to mediaItems.size,
                         "resolvedCount" to resolved.size,
+                        "requestedItems" to mediaItems.mediaItemsSummary(),
+                        "resolvedItems" to resolved.mediaItemsSummary(),
                     ),
                 )
                 future.set(resolved)
+            }
+            return future
+        }
+
+        override fun onSetMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+            startIndex: Int,
+            startPositionMs: Long,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            if (mediaItems.isEmpty()) {
+                return Futures.immediateFuture(
+                    MediaSession.MediaItemsWithStartPosition(emptyList(), startIndex, startPositionMs),
+                )
+            }
+            val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+            serviceScope.launch {
+                val resolved = runCatching {
+                    resolveAssistantMediaItems(mediaItems)
+                }.onFailure { err ->
+                    DiagnosticsLogStore.record(
+                        area = "playback_service",
+                        event = "assistant_media_set_resolve_failed",
+                        fields = mapOf(
+                            "controller" to controller.packageName,
+                            "requestedCount" to mediaItems.size,
+                            "startIndex" to startIndex,
+                            "startPositionMs" to startPositionMs,
+                            "requestedItems" to mediaItems.mediaItemsSummary(),
+                            "errorType" to err::class.java.simpleName,
+                            "message" to err.message,
+                        ),
+                    )
+                }.getOrDefault(mutableListOf())
+                val resolvedStartIndex = when {
+                    resolved.isEmpty() -> C.INDEX_UNSET
+                    startIndex == C.INDEX_UNSET -> 0
+                    else -> startIndex.coerceIn(0, resolved.lastIndex)
+                }
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "assistant_media_set_resolved",
+                    fields = mapOf(
+                        "controller" to controller.packageName,
+                        "requestedCount" to mediaItems.size,
+                        "resolvedCount" to resolved.size,
+                        "startIndex" to startIndex,
+                        "resolvedStartIndex" to resolvedStartIndex,
+                        "startPositionMs" to startPositionMs,
+                        "requestedItems" to mediaItems.mediaItemsSummary(),
+                        "resolvedItems" to resolved.mediaItemsSummary(),
+                    ),
+                )
+                future.set(MediaSession.MediaItemsWithStartPosition(resolved, resolvedStartIndex, startPositionMs))
             }
             return future
         }
@@ -386,11 +445,7 @@ class PipoPlaybackService : MediaLibraryService() {
                         // 换曲 = 旧的卡顿观察作废,新曲重置重踢预算
                         cancelBufferStallCheck()
                         resetBufferStallAttempts()
-                        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
-                            serviceUrlRefreshTried.clear()
-                        } else {
-                            mediaItem?.mediaId?.let { serviceUrlRefreshTried.remove(it) }
-                        }
+                        updateServiceUrlRefreshTriedOnTransition(mediaItem?.mediaId, reason)
                         // 响度对齐:按新当前轨的整曲 rmsDb 设主 player 衰减增益。clip 的 mediaId
                         // ("automix:…")查不到 features → null → 中性(clip 已在 Rust 内部对齐)。
                         playbackGain.applyForRms(
@@ -495,10 +550,12 @@ class PipoPlaybackService : MediaLibraryService() {
                             Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> {
                                 if (!playWhenReady && autoPausingForExternalAudio) {
                                     autoPausingForExternalAudio = false
+                                    val shouldWaitForFocusGain = waitingForAudioFocusGain && !hasAudioFocus
                                     armAudioFocusAutoResume(
                                         player = this@apply,
                                         reason = "external-audio-pause",
                                         observedExternalAudio = true,
+                                        waitForAudioFocusGain = shouldWaitForFocusGain,
                                     )
                                 } else {
                                     clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
@@ -747,13 +804,127 @@ class PipoPlaybackService : MediaLibraryService() {
         }
 
         val query = queryFromRequestedItem(item) ?: return null
-        val track = withContext(Dispatchers.IO) {
+        val candidates = withContext(Dispatchers.IO) {
             val candidates = runCatching {
                 PipoGraph.repository.searchTracks(query, ASSISTANT_SEARCH_LIMIT)
             }.getOrDefault(emptyList())
-            urlResolver.resolveFirstPlayable(candidates, ASSISTANT_PLAY_SCAN_LIMIT)
-        } ?: return null
+            assistantSearchCandidates(query, candidates)
+        }
+        if (candidates.isEmpty()) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "assistant_media_search_rejected",
+                fields = mapOf(
+                    "query" to query,
+                    "requestedItem" to item.mediaItemSummary(),
+                ),
+            )
+            return null
+        }
+        val track = urlResolver.resolveFirstPlayable(candidates, ASSISTANT_PLAY_SCAN_LIMIT) ?: return null
         return mediaFactory.toMediaItem(track)
+    }
+
+    private fun assistantSearchCandidates(query: String, candidates: List<NativeTrack>): List<NativeTrack> {
+        val normalizedQuery = normalizeAssistantSearchText(query)
+        val queryTokens = assistantSearchTokens(normalizedQuery)
+        if (normalizedQuery.isBlank() && queryTokens.isEmpty()) return emptyList()
+        return candidates.filter { track ->
+            assistantQueryMatchesTrack(normalizedQuery, queryTokens, track)
+        }
+    }
+
+    private fun assistantQueryMatchesTrack(
+        normalizedQuery: String,
+        queryTokens: List<String>,
+        track: NativeTrack,
+    ): Boolean {
+        val title = normalizeAssistantSearchText(track.title)
+        val artist = normalizeAssistantSearchText(track.artist)
+        val album = normalizeAssistantSearchText(track.album)
+        val combined = listOf(title, artist, album)
+            .filter { it.isNotBlank() }
+            .joinToString(" ")
+        if (combined.isBlank()) return false
+        if (normalizedQuery.isNotBlank() && combined.contains(normalizedQuery)) return true
+        if (title.isNotBlank() && normalizedQuery.isNotBlank()) {
+            if (title == normalizedQuery) return true
+            if (title.contains(normalizedQuery) || normalizedQuery.contains(title)) return true
+            if (assistantCloseEnough(normalizedQuery, title)) return true
+        }
+        if (queryTokens.isEmpty()) return false
+        val trackTokens = assistantSearchTokens(combined)
+        return queryTokens.all { token ->
+            combined.contains(token) || trackTokens.any { candidate -> assistantCloseEnough(token, candidate) }
+        }
+    }
+
+    private fun normalizeAssistantSearchText(value: String?): String {
+        if (value.isNullOrBlank()) return ""
+        return buildString(value.length) {
+            value.lowercase(Locale.ROOT).forEach { ch ->
+                append(if (ch.isLetterOrDigit()) ch else ' ')
+            }
+        }.trim().replace(Regex("\\s+"), " ")
+    }
+
+    private fun assistantSearchTokens(value: String): List<String> {
+        if (value.isBlank()) return emptyList()
+        return value.split(' ')
+            .map { it.trim() }
+            .filter { it.length >= 2 && it !in ASSISTANT_QUERY_STOP_WORDS }
+    }
+
+    private fun assistantCloseEnough(left: String, right: String): Boolean {
+        if (left.isBlank() || right.isBlank()) return false
+        val maxLen = maxOf(left.length, right.length)
+        val allowedDistance = when {
+            maxLen <= 5 -> 1
+            maxLen <= 12 -> 2
+            else -> 3
+        }
+        if (kotlin.math.abs(left.length - right.length) > allowedDistance) return false
+        return boundedEditDistance(left, right, allowedDistance) <= allowedDistance
+    }
+
+    private fun boundedEditDistance(left: String, right: String, maxDistance: Int): Int {
+        if (left == right) return 0
+        var previous = IntArray(right.length + 1) { it }
+        var current = IntArray(right.length + 1)
+        for (i in 1..left.length) {
+            current[0] = i
+            var rowMin = current[0]
+            for (j in 1..right.length) {
+                val cost = if (left[i - 1] == right[j - 1]) 0 else 1
+                current[j] = minOf(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + cost,
+                )
+                rowMin = minOf(rowMin, current[j])
+            }
+            if (rowMin > maxDistance) return maxDistance + 1
+            val swap = previous
+            previous = current
+            current = swap
+        }
+        return previous[right.length]
+    }
+
+    private fun List<MediaItem>.mediaItemsSummary(): String {
+        return take(4).joinToString(" | ") { it.mediaItemSummary() }
+    }
+
+    private fun MediaItem.mediaItemSummary(): String {
+        val title = mediaMetadata.title?.toString().orEmpty()
+        val artist = mediaMetadata.artist?.toString().orEmpty()
+        val query = requestMetadata.searchQuery.orEmpty()
+        return listOf(
+            mediaId.takeIf { it.isNotBlank() }?.let { "id=$it" },
+            title.takeIf { it.isNotBlank() }?.let { "title=$it" },
+            artist.takeIf { it.isNotBlank() }?.let { "artist=$it" },
+            query.takeIf { it.isNotBlank() }?.let { "query=$it" },
+        ).filterNotNull().joinToString(",").take(220)
     }
 
     private fun findCurrentQueueMediaItem(mediaId: String): MediaItem? {
@@ -998,7 +1169,8 @@ class PipoPlaybackService : MediaLibraryService() {
             clearAudioFocusAutoResume("not-needed-$reason")
             return
         }
-        if (hasExternalInterruptingAudio(configs, allowMediaWithoutRecentFocus = true)) {
+        val allowMediaWithoutRecentFocus = waitingForAudioFocusGain && !hasAudioFocus
+        if (hasExternalInterruptingAudio(configs, allowMediaWithoutRecentFocus = allowMediaWithoutRecentFocus)) {
             externalAudioObservedSincePause = true
             externalAudioQuietSinceMs = 0L
             scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "external-still-active")
@@ -1171,6 +1343,24 @@ class PipoPlaybackService : MediaLibraryService() {
         scheduleBadSourceSkip(player, error)
     }
 
+    private fun markServiceUrlRefreshReplacement(mediaId: String) {
+        serviceUrlRefreshReplacementMediaId = mediaId
+    }
+
+    private fun updateServiceUrlRefreshTriedOnTransition(mediaId: String?, reason: Int) {
+        val isRefreshReplacement = mediaId != null && mediaId == serviceUrlRefreshReplacementMediaId
+        if (isRefreshReplacement) {
+            serviceUrlRefreshReplacementMediaId = null
+        }
+        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
+            if (!isRefreshReplacement) {
+                serviceUrlRefreshTried.clear()
+            }
+        } else {
+            mediaId?.let { serviceUrlRefreshTried.remove(it) }
+        }
+    }
+
     private fun startServiceUrlRefresh(player: Player, error: PlaybackException): Boolean {
         if (!player.playWhenReady || player.mediaItemCount == 0) return false
         val mediaItem = player.currentMediaItem ?: return false
@@ -1242,6 +1432,7 @@ class PipoPlaybackService : MediaLibraryService() {
                 val liveItem = player.currentMediaItem ?: return@runCatching
                 val itemIndex = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
                 if (itemIndex !in 0 until player.mediaItemCount) return@runCatching
+                val resumePositionMs = maxOf(startPositionMs, player.currentPosition.coerceAtLeast(0L))
                 clearBadSourceRecovery(mediaId)
                 DiagnosticsLogStore.record(
                     area = "playback_service",
@@ -1249,9 +1440,10 @@ class PipoPlaybackService : MediaLibraryService() {
                     fields = playerFields(player) + mapOf(
                         "code" to error.errorCodeName,
                         "neteaseId" to neteaseId,
-                        "resumePositionMs" to startPositionMs,
+                        "resumePositionMs" to resumePositionMs,
                     ),
                 )
+                markServiceUrlRefreshReplacement(mediaId)
                 player.replaceMediaItem(
                     itemIndex,
                     liveItem.buildUpon()
@@ -1259,10 +1451,13 @@ class PipoPlaybackService : MediaLibraryService() {
                         .setCustomCacheKey(liveItem.localConfiguration?.customCacheKey ?: fresh.cacheKey)
                         .build(),
                 )
-                player.seekTo(itemIndex, startPositionMs)
+                player.seekTo(itemIndex, resumePositionMs)
                 player.prepare()
                 player.play()
             }.onFailure { err ->
+                if (serviceUrlRefreshReplacementMediaId == mediaId) {
+                    serviceUrlRefreshReplacementMediaId = null
+                }
                 clearBadSourceRecovery(mediaId)
                 DiagnosticsLogStore.record(
                     area = "playback_service",
@@ -1605,7 +1800,9 @@ class PipoPlaybackService : MediaLibraryService() {
             runCatching {
                 val idx = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
                 if (idx !in 0 until player.mediaItemCount) return@runCatching
+                val resumePositionMs = maxOf(startPositionMs, player.currentPosition.coerceAtLeast(0L))
                 clearBadSourceRecovery(mediaId)
+                markServiceUrlRefreshReplacement(mediaId)
                 player.replaceMediaItem(
                     idx,
                     mediaItem.buildUpon()
@@ -1613,15 +1810,18 @@ class PipoPlaybackService : MediaLibraryService() {
                         .setCustomCacheKey(mediaItem.localConfiguration?.customCacheKey ?: fresh.cacheKey)
                         .build(),
                 )
-                player.seekTo(idx, startPositionMs)
+                player.seekTo(idx, resumePositionMs)
                 player.prepare()
                 player.play()
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "silent_stall_url_refresh_success",
-                    fields = playerFields(player) + mapOf("neteaseId" to neteaseId, "resumePositionMs" to startPositionMs),
+                    fields = playerFields(player) + mapOf("neteaseId" to neteaseId, "resumePositionMs" to resumePositionMs),
                 )
             }.onFailure {
+                if (serviceUrlRefreshReplacementMediaId == mediaId) {
+                    serviceUrlRefreshReplacementMediaId = null
+                }
                 clearBadSourceRecovery(mediaId)
                 skipStalledToNext(player, "refresh-failed")
             }
@@ -1810,6 +2010,15 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val TRACK_MEDIA_ID_PREFIX = "pipo:track:"
         private const val ASSISTANT_SEARCH_LIMIT = 20
         private const val ASSISTANT_PLAY_SCAN_LIMIT = 8
+        private val ASSISTANT_QUERY_STOP_WORDS = setOf(
+            "a",
+            "an",
+            "the",
+            "play",
+            "song",
+            "music",
+            "please",
+        )
         private val STREAM_LEVEL_FALLBACKS = listOf("lossless", "exhigh", "higher", "standard")
     }
 }
@@ -1817,7 +2026,8 @@ class PipoPlaybackService : MediaLibraryService() {
 private fun isLikelyBadSource(error: PlaybackException): Boolean = when (error.errorCode) {
     PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
     PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
-    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE -> true
+    PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+    PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
     else -> false
 }
 
