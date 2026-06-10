@@ -333,7 +333,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             .put("system", system)
             .put("temperature", temperature)
             .put("maxTokens", maxTokens)
-        return parseJsonString(callRaw("ai_chat", args))
+        return parseJsonString(callRaw("ai_chat", args, timeoutMs = AI_CALL_TIMEOUT_MS))
     }
 
     override suspend fun aiChatTools(
@@ -349,13 +349,13 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             .put("maxTokens", maxTokens)
         // 成功时 bridge 原样回传 assistant message JSON 对象（含 tool_calls）。
         // callRaw 只在出现顶层 "error" 字段时抛错；普通 message 不含该字段，原样返回。
-        return callRaw("ai_chat_tools", args)
+        return callRaw("ai_chat_tools", args, timeoutMs = AI_CALL_TIMEOUT_MS)
     }
 
     override suspend fun aiEmbed(inputs: List<String>): List<FloatArray> {
         if (inputs.isEmpty()) return emptyList()
         val args = JSONObject().put("inputs", JSONArray(inputs))
-        val arr = callArray("ai_embed", args)
+        val arr = callArray("ai_embed", args, timeoutMs = AI_CALL_TIMEOUT_MS)
         val out = ArrayList<FloatArray>(arr.length())
         for (i in 0 until arr.length()) {
             val vec = arr.optJSONArray(i) ?: continue
@@ -370,21 +370,30 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         return JSONObject(callRaw(command, args))
     }
 
-    private suspend fun callArray(command: String, args: JSONObject = JSONObject()): JSONArray {
-        return JSONArray(callRaw(command, args))
+    private suspend fun callArray(
+        command: String,
+        args: JSONObject = JSONObject(),
+        timeoutMs: Long = DEFAULT_CALL_TIMEOUT_MS,
+    ): JSONArray {
+        return JSONArray(callRaw(command, args, timeoutMs))
     }
 
-    private suspend fun callRaw(command: String, args: JSONObject = JSONObject()): String {
+    private suspend fun callRaw(
+        command: String,
+        args: JSONObject = JSONObject(),
+        timeoutMs: Long = DEFAULT_CALL_TIMEOUT_MS,
+    ): String {
         // 给 JNI 调用一个硬上限。invokeNative 是同步 native 调用,withTimeout cancel
         // 只能解锁 Kotlin 这边的 suspend —— 底层 native 线程不响应 Java thread interrupt,
         // 会继续跑到 Rust 端自己的 timeout / 完成。我们容忍这种"僵尸 IO 线程",
         // 关键是上层 viewModelScope 不会永久 pending(协程堆积、歌词不显示、续杯不来
         // 都会消解)。
         //
-        // 30s 是经验值:DeepSeek/网易 API 正常 RTT < 2s,留 15× 余量给慢网三次重试。
-        // AI chat / embed 类大 payload 偶尔慢,所以不能太短。
+        // 默认 30s 是按网易 API 估的(正常 RTT < 2s)。AI chat/tools/embed 一轮带大上下文
+        // 经常超 30s,Rust 端 reqwest 自己的硬超时是 60s —— 所以 AI 类命令用
+        // AI_CALL_TIMEOUT_MS(75s) 让 Rust 先返回,避免 Kotlin 提前掐断一个其实会成功的调用。
         return try {
-            withTimeout(30_000L) {
+            withTimeout(timeoutMs) {
                 withContext(bridgeDispatcher) {
                     invokeNative(command, args.toString()).also { raw ->
                         val trimmed = raw.trimStart()
@@ -410,7 +419,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         } catch (e: TimeoutCancellationException) {
             // 转成 RustBridgeException,跟其它 bridge 错误统一被上层 runCatching 捕获,
             // 不会冒泡成未捕获异常崩 app
-            throw RustBridgeException(command, "timeout after 30s")
+            throw RustBridgeException(command, "timeout after ${timeoutMs / 1000}s")
         }
     }
 
@@ -421,6 +430,11 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     }
 
     companion object {
+        private const val DEFAULT_CALL_TIMEOUT_MS = 30_000L
+
+        /** AI 类命令(chat/tools/embed):Rust reqwest 硬超时 60s,Kotlin 留 75s 让 Rust 先返回。 */
+        private const val AI_CALL_TIMEOUT_MS = 75_000L
+
         private const val BRIDGE_PARALLELISM = 6
         private val bridgeDispatcher = Executors.newFixedThreadPool(BRIDGE_PARALLELISM) { task ->
             Thread(task, "pipo-rust-bridge").apply { isDaemon = true }

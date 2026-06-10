@@ -135,8 +135,8 @@ internal fun LandscapePlayerLyricsScreen(
                             lyricFontWeight = FontWeight.ExtraBold,
                             bottomFadeStart = 0.90f,
                             bottomFadeSoftEnd = 0.98f,
-                            // 横屏把固定歌词位置整体下移 80dp（竖屏 ImmersiveLyrics 不传，保持不变）。
-                            anchorBiasDp = 80.dp,
+                            // 横屏把固定歌词位置整体下移 60dp（竖屏 ImmersiveLyrics 不传，保持不变）。
+                            anchorBiasDp = 60.dp,
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth(),

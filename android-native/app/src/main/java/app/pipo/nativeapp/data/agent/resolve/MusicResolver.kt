@@ -18,6 +18,9 @@ import app.pipo.nativeapp.data.agent.domain.PlayMode
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
 import app.pipo.nativeapp.data.agent.normalize.CatalogLexicon
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 
 class MusicResolver(
@@ -370,19 +373,28 @@ class MusicResolver(
             .filter { it.isNotBlank() }
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
-        for (query in queries) {
+        // 分批并行搜（批内 3 个并行，凑够 desired 不开下一批）。query 按「具体歌→歌手→风格」
+        // 优先级排序，合并仍按该顺序取，结果语义与串行一致；wall-time 约为串行的 1/3。
+        for (batch in queries.chunked(3)) {
             if (out.size >= desired) break
-            val hits = runCatching { repository.searchTracks(query, limit = 20) }.getOrDefault(emptyList())
-            val scopedHits = when {
-                artistScope == ArtistScope.Strict && artistKeys.isNotEmpty() ->
-                    hits.filter { artistMatchesAny(it.artist, artistKeys) }
-                artistScope == ArtistScope.Focus && artistKeys.isNotEmpty() ->
-                    hits.sortedByDescending { if (artistMatchesAny(it.artist, artistKeys)) 1 else 0 }
-                else -> hits
+            val hitsPerQuery = coroutineScope {
+                batch.map { query ->
+                    async { runCatching { repository.searchTracks(query, limit = 20) }.getOrDefault(emptyList()) }
+                }.awaitAll()
             }
-            for (track in scopedHits) {
-                if (seen.add(TrackDedupe.songKey(track))) out.add(track)
+            for (hits in hitsPerQuery) {
                 if (out.size >= desired) break
+                val scopedHits = when {
+                    artistScope == ArtistScope.Strict && artistKeys.isNotEmpty() ->
+                        hits.filter { artistMatchesAny(it.artist, artistKeys) }
+                    artistScope == ArtistScope.Focus && artistKeys.isNotEmpty() ->
+                        hits.sortedByDescending { if (artistMatchesAny(it.artist, artistKeys)) 1 else 0 }
+                    else -> hits
+                }
+                for (track in scopedHits) {
+                    if (seen.add(TrackDedupe.songKey(track))) out.add(track)
+                    if (out.size >= desired) break
+                }
             }
         }
         return out
