@@ -2200,8 +2200,12 @@ private class NativeTimedLyricPlan(
     // 不能让相邻行的 clip band 重叠，否则整段 paragraph 重绘会把别的行也染进来。
     val rowClipTop: FloatArray,
     val rowClipBottom: FloatArray,
+    val rowGlowClipTop: FloatArray,
+    val rowGlowClipBottom: FloatArray,
     val segClipLeft: FloatArray,
     val segClipRight: FloatArray,
+    val segGlowClipLeft: FloatArray,
+    val segGlowClipRight: FloatArray,
     val segSlow: FloatArray,
     val segNeedsDescenderSafe: BooleanArray,
     val glyphBoxLeft: FloatArray,
@@ -2228,13 +2232,19 @@ private fun nativeTimedLyricPlan(
     val fadeWidth = nativeWordFadeWidth(layout, fontPx)
     val segClipLeft = FloatArray(segments.size)
     val segClipRight = FloatArray(segments.size)
+    val segGlowClipLeft = FloatArray(segments.size)
+    val segGlowClipRight = FloatArray(segments.size)
     // 悬伸/抗锯齿裁切余量在排版期一次性烘焙进段裁切带，并在函数内夹到词间留白中点，
     // 避免逐帧绘制时再对相邻段无条件加 pad 造成裁切带重叠（上浮错相位重影）。
     val glyphClipPad = fontPx * NATIVE_GLYPH_HORIZONTAL_CLIP_PAD_EM
-    segments.forEachIndexed { idx, _ ->
+    val slowGlowClipPad = nativeSlowGlowClipPad(fontPx)
+    val slowGlowClipPadX = slowGlowClipPad + glyphClipPad
+    segments.forEachIndexed { idx, segment ->
         val bounds = nativeSegmentClipBounds(layout, segments, idx, fadeWidth, glyphClipPad)
         segClipLeft[idx] = bounds.left
         segClipRight[idx] = bounds.right
+        segGlowClipLeft[idx] = segment.left - slowGlowClipPadX
+        segGlowClipRight[idx] = segment.right + slowGlowClipPadX
     }
     val text = layout.layoutInput.text.text
     val glyphBoxLeft = FloatArray(text.length) { Float.NaN }
@@ -2278,6 +2288,15 @@ private fun nativeTimedLyricPlan(
             expanded.coerceAtMost(rowTopArr[line + 1])
         }
     }
+    // 慢词光晕只绘制当前字形，不会把相邻行的整段 paragraph 染进来，因此它的纵向 clip
+    // 不需要像普通 sweep slice 那样夹在相邻 line box 中间。给 blur 自然衰减的空间，
+    // 否则第二行及之后的 glow 会被行边界切出水平硬线。
+    val rowGlowClipTopArr = FloatArray(layout.lineCount) { line ->
+        rowTopArr[line] - slowGlowClipPad
+    }
+    val rowGlowClipBottomArr = FloatArray(layout.lineCount) { line ->
+        rowBottomArr[line] + slowGlowClipPad
+    }
     return NativeTimedLyricPlan(
         layout = layout,
         segments = segments,
@@ -2287,8 +2306,12 @@ private fun nativeTimedLyricPlan(
         rowBottom = rowBottomArr,
         rowClipTop = rowClipTopArr,
         rowClipBottom = rowClipBottomArr,
+        rowGlowClipTop = rowGlowClipTopArr,
+        rowGlowClipBottom = rowGlowClipBottomArr,
         segClipLeft = segClipLeft,
         segClipRight = segClipRight,
+        segGlowClipLeft = segGlowClipLeft,
+        segGlowClipRight = segGlowClipRight,
         segSlow = FloatArray(segments.size) { idx ->
             nativeSlowWordAmount(
                 displayToken = segments[idx].timing,
@@ -2321,6 +2344,12 @@ private fun nativeTimedGlyphTextStyle(style: TextStyle): TextStyle {
         ),
         platformStyle = PlatformTextStyle(includeFontPadding = true),
     )
+}
+
+private fun nativeSlowGlowClipPad(fontPx: Float): Float {
+    return fontPx / NATIVE_APPLE_WEB_LINE_FONT_PX *
+        NATIVE_SLOW_SHADOW_PEAK_WEB_PX *
+        NATIVE_SLOW_SHADOW_CLIP_RADIUS_MULTIPLIER
 }
 
 private fun DrawScope.drawNativeTimedLyric(
@@ -2896,15 +2925,11 @@ private fun DrawScope.drawNativeSlowSegmentText(
     val mScale = motionScale.coerceIn(0f, 1f)
 
     val text = layout.layoutInput.text.text
-    val clipTop = lineTop - fontPx
-    val clipBottom = lineBottom + fontPx
+    val clipTop = plan.rowGlowClipTop[segment.line]
+    val clipBottom = plan.rowGlowClipBottom[segment.line]
     val glyphCenterY = (lineTop + lineBottom) * 0.5f
-    val textClipPadX = fontPx * NATIVE_GLYPH_HORIZONTAL_CLIP_PAD_EM
-    val maxShadowClipPad = fontPx / NATIVE_APPLE_WEB_LINE_FONT_PX *
-        NATIVE_SLOW_SHADOW_PEAK_WEB_PX *
-        NATIVE_SLOW_SHADOW_CLIP_RADIUS_MULTIPLIER
-    val glowClipLeft = segment.left - maxShadowClipPad - textClipPadX
-    val glowClipRight = segment.right + maxShadowClipPad + textClipPadX
+    val glowClipLeft = plan.segGlowClipLeft[segmentIndex]
+    val glowClipRight = plan.segGlowClipRight[segmentIndex]
 
     val segStartMs = segment.slowStartMs
     val segDurationMs = (segment.slowEndMs - segStartMs)
@@ -3069,7 +3094,9 @@ private fun DrawScope.drawNativeSlowGlyphSweepText(
 // 文字本体由 sweep 路径绘制，这里只铺光：填充用近零 alpha 让 shadowLayer 单独
 // 成像，光形完全来自字形轮廓，所以不会污染相邻字符的笔画。Apple 的
 // text-shadow 挂在 `.letter` 上，不会给每个字母外面再套一个贴边硬裁剪；Android
-// 也使用词级 glow clip，避免慢词上浮时出现竖向断边。
+// 也使用词级 glow clip，避免慢词上浮时出现竖向断边。clip 是 paragraph 行坐标下
+// 的安全雾化带，不能再叠加单字 baseline 的 topLeft.y；否则第二行起会把 glow 框
+// 整体下推，雾背景上下边缘被切成水平硬线。
 private fun DrawScope.drawNativeSlowGlyphGlow(
     glyphLayout: TextLayoutResult,
     topLeft: Offset,
@@ -3083,9 +3110,7 @@ private fun DrawScope.drawNativeSlowGlyphGlow(
     if (opacity <= 0.004f || blurPx <= 0.2f) return
     if (glowRight <= glowLeft || clipBottom <= clipTop) return
     val carrier = Color.White.copy(alpha = NATIVE_SLOW_GLOW_FILL_ALPHA)
-    val shiftedClipTop = clipTop + topLeft.y
-    val shiftedClipBottom = clipBottom + topLeft.y
-    nativeClipTextRect(glowLeft, shiftedClipTop, glowRight, shiftedClipBottom) {
+    nativeClipTextRect(glowLeft, clipTop, glowRight, clipBottom) {
         drawText(
             glyphLayout,
             color = carrier,
