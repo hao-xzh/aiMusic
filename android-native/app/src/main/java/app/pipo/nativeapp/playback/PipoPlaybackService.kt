@@ -489,10 +489,9 @@ class PipoPlaybackService : MediaLibraryService() {
                     ) {
                         // seek（含歌词点跳回放旧段）会把 position 拉回历史最高水位之下。
                         // 进度看门狗的基线"只认创新高"，不随 seek 重置的话，重放旧区间会被
-                        // 误判为 4s 无前进 → 每 4s 原地重踢（seekTo+prepare）：音频打嗝、
-                        // isPlaying 抖动、歌词扫色跳段，直到重新越过旧水位才停
-                        // （诊断日志里 progress_stall_rekick attempt=1 连环就是它）。
-                        // 真实卡死不受影响：重踢自身的 seek 重置基线后位置仍冻结，4s 照样再触发。
+                        // 误判为无前进 → 触发内部恢复 seek：音频打嗝、isPlaying 抖动、
+                        // 歌词扫色跳段，直到重新越过旧水位才停。真实卡死不受影响：
+                        // 内部恢复 seek 不重置基线，位置仍冻结时下一轮照样继续恢复。
                         if (reason == Player.DISCONTINUITY_REASON_SEEK ||
                             reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
                         ) {
@@ -1777,10 +1776,10 @@ class PipoPlaybackService : MediaLibraryService() {
 
     /**
      * 进度看门狗:只看 position 是否前进,不看 state。补 buffer_stall 的盲区 —— "buffering/ready 高频
-     * 抖动但 position 不动"会把 buffer_stall 的检查定时器反复 cancel,导致永不重踢、无限卡死(用户遇到
+     * 抖动但 position 不动"会把 buffer_stall 的检查定时器反复 cancel,导致无限卡死(用户遇到
      * 的"放着放着卡住、暂停加载暂停加载")。这里以 playWhenReady 为生命周期(抖动骗不过它),想播却
-     * ≥PROGRESS_STALL_THRESHOLD_MS 没前进就重踢续传(seek 原位 + prepare)。这里使用独立计数,
-     * 避免 READY/BUFFERING 抖动把 buffer stall 预算清零后,进度看门狗永远只停在 attempt=1。
+     * ≥PROGRESS_STALL_THRESHOLD_MS 没前进就直接小步前跳。Good Days 这类固定坏片段原地 prepare 无效,
+     * 用户手动跳到 7~9s 能续播,所以自动恢复也走同一策略。
      */
     private fun evaluateProgressWatchdog(player: Player) {
         if (!player.playWhenReady || player.mediaItemCount == 0) return // 暂停/空 → 歇着,等下次 arm
@@ -1807,30 +1806,10 @@ class PipoPlaybackService : MediaLibraryService() {
                 progressStallAttempts = 0
                 progressStallSkipAheadMediaId = null
             }
-            if (progressStallAttempts < PROGRESS_STALL_REKICK_LIMIT) {
-                // 先试轻量重踢:可能只是临时网络抖动,原地 seek + prepare 逼它续传
-                progressStallAttempts += 1
-                DiagnosticsLogStore.record(
-                    area = "playback_service",
-                    event = "progress_stall_rekick",
-                    fields = playerFields(player) + mapOf(
-                        "attempt" to progressStallAttempts,
-                        "positionMs" to positionNow,
-                        "stalledMs" to (now - lastProgressAtMs),
-                    ),
-                )
-                runCatching {
-                    markProgressWatchdogInternalSeek()
-                    player.seekTo(positionNow)
-                    player.prepare()
-                }
-                lastProgressAtMs = now // 给恢复时间,避免连环重踢
-            } else if (progressStallSkipAheadMediaId != mediaId && tryProgressStallSkipAhead(player, mediaId, positionNow, now)) {
-                // Good Days 这类固定点坏片段,用户手动跳到 7~9s 能继续播；先自动小步前跳一次,
-                // 比直接重签 URL 或整首跳过更贴近用户期望。
+            if (progressStallSkipAheadMediaId != mediaId && tryProgressStallSkipAhead(player, mediaId, positionNow, now)) {
                 lastProgressAtMs = now
             } else {
-                // 重踢 / 小步前跳后还卡 = 不是临时抖动,是这首在该位置源/URL 拉不到数据。
+                // 小步前跳后还卡 = 不是单个坏片段,是这首在该位置源/URL 拉不到数据。
                 // 升级:重签 URL → 换 URI 续播;拿不到 / 已重签过 → 跳到下一首。不再干重踢。
                 progressStallAttempts += 1
                 DiagnosticsLogStore.record(
@@ -2195,11 +2174,9 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val BUFFER_STALL_PROGRESS_TOLERANCE_MS = 250L
         // 同一首最多重踢几次,防止网络真没了时 prepare 风暴
         private const val BUFFER_STALL_MAX_ATTEMPTS = 4
-        // 进度看门狗:每 2s 看一次 position;想播却 ≥4s 没前进就判定卡住。
-        private const val PROGRESS_WATCHDOG_INTERVAL_MS = 2_000L
-        private const val PROGRESS_STALL_THRESHOLD_MS = 4_000L
-        // 进度卡死比单纯 BUFFERING 更确定；原地重踢一次仍不前进,就先小步前跳绕过坏片段。
-        private const val PROGRESS_STALL_REKICK_LIMIT = 1
+        // 进度看门狗:每 1s 看一次 position;想播却约 3s 没前进就判定卡住并小步前跳。
+        private const val PROGRESS_WATCHDOG_INTERVAL_MS = 1_000L
+        private const val PROGRESS_STALL_THRESHOLD_MS = 2_500L
         private const val PROGRESS_STALL_SKIP_AHEAD_MS = 4_000L
         private const val PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS = 1_500L
         private const val PROGRESS_WATCHDOG_INTERNAL_SEEK_GRACE_MS = 1_000L

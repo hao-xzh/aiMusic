@@ -14,11 +14,13 @@ package app.pipo.nativeapp.data
 object LyricCredits {
     fun stripLeading(lines: List<PipoLyricLine>): List<PipoLyricLine> {
         if (lines.isEmpty()) return lines
+        val sanitized = lines.mapNotNull(::sanitizeRenderableLine)
+        if (sanitized.isEmpty()) return sanitized
         var drop = 0
         var sawKeywordCredit = false
-        for ((index, line) in lines.withIndex()) {
+        for ((index, line) in sanitized.withIndex()) {
             val text = line.text.trim()
-            val prevStartMs = if (index > 0) lines[index - 1].startMs else 0L
+            val prevStartMs = if (index > 0) sanitized[index - 1].startMs else 0L
             val isCredit = when {
                 CREDIT_PREFIX.containsMatchIn(text) ||
                     CREDIT_PREFIX_SHORT.containsMatchIn(text) ||
@@ -37,10 +39,32 @@ object LyricCredits {
             }
             if (isCredit) drop = index + 1 else break
         }
-        if (drop == 0) return lines
+        if (drop == 0) return sanitized
         // 整首都像 credit 的不可能是真歌词文件出问题，保守不动。
-        if (drop >= lines.size) return lines
-        return lines.drop(drop)
+        if (drop >= sanitized.size) return sanitized
+        return sanitized.drop(drop)
+    }
+
+    private fun sanitizeRenderableLine(line: PipoLyricLine): PipoLyricLine? {
+        val text = line.text.trim()
+        if (!hasRenderableLyricText(text)) return null
+        val companions = line.companionLines.mapNotNull(::sanitizeRenderableLine)
+        return line.copy(text = text, companionLines = companions)
+    }
+
+    private fun hasRenderableLyricText(text: String): Boolean {
+        val compact = text.trim()
+        if (compact.isEmpty()) return false
+        if (LRC_TIMESTAMP_RESIDUE.matches(compact)) return false
+        if (LRC_METADATA_TAG.matches(compact)) return false
+        val unwrapped = compact.trim(*WRAPPER_CHARS).trim()
+        if (unwrapped.isEmpty()) return false
+        return unwrapped.any { ch ->
+            ch.isLetterOrDigit() ||
+                ch in '\u4e00'..'\u9fff' ||
+                ch in '\u3040'..'\u30ff' ||
+                ch in '\uac00'..'\ud7af'
+        }
     }
 
     /**
@@ -51,6 +75,10 @@ object LyricCredits {
     private val CREDIT_PREFIX = Regex(
         "^[（(\\[【]?\\s*(作词|作詞|填词|填詞|作曲|谱曲|譜曲|编曲|編曲|制作人|製作人|监制|監製|出品人|出品|发行|發行|录音师|錄音師|录音室|錄音室|录音棚|錄音棚|录音|錄音|混音师|混音師|混音|母带|母帶|和声|和聲|合声|合聲|配唱|演唱|原唱|翻唱|演奏|吉他|贝斯|貝斯|贝司|键盘|鍵盤|钢琴|鋼琴|弦乐|弦樂|打击乐|打擊樂|人声|人聲|制作|製作|企划|企劃|统筹|統籌|文案|封面|插画|插畫|设计|設計|总监|總監|工程师|工程師)[一-鿿A-Za-z ./&-]{0,20}[:：]",
     )
+
+    private val LRC_TIMESTAMP_RESIDUE = Regex("^\\[+\\s*\\d{1,2}:\\d{2}(?:\\.\\d{1,3})?\\s*]+$")
+    private val LRC_METADATA_TAG = Regex("^\\[?\\s*(by|ti|ar|al|offset|offsetMs)\\s*[:：].*]?$", RegexOption.IGNORE_CASE)
+    private val WRAPPER_CHARS = charArrayOf('[', ']', '【', '】', '(', ')', '（', '）')
 
     /** 单字 / 缩写关键词：必须紧跟冒号（可带拉丁注解），不允许中文后缀。 */
     private val CREDIT_PREFIX_SHORT = Regex(
