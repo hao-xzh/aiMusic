@@ -21,7 +21,7 @@ import kotlinx.coroutines.withContext
 /**
  * 封面边缘色采样 + 明暗判断 —— 镜像 src/lib/cover-color.ts。
  *
- *   - 顶 / 底 / 左 / 右边各采样 5px，平均 RGB
+ *   - 顶 / 底 / 左 / 右边取边缘 + 内圈带，找稳定主底色而不是硬平均
  *   - luma 145 阈值 → "dark"（用深色文字）/ "light"（用浅色文字）
  */
 data class EdgeColors(
@@ -32,6 +32,9 @@ data class EdgeColors(
     // 封面主色调（最鲜艳的一簇颜色）—— 用来给歌词扫描交界处染"随歌曲变化的微光"。
     // 灰度封面提不出主色时为 null（此时歌词不染色，保持纯白/黑）。
     val accent: IntArray? = null,
+    // 全图稳定底色：用于沉浸页背景/封面融合。它偏向大面积、低噪声颜色，
+    // 避免黑字、贴纸、局部高饱和块把背景揉脏。
+    val ambient: IntArray? = null,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -80,36 +83,85 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
 }
 
 private fun sampleEdges(bitmap: Bitmap): EdgeColors {
-    val w = 32
-    val h = 32
+    val w = 48
+    val h = 48
     val small: Bitmap = bitmap.scale(w, h)
     val pixels = IntArray(w * h)
     small.getPixels(pixels, 0, w, 0, 0, w, h)
 
-    fun avg(yStart: Int, yEnd: Int, xStart: Int = 0, xEnd: Int = w): IntArray? {
-        var r = 0L; var g = 0L; var b = 0L; var n = 0
-        for (y in yStart until yEnd) {
+    fun dominant(
+        yStart: Int,
+        yEnd: Int,
+        xStart: Int = 0,
+        xEnd: Int = w,
+        edge: EdgeSide? = null,
+    ): IntArray? {
+        val bucketWeight = DoubleArray(16 * 16 * 16)
+        val bucketR = DoubleArray(bucketWeight.size)
+        val bucketG = DoubleArray(bucketWeight.size)
+        val bucketB = DoubleArray(bucketWeight.size)
+        for (y in yStart.coerceIn(0, h) until yEnd.coerceIn(0, h)) {
             val row = y * w
-            for (x in xStart until xEnd) {
+            for (x in xStart.coerceIn(0, w) until xEnd.coerceIn(0, w)) {
                 val c = pixels[row + x]
-                r += (c shr 16) and 0xFF
-                g += (c shr 8) and 0xFF
-                b += c and 0xFF
-                n++
+                val alpha = (c ushr 24) and 0xFF
+                if (alpha < 16) continue
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                val luma = 0.299 * r + 0.587 * g + 0.114 * b
+                val chroma = maxOf(r, g, b) - minOf(r, g, b)
+                val distanceWeight = when (edge) {
+                    EdgeSide.Top -> 1.0 - (y.toDouble() / h.toDouble()) * 0.42
+                    EdgeSide.Bottom -> 1.0 - ((h - 1 - y).toDouble() / h.toDouble()) * 0.42
+                    EdgeSide.Left -> 1.0 - (x.toDouble() / w.toDouble()) * 0.42
+                    EdgeSide.Right -> 1.0 - ((w - 1 - x).toDouble() / w.toDouble()) * 0.42
+                    null -> 1.0
+                }.coerceIn(0.58, 1.0)
+                // 黑字/纯白高光/高饱和小贴纸通常面积不大但很抢眼，降低它们对"背景底色"
+                // 的投票权；真正大面积的强色仍会靠面积胜出。
+                val noiseWeight = when {
+                    luma < 28.0 -> 0.28
+                    luma > 246.0 -> 0.46
+                    chroma > 156 -> 0.68
+                    else -> 1.0
+                }
+                val weight = distanceWeight * noiseWeight
+                val idx = ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
+                bucketWeight[idx] += weight
+                bucketR[idx] += r * weight
+                bucketG[idx] += g * weight
+                bucketB[idx] += b * weight
             }
         }
-        if (n == 0) return null
-        return intArrayOf((r / n).toInt(), (g / n).toInt(), (b / n).toInt())
+        var best = -1
+        var bestWeight = 0.0
+        for (i in bucketWeight.indices) {
+            if (bucketWeight[i] > bestWeight) {
+                best = i
+                bestWeight = bucketWeight[i]
+            }
+        }
+        if (best < 0 || bestWeight <= 0.0) return null
+        return intArrayOf(
+            (bucketR[best] / bestWeight).toInt(),
+            (bucketG[best] / bestWeight).toInt(),
+            (bucketB[best] / bestWeight).toInt(),
+        )
     }
 
-    val top = avg(0, 5)
-    val bottom = avg(h - 5, h)
-    val right = avg(0, h, w - 5, w)
-    val left = avg(0, h, 0, 5)
+    val band = 14
+    val top = dominant(0, band, edge = EdgeSide.Top)
+    val bottom = dominant(h - band, h, edge = EdgeSide.Bottom)
+    val right = dominant(0, h, w - band, w, EdgeSide.Right)
+    val left = dominant(0, h, 0, band, EdgeSide.Left)
     val accent = extractVibrant(pixels)
+    val ambient = dominant(0, h)
     if (small !== bitmap) small.recycle()
-    return EdgeColors(top, bottom, right, left, accent)
+    return EdgeColors(top, bottom, right, left, accent, ambient)
 }
+
+private enum class EdgeSide { Top, Bottom, Left, Right }
 
 /**
  * 从缩略图里提取"最鲜艳的一簇颜色"作为封面主色调。
@@ -174,4 +226,15 @@ fun pickFgUnsung(tone: Tone): Color =
 fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback
     return Color(red = rgb[0] / 255f, green = rgb[1] / 255f, blue = rgb[2] / 255f)
+}
+
+fun blendRgb(a: IntArray?, b: IntArray?, amount: Float): IntArray? {
+    val left = a?.takeIf { it.size >= 3 } ?: return b
+    val right = b?.takeIf { it.size >= 3 } ?: return left
+    val t = amount.coerceIn(0f, 1f)
+    return intArrayOf(
+        (left[0] + (right[0] - left[0]) * t).toInt().coerceIn(0, 255),
+        (left[1] + (right[1] - left[1]) * t).toInt().coerceIn(0, 255),
+        (left[2] + (right[2] - left[2]) * t).toInt().coerceIn(0, 255),
+    )
 }

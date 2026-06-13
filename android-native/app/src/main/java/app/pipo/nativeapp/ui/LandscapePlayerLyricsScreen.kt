@@ -69,17 +69,22 @@ internal fun LandscapePlayerLyricsScreen(
     onSeekToMs: (Long) -> Unit,
 ) {
     val edges = useCoverEdgeColors(coverUrl)
-    val tone = computeTone(edges.right ?: edges.bottom ?: edges.top)
+    val ambientRgb = edges.ambient ?: edges.right ?: edges.bottom ?: edges.top ?: edges.left
+    val edgeRgb = blendRgb(edges.right ?: edges.bottom ?: edges.top, ambientRgb, 0.46f)
+    val accentRgb = blendRgb(edges.accent ?: edges.right, ambientRgb, 0.30f)
+    val tone = computeTone(edgeRgb ?: ambientRgb)
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
-    val landscapeAccent = rgbToColor(edges.right ?: edges.top ?: edges.left ?: edges.bottom, fallback = PipoColors.Bg1)
-    val seamColor = landscapeAccent
+    val ambientColor = rgbToColor(ambientRgb, fallback = PipoColors.Bg1)
+    val landscapeAccent = rgbToColor(accentRgb, fallback = ambientColor)
+    val seamColor = rgbToColor(edgeRgb, fallback = ambientColor)
 
     Box(modifier = Modifier.fillMaxSize()) {
         LandscapeBackdrop(
+            ambientColor = ambientColor,
             accentColor = landscapeAccent,
-            edgeColor = landscapeAccent,
+            edgeColor = seamColor,
         )
 
         BoxWithConstraints(
@@ -162,13 +167,14 @@ internal fun LandscapePlayerLyricsScreen(
 
 @Composable
 private fun LandscapeBackdrop(
+    ambientColor: Color,
     accentColor: Color,
     edgeColor: Color,
 ) {
-    val seamAccent = accentColor
-    val panelAccent = lerp(accentColor, Color.Black, 0.14f)
-    val farAccent = lerp(accentColor, Color(0xFF10131B), 0.24f)
-    val quietEdge = lerp(edgeColor, panelAccent, 0.18f)
+    val seamAccent = lerp(ambientColor, edgeColor, 0.34f)
+    val panelAccent = lerp(ambientColor, edgeColor, 0.18f)
+    val farAccent = lerp(ambientColor, Color.Black, 0.08f)
+    val quietEdge = lerp(edgeColor, ambientColor, 0.40f)
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -189,7 +195,7 @@ private fun LandscapeBackdrop(
                 val maxDim = kotlin.math.max(w, h)
                 drawCircle(
                     brush = Brush.radialGradient(
-                        colors = listOf(accentColor.copy(alpha = 0.18f), Color.Transparent),
+                        colors = listOf(accentColor.copy(alpha = 0.12f), Color.Transparent),
                         center = androidx.compose.ui.geometry.Offset(w * 0.22f, h * 0.22f),
                         radius = maxDim * 0.90f,
                     ),
@@ -198,7 +204,7 @@ private fun LandscapeBackdrop(
                 )
                 drawCircle(
                     brush = Brush.radialGradient(
-                        colors = listOf(quietEdge.copy(alpha = 0.10f), Color.Transparent),
+                        colors = listOf(quietEdge.copy(alpha = 0.12f), Color.Transparent),
                         center = androidx.compose.ui.geometry.Offset(w * 0.88f, h * 0.26f),
                         radius = maxDim * 0.78f,
                     ),
@@ -263,9 +269,10 @@ private fun LandscapeCoverPane(
                     Brush.horizontalGradient(
                         colorStops = arrayOf(
                             0.0f to Color.Transparent,
-                            0.46f to Color.Transparent,
-                            0.78f to seamColor.copy(alpha = 0.26f),
-                            1.0f to seamColor.copy(alpha = 0.62f),
+                            0.48f to Color.Transparent,
+                            0.72f to seamColor.copy(alpha = 0.14f),
+                            0.88f to seamColor.copy(alpha = 0.30f),
+                            1.0f to seamColor.copy(alpha = 0.46f),
                         ),
                     ),
                 ),

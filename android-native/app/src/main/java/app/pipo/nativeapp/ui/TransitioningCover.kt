@@ -70,6 +70,11 @@ fun TransitioningCover(
     // immersive 时底部大段渐隐到透明，让封面"溶进"下方同源重模糊背景，
     // 跟 Mac PlayerCard 那种"封面和背景是一张图"的整体感一致。
     val maskStrength = progress
+    val edges = useCoverEdgeColors(coverUrl)
+    val seamColor = rgbToColor(
+        blendRgb(edges.bottom, edges.ambient, 0.36f),
+        fallback = rgbToColor(edges.ambient, fallback = PipoColors.Bg1),
+    )
 
     // ⚠ .background 必须在 .graphicsLayer { Offscreen } 之"内"才能跟 mask 一起被裁。
     // 之前 .background 在 .graphicsLayer 之前 = 黑底直接画到屏幕，mask 透明区只能
@@ -113,6 +118,21 @@ fun TransitioningCover(
                     .background(Color(0xFF11151D)),  // 兜底色在 offscreen 层之内，跟 mask 一起裁
                 contentScale = ContentScale.Crop,
                 durationMs = 520,
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colorStops = arrayOf(
+                                0.0f to Color.Transparent,
+                                0.52f to Color.Transparent,
+                                0.70f to seamColor.copy(alpha = 0.10f * maskStrength),
+                                0.86f to seamColor.copy(alpha = 0.24f * maskStrength),
+                                1.0f to seamColor.copy(alpha = 0.42f * maskStrength),
+                            ),
+                        ),
+                    ),
             )
         }
     }
