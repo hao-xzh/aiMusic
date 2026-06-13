@@ -86,6 +86,7 @@ class PipoPlaybackService : MediaLibraryService() {
     private var progressStallAttempts: Int = 0
     private var progressStallSkipAheadMediaId: String? = null
     private var progressWatchdogInternalSeekUntilMs: Long = 0L
+    private val learnedProgressStallSkips = LinkedHashMap<String, ProgressStallSkip>()
     private var lastTransientNetworkErrorAtMs: Long = 0L
     private var badSourceRefreshJob: Job? = null
     private var audioFocusResumeJob: Job? = null
@@ -132,6 +133,12 @@ class PipoPlaybackService : MediaLibraryService() {
             maybeResumeAfterExternalAudioStops("playback-callback", configs)
         }
     }
+    private data class ProgressStallSkip(
+        val fromMs: Long,
+        val toMs: Long,
+        val learnedAtMs: Long,
+    )
+
     private val serviceUrlRefreshTried = LinkedHashSet<String>()
     private var serviceUrlRefreshReplacementMediaId: String? = null
     private val urlResolver by lazy {
@@ -1791,6 +1798,10 @@ class PipoPlaybackService : MediaLibraryService() {
             return
         }
         val positionNow = player.currentPosition.coerceAtLeast(0L)
+        if (maybeSkipKnownProgressStall(player, mediaId, positionNow, now)) {
+            scheduleProgressWatchdog(player)
+            return
+        }
         // 只有"超过历史最大已播位置"才算真前进 —— buffering/ready 抖动里的倒退后小幅涨回不算,
         // 否则反复清零重试计数 → 永不升级、无限重踢(Good Days 日志里 attempt 一直=1)。
         if (positionNow > maxReachedPositionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) {
@@ -1828,17 +1839,12 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     private fun tryProgressStallSkipAhead(player: Player, mediaId: String, positionMs: Long, now: Long): Boolean {
-        val durationMs = player.duration.takeIf { it > 0L && it != C.TIME_UNSET }
-        val maxTargetMs = durationMs?.let { it - PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS }
-        val targetMs = if (maxTargetMs != null) {
-            (positionMs + PROGRESS_STALL_SKIP_AHEAD_MS).coerceAtMost(maxTargetMs)
-        } else {
-            positionMs + PROGRESS_STALL_SKIP_AHEAD_MS
-        }
+        val targetMs = progressStallTargetMs(player, positionMs + PROGRESS_STALL_SKIP_AHEAD_MS)
         if (targetMs <= positionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) return false
         progressStallSkipAheadMediaId = mediaId
         progressStallAttempts += 1
         maxReachedPositionMs = targetMs
+        rememberProgressStallSkip(mediaId, positionMs, targetMs, now)
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "progress_stall_skip_ahead",
@@ -1855,6 +1861,74 @@ class PipoPlaybackService : MediaLibraryService() {
             player.prepare()
         }
         return true
+    }
+
+    private fun maybeSkipKnownProgressStall(
+        player: Player,
+        mediaId: String,
+        positionMs: Long,
+        now: Long,
+    ): Boolean {
+        val learnedSkip = learnedProgressStallSkips[mediaId] ?: return false
+        if (now - learnedSkip.learnedAtMs > PROGRESS_STALL_LEARNED_SKIP_TTL_MS) {
+            learnedProgressStallSkips.remove(mediaId)
+            return false
+        }
+        val skipWindowStartMs = (learnedSkip.fromMs - PROGRESS_STALL_KNOWN_SKIP_LEAD_MS).coerceAtLeast(0L)
+        val skipWindowEndMs = learnedSkip.fromMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS
+        if (positionMs !in skipWindowStartMs..skipWindowEndMs) return false
+
+        val targetMs = progressStallTargetMs(player, learnedSkip.toMs)
+        if (targetMs <= positionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) return false
+        maxReachedPositionMs = targetMs
+        lastProgressAtMs = now
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "progress_stall_known_skip",
+            fields = playerFields(player) + mapOf(
+                "fromPositionMs" to positionMs,
+                "toPositionMs" to targetMs,
+                "learnedFromMs" to learnedSkip.fromMs,
+                "learnedToMs" to learnedSkip.toMs,
+            ),
+        )
+        runCatching {
+            markProgressWatchdogInternalSeek()
+            player.seekTo(targetMs)
+            player.prepare()
+        }
+        return true
+    }
+
+    private fun progressStallTargetMs(player: Player, requestedTargetMs: Long): Long {
+        val durationMs = player.duration.takeIf { it > 0L && it != C.TIME_UNSET }
+        val maxTargetMs = durationMs?.let { it - PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS }
+        return if (maxTargetMs != null) {
+            requestedTargetMs.coerceAtMost(maxTargetMs)
+        } else {
+            requestedTargetMs
+        }
+    }
+
+    private fun rememberProgressStallSkip(mediaId: String, fromMs: Long, toMs: Long, now: Long) {
+        if (mediaId.isBlank()) return
+        trimExpiredProgressStallSkips(now)
+        learnedProgressStallSkips.remove(mediaId)
+        learnedProgressStallSkips[mediaId] = ProgressStallSkip(fromMs = fromMs, toMs = toMs, learnedAtMs = now)
+        while (learnedProgressStallSkips.size > PROGRESS_STALL_LEARNED_SKIP_MAX) {
+            val oldestMediaId = learnedProgressStallSkips.keys.firstOrNull() ?: break
+            learnedProgressStallSkips.remove(oldestMediaId)
+        }
+    }
+
+    private fun trimExpiredProgressStallSkips(now: Long) {
+        val iterator = learnedProgressStallSkips.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (now - entry.value.learnedAtMs > PROGRESS_STALL_LEARNED_SKIP_TTL_MS) {
+                iterator.remove()
+            }
+        }
     }
 
     /**
@@ -2174,11 +2248,14 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val BUFFER_STALL_PROGRESS_TOLERANCE_MS = 250L
         // 同一首最多重踢几次,防止网络真没了时 prepare 风暴
         private const val BUFFER_STALL_MAX_ATTEMPTS = 4
-        // 进度看门狗:每 1s 看一次 position;想播却约 3s 没前进就判定卡住并小步前跳。
-        private const val PROGRESS_WATCHDOG_INTERVAL_MS = 1_000L
-        private const val PROGRESS_STALL_THRESHOLD_MS = 2_500L
+        // 进度看门狗:每 0.5s 看一次 position;想播却约 1.5s 没前进就判定卡住并小步前跳。
+        private const val PROGRESS_WATCHDOG_INTERVAL_MS = 500L
+        private const val PROGRESS_STALL_THRESHOLD_MS = 1_250L
         private const val PROGRESS_STALL_SKIP_AHEAD_MS = 4_000L
         private const val PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS = 1_500L
+        private const val PROGRESS_STALL_KNOWN_SKIP_LEAD_MS = 800L
+        private const val PROGRESS_STALL_LEARNED_SKIP_TTL_MS = 6 * 60 * 60 * 1000L
+        private const val PROGRESS_STALL_LEARNED_SKIP_MAX = 32
         private const val PROGRESS_WATCHDOG_INTERNAL_SEEK_GRACE_MS = 1_000L
         private const val TRANSIENT_NETWORK_SKIP_DEFER_MS = 60_000L
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
