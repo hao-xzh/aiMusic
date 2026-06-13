@@ -66,7 +66,14 @@ pub extern "system" fn Java_app_pipo_nativeapp_data_JsonRustPipoBridge_invokeNat
         Err(e) => return string_or_null(&mut env, &error_json(format!("read args: {e}"))),
     };
     let args = serde_json::from_str::<Value>(&args_json).unwrap_or(Value::Null);
-    let out = dispatch(&command, args);
+    let out =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&command, args))) {
+            Ok(out) => out,
+            Err(payload) => error_json(format!(
+                "native panic in {command}: {}",
+                panic_payload_message(payload)
+            )),
+        };
     string_or_null(&mut env, &out)
 }
 
@@ -219,6 +226,22 @@ fn dispatch(command: &str, args: Value) -> String {
             let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
             run_json(async move {
                 let lyric = netease_client().song_lyric(id).await?;
+                Ok(serde_json::to_value(lyric)?)
+            })
+        }
+        "netease_cloud_lyric" => {
+            let song_id = args
+                .get("songId")
+                .or_else(|| args.get("song_id"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let user_id = args
+                .get("userId")
+                .or_else(|| args.get("user_id"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            run_json(async move {
+                let lyric = netease_client().cloud_lyric(song_id, user_id).await?;
                 Ok(serde_json::to_value(lyric)?)
             })
         }
@@ -581,6 +604,16 @@ where
 
 fn error_json(message: String) -> String {
     json!({ "error": message }).to_string()
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn string_or_null(env: &mut JNIEnv, value: &str) -> jstring {

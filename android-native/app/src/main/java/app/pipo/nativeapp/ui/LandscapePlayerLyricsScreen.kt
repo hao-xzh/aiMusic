@@ -54,10 +54,9 @@ internal fun LandscapePlayerLyricsScreen(
     album: String,
     trackId: String?,
     lyrics: List<PipoLyricLine>,
-    activeLyricIndex: Int,
-    positionMs: Long,
     durationMs: Long,
-    progress: Float,
+    positionProvider: () -> Long,
+    progressProvider: () -> Float,
     isPlaying: Boolean,
     isLoading: Boolean,
     controlsEnabled: Boolean,
@@ -119,9 +118,8 @@ internal fun LandscapePlayerLyricsScreen(
                         AppleMusicLyricColumn(
                             lines = lyrics,
                             sessionId = trackId,
-                            activeLyricIndex = activeLyricIndex,
-                            positionMs = positionMs,
                             isPlaying = isPlaying,
+                            positionProvider = positionProvider,
                             fg = fg,
                             fgDim = fgDim,
                             fgUnsung = fgUnsung,
@@ -144,8 +142,8 @@ internal fun LandscapePlayerLyricsScreen(
                     }
 
                     LandscapeBottomControls(
-                        progress = progress,
-                        positionMs = positionMs,
+                        progressProvider = progressProvider,
+                        positionProvider = positionProvider,
                         durationMs = durationMs,
                         isPlaying = isPlaying,
                         isLoading = isLoading,
@@ -338,8 +336,8 @@ private fun LandscapeTrackHeader(
 
 @Composable
 private fun LandscapeBottomControls(
-    progress: Float,
-    positionMs: Long,
+    progressProvider: () -> Float,
+    positionProvider: () -> Long,
     durationMs: Long,
     isPlaying: Boolean,
     isLoading: Boolean,
@@ -358,15 +356,19 @@ private fun LandscapeBottomControls(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        LandscapeTimeText(positionMs, fgDim)
+        LandscapeTimeText(positionProvider, fgDim)
         PipoProgressBar(
-            progress = { progress },
+            progress = progressProvider,
             onSeek = onSeek,
             trackColor = fg.copy(alpha = 0.18f),
             fillColor = fg,
             modifier = Modifier.weight(1f),
         )
-        LandscapeTimeText((durationMs - positionMs).coerceAtLeast(0L), fgDim, prefix = "-")
+        LandscapeTimeText(
+            { (durationMs - positionProvider()).coerceAtLeast(0L) },
+            fgDim,
+            prefix = "-",
+        )
         LandscapeRoundButton(
             enabled = enabled,
             onClick = onToggle,
@@ -416,8 +418,8 @@ private fun LandscapeRoundButton(
 }
 
 @Composable
-private fun LandscapeTimeText(ms: Long, color: Color, prefix: String = "") {
-    val total = (ms / 1000).coerceAtLeast(0)
+private fun LandscapeTimeText(ms: () -> Long, color: Color, prefix: String = "") {
+    val total = (ms() / 1000).coerceAtLeast(0)
     val m = total / 60
     val s = total % 60
     Text(

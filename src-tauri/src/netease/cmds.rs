@@ -165,6 +165,15 @@ pub async fn netease_song_lyric(state: NeteaseState<'_>, id: i64) -> Result<Lyri
     state.song_lyric(id).await.map_err(to_err)
 }
 
+#[tauri::command]
+pub async fn netease_cloud_lyric(
+    state: NeteaseState<'_>,
+    song_id: i64,
+    user_id: i64,
+) -> Result<LyricData, String> {
+    state.cloud_lyric(song_id, user_id).await.map_err(to_err)
+}
+
 /// 关键词搜索单曲 —— Phase B "库外推荐" 流水线第一站。
 /// AI 给的关键词 / 艺人组合 → 这里搜回真实可播的曲目集 → AI 再 rerank。
 #[tauri::command]

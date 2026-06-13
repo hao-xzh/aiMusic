@@ -194,6 +194,18 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
 
     override suspend fun neteaseSongLyric(trackId: String): List<PipoLyricLine> {
         val raw = callObject("netease_song_lyric", jsonObject("id" to trackId.toLongOrNull()))
+        return parseLyricObject(raw)
+    }
+
+    override suspend fun neteaseCloudLyric(songId: Long, userId: Long): List<PipoLyricLine> {
+        val raw = callObject(
+            "netease_cloud_lyric",
+            jsonObject("songId" to songId, "userId" to userId),
+        )
+        return parseLyricObject(raw)
+    }
+
+    private fun parseLyricObject(raw: JSONObject): List<PipoLyricLine> {
         val translations = raw.optStringOrNull("translation")
             ?.let { LrcParser.parse(it) }
             .orEmpty()

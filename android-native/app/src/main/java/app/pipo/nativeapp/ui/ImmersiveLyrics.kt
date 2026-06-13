@@ -39,7 +39,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.PipoLyricLine
 
 /**
@@ -296,18 +295,12 @@ private fun ImmersiveLyricsColumnLayer(
     lyricsTopPadding: Dp,
     lyricsRiseDp: Dp,
 ) {
-    // 进度是 30Hz 热路径，只在歌词列子树读取，避免标题、控件、backdrop 跟着重组。
-    val lyricClock = LyricTiming.resolve(
-        positionMs = positionProvider(),
-        lines = lyrics,
-    )
     androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides lyricAccentColor) {
         AppleMusicLyricColumn(
             lines = lyrics,
             sessionId = trackId,
-            activeLyricIndex = lyricClock.activeIndex,
-            positionMs = lyricClock.positionMs,
             isPlaying = isPlaying,
+            positionProvider = positionProvider,
             fg = fg,
             fgDim = fgDim,
             fgUnsung = fgUnsung,

@@ -588,10 +588,26 @@ pub struct SongUrlResp {
 //   }
 // 我们抹平成一个 claudio 侧结构。
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct LyricInner {
-    #[serde(default)]
     pub lyric: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LyricInner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let lyric = match value {
+            Value::String(s) => Some(s),
+            Value::Object(mut obj) => obj
+                .remove("lyric")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned)),
+            _ => None,
+        };
+        Ok(Self { lyric })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,7 +620,7 @@ pub struct LyricResp {
     /// 逐字（karaoke）歌词。网易云对收录较好的主流流行歌返回，独立 / 民谣常常没有。
     /// 格式：每行 `[lineStartMs,lineDurMs](charStartMs,charDurMs,0)char(charStartMs,charDurMs,0)char...`
     /// 用 lyric 字段透传给前端解析。
-    #[serde(default)]
+    #[serde(default, alias = "krc")]
     pub yrc: Option<LyricInner>,
     #[serde(default)]
     pub nolyric: bool,

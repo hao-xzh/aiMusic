@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CancellationException
+import java.util.Locale
 
 /**
  * Repository implementation target for the full native build.
@@ -18,7 +19,7 @@ import kotlinx.coroutines.CancellationException
  *
  * - netease_qr_start / netease_qr_check
  * - netease_account / netease_user_playlists / netease_playlist_detail
- * - netease_song_urls / netease_song_lyric
+ * - netease_song_urls / netease_song_lyric / netease_cloud_lyric
  * - audio_cache_* / audio_get_features
  * - ai_get_config / ai_set_provider / ai_set_api_key / ai_set_model
  */
@@ -50,6 +51,8 @@ class RustBridgeRepository(
     /** 曲目内存缓存：playlistId → tracks。冷启动 init 时灌入上次的快照，运行时累加 */
     private val tracksCacheLock = Any()
     private val tracksMemoryCache = mutableMapOf<Long, List<NativeTrack>>()
+    private val cloudSearchMatchLock = Any()
+    private val cloudSearchMatchCache = mutableMapOf<String, NativeTrack>()
 
     init {
         // 冷启动 sync 读盘：把上次的 playlist 列表 + 已知 tracks 灌进 in-memory state。
@@ -305,9 +308,14 @@ class RustBridgeRepository(
                     event = "cloud_disk_tracks_cache_hit",
                     fields = mapOf("count" to it.size),
                 )
-                // 确保 Flow 跟内存 cache 同步（init 已经灌过一次，这里幂等）
-                if (cloudTracksState.value !== it) cloudTracksState.value = it
-                return it
+                val hydrated = hydrateCloudFirstAvailableCover(it)
+                if (hydrated != it) {
+                    replaceCloudTracks(hydrated)
+                } else if (cloudTracksState.value !== it) {
+                    // 确保 Flow 跟内存 cache 同步（init 已经灌过一次，这里幂等）
+                    cloudTracksState.value = it
+                }
+                return hydrated
             }
         } else {
             synchronized(tracksCacheLock) { tracksMemoryCache.remove(sentinel) }
@@ -329,24 +337,19 @@ class RustBridgeRepository(
             // 退回 fallback（一般 EmptyPipoRepository 给空 list），让 UI 显示"空网盘"提示
             return runCatching { fallback.cloudDiskTracks(forceRefresh) }.getOrDefault(emptyList())
         }
+        val hydratedFresh = hydrateCloudFirstAvailableCover(fresh)
         DiagnosticsLogStore.record(
             area = "library",
             event = "cloud_disk_tracks_fetch_ok",
-            fields = mapOf("count" to fresh.size),
+            fields = mapOf(
+                "count" to hydratedFresh.size,
+                "availableCover" to hydratedFresh.any { !it.artworkUrl.isNullOrBlank() },
+            ),
         )
-        if (fresh.isNotEmpty()) {
-            val tracksSnapshot = synchronized(tracksCacheLock) {
-                tracksMemoryCache[sentinel] = fresh
-                HashMap(tracksMemoryCache)
-            }
-            cloudTracksState.value = fresh  // emit 到 Flow，UI cover/count 自动更新
-            val uid = accountState.value?.userId ?: cachedUserId
-            val playlists = playlistState.value
-            if (uid != null && playlists.isNotEmpty()) {
-                playlistCache?.save(uid, playlists, tracksSnapshot)
-            }
+        if (hydratedFresh.isNotEmpty()) {
+            replaceCloudTracks(hydratedFresh)
         }
-        return fresh
+        return hydratedFresh
     }
 
     override suspend fun searchTracks(query: String, limit: Int): List<NativeTrack> {
@@ -358,6 +361,63 @@ class RustBridgeRepository(
     }
 
     override suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine> {
+        val cloudTrack = cachedCloudTrackFor(trackId)
+        if (cloudTrack != null) {
+            val cloudLines = loadCloudLyricsById(trackId, cloudTrack)
+            if (lyricsAreUsable(cloudLines)) return cloudLines
+        }
+
+        val primaryLines = loadLyricsById(trackId)
+        if (lyricsAreUsable(primaryLines)) return primaryLines
+
+        if (cloudTrack == null) return emptyList()
+        DiagnosticsLogStore.record(
+            area = "lyrics",
+            event = "cloud_lyric_primary_unusable",
+            fields = mapOf(
+                "trackId" to trackId,
+                "title" to cloudTrack.title,
+                "artist" to cloudTrack.artist,
+                "lineCount" to primaryLines.size,
+                "nonBlankLineCount" to primaryLines.count { it.text.isNotBlank() },
+            ),
+        )
+        val matched = resolveCloudSearchMatch(trackId, cloudTrack, allowSameId = false) ?: return emptyList()
+        val matchedId = matched.neteaseId ?: return emptyList()
+        val matchedLines = loadLyricsById(matchedId.toString())
+        if (lyricsAreUsable(matchedLines)) {
+            DiagnosticsLogStore.record(
+                area = "lyrics",
+                event = "cloud_lyric_match_loaded",
+                fields = mapOf(
+                    "trackId" to trackId,
+                    "matchedId" to matchedId,
+                    "title" to cloudTrack.title,
+                    "matchedTitle" to matched.title,
+                    "matchedArtist" to matched.artist,
+                    "lineCount" to matchedLines.size,
+                ),
+            )
+            return matchedLines
+        } else {
+            DiagnosticsLogStore.record(
+                area = "lyrics",
+                event = "cloud_lyric_match_empty",
+                fields = mapOf(
+                    "trackId" to trackId,
+                    "matchedId" to matchedId,
+                    "title" to cloudTrack.title,
+                    "matchedTitle" to matched.title,
+                    "matchedArtist" to matched.artist,
+                    "lineCount" to matchedLines.size,
+                    "nonBlankLineCount" to matchedLines.count { it.text.isNotBlank() },
+                ),
+            )
+        }
+        return emptyList()
+    }
+
+    private suspend fun loadLyricsById(trackId: String): List<PipoLyricLine> {
         // 优先走 AMLL TTML 数据库（字级时间戳，质量明显高于 netease yrc）；
         // 命中失败（404 / 网络错误 / 非数字 trackId / 解析空）才回落到 Rust bridge。
         // AmllLyricsSource 内部已经做了本地永久缓存 + 404 哨兵，重复播同一首不会反复打网络。
@@ -368,6 +428,267 @@ class RustBridgeRepository(
         return LyricCredits.stripLeading(
             safe({ bridge.neteaseSongLyric(trackId) }, { fallback.lyricsForTrack(trackId) }),
         )
+    }
+
+    private suspend fun loadCloudLyricsById(trackId: String, track: NativeTrack): List<PipoLyricLine> {
+        val songId = track.neteaseId ?: trackId.toLongOrNull()
+        if (songId == null) {
+            DiagnosticsLogStore.record(
+                area = "lyrics",
+                event = "cloud_lyric_missing_song_id",
+                fields = mapOf(
+                    "trackId" to trackId,
+                    "title" to track.title,
+                    "artist" to track.artist,
+                ),
+            )
+            return emptyList()
+        }
+
+        val userId = currentUserIdForCloudLyric()
+        if (userId == null) {
+            DiagnosticsLogStore.record(
+                area = "lyrics",
+                event = "cloud_lyric_missing_user",
+                fields = mapOf(
+                    "trackId" to trackId,
+                    "songId" to songId,
+                    "title" to track.title,
+                    "artist" to track.artist,
+                ),
+            )
+            return emptyList()
+        }
+
+        val lines = try {
+            bridge.neteaseCloudLyric(songId, userId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DiagnosticsLogStore.record(
+                area = "lyrics",
+                event = "cloud_lyric_load_failed",
+                fields = mapOf(
+                    "trackId" to trackId,
+                    "songId" to songId,
+                    "userId" to userId,
+                    "title" to track.title,
+                    "artist" to track.artist,
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
+            emptyList()
+        }
+        val stripped = LyricCredits.stripLeading(lines)
+        DiagnosticsLogStore.record(
+            area = "lyrics",
+            event = "cloud_lyric_loaded",
+            fields = mapOf(
+                "trackId" to trackId,
+                "songId" to songId,
+                "userId" to userId,
+                "title" to track.title,
+                "artist" to track.artist,
+                "lineCount" to stripped.size,
+                "nonBlankLineCount" to stripped.count { it.text.isNotBlank() },
+                "usable" to lyricsAreUsable(stripped),
+            ),
+        )
+        return stripped
+    }
+
+    private suspend fun currentUserIdForCloudLyric(): Long? {
+        accountState.value?.userId?.let { return it }
+        cachedUserId?.let { return it }
+        val account = try {
+            bridge.neteaseAccount()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        accountState.value = account
+        return account?.userId?.also { cachedUserId = it }
+    }
+
+    private fun lyricsAreUsable(lines: List<PipoLyricLine>): Boolean {
+        if (lines.isEmpty()) return false
+        val texts = lines.map { it.text.trim() }.filter { it.isNotBlank() }
+        if (texts.isEmpty()) return false
+        return texts.any { text -> normalizeLyricPlaceholder(text) !in NO_LYRIC_PLACEHOLDERS }
+    }
+
+    private suspend fun hydrateCloudFirstAvailableCover(tracks: List<NativeTrack>): List<NativeTrack> {
+        if (tracks.isEmpty() || tracks.any { !it.artworkUrl.isNullOrBlank() }) return tracks
+        tracks.take(CLOUD_COVER_MATCH_SCAN_LIMIT).forEachIndexed { index, track ->
+            val matched = resolveCloudSearchMatch(track.id, track) ?: return@forEachIndexed
+            val cover = matched.artworkUrl?.takeIf { it.isNotBlank() } ?: return@forEachIndexed
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "cloud_cover_matched",
+                fields = mapOf(
+                    "trackId" to track.id,
+                    "matchedId" to matched.neteaseId,
+                    "index" to index,
+                    "title" to track.title,
+                    "matchedTitle" to matched.title,
+                    "matchedArtist" to matched.artist,
+                ),
+            )
+            return tracks.toMutableList().also { it[index] = track.copy(artworkUrl = cover) }
+        }
+        return tracks
+    }
+
+    private fun replaceCloudTracks(tracks: List<NativeTrack>) {
+        val tracksSnapshot = synchronized(tracksCacheLock) {
+            tracksMemoryCache[CLOUD_DISK_PLAYLIST_ID] = tracks
+            HashMap(tracksMemoryCache)
+        }
+        cloudTracksState.value = tracks
+        val uid = accountState.value?.userId ?: cachedUserId
+        val playlists = playlistState.value
+        if (uid != null && playlists.isNotEmpty()) {
+            playlistCache?.save(uid, playlists, tracksSnapshot)
+        }
+    }
+
+    private fun cachedCloudTrackFor(trackId: String): NativeTrack? =
+        synchronized(tracksCacheLock) {
+            tracksMemoryCache[CLOUD_DISK_PLAYLIST_ID]
+                ?.firstOrNull { it.id == trackId || it.neteaseId?.toString() == trackId }
+        }
+
+    private suspend fun resolveCloudSearchMatch(
+        trackId: String,
+        track: NativeTrack,
+        allowSameId: Boolean = true,
+    ): NativeTrack? {
+        val cacheKey = "$trackId:${if (allowSameId) "any" else "other"}"
+        synchronized(cloudSearchMatchLock) {
+            if (cloudSearchMatchCache.containsKey(cacheKey)) return cloudSearchMatchCache[cacheKey]
+        }
+        val query = buildCloudMatchQuery(track) ?: return null
+        val hits = safe({ bridge.neteaseSearch(query, 10) }, { fallback.searchTracks(query, 10) })
+        val matched = hits
+            .asSequence()
+            .filter { candidate -> allowSameId || candidate.neteaseId?.toString() != trackId }
+            .mapNotNull { candidate ->
+                cloudMatchScore(track, candidate)?.let { score -> score to candidate }
+            }
+            .maxByOrNull { it.first }
+            ?.second
+        DiagnosticsLogStore.record(
+            area = "library",
+            event = if (matched != null) "cloud_track_match_found" else "cloud_track_match_missing",
+            fields = mapOf(
+                "trackId" to trackId,
+                "query" to query,
+                "title" to track.title,
+                "artist" to track.artist,
+                "allowSameId" to allowSameId,
+                "matchedId" to matched?.neteaseId,
+                "matchedTitle" to matched?.title,
+                "matchedArtist" to matched?.artist,
+            ),
+        )
+        if (matched != null) {
+            synchronized(cloudSearchMatchLock) { cloudSearchMatchCache[cacheKey] = matched }
+        }
+        return matched
+    }
+
+    private fun buildCloudMatchQuery(track: NativeTrack): String? {
+        val title = track.title
+            .takeIf { !isUnknownValue(it) }
+            ?.let(::cleanCloudSearchTerm)
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        val artist = track.artist
+            .takeIf { !isUnknownValue(it) }
+            ?.let(::cleanCloudSearchTerm)
+            ?.takeIf { it.isNotBlank() }
+        return listOfNotNull(title, artist).joinToString(" ").takeIf { it.isNotBlank() }
+    }
+
+    private fun cloudMatchScore(source: NativeTrack, candidate: NativeTrack): Int? {
+        val sourceTitle = normalizeTrackText(source.title)
+        val candidateTitle = normalizeTrackText(candidate.title)
+        if (sourceTitle.isBlank() || candidateTitle.isBlank()) return null
+        val titleScore = when {
+            sourceTitle == candidateTitle -> 100
+            sourceTitle.length >= 2 && candidateTitle.contains(sourceTitle) -> 82
+            candidateTitle.length >= 2 && sourceTitle.contains(candidateTitle) -> 82
+            else -> return null
+        }
+
+        val sourceArtists = artistKeys(source.artist)
+        val candidateArtists = artistKeys(candidate.artist)
+        val artistMatches = sourceArtists.isNotEmpty() &&
+            candidateArtists.isNotEmpty() &&
+            sourceArtists.any { sourceArtist ->
+                candidateArtists.any { candidateArtist ->
+                    sourceArtist == candidateArtist ||
+                        sourceArtist.contains(candidateArtist) ||
+                        candidateArtist.contains(sourceArtist)
+                }
+            }
+        val titleContainsCandidateArtist = candidateArtists.any { sourceTitle.contains(it) }
+        if (sourceArtists.isNotEmpty() && !artistMatches && !titleContainsCandidateArtist) return null
+
+        val durationScore = if (
+            source.durationMs > 0L &&
+            candidate.durationMs > 0L &&
+            kotlin.math.abs(source.durationMs - candidate.durationMs) <= 3_000L
+        ) {
+            8
+        } else {
+            0
+        }
+        return titleScore + (if (artistMatches || titleContainsCandidateArtist) 20 else 0) + durationScore
+    }
+
+    private fun normalizeTrackText(value: String): String =
+        value
+            .lowercase(Locale.ROOT)
+            .replace(Regex("\\.(mp3|flac|wav|m4a|aac|ogg)$"), "")
+            .replace(Regex("[（(【\\[].*?[）)】\\]]"), "")
+            .replace(Regex("[\\s_\\-—–·•《》<>\"'“”‘’，,。.!！?？:：/\\\\]+"), "")
+            .trim()
+
+    private fun cleanCloudSearchTerm(value: String): String =
+        value
+            .trim()
+            .replace(Regex("\\.(mp3|flac|wav|m4a|aac|ogg)$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("[_\\-—–]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun normalizeLyricPlaceholder(value: String): String =
+        value
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[\\s\\p{Punct}，。！？、；：,.!?;:]+"), "")
+            .trim()
+
+    private fun artistKeys(value: String): List<String> =
+        value
+            .takeIf { !isUnknownValue(it) }
+            ?.split(Regex("[,，、/&＋+;；\\s]+"))
+            ?.map(::normalizeTrackText)
+            ?.filter { it.isNotBlank() }
+            ?.distinct()
+            .orEmpty()
+
+    private fun isUnknownValue(value: String): Boolean {
+        val normalized = value.trim().lowercase(Locale.ROOT)
+        return normalized.isBlank() ||
+            normalized == "unknown artist" ||
+            normalized == "unknown track" ||
+            normalized == "unknown album" ||
+            normalized == "未知歌手" ||
+            normalized == "未知曲目" ||
+            normalized == "未知专辑"
     }
 
     override suspend fun likeSong(id: Long, like: Boolean) {
@@ -566,6 +887,19 @@ class RustBridgeRepository(
  */
 const val CLOUD_DISK_PLAYLIST_ID: Long = -1L
 
+private const val CLOUD_COVER_MATCH_SCAN_LIMIT = 8
+
+private val NO_LYRIC_PLACEHOLDERS = setOf(
+    "暂无歌词",
+    "暂无歌词敬请期待",
+    "此歌曲暂无歌词",
+    "此歌曲为没有填词的纯音乐请欣赏",
+    "纯音乐请欣赏",
+    "instrumental",
+    "nolyric",
+    "nolyrics",
+)
+
 interface RustPipoBridge {
     suspend fun neteaseAccount(): PipoAccount?
     suspend fun neteaseLogout()
@@ -581,6 +915,7 @@ interface RustPipoBridge {
     suspend fun neteasePhoneLogin(phone: String, captcha: String, countryCode: Int): PhoneLoginStatus
     suspend fun neteaseSongUrls(ids: List<Long>, level: String): List<NativeSongUrl>
     suspend fun neteaseSongLyric(trackId: String): List<PipoLyricLine>
+    suspend fun neteaseCloudLyric(songId: Long, userId: Long): List<PipoLyricLine>
     suspend fun neteaseLikeSong(id: Long, like: Boolean)
     suspend fun neteasePlaylistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>)
     suspend fun audioCacheStats(): AudioCacheStats

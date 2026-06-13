@@ -65,7 +65,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.playback.PlayerViewModel
 import app.pipo.nativeapp.runtime.Amp
 import kotlinx.coroutines.delay
@@ -109,6 +108,7 @@ fun PlayerScreen(
     val progressProvider: () -> Float = {
         if (durationMs > 0) (viewModel.positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
     }
+    val positionProvider = remember(viewModel) { { viewModel.positionMs } }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
         configuration.screenWidthDp > configuration.screenHeightDp
@@ -140,11 +140,6 @@ fun PlayerScreen(
         label = "playerOrientation",
     ) { landscape ->
         if (landscape) {
-            // 横屏歌词逐帧驱动,直接读 viewModel.positionMs —— 该分支随之 30Hz,本就如此。
-            val lyricClock = LyricTiming.resolve(
-                positionMs = viewModel.positionMs,
-                lines = state.lyrics,
-            )
             LandscapePlayerLyricsScreen(
                 coverUrl = state.artworkUrl,
                 title = state.title,
@@ -152,10 +147,9 @@ fun PlayerScreen(
                 album = state.album,
                 trackId = state.currentTrackId,
                 lyrics = state.lyrics,
-                activeLyricIndex = lyricClock.activeIndex,
-                positionMs = lyricClock.positionMs,
                 durationMs = state.durationMs,
-                progress = progressProvider(),
+                positionProvider = positionProvider,
+                progressProvider = progressProvider,
                 isPlaying = state.isPlaying,
                 isLoading = state.isLoading,
                 controlsEnabled = state.queue.isNotEmpty(),
@@ -177,7 +171,7 @@ fun PlayerScreen(
                 lyricsReady = state.lyrics.isNotEmpty(),
                 queueReady = state.queue.isNotEmpty(),
                 isLoading = state.isLoading,
-                positionProvider = { viewModel.positionMs },
+                positionProvider = positionProvider,
                 durationMs = state.durationMs,
                 progressProvider = progressProvider,
                 hideAlpha = hideAlpha,

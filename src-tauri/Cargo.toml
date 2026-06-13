@@ -35,6 +35,7 @@ rand = "0.8"
 num-bigint = "0.4"
 num-traits = "0.2"
 url = "2"
+md5 = "0.7"
 
 # 本地缓存（歌单 / 曲目 / 歌词 / kv 状态）
 # `bundled` 把 sqlite3 编译进来，不依赖系统 libsqlite。

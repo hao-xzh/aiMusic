@@ -199,6 +199,11 @@ private fun DistillLibrary(
         cloudTracksFlow.firstNotNullOfOrNull { it.artworkUrl?.takeIf(String::isNotBlank) }
     }
     val cloudDiskCount = cloudTracksFlow.size
+    LaunchedEffect(cloudDiskCover, cloudDiskCount, repository) {
+        if (cloudDiskCover == null) {
+            runCatching { repository.cloudDiskTracks() }
+        }
+    }
     // 没有自带 coverUrl 的歌单（少数）用第一首歌的 artworkUrl 兜底；用 mutableStateMap +
     // derivedStateOf 让 buildList 在 map 写入时自动重算（普通 remember 不订阅 map 内变化）。
     val firstTrackCovers = remember { mutableStateMapOf<Long, String>() }

@@ -16,6 +16,7 @@ cipher = { version = "0.4", features = ["block-padding"] }
 cookie_store = "0.21"
 hex = "0.4"
 jni = "0.21"
+md5 = "0.7"
 num-bigint = "0.4"
 num-traits = "0.2"
 rand = "0.8"

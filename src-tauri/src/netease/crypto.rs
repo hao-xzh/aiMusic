@@ -25,6 +25,7 @@ type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 const FIRST_KEY: &[u8; 16] = b"0CoJUm6Qyw8W8jud";
 const IV: &[u8; 16] = b"0102030405060708";
 const LINUXAPI_KEY: &[u8; 16] = b"rFgB&h#%2?^eDg:Q";
+const EAPI_KEY: &[u8; 16] = b"e82ckenh8dichen8";
 
 // 官方 weapi 公钥（模数，十六进制；公钥指数固定 65537）
 const PUB_MOD_HEX: &str = "00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7";
@@ -40,6 +41,10 @@ pub struct WeapiBody {
 
 pub struct LinuxApiBody {
     pub eparams: String,
+}
+
+pub struct EapiBody {
+    pub params: String,
 }
 
 fn aes_cbc_encrypt(data: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
@@ -108,6 +113,20 @@ pub fn linuxapi_encrypt(params: &serde_json::Value) -> LinuxApiBody {
     let encrypted = aes_ecb_encrypt(text.as_bytes(), LINUXAPI_KEY);
     LinuxApiBody {
         eparams: hex::encode_upper(encrypted),
+    }
+}
+
+/// eapi: AES-128-ECB(PKCS7) + MD5 guard.
+///
+/// `uri` 是被签名的 `/api/...` 路径；实际请求会发到 `interface.music.163.com/eapi/...`。
+pub fn eapi_encrypt(uri: &str, params: &serde_json::Value) -> EapiBody {
+    let text = serde_json::to_string(params).expect("serializable");
+    let message = format!("nobody{uri}use{text}md5forencrypt");
+    let digest = format!("{:x}", md5::compute(message.as_bytes()));
+    let data = format!("{uri}-36cd479b6b5-{text}-36cd479b6b5-{digest}");
+    let encrypted = aes_ecb_encrypt(data.as_bytes(), EAPI_KEY);
+    EapiBody {
+        params: hex::encode_upper(encrypted),
     }
 }
 

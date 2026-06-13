@@ -61,6 +61,7 @@ pub fn run() {
             netease_playlist_detail,
             netease_song_urls,
             netease_song_lyric,
+            netease_cloud_lyric,
             netease_search,
             netease_like_song,
             netease_playlist_modify_tracks,

@@ -595,6 +595,35 @@ impl NeteaseClient {
         })
     }
 
+    /// 拿云盘歌曲歌词。
+    ///
+    /// 云盘里随歌曲上传的同名 LRC 不走普通 `song/lyric`，只能用登录用户 + 云盘 songId
+    /// 调 eapi `/api/cloud/lyric/get`。这个接口反过来也拿不到普通收录歌曲歌词。
+    pub async fn cloud_lyric(&self, song_id: i64, user_id: i64) -> Result<LyricData> {
+        let resp: LyricResp = self
+            .eapi(
+                "cloud/lyric/get",
+                json!({
+                    "songId": song_id,
+                    "userId": user_id,
+                    "lv": 0,
+                    "kv": 0,
+                    "tv": 0,
+                }),
+            )
+            .await?;
+        if resp.code != 200 {
+            return Err(anyhow!("cloud_lyric code={}", resp.code));
+        }
+        Ok(LyricData {
+            lyric: resp.lrc.and_then(|l| l.lyric).filter(|s| !s.is_empty()),
+            translation: resp.tlyric.and_then(|l| l.lyric).filter(|s| !s.is_empty()),
+            yrc: resp.yrc.and_then(|l| l.lyric).filter(|s| !s.is_empty()),
+            instrumental: resp.nolyric,
+            uncollected: resp.uncollected,
+        })
+    }
+
     /// 收藏 / 取消收藏单曲 —— 写到用户的"我喜欢的音乐"红心歌单。
     /// weapi: radio/like，参数 trackId + like(bool) + time(秒，一般 25)。
     pub async fn like_song(&self, id: i64, like: bool) -> Result<bool> {

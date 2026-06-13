@@ -15,13 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::Client;
+use rand::Rng;
+use reqwest::{header::HeaderValue, Client};
 use reqwest_cookie_store::CookieStoreMutex;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use url::Url;
 
-use super::crypto::{linuxapi_encrypt, weapi_encrypt};
+use super::crypto::{eapi_encrypt, linuxapi_encrypt, weapi_encrypt};
 
 // 模拟官方 PC 客户端的 UA —— Safari UA 会被部分端点 (-462) 打回。
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -29,6 +30,7 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 const LINUX_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                         (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36";
 const HOST: &str = "https://music.163.com";
+const API_HOST: &str = "https://interface.music.163.com";
 
 /// "realIP" 业务参数：网易云会把它作为地区/客户端身份信号之一。
 /// 使用稳定的大陆公网 IP 可以减少 `-462` 这类地区误判，但不能保证通过账号风险校验。
@@ -180,6 +182,59 @@ impl NeteaseClient {
         .await
     }
 
+    /// 发一个 eapi POST。`endpoint` 可以是 `cloud/lyric/get` 或 `/api/cloud/lyric/get`。
+    pub async fn eapi<T: DeserializeOwned>(&self, endpoint: &str, mut params: Value) -> Result<T> {
+        let endpoint = endpoint.trim_start_matches('/');
+        let api_endpoint = endpoint
+            .strip_prefix("api/")
+            .or_else(|| endpoint.strip_prefix("eapi/"))
+            .unwrap_or(endpoint);
+        let uri = format!("/api/{}", api_endpoint.trim_start_matches('/'));
+        let url = format!("{API_HOST}/eapi/{}", api_endpoint.trim_start_matches('/'));
+
+        let csrf = self.cookie_value("__csrf").unwrap_or_default();
+        let header = self.eapi_header(&csrf);
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("header".into(), header.clone());
+        }
+
+        let body = eapi_encrypt(&uri, &params);
+        let mut request = self
+            .http
+            .post(&url)
+            .header("Referer", format!("{HOST}/"))
+            .header("Origin", API_HOST)
+            .header(
+                reqwest::header::USER_AGENT,
+                "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)",
+            )
+            .form(&[("params", body.params)]);
+        if let Some(cookie) = eapi_cookie_header(&header) {
+            let cookie = HeaderValue::from_str(&cookie)
+                .with_context(|| format!("build eapi cookie header for {api_endpoint}"))?;
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let resp = request
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.context("read body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "netease eapi {api_endpoint} -> {status}: {}",
+                truncate(&text, 400)
+            ));
+        }
+        serde_json::from_str::<T>(&text).with_context(|| {
+            format!(
+                "parse eapi {api_endpoint} response: {}",
+                truncate(&text, 400)
+            )
+        })
+    }
+
     async fn weapi_at_path<T: DeserializeOwned>(
         &self,
         path: String,
@@ -289,6 +344,68 @@ impl NeteaseClient {
         found
     }
 
+    fn eapi_header(&self, csrf: &str) -> Value {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let request_id = format!("{now_ms}_{:04}", rand::thread_rng().gen_range(0..1000));
+        let buildver = (now_ms / 1000).to_string();
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "osver".into(),
+            json!(self
+                .cookie_value("osver")
+                .unwrap_or_else(|| "Microsoft-Windows-10-Professional-build-22631".into())),
+        );
+        header.insert(
+            "deviceId".into(),
+            json!(self.cookie_value("deviceId").unwrap_or_default()),
+        );
+        header.insert(
+            "os".into(),
+            json!(self.cookie_value("os").unwrap_or_else(|| "pc".into())),
+        );
+        header.insert(
+            "appver".into(),
+            json!(self
+                .cookie_value("appver")
+                .unwrap_or_else(|| "2.10.2".into())),
+        );
+        header.insert(
+            "versioncode".into(),
+            json!(self
+                .cookie_value("versioncode")
+                .unwrap_or_else(|| "140".into())),
+        );
+        header.insert(
+            "mobilename".into(),
+            json!(self.cookie_value("mobilename").unwrap_or_default()),
+        );
+        header.insert("buildver".into(), json!(buildver));
+        header.insert(
+            "resolution".into(),
+            json!(self
+                .cookie_value("resolution")
+                .unwrap_or_else(|| "1920x1080".into())),
+        );
+        header.insert("__csrf".into(), json!(csrf));
+        header.insert(
+            "channel".into(),
+            json!(self
+                .cookie_value("channel")
+                .unwrap_or_else(|| "netease".into())),
+        );
+        header.insert("requestId".into(), json!(request_id));
+        if let Some(music_u) = self.cookie_value("MUSIC_U") {
+            header.insert("MUSIC_U".into(), json!(music_u));
+        }
+        if let Some(music_a) = self.cookie_value("MUSIC_A") {
+            header.insert("MUSIC_A".into(), json!(music_a));
+        }
+        Value::Object(header)
+    }
+
     fn cookie_header_with_overrides(
         &self,
         url: &Url,
@@ -327,11 +444,31 @@ fn seed_identity_cookies(store: &mut cookie_store::CookieStore) -> Result<()> {
     Ok(())
 }
 
+fn eapi_cookie_header(header: &Value) -> Option<String> {
+    let obj = header.as_object()?;
+    let cookie = obj
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = value.as_str().unwrap_or_default();
+            if value.is_empty() {
+                None
+            } else {
+                Some(format!("{name}={value}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if cookie.is_empty() {
+        None
+    } else {
+        Some(cookie)
+    }
+}
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        format!("{}…", s.chars().take(n).collect::<String>())
     }
 }
 
