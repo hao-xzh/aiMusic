@@ -131,7 +131,7 @@ internal fun LandscapePlayerLyricsScreen(
                             rowMinHeight = 52.dp,
                             rowVerticalPadding = 6.dp,
                             lyricFontSize = 25.sp,
-                            lyricLineHeight = 39.sp,
+                            lyricLineHeight = 30.sp,
                             lyricFontWeight = FontWeight.ExtraBold,
                             bottomFadeStart = 0.90f,
                             bottomFadeSoftEnd = 0.98f,

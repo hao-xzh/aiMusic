@@ -121,13 +121,19 @@ export const netease = {
   /** 关键词搜歌（type=1 单曲）—— 库外推荐流水线用 */
   search: (query: string, limit?: number) =>
     invoke<TrackInfo[]>("netease_search", { query, limit }),
+  /** 收藏 / 取消收藏单曲，写到网易云红心歌单。 */
+  likeSong: (id: number, like: boolean) =>
+    invoke<boolean>("netease_like_song", { id, like }),
+  /** 歌单加 / 删歌；op = "add" | "del"。 */
+  playlistModifyTracks: (playlistId: number, op: "add" | "del", trackIds: number[]) =>
+    invoke<boolean>("netease_playlist_modify_tracks", { playlistId, op, trackIds }),
   isLoggedIn: () => invoke<boolean>("netease_is_logged_in"),
 };
 
-// ---------- AI (多 provider: DeepSeek / OpenAI / 小米 MiMo) ----------
+// ---------- AI (多 provider: DeepSeek / OpenAI / 小米 MiMo / 自定义中转) ----------
 
 /** 后端固定支持的 provider id */
-export type ProviderId = "deepseek" | "openai" | "xiaomi-mimo";
+export type ProviderId = "deepseek" | "openai" | "xiaomi-mimo" | "custom";
 
 /**
  * 单个 provider 的状态视图。永远不回传完整 key，只给 hasKey + 预览。
@@ -168,6 +174,9 @@ export const ai = {
   /** 给某 provider 选模型 —— 持久化，下次启动也记得 */
   setModel: (provider: ProviderId, model: string) =>
     invoke<void>("ai_set_model", { provider, model }),
+  /** 给自定义 provider 设置 OpenAI-compatible Base URL / 中转站地址 */
+  setBaseUrl: (provider: ProviderId, baseUrl: string) =>
+    invoke<void>("ai_set_base_url", { provider, baseUrl }),
   /** 快速 ping：当前激活 provider 回一句 DJ 口吻的短问候 */
   ping: () => invoke<string>("ai_ping"),
   /** 通用 chat（走当前激活 provider）。temperature/maxTokens 不传时后端默认 0.8/400 */

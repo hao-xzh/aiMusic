@@ -9,12 +9,12 @@
  *   留个"用扫码登录"的兜底链接（极少数用户可能想拿别的设备扫）。
  *
  * 两条路径成功后 cookie 都已经在 Rust 侧 persist()，前端展示 "已登录"，
- * 用户自己回首页 / 去蒸馏歌单（跟原扫码流程行为一致，不强制跳转）。
+ * 用户可以直接进歌单列表听歌。
  */
 
 import { BackButton } from "@/components/BackButton";
-import { DotText } from "@/components/DotText";
 import { netease, type QrCheck } from "@/lib/tauri";
+import Link from "next/link";
 import QRCode from "qrcode";
 import { useEffect, useRef, useState } from "react";
 
@@ -58,53 +58,32 @@ export default function LoginPage() {
   }, []);
 
   return (
-    <div
-      style={{
-        padding: "clamp(8px, 2vw, 16px) clamp(12px, 4vw, 24px) 60px",
-        maxWidth: 520,
-        margin: "0 auto",
-        width: "100%",
-      }}
-    >
+    <div style={pageWrap}>
       <div className="safe-top" style={{ display: "flex", paddingTop: 4 }}>
         <BackButton href="/" />
       </div>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "center",
-          marginTop: "clamp(12px, 3vh, 24px)",
-          marginBottom: 6,
-        }}
-      >
-        <DotText
-          text={usePhone ? "手机号登录" : "扫码登录"}
-          fontSize={48}
-          grid={4}
-          dotRadius={1.6}
-        />
-      </div>
-      <div
-        style={{
-          textAlign: "center",
-          color: "#8a93a8",
-          marginBottom: "clamp(18px, 4vh, 28px)",
-          fontSize: 13,
-        }}
-      >
-        {usePhone
-          ? "用手机号 + 短信验证码登录，把你 14 年的歌全部接进来。"
-          : "用手机上的网易云音乐 App 扫码，就能把你 14 年的歌全部接进来。"}
-      </div>
+      <PageHeading
+        title="LOGIN"
+        subtitle={
+          usePhone
+            ? "登录网易云，把歌单和云盘接进 Pipo。"
+            : "用网易云 App 扫码确认登录。"
+        }
+      />
 
-      {decided && (usePhone ? <PhoneLoginCard /> : <QrLoginCard />)}
+      {decided && (
+        <>
+          <LoginSectionHeader index="01" title={usePhone ? "PHONE" : "QR"} />
+          {usePhone ? <PhoneLoginCard /> : <QrLoginCard />}
+        </>
+      )}
 
       {decided && (
         <div
           style={{
             color: "#8a93a8",
             fontSize: 12,
-            textAlign: "center",
+            textAlign: "left",
             marginTop: 14,
           }}
         >
@@ -122,7 +101,7 @@ export default function LoginPage() {
         style={{
           color: "#8a93a8",
           fontSize: 12,
-          textAlign: "center",
+          textAlign: "left",
           marginTop: 18,
         }}
       >
@@ -217,7 +196,7 @@ function QrLoginCard() {
   const statusLine = qrStatusLine(phase);
 
   return (
-    <div className="glass" style={card}>
+    <div style={card}>
       <div style={qrBox}>
         <canvas
           ref={canvasRef}
@@ -239,14 +218,7 @@ function QrLoginCard() {
           </div>
         )}
         {phase.kind === "done" && (
-          <div style={{ ...expiredBox, color: MINT }}>
-            <div style={{ fontSize: 22, fontWeight: 700 }}>
-              已登录{phase.nickname ? ` · ${phase.nickname}` : ""}
-            </div>
-            <div style={{ color: "#8a93a8", marginTop: 8, fontSize: 12 }}>
-              现在可以去蒸馏歌单了。
-            </div>
-          </div>
+          <LoginDone nickname={phase.nickname} compact />
         )}
       </div>
 
@@ -386,15 +358,8 @@ function PhoneLoginCard() {
   // 已登录态：跟扫码成功一样，留个静态卡片就行。
   if (phase.kind === "done") {
     return (
-      <div className="glass" style={card}>
-        <div style={{ ...expiredBox, color: MINT }}>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>
-            已登录{phase.nickname ? ` · ${phase.nickname}` : ""}
-          </div>
-          <div style={{ color: "#8a93a8", marginTop: 8, fontSize: 12 }}>
-            现在可以去蒸馏歌单了。
-          </div>
-        </div>
+      <div style={card}>
+        <LoginDone nickname={phase.nickname} />
       </div>
     );
   }
@@ -407,7 +372,7 @@ function PhoneLoginCard() {
     !phoneOk || !captchaOk || verifying || phase.kind === "sending";
 
   return (
-    <div className="glass" style={{ ...card, alignItems: "stretch" }}>
+    <div style={{ ...card, alignItems: "stretch" }}>
       <label style={fieldLabel}>手机号</label>
       <div style={{ display: "flex", gap: 8 }}>
         <div style={prefix}>+86</div>
@@ -513,10 +478,118 @@ function phoneStatusLine(phase: PhonePhase): string {
   }
 }
 
+function LoginDone({
+  nickname,
+  compact = false,
+}: {
+  nickname?: string | null;
+  compact?: boolean;
+}) {
+  return (
+    <div style={{ ...expiredBox, color: MINT, maxWidth: compact ? 216 : 320 }}>
+      <div style={{ fontSize: compact ? 19 : 22, fontWeight: 700 }}>
+        已登录{nickname ? ` · ${nickname}` : ""}
+      </div>
+      <Link href="/distill" style={playlistCta}>
+        进入我的歌单 →
+      </Link>
+    </div>
+  );
+}
+
 // ============================ 样式 ============================
 
+const pageWrap: React.CSSProperties = {
+  padding: "clamp(12px, 2vw, 18px) clamp(18px, 5vw, 34px) 60px",
+  maxWidth: 620,
+  margin: "0 auto",
+  width: "100%",
+};
+
+function PageHeading({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <header style={pageHeading}>
+      <div style={pageTitle}>{title}</div>
+      <div style={pageSubtitle}>{subtitle}</div>
+    </header>
+  );
+}
+
+function LoginSectionHeader({ index, title }: { index: string; title: string }) {
+  return (
+    <div style={sectionBlock}>
+      <div style={sectionHeader}>
+        <span style={sectionIndex}>{index}</span>
+        <span style={sectionSlash}>/</span>
+        <span style={sectionLabel}>{title}</span>
+      </div>
+      <div style={divider} />
+    </div>
+  );
+}
+
+const pageHeading: React.CSSProperties = {
+  paddingTop: "clamp(18px, 4vh, 34px)",
+  paddingBottom: 18,
+};
+
+const pageTitle: React.CSSProperties = {
+  color: "#e9efff",
+  fontSize: 20,
+  fontWeight: 800,
+  letterSpacing: 4,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const pageSubtitle: React.CSSProperties = {
+  color: "rgba(233,239,255,0.42)",
+  marginTop: 8,
+  fontSize: 13,
+  lineHeight: 1.55,
+};
+
+const sectionBlock: React.CSSProperties = {
+  marginBottom: 0,
+};
+
+const sectionHeader: React.CSSProperties = {
+  display: "flex",
+  alignItems: "baseline",
+  gap: 8,
+  paddingTop: 10,
+  paddingBottom: 8,
+};
+
+const sectionIndex: React.CSSProperties = {
+  color: "rgba(233,239,255,0.42)",
+  fontSize: 11,
+  fontWeight: 800,
+  letterSpacing: 2,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const sectionSlash: React.CSSProperties = {
+  color: "rgba(233,239,255,0.22)",
+  fontSize: 11,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const sectionLabel: React.CSSProperties = {
+  color: "#e9efff",
+  fontSize: 12,
+  fontWeight: 800,
+  letterSpacing: 3,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const divider: React.CSSProperties = {
+  height: 1,
+  background: "rgba(233,239,255,0.08)",
+  width: "100%",
+};
+
 const card: React.CSSProperties = {
-  padding: 28,
+  padding: "18px 0 0",
   display: "flex",
   flexDirection: "column",
   alignItems: "center",
@@ -525,8 +598,8 @@ const qrBox: React.CSSProperties = {
   width: 240,
   height: 240,
   padding: 10,
-  borderRadius: 16,
-  background: "rgba(255,255,255,0.03)",
+  borderRadius: 0,
+  background: "rgba(10,13,20,0.72)",
   border: "1px solid rgba(233,239,255,0.08)",
   display: "flex",
   alignItems: "center",
@@ -538,12 +611,28 @@ const expiredBox: React.CSSProperties = {
 };
 const refreshBtn: React.CSSProperties = {
   padding: "8px 16px",
-  borderRadius: 999,
+  borderRadius: 0,
   border: `1px solid ${AMBER}`,
   background: "transparent",
   color: AMBER,
   cursor: "pointer",
   fontSize: 13,
+};
+const playlistCta: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  marginTop: 16,
+  padding: "8px 14px",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.92)",
+  background: "rgba(233,239,255,0.94)",
+  color: "#05060a",
+  textDecoration: "none",
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 700,
+  letterSpacing: 0.8,
 };
 const fieldLabel: React.CSSProperties = {
   color: "#8a93a8",
@@ -553,9 +642,9 @@ const fieldLabel: React.CSSProperties = {
 const input: React.CSSProperties = {
   height: 44,
   padding: "0 14px",
-  borderRadius: 12,
-  border: "1px solid rgba(233,239,255,0.12)",
-  background: "rgba(255,255,255,0.04)",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.10)",
+  background: "rgba(10,13,20,0.72)",
   color: "#e9efff",
   fontSize: 16,
   outline: "none",
@@ -567,16 +656,16 @@ const prefix: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
   padding: "0 14px",
-  borderRadius: 12,
-  border: "1px solid rgba(233,239,255,0.12)",
-  background: "rgba(255,255,255,0.04)",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.10)",
+  background: "rgba(10,13,20,0.72)",
   color: "#8a93a8",
   fontSize: 14,
 };
 const sendCodeBtn: React.CSSProperties = {
   height: 44,
   padding: "0 14px",
-  borderRadius: 12,
+  borderRadius: 0,
   border: `1px solid ${MINT}`,
   background: "transparent",
   color: MINT,
@@ -586,12 +675,13 @@ const sendCodeBtn: React.CSSProperties = {
 };
 const submitBtn: React.CSSProperties = {
   height: 48,
-  borderRadius: 999,
-  border: "none",
-  background: MINT,
-  color: "#0e1116",
-  fontSize: 15,
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.92)",
+  background: "rgba(233,239,255,0.94)",
+  color: "#05060a",
+  fontSize: 13,
   fontWeight: 700,
+  letterSpacing: 0.8,
   fontFamily: "inherit",
 };
 const swapBtn: React.CSSProperties = {

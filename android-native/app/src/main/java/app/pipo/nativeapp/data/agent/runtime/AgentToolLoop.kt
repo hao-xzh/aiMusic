@@ -556,7 +556,7 @@ class AgentToolLoop(
             )
             PlayMode.InsertNext -> executor.insertNext(
                 actionId = play.actionId,
-                track = play.tracks.first(),
+                tracks = play.tracks,
                 jumpToInserted = play.jumpToInserted,
             )
         }
@@ -698,12 +698,26 @@ class AgentToolLoop(
                     placement = if (mode == PlayMode.InsertNext) TrackPlacement.Next else TrackPlacement.Now,
                 )
             }
+        val explicitCount = args.optInt("count", args.optInt("desired_count", 0)).takeIf { it > 0 }
+        // insert_next 默认插 1 首；带 artists/playlist 而无具体目标歌时视为“插一批”
+        //（这首听完放 X 的歌 / 下一首开始听 Y），默认给一小组。
+        val batchInsertImplied = mode == PlayMode.InsertNext && target == null &&
+            (
+                stringArray(args, "artists").isNotEmpty() ||
+                    stringArray(args, "primary_artists").isNotEmpty() ||
+                    args.optString("playlist_name").isNotBlank()
+                )
+        val desiredCount = when {
+            explicitCount != null -> explicitCount
+            mode == PlayMode.InsertNext -> if (batchInsertImplied) DEFAULT_INSERT_BATCH_COUNT else 1
+            else -> 12
+        }.coerceIn(1, 60)
         return PlannedAction.PlayRequest(
             actionId = "draft",
             mode = mode,
             primaryGoal = goalFromArgs(args),
             target = target,
-            desiredCount = args.optInt("count", args.optInt("desired_count", 12)).coerceIn(1, 60),
+            desiredCount = desiredCount,
             similar = args.optBoolean("similar", operation.contains("similar", ignoreCase = true)),
             jumpToInserted = args.optBoolean("jump_to_inserted", defaultJumpToInserted(mode)),
         )
@@ -1138,7 +1152,7 @@ class AgentToolLoop(
             .put("playlist_name", stringSchema("Scope to a playlist/cloud disk when requested"))
             .put("artists", arraySchema("Primary real artist names"))
             .put("artist_scope", enumSchema("Artist scope", listOf("Strict", "Focus", "Similar")))
-            .put("count", integerSchema("Desired count"))
+            .put("count", integerSchema("Desired count. For insert_next: omit/1 = 插单首；>1 = 批量插播（整批排在当前歌后面）"))
             .put("target_title", stringSchema("Specific first/next track title"))
             .put("target_artist", stringSchema("Specific first/next artist hint"))
             .put("jump_to_inserted", booleanSchema("LLM semantic decision for insert_next: true means jump immediately, false means keep current song playing and only queue next"))
@@ -1154,7 +1168,7 @@ class AgentToolLoop(
     private fun queueCommitProperties(): JSONObject =
         JSONObject()
             .put("draft_id", stringSchema("draftId returned by draft_queue"))
-            .put("track_keys", arraySchema("Explicit track keys returned by search/get_playlist/draft, or [key] shown in the current-queue context"))
+            .put("track_keys", arraySchema("Explicit track keys returned by search/get_playlist/draft, or [key] shown in the current-queue context. For insert_next, ALL keys are inserted in order right after the current song"))
             .put("operation", enumSchema("Queue operation", listOf("replace_queue", "play_now", "insert_next")))
             .put("jump_to_inserted", booleanSchema("For insert_next, true only when the user explicitly asks to jump immediately; 下一首想听/接下来想听 should be false"))
             .put("similar", booleanSchema("Whether this is a similar/style continuation"))
@@ -1300,6 +1314,9 @@ class AgentToolLoop(
     private companion object {
         private const val MAX_STEPS = 7
 
+        /** 批量插播（insert_next 带 artists/playlist 而没有具体目标歌）时的默认张数。 */
+        private const val DEFAULT_INSERT_BATCH_COUNT = 6
+
         /** 整轮 wall-clock 预算：超过就不再开新的 LLM 轮，直接 salvage 收口，防止极端慢网把用户晾几分钟。 */
         private const val TURN_BUDGET_MS = 110_000L
 
@@ -1334,6 +1351,7 @@ class AgentToolLoop(
 【动作区分】
 10. “播放/放/听 +（某歌手的）某首歌” = 立即播放：draft_queue(operation="play_now", target_title=歌名, target_artist=歌手) 再 commit_queue。
 11. “下一首/插到下一首/等这首放完/不要打断” = 排到下一首：draft_queue(operation="insert_next", target_title=歌名, jump_to_inserted=false)；只有用户明确“现在就切过去”才 jump_to_inserted=true。
+11b. 批量插播：“这首听完之后放 X 的歌 / 下一首开始听 Taylor / 接下来来一批 Y / 听完放某张专辑” = draft_queue(operation="insert_next", artists=[X] 或 query=专辑名/风格, count=想插的张数(歌手/专辑默认 6~8), jump_to_inserted=false)——整批插在当前歌后面、不打断当前播放。专辑也可以先 search_tracks(专辑名) 再 commit_queue(track_keys=[整批 key], operation="insert_next", jump_to_inserted=false)。批量插播是“加塞”，不要用 replace_queue（那会清掉用户当前队列）。
 12. “我想听 X，加一首 Y / 带上 Y / 包含 Y” = 重排队列且必含：draft_queue(operation="replace_queue", artists=[X], must_include_titles=[Y])。X 是主目标，Y 只是必含；Y 默认不能排第一首，除非用户明确说“先放 Y / 开头放 Y”。别让附加的 Y 抢掉主目标 X。
 13. “最后/收尾/结尾用 Z 收住” → closer_title=Z。
 14. “不要/别/不想听 …”（歌手、语言、风格）→ exclude_terms；“别太吵/别太炸/别太苦” → style.avoid_tags。

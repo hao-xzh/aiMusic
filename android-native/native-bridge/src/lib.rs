@@ -303,6 +303,7 @@ fn dispatch(command: &str, args: Value) -> String {
                 provider_view(ai::config::Provider::Deepseek, &cfg.deepseek),
                 provider_view(ai::config::Provider::Openai, &cfg.openai),
                 provider_view(ai::config::Provider::XiaomiMimo, &cfg.xiaomi_mimo),
+                provider_view(ai::config::Provider::Custom, &cfg.custom),
             ];
             json!({
                 "activeProvider": provider_key(cfg.provider),
@@ -385,9 +386,10 @@ fn dispatch(command: &str, args: Value) -> String {
         "ai_ping" => run_json(async {
             let (key, base_url, model) = ai_store().active();
             let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
+            let base_url = base_url.ok_or_else(|| anyhow::anyhow!("missing API base URL"))?;
             let reply = ai::openai_compat::chat(
                 &key,
-                base_url,
+                &base_url,
                 &model,
                 &[ai::openai_compat::ChatMessage {
                     role: "user".to_string(),
@@ -417,6 +419,7 @@ fn dispatch(command: &str, args: Value) -> String {
             run_json(async move {
                 let (key, base_url, model) = ai_store().active();
                 let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
+                let base_url = base_url.ok_or_else(|| anyhow::anyhow!("missing API base URL"))?;
                 let mut messages = Vec::new();
                 if let Some(system) = system {
                     messages.push(ai::openai_compat::ChatMessage {
@@ -430,7 +433,7 @@ fn dispatch(command: &str, args: Value) -> String {
                 });
                 let reply = ai::openai_compat::chat(
                     &key,
-                    base_url,
+                    &base_url,
                     &model,
                     &messages,
                     temperature,
@@ -457,9 +460,10 @@ fn dispatch(command: &str, args: Value) -> String {
             run_json(async move {
                 let (key, base_url, model) = ai_store().active();
                 let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
+                let base_url = base_url.ok_or_else(|| anyhow::anyhow!("missing API base URL"))?;
                 let message = ai::openai_compat::chat_tools(
                     &key,
-                    base_url,
+                    &base_url,
                     &model,
                     messages,
                     tools,
@@ -491,11 +495,12 @@ fn dispatch(command: &str, args: Value) -> String {
                     })?;
                 let (key, base_url, _chat_model) = ai_store().active();
                 let key = key.ok_or_else(|| anyhow::anyhow!("missing API key"))?;
+                let base_url = base_url.ok_or_else(|| anyhow::anyhow!("missing API base URL"))?;
                 if inputs.is_empty() {
                     return Ok(json!([]));
                 }
                 let vectors =
-                    ai::openai_compat::embeddings(&key, base_url, embed_model, &inputs).await?;
+                    ai::openai_compat::embeddings(&key, &base_url, embed_model, &inputs).await?;
                 Ok(serde_json::to_value(vectors)?)
             })
         }
@@ -508,6 +513,7 @@ fn parse_provider(id: &str) -> Result<ai::config::Provider, String> {
         "deepseek" => Ok(ai::config::Provider::Deepseek),
         "openai" => Ok(ai::config::Provider::Openai),
         "xiaomi-mimo" => Ok(ai::config::Provider::XiaomiMimo),
+        "custom" => Ok(ai::config::Provider::Custom),
         other => Err(format!("unknown provider: {other}")),
     }
 }
@@ -520,6 +526,7 @@ fn slot_mut(
         ai::config::Provider::Deepseek => &mut c.deepseek,
         ai::config::Provider::Openai => &mut c.openai,
         ai::config::Provider::XiaomiMimo => &mut c.xiaomi_mimo,
+        ai::config::Provider::Custom => &mut c.custom,
     }
 }
 
@@ -530,7 +537,8 @@ fn provider_view(provider: ai::config::Provider, slot: &ai::config::ProviderSlot
         "hasKey": slot.api_key.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false),
         "keyPreview": slot.api_key.as_deref().filter(|s| !s.trim().is_empty()).map(key_preview),
         "model": slot.model,
-        "baseUrl": ai::config::default_base_url(provider),
+        "baseUrl": ai::config::effective_base_url(provider, slot)
+            .unwrap_or_else(|| slot.base_url.clone().unwrap_or_default()),
     })
 }
 
@@ -539,6 +547,7 @@ fn provider_key(provider: ai::config::Provider) -> &'static str {
         ai::config::Provider::Deepseek => "deepseek",
         ai::config::Provider::Openai => "openai",
         ai::config::Provider::XiaomiMimo => "xiaomi-mimo",
+        ai::config::Provider::Custom => "custom",
     }
 }
 
@@ -547,6 +556,7 @@ fn provider_label(provider: ai::config::Provider) -> &'static str {
         ai::config::Provider::Deepseek => "DeepSeek",
         ai::config::Provider::Openai => "OpenAI",
         ai::config::Provider::XiaomiMimo => "MiMo",
+        ai::config::Provider::Custom => "Custom",
     }
 }
 

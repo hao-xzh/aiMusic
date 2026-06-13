@@ -4,6 +4,8 @@ import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -16,7 +18,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -75,8 +76,8 @@ import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -85,7 +86,8 @@ import app.pipo.nativeapp.data.PipoLyricAlignment
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.PipoLyricRole
-import app.pipo.nativeapp.data.progress
+import app.pipo.nativeapp.data.effectiveDurationMs
+import app.pipo.nativeapp.data.effectiveEndMs
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -116,8 +118,8 @@ internal fun AppleMusicLyricColumn(
     rowMinHeight: Dp = 60.dp,
     rowVerticalPadding: Dp = 8.dp,
     lyricFontSize: TextUnit = 28.sp,
-    lyricLineHeight: TextUnit = 44.sp,
-    lyricFontWeight: FontWeight = FontWeight.ExtraBold,
+    lyricLineHeight: TextUnit = 33.sp,
+    lyricFontWeight: FontWeight = FontWeight.Bold,
     bottomFadeStart: Float = 0.80f,
     bottomFadeSoftEnd: Float = 0.94f,
     lineWidthAspect: Float = NATIVE_LINE_WIDTH_ASPECT,
@@ -129,8 +131,6 @@ internal fun AppleMusicLyricColumn(
     val clockState = rememberNativeLyricClockMs(positionMs, isPlaying, sessionKey)
     val rawPositionState = rememberUpdatedState(positionMs)
     val hasWordTiming = remember(lines) { lines.any { it.chars.isNotEmpty() } }
-    val hasDuetLine = remember(lines) { lines.any { it.alignment == PipoLyricAlignment.End } }
-    val focusLeadMs = LyricTiming.focusLeadMs(lines)
     val haptics = LocalHapticFeedback.current
     val density = LocalDensity.current
     val gestureScope = rememberCoroutineScope()
@@ -158,6 +158,7 @@ internal fun AppleMusicLyricColumn(
     // 反馈回 rowTop，从根上消除测量回路的一帧延迟造成的列表抽动。
     val mainRowHeights = remember(sessionKey) { mutableStateMapOf<Int, Int>() }
     val transFullHeights = remember(sessionKey) { mutableStateMapOf<Int, Int>() }
+    val transMaxHeights = remember(sessionKey) { mutableStateMapOf<Int, Int>() }
     val estimatedRowHeightPx = with(density) { rowMinHeight.toPx().toInt().coerceAtLeast(1) }
     val horizontalPaddingPx = with(density) { horizontalPadding.toPx() }
     val compactWidthPx = with(density) { NATIVE_COMPACT_WIDTH_DP.dp.toPx() }
@@ -167,12 +168,11 @@ internal fun AppleMusicLyricColumn(
     LaunchedEffect(showTranslation) {
         transAnim.animateTo(
             targetValue = if (showTranslation) 1f else 0f,
-            animationSpec = spring(
-                dampingRatio = nativeDampingRatio(
-                    stiffness = NATIVE_SUBLINE_SLIDE_STIFFNESS,
-                    damping = NATIVE_SUBLINE_SLIDE_DAMPING,
-                ),
-                stiffness = NATIVE_SUBLINE_SLIDE_STIFFNESS,
+            animationSpec = tween(
+                durationMillis = NATIVE_SUBLINE_ANIMATION_MS,
+                // Apple Web revealTranslations/revealPronunciations omit easing and fall back to
+                // AnimSystem's linear default for y/opacity/max-height.
+                easing = LinearEasing,
             ),
         )
     }
@@ -186,6 +186,7 @@ internal fun AppleMusicLyricColumn(
                 transProgress = transProgressState.value,
                 mainRowHeights = mainRowHeights,
                 transFullHeights = transFullHeights,
+                transMaxHeights = transMaxHeights,
             )
         }
     }
@@ -205,7 +206,8 @@ internal fun AppleMusicLyricColumn(
     // 渲染坐标 → 基准坐标：手动拖动以 1:1 手感工作在渲染坐标，松手时换算回基准交给 spring。
     fun baseForRenderCenter(renderPos: Float): Float = rowMetrics.baseForRenderCenter(renderPos)
 
-    val timelineSnapshot by remember(lines, hasWordTiming, focusLeadMs, isPlaying, clockState) {
+    val timelineCache = remember(lines) { NativeTimelineCache(lines) }
+    val timelineSnapshot by remember(lines, hasWordTiming, isPlaying, clockState) {
         derivedStateOf {
             val clockMs = if (isPlaying) {
                 clockState.value.toLong()
@@ -214,22 +216,63 @@ internal fun AppleMusicLyricColumn(
             }
             nativeTimelineSnapshot(
                 lines = lines,
+                cache = timelineCache,
                 positionMs = clockMs,
-                targetPositionMs = clockMs + focusLeadMs,
+                // Apple Web updateCurrentIndex: currentPlaybackMillis + 250ms。
+                // 先用于当前行/滚动目标前瞻；当前行词级 TimeGroup 也在绘制层接同一提前量。
+                targetPositionMs = clockMs + NATIVE_SCROLL_FOCUS_LEAD_MS,
             )
         }
     }
     val playbackActiveIdx = timelineSnapshot.targetIndex
     val singingAnchorIdx = (timelineSnapshot.activeIndices.minOrNull() ?: playbackActiveIdx)
         .coerceIn(lines.indices)
-    val latestActiveIdx = timelineSnapshot.latestIndex
-    // 间奏/前奏空档 ≥4s 时的 Apple 式三点呼吸指示。配合数据层 LyricCredits 把开头
+    // Apple 在歌词结构层只给 >9s 的前奏/间奏插入三点呼吸指示。配合数据层 LyricCredits 把开头
     // 制作人信息行剥掉后，每首歌前奏从 0ms 起就是这三个点，而不是干等第一句。
-    val interlude: NativeInterlude? = rememberNativeVisibleInterlude(
-        interlude = timelineSnapshot.interlude,
-        currentTimeMs = { clockState.value.toLong() },
-        sessionKey = sessionKey,
-    )
+    val interlude: NativeInterlude? = timelineSnapshot.interlude
+    // 歌中间奏的三点需要真实的布局空隙：间奏大半段里滚动焦点仍停在上一句，
+    // 三点若只是浮层画在“下一句行顶上方”，就会压在上一句的文本/译文上。
+    // 这里给 nextIndex 起的所有行撑开一段可收放的 room（spring 开合，对齐 Apple
+    // 的“点收起、下一句滑入原位”），三点住进腾出的空隙；前奏（anchor=-1，
+    // 上方没有行）不存在重叠，room 保持 0、点位与原来一致。
+    val interludeRoomAnim = remember(sessionKey) { Animatable(0f) }
+    var interludeRoomFromIndex by remember(sessionKey) { mutableStateOf(Int.MAX_VALUE) }
+    val interludeRoomTargetPx = if (interlude != null && interlude.anchorLineIndex >= 0 && containerHeightPx > 0) {
+        val fontPx = with(density) { lyricFontSize.toPx() }
+        nativeInterludeDotSizePx(fontPx) +
+            fontPx * NATIVE_INTERLUDE_MARGIN_EM * 2f
+    } else {
+        0f
+    }
+    LaunchedEffect(sessionKey, interlude?.anchorLineIndex, interludeRoomTargetPx) {
+        val roomSpring = spring<Float>(
+            dampingRatio = nativeDampingRatio(
+                stiffness = NATIVE_INTERLUDE_SCROLL_STIFFNESS,
+                damping = NATIVE_INTERLUDE_SCROLL_DAMPING,
+            ),
+            stiffness = NATIVE_INTERLUDE_SCROLL_STIFFNESS,
+        )
+        if (interludeRoomTargetPx > 0f && interlude != null) {
+            val newFromIndex = interlude.anchorLineIndex + 1
+            if (interludeRoomFromIndex != newFromIndex &&
+                interludeRoomFromIndex != Int.MAX_VALUE &&
+                interludeRoomAnim.value > 0.5f
+            ) {
+                // 换 anchor（相邻两段间奏/seek 跨间奏）：先在旧位置把 room 收完再换
+                // 生效行，否则旧区间的行会带着未收的 room 一帧掉回去。
+                interludeRoomAnim.animateTo(0f, roomSpring)
+            }
+            interludeRoomFromIndex = newFromIndex
+            interludeRoomAnim.animateTo(interludeRoomTargetPx, roomSpring)
+        } else {
+            interludeRoomAnim.animateTo(0f, roomSpring)
+            // 收完才解除生效行，避免下方行在收拢动画途中瞬跳回去。
+            interludeRoomFromIndex = Int.MAX_VALUE
+        }
+    }
+    // 只允许在 layout/draw 阶段调用（同 renderCenterNow 的约束），不要在组合体里读。
+    fun interludeRoomFor(idx: Int): Float =
+        if (idx >= interludeRoomFromIndex) interludeRoomAnim.value else 0f
     val activeLineTopLiftPx = estimatedRowHeightPx.toFloat() * NATIVE_ACTIVE_LINE_TOP_UPSHIFT_ROWS
     val activeLineExtraLiftPx = with(density) { NATIVE_ACTIVE_LINE_EXTRA_UPSHIFT_DP.dp.toPx() }
     val anchorBiasPx = with(density) { anchorBiasDp.toPx() }
@@ -243,11 +286,6 @@ internal fun AppleMusicLyricColumn(
     var lastScrollTargetCenter by remember(sessionKey) { mutableFloatStateOf(Float.NaN) }
     var lastLayoutAnchorIdx by remember(sessionKey) { mutableStateOf(singingAnchorIdx) }
     var lastLayoutAnchorCenter by remember(sessionKey) { mutableFloatStateOf(Float.NaN) }
-    var motionFromCenter by remember(sessionKey) {
-        mutableFloatStateOf(rowAnchor(activeLyricIndex.coerceIn(lines.indices)))
-    }
-    var motionFromIdx by remember(sessionKey) { mutableStateOf(activeLyricIndex.coerceIn(lines.indices)) }
-    var motionTargetIdx by remember(sessionKey) { mutableStateOf(playbackActiveIdx) }
     val scrollTargetCenter = rowAnchor(playbackActiveIdx.coerceIn(lines.indices))
     val layoutAnchorCenter = rowAnchor(singingAnchorIdx)
     val measuredRowCount = mainRowHeights.size
@@ -271,25 +309,6 @@ internal fun AppleMusicLyricColumn(
     fun focusCenterBaseNow(): Float = manualScrollCenterPx.let { m ->
         if (m.isFinite()) baseForRenderCenter(m) else scrollSpring.value
     }
-    // Apple 标志性的级联滚动（cascade）：切句时目标行下方的行按行距递增小幅滞后，
-    // 整列像一道波次推进而非刚体平移。按全局 spring 进度做 per-row 重映射，
-    // 仍只在 layout 阶段读取（不触发重组）；手动拖动 / from==to 时退回刚体滚动。
-    fun rowScrollCenterNow(idx: Int): Float {
-        val m = manualScrollCenterPx
-        if (m.isFinite()) return m
-        val springVal = scrollSpring.value
-        val fromC = motionFromCenter
-        val toC = rowAnchor(motionTargetIdx)
-        val denom = toC - fromC
-        if (kotlin.math.abs(denom) < 1f) return springVal + transOffsetForBase(springVal)
-        val pGlobal = ((springVal - fromC) / denom).coerceIn(0f, 1f)
-        val rowsBelow = (idx - motionTargetIdx).coerceAtLeast(0)
-        val delay = (rowsBelow * NATIVE_SCROLL_STAGGER_PER_ROW).coerceAtMost(NATIVE_SCROLL_STAGGER_MAX)
-        val pRow = if (delay <= 0f) pGlobal else ((pGlobal - delay) / (1f - delay)).coerceIn(0f, 1f)
-        val baseC = fromC + denom * pRow
-        return baseC + transOffsetForBase(baseC)
-    }
-
     LaunchedEffect(
         sessionKey,
         scrollTargetCenter,
@@ -315,11 +334,6 @@ internal fun AppleMusicLyricColumn(
         val previousTargetCenter = lastScrollTargetCenter
         val previousLayoutAnchorIdx = lastLayoutAnchorIdx
         val previousLayoutAnchorCenter = lastLayoutAnchorCenter
-        if (previousIdx != playbackActiveIdx) {
-            motionFromCenter = scrollSpring.value
-            motionFromIdx = previousIdx.coerceIn(lines.indices)
-            motionTargetIdx = playbackActiveIdx
-        }
         lastScrollTargetIdx = playbackActiveIdx
         lastScrollTargetCenter = scrollTargetCenter
         lastLayoutAnchorIdx = singingAnchorIdx
@@ -333,7 +347,6 @@ internal fun AppleMusicLyricColumn(
             val layoutDelta = layoutAnchorCenter - previousLayoutAnchorCenter
             if (kotlin.math.abs(layoutDelta) > 0.5f) {
                 scrollSpring.snapTo(scrollSpring.value + layoutDelta)
-                motionFromCenter += layoutDelta
             }
         }
         val distance = kotlin.math.abs(scrollSpring.value - scrollTargetCenter)
@@ -344,9 +357,6 @@ internal fun AppleMusicLyricColumn(
             (targetRowTop + targetRowHeight < 0f || targetRowTop > containerHeightPx.toFloat())
         if (!initialLayoutSettled || targetLineInvisible) {
             scrollSpring.snapTo(scrollTargetCenter)
-            motionFromCenter = scrollTargetCenter
-            motionFromIdx = playbackActiveIdx
-            motionTargetIdx = playbackActiveIdx
             if (!initialLayoutSettled && containerHeightPx > 0 && measuredRowCount > 0) {
                 initialLayoutSettled = true
             }
@@ -354,23 +364,15 @@ internal fun AppleMusicLyricColumn(
         }
         if (!isPlaying) {
             scrollSpring.stop()
-            motionFromCenter = scrollSpring.value
-            motionFromIdx = playbackActiveIdx
-            motionTargetIdx = playbackActiveIdx
             return@LaunchedEffect
         }
         if (distance > NATIVE_SCROLL_SNAP_DISTANCE_PX || kotlin.math.abs(playbackActiveIdx - previousIdx) > 6) {
             scrollSpring.snapTo(scrollTargetCenter)
-            motionFromCenter = scrollTargetCenter
-            motionFromIdx = playbackActiveIdx
-            motionTargetIdx = playbackActiveIdx
             return@LaunchedEffect
         }
         scrollSpring.animateTo(
             targetValue = scrollTargetCenter,
-            animationSpec = nativeScrollSpringSpec(
-                lines = lines,
-                activeIdx = playbackActiveIdx,
+            animationSpec = nativeScrollAnimationSpec(
                 isInterludeActive = interlude != null,
             ),
         )
@@ -386,10 +388,6 @@ internal fun AppleMusicLyricColumn(
             val startCenter = baseForRenderCenter(manualScrollCenterPx)
             manualScrollCenterPx = Float.NaN
             scrollSpring.snapTo(startCenter)
-            motionFromCenter = startCenter
-            motionFromIdx = lines.indices.minByOrNull { idx -> kotlin.math.abs(rowAnchor(idx) - startCenter) }
-                ?: playbackActiveIdx
-            motionTargetIdx = playbackActiveIdx
             scrollSpring.animateTo(
                 targetValue = scrollTargetCenter,
                 animationSpec = nativeManualRestoreSpringSpec(),
@@ -425,7 +423,7 @@ internal fun AppleMusicLyricColumn(
             if (
                 showTranslation &&
                 nativeHasStaticSubline(lines[idx]) &&
-                !transFullHeights.containsKey(idx)
+                (!transFullHeights.containsKey(idx) || !transMaxHeights.containsKey(idx))
             ) {
                 ready = false
             }
@@ -549,29 +547,39 @@ internal fun AppleMusicLyricColumn(
             key(idx, line.startMs, line.text) {
                 val distance = kotlin.math.abs(idx - visualActiveIdx)
                 val rowEnter = nativeRowEnterProgress(calibratedEnterProgress, distance)
-                val isActive = idx in timelineSnapshot.activeIndices
+                // Apple Web uses the +250ms lookahead to choose a single `is-current`
+                // synced-line. As soon as that line becomes current, manageAnimations()
+                // starts its TimeGroup, so the word-level sweep/glow must be active even
+                // during the 250ms pre-roll before the raw audio reaches line.begin.
+                // Older overlapping lines may still be inside their audio interval, but
+                // they no longer satisfy `.display-synced-line.is-current`, so their
+                // word gradient/shadow should not keep competing with the next line.
+                val isCurrentLine = idx == playbackActiveIdx
+                val isActive = isCurrentLine
                 val isManualFocus = manualScrollActive && idx == visualActiveIdx
                 // 焦点统一为一个 composition 稳定的布尔（仅切句/越行才变）；缩放/上浮/透明度/虚化
                 // 都在行内用 tween 平滑驱动，滚动期间不再每帧重组（流畅度关键）。
                 val isFocused = idx == pendingSeekIdx || if (manualScrollActive) {
                     idx == visualActiveIdx
                 } else {
-                    idx == playbackActiveIdx ||
-                        idx == lastScrollTargetIdx ||
-                        (idx == singingAnchorIdx && isActive)
+                    // Apple Web render() only passes `isCurrent:s===e` to one
+                    // synced line. Previous/overlapping lines may keep
+                    // `willAnimate`, but they do not keep current-line color or
+                    // gradient masks after the +250ms current switch.
+                    idx == playbackActiveIdx
                 }
-                val isPast = idx < playbackActiveIdx && !isActive
-                val isCompactLayout = with(density) { containerWidthPx.toDp().value <= NATIVE_COMPACT_LAYOUT_DP }
+                val hasAppleLineFocus = isCurrentLine || isManualFocus || idx == pendingSeekIdx
+                val isPast = idx < playbackActiveIdx
                 val blurTarget = nativeLineBlur(
-                    itemIndex = idx,
-                    scrollToIndex = playbackActiveIdx,
-                    latestIndex = latestActiveIdx,
-                    isActive = isFocused,
-                    isUserDragging = isUserDragging,
-                    isCompact = isCompactLayout,
+                    hasLineFocus = hasAppleLineFocus,
+                    isFirstLine = idx == 0,
+                    isUserInteracting = isUserDragging || manualScrollActive,
                 )
+                // Apple's fade-out animation is present in CSS but paused in the live
+                // component bundle; keep past lines on the normal non-current opacity.
+                val fadeOutPastLine = false
                 val opacityTarget = nativeLineOpacity(
-                    isActive = isFocused,
+                    fadeOutPastLine = fadeOutPastLine,
                 )
                 val itemAlignment = if (line.alignment == PipoLyricAlignment.End) Alignment.TopEnd else Alignment.TopStart
                 val lineWidthPx = nativeLineWidthPx(
@@ -581,18 +589,25 @@ internal fun AppleMusicLyricColumn(
                     aspect = lineWidthAspectState.value,
                 )
                 val lineWidthDp = with(density) { lineWidthPx.toDp() }
-                val duetInsetDp = with(density) {
-                    (lineWidthPx * NATIVE_DUET_INSET_ASPECT).toDp()
-                }
-                val duetStartPadding = if (hasDuetLine && line.alignment == PipoLyricAlignment.End) duetInsetDp else 0.dp
-                val duetEndPadding = if (hasDuetLine && line.alignment != PipoLyricAlignment.End) duetInsetDp else 0.dp
-                val lineContentWidthPx = (
-                    lineWidthPx - if (hasDuetLine) lineWidthPx * NATIVE_DUET_INSET_ASPECT else 0f
-                    ).coerceAtLeast(1f)
+                // 合唱/对唱行只改变对齐方向（右对齐），不再额外内缩宽度——此前只要全曲存在一条对唱行，
+                // 所有行都按 NATIVE_DUET_INSET_ASPECT(0.40) 内缩，导致整体歌词宽度只剩约一半。
+                // 左右“对话感”由 itemAlignment（左/右对齐）体现即可，宽度与普通行保持一致。
+                val lineContentWidthPx = lineWidthPx
                 val rowScaleAnchor = rowAnchor(idx)
                 val rowScaleSpanPx = estimatedRowHeightPx.toFloat() * NATIVE_ROW_SCALE_FOCUS_SPAN_ROWS
                 val rowFocusProvider: () -> Float = {
                     nativePositionFocus(
+                        rowAnchor = rowScaleAnchor,
+                        focusAnchor = focusCenterBaseNow(),
+                        spanPx = rowScaleSpanPx,
+                    )
+                }
+                // 行级放大由“行到滚动焦点的距离”连续驱动（对称衰减）：行越靠近焦点越大、
+                // 随滚动离开焦点连续缩小。缩放因此 = 滚动位移的函数，与滚动永远同相——
+                // 唱完那行的缩小完全融进上滚过程，不再是“先缩小、再滚动”的两段式。
+                // 在 graphicsLayer 内延迟调用：读 scrollSpring.value 不触发重组。
+                val rowScaleProvider: () -> Float = {
+                    nativeScaleFocus(
                         rowAnchor = rowScaleAnchor,
                         focusAnchor = focusCenterBaseNow(),
                         spanPx = rowScaleSpanPx,
@@ -606,16 +621,24 @@ internal fun AppleMusicLyricColumn(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = horizontalPadding)
-                        // 行位置在 layout 阶段计算：读取滚动中心只触发重新布局、不触发重组，滚动因此流畅。
-                        .offset {
-                            IntOffset(0, (renderTop(idx) + anchorYPx - rowScrollCenterNow(idx)).roundToInt())
+                        // 行位置在 graphicsLayer 读取滚动中心：每帧只更新图层平移，
+                        // 不触发重组也不触发重排布（比旧的 offset{} 重排布更省）；
+                        // 浮点 translationY 是亚像素定位——offset 的 IntOffset 取整会让
+                        // 慢速 spring 收尾时行以 1px 步进，仔细看有“格格”感。
+                        // 命中测试随图层平移走，点击/双击 seek 不受影响。
+                        .graphicsLayer {
+                            // Apple Web performs one 350ms scrollTop animation for
+                            // the whole lyrics container. Per-line differences come
+                            // from current-line transform/padding/color transitions,
+                            // not from delayed scroll centers per row.
+                            translationY = renderTop(idx) + anchorYPx - renderCenterNow() +
+                                interludeRoomFor(idx)
                         },
                     contentAlignment = itemAlignment,
                 ) {
                     Box(
                         modifier = Modifier
                             .width(lineWidthDp)
-                            .padding(start = duetStartPadding, end = duetEndPadding)
                             .then(
                                 if (rowVisibleForClick) {
                                     // 两段式跳转（防误触）：第一击固定/高亮该行并暂停自动跟随；
@@ -631,14 +654,14 @@ internal fun AppleMusicLyricColumn(
                                                     manualHoldUntilMs = 0L
                                                     isUserDragging = false
                                                     val seekCenter = rowAnchor(idx)
+                                                    // 清掉手动态前先取“点击前最后一帧”的渲染中心；
+                                                    // 清掉 NaN 后 renderCenterNow 会回到旧 scroll 值。
+                                                    val resumeCenter = baseForRenderCenter(renderCenterNow())
                                                     manualScrollCenterPx = Float.NaN
                                                     gestureScope.launch {
                                                         scrollSpring.stop()
                                                         // 处于手动态时渲染坐标≠基准坐标，先无缝接续，避免点击瞬跳。
-                                                        scrollSpring.snapTo(baseForRenderCenter(renderCenterNow()))
-                                                        motionFromCenter = scrollSpring.value
-                                                        motionFromIdx = visualActiveIdx
-                                                        motionTargetIdx = idx
+                                                        scrollSpring.snapTo(resumeCenter)
                                                         scrollSpring.animateTo(
                                                             targetValue = seekCenter,
                                                             animationSpec = nativeSeekSpringSpec(),
@@ -674,6 +697,7 @@ internal fun AppleMusicLyricColumn(
                             line = line,
                             isActive = isActive,
                             isFocused = isFocused,
+                            isCurrentLine = isCurrentLine,
                             isPast = isPast,
                             // 关键性能点：不再把 30Hz 变化的 positionMs 作为参数穿透行树
                             // （那会让每个可见行每 tick 全量重组）；改传稳定的 State，
@@ -687,13 +711,16 @@ internal fun AppleMusicLyricColumn(
                             enterAlpha = rowEnter,
                             onMainHeight = { h -> if (mainRowHeights[idx] != h) mainRowHeights[idx] = h },
                             onTransFullHeight = { h -> if (transFullHeights[idx] != h) transFullHeights[idx] = h },
+                            onTransMaxHeight = { h -> if (transMaxHeights[idx] != h) transMaxHeights[idx] = h },
                             rowMinHeight = rowMinHeight,
                             isUserDragging = isUserDragging,
                             isPlaying = isPlaying,
                             targetOpacity = opacityTarget,
+                            fadeOutPastLine = fadeOutPastLine,
                             targetBlur = blurTarget,
                             isManualFocus = isManualFocus,
                             rowFocusProvider = rowFocusProvider,
+                            rowScaleProvider = rowScaleProvider,
                             fontSize = lyricFontSize,
                             lineHeight = lyricLineHeight,
                             fontWeight = lyricFontWeight,
@@ -716,8 +743,8 @@ internal fun AppleMusicLyricColumn(
                 aspect = lineWidthAspectState.value,
             )
             val fontPx = with(density) { lyricFontSize.toPx() }
-            val dotSizePx = nativeInterludeDotSizePx(fontPx, containerHeightPx.toFloat())
-            val dotGapPx = dotSizePx * NATIVE_INTERLUDE_DOT_GAP_EM
+            val dotSizePx = nativeInterludeDotSizePx(fontPx)
+            val dotGapPx = dotSizePx * NATIVE_INTERLUDE_DOT_GAP_RATIO
             val dotsWidthPx = dotSizePx * 3f + dotGapPx * 2f
             val dotMarginPx = fontPx * NATIVE_INTERLUDE_MARGIN_EM
             val alignEnd = nextLine.alignment == PipoLyricAlignment.End
@@ -727,9 +754,11 @@ internal fun AppleMusicLyricColumn(
                     .fillMaxWidth()
                     .padding(horizontal = horizontalPadding)
                     // 滚动中心在 graphicsLayer 内逐帧读取（与歌词行同规），
-                    // 点位跟随滚动但不触发整列重组。
+                    // 点位跟随滚动但不触发整列重组。叠加 room 后：歌中间奏的点
+                    // 落在撑开的空隙正中（上下各留 margin），不再压住上一句。
                     .graphicsLayer {
-                        val nextRowTop = renderTop(nextIndex) + anchorYPx - renderCenterNow()
+                        val nextRowTop = renderTop(nextIndex) + anchorYPx - renderCenterNow() +
+                            interludeRoomFor(nextIndex)
                         translationY = nextRowTop - dotMarginPx - dotSizePx
                     },
                 contentAlignment = if (alignEnd) Alignment.TopEnd else Alignment.TopStart,
@@ -741,7 +770,7 @@ internal fun AppleMusicLyricColumn(
                     NativeInterludeDots(
                         interlude = interlude,
                         clockState = clockState,
-                        offsetMs = 20L,
+                        offsetMs = 0L,
                         color = fg,
                         dotSize = with(density) { dotSizePx.toDp() },
                         dotGap = with(density) { dotGapPx.toDp() },
@@ -758,6 +787,7 @@ private fun NativeAmllLyricRow(
     line: PipoLyricLine,
     isActive: Boolean,
     isFocused: Boolean,
+    isCurrentLine: Boolean,
     isPast: Boolean,
     timeState: State<Long>,
     clockState: State<Float>,
@@ -768,13 +798,16 @@ private fun NativeAmllLyricRow(
     enterAlpha: Float,
     onMainHeight: (Int) -> Unit,
     onTransFullHeight: (Int) -> Unit,
+    onTransMaxHeight: (Int) -> Unit,
     rowMinHeight: Dp,
     isUserDragging: Boolean,
     isPlaying: Boolean,
     targetOpacity: Float,
+    fadeOutPastLine: Boolean,
     targetBlur: Float,
     isManualFocus: Boolean,
     rowFocusProvider: () -> Float,
+    rowScaleProvider: () -> Float,
     fontSize: TextUnit,
     lineHeight: TextUnit,
     fontWeight: FontWeight,
@@ -783,6 +816,7 @@ private fun NativeAmllLyricRow(
     effectsEnabled: Boolean,
 ) {
     val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
     val ease = remember { NATIVE_LINE_SWITCH_EASE }
     // 背景人声（大字浮入、参与时间轴）= Companion；小字行 = 罗马音(音译) + 翻译。
     val timedCompanions = remember(line) { line.companionLines.filter { it.role == PipoLyricRole.Companion } }
@@ -792,33 +826,62 @@ private fun NativeAmllLyricRow(
             .filter { it.role == PipoLyricRole.Translation || it.role == PipoLyricRole.Romaji }
             .sortedBy { if (it.role == PipoLyricRole.Romaji) 0 else 1 }
     }
-    val mainStartMs = remember(line) { nativeLineMainStartMs(line) }
-    val leadingCompanions = remember(line, mainStartMs) {
-        timedCompanions.filter { nativeLineAudioStartMs(it) < mainStartMs }
+    val backgroundVocals = remember(line) { timedCompanions }
+    // Apple Web: componentDidLoad() 会在当前行上直接 manageAnimations(true)，不会因为
+    // 容器刚入场就把这一整行的扫色/慢词锁死。这里仅阻止 true->false 在激活期回落；
+    // false->true 仍允许补上，避免开屏或 seek 后当前行完全看不到慢词。
+    var rowEffectsEnabled by remember(line) { mutableStateOf(effectsEnabled || isActive) }
+    LaunchedEffect(line, effectsEnabled, isActive) {
+        if ((effectsEnabled || isActive) && !rowEffectsEnabled) {
+            rowEffectsEnabled = true
+        } else if (!isActive && rowEffectsEnabled != effectsEnabled) {
+            rowEffectsEnabled = effectsEnabled
+        }
     }
-    val trailingCompanions = remember(line, mainStartMs) {
-        timedCompanions.filter { nativeLineAudioStartMs(it) >= mainStartMs }
-    }
+    // Apple Web render() marks current and previous rows as `willAnimate`, but only the
+    // single `is-current` row gets current color/scale/background-vocals display. Previous
+    // rows match `:has(~[is-current])`; fade-out is named there, yet `.line` keeps
+    // `animation-play-state` paused in the live bundle. So Android should not keep an
+    // already-past row bright or blur-free after the currentIndex switch.
     val rowAlpha by animateFloatAsState(
         targetValue = targetOpacity,
-        animationSpec = tween(durationMillis = NATIVE_LINE_SWITCH_MS, easing = ease),
+        animationSpec = if (fadeOutPastLine && targetOpacity <= 0.001f) {
+            tween(
+                durationMillis = NATIVE_LINE_FADE_OUT_MS,
+                delayMillis = NATIVE_LINE_FADE_OUT_DELAY_MS,
+                easing = LinearEasing,
+            )
+        } else {
+            tween(durationMillis = NATIVE_LINE_SWITCH_MS, easing = ease)
+        },
         label = "nativeLyricRowAlpha",
     )
     val rowBlur by animateFloatAsState(
-        targetValue = if (effectsEnabled) targetBlur else 0f,
-        animationSpec = tween(durationMillis = 260, easing = ease),
+        targetValue = if (!effectsEnabled) 0f else targetBlur,
+        animationSpec = tween(durationMillis = NATIVE_BLUR_TRANSITION_MS, easing = LinearEasing),
         label = "nativeLyricRowBlur",
     )
+    // 行高/内边距进度（影响测量高度 → 反馈滚动目标 → 触发整列重组）：保持短时长，
+    // 把切行后的“整列重组窗口”限制在 ~100ms，沿用作者的发热/掉帧优化约束。
+    val currentLineLayoutProgress by animateFloatAsState(
+        targetValue = if (isCurrentLine) 1f else 0f,
+        animationSpec = tween(durationMillis = NATIVE_LINE_SWITCH_MS, easing = ease),
+        label = "nativeLyricCurrentPadding",
+    )
+    // 行级放大不再用离散 tween（那会与滚动形成“先缩小/放大、再滚动”的两段式），改由
+    // rowScaleProvider 按“行到滚动焦点的距离”连续驱动——见下方 graphicsLayer 内的延迟读取。
     val maskAlpha = rememberNativeMaskAlpha(
         target = nativeMaskAlpha(gradient = isActive || isFocused),
     )
     val pivotX = if (line.alignment == PipoLyricAlignment.End) 1f else 0f
     val itemAlignment = if (line.alignment == PipoLyricAlignment.End) Alignment.End else Alignment.Start
     val textAlign = if (line.alignment == PipoLyricAlignment.End) TextAlign.End else TextAlign.Start
-    val mainTextStyle = nativeLyricTextStyle(fontSize, lineHeight, fontWeight, textAlign)
-    val displayLine = remember(line, lineWidthPx, mainTextStyle, textMeasurer) {
+    val effectiveMainFontWeight = nativeAppleLyricFontWeight(line.text, fontWeight)
+    val mainTextStyle = nativeLyricTextStyle(fontSize, lineHeight, effectiveMainFontWeight, textAlign)
+    val appleDisplayLine = remember(line) { nativeAppleDisplayTimedLine(line) }
+    val displayLine = remember(appleDisplayLine, lineWidthPx, mainTextStyle, textMeasurer) {
         nativeBalancedLyricLine(
-            line = line,
+            line = appleDisplayLine,
             containerWidthPx = lineWidthPx,
             style = mainTextStyle,
             textMeasurer = textMeasurer,
@@ -828,24 +891,51 @@ private fun NativeAmllLyricRow(
     // 译文紧贴主歌词，且收起时尾部无空白会被 clip 透出。
     val rowTopPadPx = with(LocalDensity.current) { (verticalPadding * 2).roundToPx() }
     val rowMinHeightPx = with(LocalDensity.current) { rowMinHeight.roundToPx() }
+    // Apple Web `.display-synced-line.is-current .line` drives color / transform /
+    // padding as one 100ms class-state switch. Android keeps the scrollTop-style
+    // 350ms column motion separate, matching the web bundle's split between
+    // scroll animation and per-line CSS transition.
+    val currentLinePaddingPx = with(density) {
+        (fontSize.toPx() * NATIVE_CURRENT_LINE_PADDING_EM * currentLineLayoutProgress)
+            .roundToInt()
+            .coerceAtLeast(0)
+    }
+    val backgroundVocalTopMargin = with(density) {
+        (fontSize.toPx() * NATIVE_BG_MARGIN_TOP_EM).toDp()
+    }
+    val translationMaxHeightPx = with(density) {
+        (fontSize.toPx() * (NATIVE_SUBLINE_MAX_HEIGHT_WEB_PX / NATIVE_APPLE_WEB_LINE_FONT_PX))
+            .roundToInt()
+            .coerceAtLeast(1)
+    }
+    val transMaxHeightPx = translationMaxHeightPx * translations.size
     // 主体与译文以单次 Layout 组合：主体高度（含行距、应用最小行高）稳定且不含译文，
-    // 译文完整高度单独上报，折叠高度 = transFull × transProgress；二者高度彻底分离，
-    // 译文展开/收起不再经测量回路扰动 rowTop/scrollSpring，从根上消除列表抽动。
+    // 译文完整高度与 Apple max-height 上限单独上报；高度曲线用
+    // min(full, 50px×progress)，对齐 Apple Web `max-height:[0,"50px"]`。
     Layout(
         modifier = Modifier
             .fillMaxWidth()
             .graphicsLayer {
-                val rowScale = nativeRowScale(rowFocusProvider())
+                val rowScale = nativeRowScale(
+                    rowScaleProvider().coerceIn(0f, NATIVE_LINE_TRANSFORM_PROGRESS_MAX),
+                )
                 // 入场淡入 + 行透明度合并到同一层（原先各占一个 graphicsLayer，每行省 2 层）。
                 alpha = rowAlpha * enterAlpha
                 scaleX = rowScale
                 scaleY = rowScale
-                // 绕行中心缩放：放大/缩小不再把内容往下顶（pivotY=0 顶边缩放会让放大时底部下坠，
-                // 切句时表现为“先往下顶一下再滚上去”）。水平仍按对齐边（左/右）作支点。
-                transformOrigin = TransformOrigin(pivotX, 0.5f)
+                // Apple Web's current-line class only transitions color,
+                // scale and block padding. The per-word/letter y keyframes
+                // carry the lyric lift, so avoid an extra whole-line translate
+                // that can fight the scrollTop animation on multi-line rows.
+                // 缩放支点 = 行顶，与滚动定位锚点一致：行的纵向定位是把“行顶”对齐到 anchorY
+                // （translationY = renderTop + anchorY - renderCenter）。若缩放绕行中心(0.5)，
+                // 唱完那行 1.1→1.0 时会顶部下移、底部上收 —— 与整列上滚叠加就成了用户看到的
+                // “先往下顶一下再往上滚”。改成绕行顶(0f)缩放后：当前行顶始终钉在锚点，唱完只是
+                // 向上收拢、不产生任何向下位移，配合上滚连续流畅。水平仍按对齐边（左/右）作支点。
+                transformOrigin = TransformOrigin(pivotX, 0f)
                 // blur 改在层内读取（Modifier.blur 会在 composition 读状态：切句后的 260ms
                 // 模糊动画期间每帧重组整行；这里读取只更新本层，且少一个独立 blur 层）。
-                clip = true
+                clip = false
                 val blurPx = rowBlur.dp.toPx()
                 renderEffect = if (blurPx > 0.05f) {
                     BlurEffect(blurPx, blurPx, TileMode.Decal)
@@ -857,38 +947,23 @@ private fun NativeAmllLyricRow(
             // slot 0：主体（伴唱 + 主歌词），不含纵向行距；高度稳定。
             Column(
                 modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(1.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
             ) {
-        leadingCompanions.forEach { companion ->
-            key("lead", companion.startMs, companion.text) {
-                NativeAmllCompanionLine(
-                    companion = companion,
-                    hostActive = isActive,
-                    itemAlignment = itemAlignment,
-                    timeState = timeState,
-                    clockState = clockState,
-                    fg = fg,
-                    fgUnsung = fgUnsung,
-                    fontSize = fontSize,
-                    lineHeight = lineHeight,
-                    maskAlpha = maskAlpha,
-                    isPlaying = isPlaying,
-                    isBeforeMain = true,
-                    ease = ease,
-                    lineWidthPx = lineWidthPx,
-                    effectsEnabled = effectsEnabled,
-                )
-            }
-        }
-
         Box(modifier = Modifier.align(itemAlignment)) {
             NativeAmllLyricText(
                 line = displayLine,
-                isActive = isActive,
+                sourceLine = line,
+                // Apple Web only applies timed gradient/shadow under
+                // `.display-synced-line.is-current`. Keep row-level overlap
+                // bookkeeping outside the text draw path so non-current
+                // overlapping lines cannot keep sweeping/lifting into the next
+                // line's TimeGroup.
+                isActive = isCurrentLine,
                 isFocused = isFocused,
                 isPast = isPast,
                 timeState = timeState,
                 clockState = if (line.chars.isNotEmpty() || isActive) clockState else null,
+                isPlaying = isPlaying,
                 motionFocus = if (isFocused) 1f else 0f,
                 motionFocusProvider = rowFocusProvider,
                 fg = fg,
@@ -896,18 +971,21 @@ private fun NativeAmllLyricRow(
                 keepFocusGradient = isManualFocus,
                 fontSize = fontSize,
                 lineHeight = lineHeight,
-                fontWeight = fontWeight,
+                fontWeight = effectiveMainFontWeight,
                 textAlign = textAlign,
                 maskAlpha = maskAlpha,
-                effectsEnabled = effectsEnabled,
+                effectsEnabled = rowEffectsEnabled,
+                wordTimelineOffsetMs = if (isCurrentLine) NATIVE_SCROLL_FOCUS_LEAD_MS else 0L,
             )
         }
 
-        trailingCompanions.forEach { companion ->
-            key("trail", companion.startMs, companion.text) {
+        backgroundVocals.forEachIndexed { bgIndex, companion ->
+            key("bg", companion.startMs, companion.text) {
                 NativeAmllCompanionLine(
                     companion = companion,
                     hostActive = isActive,
+                    hostCurrentLine = isCurrentLine,
+                    hostPast = isPast,
                     itemAlignment = itemAlignment,
                     timeState = timeState,
                     clockState = clockState,
@@ -917,10 +995,9 @@ private fun NativeAmllLyricRow(
                     lineHeight = lineHeight,
                     maskAlpha = maskAlpha,
                     isPlaying = isPlaying,
-                    isBeforeMain = false,
-                    ease = ease,
                     lineWidthPx = lineWidthPx,
-                    effectsEnabled = effectsEnabled,
+                    topMargin = if (bgIndex == 0) backgroundVocalTopMargin else 0.dp,
+                    effectsEnabled = rowEffectsEnabled,
                 )
             }
         }
@@ -929,10 +1006,8 @@ private fun NativeAmllLyricRow(
             // slot 1：译文完整内容（顶部 1dp 贴合主歌词；该 1dp 计入 transFull，progress=0 时一并收起）。
             if (translations.isNotEmpty()) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 1.dp),
-                    verticalArrangement = Arrangement.spacedBy(1.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(0.dp),
                 ) {
                     translations.forEach { translation ->
                         key("sub", translation.role, translation.startMs, translation.text) {
@@ -956,17 +1031,24 @@ private fun NativeAmllLyricRow(
         val bodyMinHeight = (rowMinHeightPx - rowTopPadPx).coerceIn(0, constraints.maxHeight)
         val bodyPlaceable = measurables[0].measure(constraints.copy(minHeight = bodyMinHeight))
         val transPlaceable = measurables.getOrNull(1)?.measure(constraints)
-        val measuredMainHeight = bodyPlaceable.height + rowTopPadPx
+        val measuredMainHeight = bodyPlaceable.height + rowTopPadPx + currentLinePaddingPx * 2
         onMainHeight(measuredMainHeight)
         val fullTrans = transPlaceable?.height ?: 0
         onTransFullHeight(fullTrans)
-        val collapsedTrans = (fullTrans * transProgress).roundToInt().coerceAtLeast(0)
+        onTransMaxHeight(transMaxHeightPx)
+        val collapsedTrans = nativeAppleSublineCollapsedHeight(
+            fullHeightPx = fullTrans,
+            maxHeightPx = transMaxHeightPx,
+            progress = transProgress,
+        )
         val width = constraints.maxWidth
         val totalHeight = measuredMainHeight + collapsedTrans
         layout(width, totalHeight) {
-            // 顶部留行距；译文紧贴主体底部展开，超出 collapsedTrans 的部分由 clipToBounds 收起（底部无留白，收起时不透出）。
-            bodyPlaceable.place(0, rowTopPadPx)
-            transPlaceable?.place(0, rowTopPadPx + bodyPlaceable.height)
+            // 顶部留行距；current padding 跟随 Apple 100ms transition 连续改变。
+            // 译文紧贴主体底部展开，超出 collapsedTrans 的部分由 clipToBounds 收起。
+            val bodyTop = rowTopPadPx + currentLinePaddingPx
+            bodyPlaceable.place(0, bodyTop)
+            transPlaceable?.place(0, bodyTop + bodyPlaceable.height)
         }
     }
 }
@@ -975,6 +1057,8 @@ private fun NativeAmllLyricRow(
 private fun NativeAmllCompanionLine(
     companion: PipoLyricLine,
     hostActive: Boolean,
+    hostCurrentLine: Boolean,
+    hostPast: Boolean,
     itemAlignment: Alignment.Horizontal,
     timeState: State<Long>,
     clockState: State<Float>,
@@ -984,60 +1068,57 @@ private fun NativeAmllCompanionLine(
     lineHeight: TextUnit,
     maskAlpha: NativeMaskAlpha,
     isPlaying: Boolean,
-    isBeforeMain: Boolean,
-    ease: CubicBezierEasing,
     lineWidthPx: Float,
+    topMargin: Dp,
     effectsEnabled: Boolean,
 ) {
     val textMeasurer = rememberTextMeasurer()
+    // Apple Web: .background-vocals 默认 display:none，只在 .is-current .line 下 display:block。
+    // 背景人声和主唱挂在同一个当前行 TimeGroup；行提前 250ms 变 current 时，
+    // 词级 sweep / slow-letter 也跟着同一条本地时间轴提前。
+    // Android 里只做同等的离散折叠/展开，不再额外套 100ms 高度/alpha tween；
+    // 否则密集切句时会叠加一条 Apple 没有的二次运动，造成前后行互相挤动。
+    // 副词一旦随当前行被唱到就出现，唱完进入 past 后保持可见（不再折叠隐藏），与主歌词一致地留在
+    // 列表里；仅尚未唱到的 future 行折叠为 0 高度。past 与 current 间恒为 1f，不会回弹。
+    val targetAppear = if (hostCurrentLine || hostPast) 1f else 0f
+    // 出现动画：像 Apple Music 一样淡入 + 上滑 + 撑开列表高度，而非离散闪出。
+    // future→current 时 0→1 平滑过渡（高度由 nativeBackgroundVocalReveal 同步撑开）；
+    // current→past 恒 1 不触发；effectsEnabled=false（低端/省电）直接取目标值省去每帧高度重测。
+    val appearAnim by animateFloatAsState(
+        targetValue = targetAppear,
+        animationSpec = tween(
+            durationMillis = NATIVE_BG_REVEAL_MS,
+            easing = NATIVE_BG_REVEAL_EASE,
+        ),
+        label = "nativeCompanionReveal",
+    )
+    val appear = if (effectsEnabled) appearAnim else targetAppear
+    val wordTimelineOffsetMs = if (hostCurrentLine) NATIVE_SCROLL_FOCUS_LEAD_MS else 0L
     // derivedStateOf：每个位置 tick 只做几次比较，布尔翻转（出现/活跃/唱过边界）才触发重组。
-    val companionActive by remember(companion) {
-        derivedStateOf { nativeIsCompanionActive(companion, timeState.value) }
+    val companionPast by remember(companion, wordTimelineOffsetMs) {
+        derivedStateOf { nativeIsCompanionPast(companion, timeState.value + wordTimelineOffsetMs) }
     }
-    val companionVisible by remember(companion) {
-        derivedStateOf { nativeIsCompanionVisible(companion, timeState.value) }
-    }
-    val companionPast by remember(companion) {
-        derivedStateOf { nativeIsCompanionPast(companion, timeState.value) }
-    }
-    // 副词（背景人声）一旦出现就保持显示，不再随时间收起：反复收起/重现会来回改变行高，
-    // 经测量回路扰动 rowTop 造成列表抖动。出现时浮入一次即可，之后常驻。
-    var hasAppeared by remember(companion) { mutableStateOf(companionVisible || !isPlaying) }
-    LaunchedEffect(companion, companionVisible) {
-        if (companionVisible) hasAppeared = true
-    }
-    val targetAppear = if (hasAppeared || !isPlaying) 1f else 0f
-    val appearAnim = remember(companion) { Animatable(targetAppear) }
-    LaunchedEffect(companion, targetAppear) {
-        appearAnim.animateTo(
-            targetValue = targetAppear,
-            animationSpec = spring(
-                dampingRatio = nativeDampingRatio(
-                    stiffness = NATIVE_BG_SLIDE_STIFFNESS,
-                    damping = NATIVE_BG_SLIDE_DAMPING,
-                ),
-                stiffness = NATIVE_BG_SLIDE_STIFFNESS,
-            ),
-        )
-    }
-    val appear = if (isPlaying) ease.transform(appearAnim.value.coerceIn(0f, 1f)) else 1f
-    val companionHeldByHost = hostActive && hasAppeared
-    val visualCompanionActive = companionActive || companionHeldByHost
-    val visualCompanionPast = companionPast && !hostActive
+    // Apple Web 在同一次 manageAnimations() 里把 backgroundVocalsContainer
+    // 和 primaryVocalsContainer 一起挂进 TimeGroup。也就是说背景人声只要所在行
+    // 是 current，就应进入 timed 绘制；未到 begin 的词保持 gradient-unsung，
+    // 到点后按自己的 data-delay/data-duration 扫色，而不是整段静态等到开唱。
+    val visualCompanionPast = companionPast && !hostActive && !hostCurrentLine
     val companionAlignment = if (companion.alignment == PipoLyricAlignment.End) Alignment.End else itemAlignment
     val companionTextAlign = if (companionAlignment == Alignment.End) TextAlign.End else TextAlign.Start
     val boxAlignment = if (companionAlignment == Alignment.End) Alignment.CenterEnd else Alignment.CenterStart
-    val companionFontSize = fontSize * 0.70f
-    val companionLineHeight = lineHeight * 0.84f
+    val companionFontSize = fontSize * NATIVE_BG_FONT_SCALE
+    val companionLineHeight = lineHeight * NATIVE_BG_LINE_HEIGHT_SCALE
+    val companionFontWeight = nativeAppleLyricFontWeight(companion.text, FontWeight.Bold)
     val companionStyle = nativeLyricTextStyle(
         fontSize = companionFontSize,
         lineHeight = companionLineHeight,
-        fontWeight = FontWeight.SemiBold,
+        fontWeight = companionFontWeight,
         textAlign = companionTextAlign,
     )
-    val displayCompanion = remember(companion, lineWidthPx, companionStyle, textMeasurer) {
+    val appleDisplayCompanion = remember(companion) { nativeAppleDisplayTimedLine(companion) }
+    val displayCompanion = remember(appleDisplayCompanion, lineWidthPx, companionStyle, textMeasurer) {
         nativeBalancedLyricLine(
-            line = companion,
+            line = appleDisplayCompanion,
             containerWidthPx = lineWidthPx,
             style = companionStyle,
             textMeasurer = textMeasurer,
@@ -1046,34 +1127,40 @@ private fun NativeAmllCompanionLine(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .nativeBackgroundVocalReveal(appear = appear, isBeforeMain = isBeforeMain)
+            .padding(top = topMargin)
+            .nativeBackgroundVocalReveal(appear = appear)
             .graphicsLayer {
                 alpha = appear
-                val scale = NATIVE_BG_WRAPPER_MIN_SCALE + (1f - NATIVE_BG_WRAPPER_MIN_SCALE) * appear
-                scaleX = scale
-                scaleY = scale
+                // 轻微上滑：未出现时下沉一点，随 appear 浮现到位，配合高度撑开像“被唱出来”。
+                translationY = (1f - appear) * companionFontSize.toPx() * NATIVE_BG_REVEAL_SLIDE_EM
                 transformOrigin = TransformOrigin(
                     pivotFractionX = if (companionAlignment == Alignment.End) 1f else 0f,
-                    pivotFractionY = if (isBeforeMain) 1f else 0f,
+                    pivotFractionY = 0f,
                 )
             },
         contentAlignment = boxAlignment,
     ) {
         NativeAmllLyricText(
             line = displayCompanion,
-            isActive = visualCompanionActive,
+            sourceLine = companion,
+            // Apple's background vocals are rendered from the same current
+            // line TimeGroup as primary vocals; when the host row is no longer
+            // current, their timed sweep/glow selectors stop applying too.
+            isActive = hostCurrentLine,
             isPast = visualCompanionPast,
             timeState = timeState,
             clockState = if (companion.chars.isNotEmpty()) clockState else null,
+            isPlaying = isPlaying,
             fg = fg,
             fgUnsung = fgUnsung,
             fontSize = companionFontSize,
             lineHeight = companionLineHeight,
-            fontWeight = FontWeight.SemiBold,
+            fontWeight = companionFontWeight,
             textAlign = companionTextAlign,
-            isBackgroundVocal = false,
+            isBackgroundVocal = true,
             maskAlpha = maskAlpha,
             effectsEnabled = effectsEnabled,
+            wordTimelineOffsetMs = wordTimelineOffsetMs,
         )
     }
 }
@@ -1088,17 +1175,41 @@ private fun NativeAmllTranslationLine(
     fontSize: TextUnit,
     lineHeight: TextUnit,
 ) {
-    val hiddenSlidePx = with(LocalDensity.current) { NATIVE_SUBLINE_HIDDEN_SLIDE_DP.dp.toPx() }
-    // 高度折叠由外层容器统一处理；这里只做淡入、缩放与轻微上滑，全部跟随同一进度。
+    val density = LocalDensity.current
+    val isSupplementary = translation.role == PipoLyricRole.Romaji
+    val sublineFontScale = if (isSupplementary) {
+        NATIVE_SUPPLEMENTARY_FONT_SCALE
+    } else {
+        NATIVE_SUBLINE_FONT_SCALE
+    }
+    val sublineLineHeightScale = if (isSupplementary) {
+        NATIVE_SUPPLEMENTARY_LINE_HEIGHT_SCALE
+    } else {
+        NATIVE_SUBLINE_LINE_HEIGHT_SCALE
+    }
+    val sublineFontSize = fontSize * sublineFontScale
+    val sublineLineHeight = lineHeight * sublineLineHeightScale
+    val hiddenSlidePx = with(density) {
+        fontSize.toPx() * (NATIVE_SUBLINE_HIDDEN_SLIDE_WEB_PX / NATIVE_APPLE_WEB_LINE_FONT_PX)
+    }
+    val visibleTopMargin = with(density) {
+        (sublineFontSize.toPx() * NATIVE_SUBLINE_VISIBLE_MARGIN_TOP_EM).toDp()
+    }
+    // Apple Web:
+    // - secondary: opacity 0 -> .45, y -10 -> 0, font 13px, margin-top .2em.
+    // - static-supplementary/pronunciation: opacity 0 -> 1, y -10 -> 0, font 15px, margin-top .2em.
+    // Apple 的 inline ruby `.supplementary` 才是 y -20；当前数据里的 Romaji 是整行 x-roman。
+    // - .line:lang(zh) drops to 600; Latin stays 700.
+    // 高度折叠由外层容器统一处理，这里只做内容层位移与淡入。
     val appear = progress.coerceIn(0f, 1f)
+    val sublineFontWeight = nativeAppleLyricFontWeight(translation.text, FontWeight.Bold)
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            .padding(top = visibleTopMargin * appear)
             .graphicsLayer {
                 alpha = appear
-                scaleX = NATIVE_SUBLINE_WRAPPER_MIN_SCALE + (1f - NATIVE_SUBLINE_WRAPPER_MIN_SCALE) * appear
-                scaleY = NATIVE_SUBLINE_WRAPPER_MIN_SCALE + (1f - NATIVE_SUBLINE_WRAPPER_MIN_SCALE) * appear
-                translationY = (1f - appear) * hiddenSlidePx
+                translationY = -(1f - appear) * hiddenSlidePx
                 transformOrigin = TransformOrigin(
                     pivotFractionX = if (itemAlignment == Alignment.End) 1f else 0f,
                     pivotFractionY = 0f,
@@ -1108,45 +1219,38 @@ private fun NativeAmllTranslationLine(
     ) {
         Text(
             text = translation.text,
-            color = nativeTranslationColor(fg),
+            color = nativeSublineColor(translation.role, fg),
             style = nativeLyricTextStyle(
-                fontSize = fontSize * NATIVE_SUBLINE_FONT_SCALE,
-                lineHeight = lineHeight * NATIVE_SUBLINE_LINE_HEIGHT_SCALE,
-                fontWeight = FontWeight.SemiBold,
+                fontSize = sublineFontSize,
+                lineHeight = sublineLineHeight,
+                fontWeight = sublineFontWeight,
                 textAlign = textAlign,
             ),
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
         )
     }
 }
 
 private fun Modifier.nativeBackgroundVocalReveal(
     appear: Float,
-    isBeforeMain: Boolean,
 ): Modifier = layout { measurable, constraints ->
     val placeable = measurable.measure(constraints)
     val progress = appear.coerceIn(0f, 1f)
     val collapsedHeight = (placeable.height * progress).roundToInt()
-    val hiddenSlide = placeable.height * NATIVE_BG_HIDDEN_SLIDE_RATIO * (1f - progress)
-    val y = if (isBeforeMain) {
-        collapsedHeight - placeable.height + hiddenSlide.roundToInt()
-    } else {
-        -hiddenSlide.roundToInt()
-    }
     layout(placeable.width, collapsedHeight) {
-        placeable.placeRelative(0, y)
+        placeable.placeRelative(0, 0)
     }
 }
 
 @Composable
 private fun NativeAmllLyricText(
     line: PipoLyricLine,
+    sourceLine: PipoLyricLine = line,
     isActive: Boolean,
     isFocused: Boolean = isActive,
     isPast: Boolean,
     timeState: State<Long>,
     clockState: State<Float>? = null,
+    isPlaying: Boolean,
     motionFocus: Float = if (isActive) 1f else 0f,
     motionFocusProvider: (() -> Float)? = null,
     fg: Color,
@@ -1159,62 +1263,111 @@ private fun NativeAmllLyricText(
     isBackgroundVocal: Boolean = false,
     maskAlpha: NativeMaskAlpha = NativeMaskAlpha.Solid,
     effectsEnabled: Boolean = true,
+    wordTimelineOffsetMs: Long = 0L,
 ) {
     var layout by remember(line.startMs, line.text) { mutableStateOf<TextLayoutResult?>(null) }
-    var timedPlan by remember(line.startMs, line.text, line.chars) { mutableStateOf<NativeTimedLyricPlan?>(null) }
-    val glowMeasurer = rememberTextMeasurer(cacheSize = 64)
-    val lyricAccent = LocalLyricAccent.current
-    val style = nativeLyricTextStyle(fontSize, lineHeight, fontWeight, textAlign)
-    val glyphLayoutCache = remember(line.text, style) { LinkedHashMap<String, TextLayoutResult>() }
-    val lineEndMs = remember(line) { nativeLineAudioEndMs(line) }
-    // 行唱完后的出场上浮：composition 只订阅“是否在 360ms 窗口内”这个布尔
-    //（derivedStateOf 每 tick 仅一次比较，翻转才重组）；连续出场进度移到 draw 阶段读取。
-    val inExitFloatWindow by remember(line) {
-        derivedStateOf { timeState.value - lineEndMs < NATIVE_WORD_EXIT_FLOAT_MS }
+    var timedPlan by remember(line.startMs, line.text, line.chars, sourceLine.chars) {
+        mutableStateOf<NativeTimedLyricPlan?>(null)
     }
-    val exitFloatActive = !isActive && isPast && inExitFloatWindow
+    // cacheSize=0：禁用测量器自身的去重缓存。否则一行里相同的单字符（如三个慢词各有的 'e'）会命中
+    // 缓存、返回同一个 TextLayoutResult 实例，导致它们共用底层 Paragraph/Paint —— 逐字发光时给某个
+    // 'e' 设的 Shadow 会串到其它 'e' 上（“第一个 e 发光，其它 e 跟着发光”的根因）。每字形/每段的复用
+    // 已由 plan 的按索引缓存（glyphLayouts / segmentLayouts）保证，这里禁用去重不会带来重复测量。
+    val glowMeasurer = rememberTextMeasurer(cacheSize = 0)
+    val density = LocalDensity.current
+    val style = nativeLyricTextStyle(fontSize, lineHeight, fontWeight, textAlign)
+    val lineStartMs = remember(sourceLine) { nativeLineMainStartMs(sourceLine) }
+    val lineEndMs = remember(sourceLine) { nativeLineAudioEndMs(sourceLine) }
     val canUseFocusGradient = !isPast || keepFocusGradient
     val focusMotion = if (isFocused && !isPast) motionFocus.coerceIn(0f, 1f) else 0f
-    val isPreActiveFocus = !isActive && focusMotion > 0.001f
+    val lineSungOut by remember(line) {
+        derivedStateOf { timeState.value >= lineEndMs }
+    }
+    // Apple Web 的 gradient/text-shadow selector 只挂在 `.is-current`。
+    // Android 不再让 previous line 继续 timed 自绘；否则 +250ms current lookahead
+    // 会出现“下一行已开唱，上一行词级上浮还在动”的交叉抖动。
     // 手动拖动到非当前播放行时，视觉焦点应该保留行色渐变；如果继续走 timed 自绘，
     // 它会用真实播放时钟计算这个远处句子的 sweep，结果常常是 0 或已结束，焦点渐变被透明文本路径盖掉。
-    val manualStaticFocus = keepFocusGradient && !isActive && !exitFloatActive
+    val manualStaticFocus = keepFocusGradient && !isActive
     val shouldDrawTimed = line.chars.isNotEmpty() &&
         !manualStaticFocus &&
-        (isActive || isPreActiveFocus || exitFloatActive)
-    val useFrameClockForDraw = clockState != null && (isActive || isPreActiveFocus)
+        isActive
+    val timedDrawOffsetMs = if (shouldDrawTimed) wordTimelineOffsetMs else 0L
+    val appleLineClockState = rememberNativeAppleLineClockMs(
+        lineStartMs = lineStartMs,
+        lineKey = "${sourceLine.startMs}:${sourceLine.text}",
+        localIsActive = shouldDrawTimed,
+        isPlaying = isPlaying,
+        rawPositionState = timeState,
+        wordTimelineOffsetMs = timedDrawOffsetMs,
+    )
     // 静态文本色不再离散跳变（旧的 when 分支在 fgUnsung→fg→已唱色之间瞬切，就是
     // “切句时颜色跳一下/闪一下”的来源之一）。改成 focus / past 两个通道各自 tween、
     // 连续插值：激活增亮、唱过变暗都有 Apple 式渐变；边界值与逐字自绘路径两端严格一致
     // （未来=fgUnsung、唱过=nativeSolidLineColor），LRC 整行歌词从此也有亮度过渡。
     val focusColorAnim by animateFloatAsState(
         targetValue = if ((isActive || isFocused) && canUseFocusGradient) 1f else 0f,
-        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_LINE_SWITCH_EASE),
+        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_CSS_DEFAULT_EASE),
         label = "nativeLyricFocusColor",
     )
     val pastColorAnim by animateFloatAsState(
-        targetValue = if (isPast) 1f else 0f,
-        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_LINE_SWITCH_EASE),
+        // “已唱”是时间事实而非焦点状态：被上一句压住焦点的短插句（isPast=false 但
+        // 音频已结束）也按已唱色渐暗，否则它会以未唱色示人，与静态已唱终态相接时跳色。
+        targetValue = if (isPast || lineSungOut) 1f else 0f,
+        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_CSS_DEFAULT_EASE),
         label = "nativeLyricPastColor",
     )
     val timedPlanReady = timedPlan?.segments?.isNotEmpty() == true
-    val baseColor = if (shouldDrawTimed && timedPlanReady) {
-        Color.Transparent
+    // 高亮端点取 timed 已唱色（alpha .85）而非纯 fg（alpha 1.0）：当前行靠 Canvas
+    // timed 自绘的已唱色就是 .85，一旦它切成 past/失焦走静态文本路径，若静态高亮端点
+    // 用满色 1.0，切换那一帧会从 .85 猛跳到 1.0 再渐隐到 .40（“切句闪一下”的根因）。
+    // 端点对齐 .85 后，timed → 静态 的衔接无亮度断点，只剩平滑的 .85 → .40 渐暗。
+    val staticFallbackColor = lerp(
+        lerp(fgUnsung, nativeSolidLineColor(fg), pastColorAnim),
+        nativeTimedGradientSungColor(fg),
+        focusColorAnim,
+    )
+    val needsTimedFallback = shouldDrawTimed && !timedPlanReady && isActive
+    val timedFallbackPositionMs = appleLineClockState.value.toLong()
+    val timedFallbackProgress = if (needsTimedFallback && lineEndMs > lineStartMs) {
+        ((timedFallbackPositionMs - lineStartMs).toFloat() / (lineEndMs - lineStartMs).toFloat()).coerceIn(0f, 1f)
     } else {
-        lerp(lerp(fgUnsung, nativeSolidLineColor(fg), pastColorAnim), fg, focusColorAnim)
+        0f
+    }
+    // Apple Web timed syllables switch to a background-clip gradient whose endpoints are fixed at
+    // alpha .85 (sung) and .5 (unsung). If Android has not built the TextLayout-driven sweep plan
+    // yet, draw the one-frame fallback inside the same alpha range instead of full current-line fg;
+    // otherwise the next frame drops from 1.0 -> .85/.5 and reads as a color jump.
+    val timedFallbackColor = lerp(
+        nativeTimedGradientUnsungColor(fg),
+        nativeTimedGradientSungColor(fg),
+        timedFallbackProgress,
+    )
+    val baseColor = when {
+        shouldDrawTimed && timedPlanReady -> Color.Transparent
+        needsTimedFallback -> timedFallbackColor
+        else -> staticFallbackColor
     }
 
     Text(
         text = line.text,
         color = baseColor,
         style = style,
+        // Apple Web renders every timed word as `.syllable { display:inline-block;
+        // white-space:pre }`: wrapping only happens between syllable groups. We
+        // already insert explicit balanced line breaks at token boundaries, so
+        // disable Compose soft wrapping to avoid splitting one timed token into
+        // multiple visual segments with independent clips.
+        softWrap = false,
         onTextLayout = { result ->
             if (layout !== result) {
                 layout = result
                 timedPlan = if (line.chars.isNotEmpty()) {
-                    NativeTimedLyricPlan(
+                    nativeTimedLyricPlan(
                         layout = result,
-                        segments = nativeLyricSegments(result, line.chars),
+                        chars = line.chars,
+                        sourceChars = sourceLine.chars,
+                        density = density,
                     )
                 } else {
                     null
@@ -1228,28 +1381,15 @@ private fun NativeAmllLyricText(
                 if (result == null || plan == null || plan.layout !== result || plan.segments.isEmpty()) {
                     drawContent()
                 } else {
-                    val drawPositionMs = if (useFrameClockForDraw) {
-                        nativeRenderPositionMs(clockState?.value ?: lineEndMs.toFloat())
-                    } else {
-                        // 非活跃绘制（出场上浮）固定画在行尾时刻（全句已唱色）。
-                        lineEndMs
-                    }
+                    val drawPositionMs = nativeRenderPositionMs(appleLineClockState.value)
                     val drawFocusMotion = if (isFocused && !isPast) {
                         (motionFocusProvider?.invoke() ?: focusMotion).coerceIn(0f, 1f)
                     } else {
                         focusMotion
                     }
-                    // 出场上浮进度在 draw 阶段读 timeState：只重绘本行，不触发重组。
-                    val drawMotionScale = if (isActive || isPreActiveFocus) {
-                        1f
-                    } else {
-                        (1f - (timeState.value - lineEndMs).toFloat() / NATIVE_WORD_EXIT_FLOAT_MS.toFloat())
-                            .coerceIn(0f, 1f)
-                    }
                     drawNativeTimedLyric(
                         plan = plan,
                         glyphMeasurer = glowMeasurer,
-                        glyphLayoutCache = glyphLayoutCache,
                         positionMs = drawPositionMs,
                         focusMotion = drawFocusMotion,
                         fg = fg,
@@ -1257,12 +1397,11 @@ private fun NativeAmllLyricText(
                         isPast = isPast,
                         isBackgroundVocal = isBackgroundVocal,
                         maskAlpha = maskAlpha,
-                        motionScale = drawMotionScale,
-                        // 出场上浮窗口内把已唱色渐变到静态已唱色：窗口结束的那一帧颜色与
-                        // 静态路径完全相等，消除旧实现 100%→40% 亮度直切的“闪一下”。
-                        pastFade = if (isActive || isPreActiveFocus) 0f else 1f - drawMotionScale,
+                        motionScale = 1f,
+                        pastFade = 0f,
+                        // Apple Web 的 gradient/text-shadow selector 只作用于 .is-current。
+                        // willAnimate / pre-active focus 只准备行级视觉，不提前跑词级 sweep/glow。
                         effectsEnabled = effectsEnabled,
-                        accent = lyricAccent,
                     )
                 }
             }
@@ -1291,6 +1430,14 @@ private fun nativeLyricTextStyle(
         ),
         platformStyle = PlatformTextStyle(includeFontPadding = false),
     )
+}
+
+private fun nativeAppleLyricFontWeight(text: String, fallback: FontWeight): FontWeight {
+    return when {
+        nativeIsCjkText(text) -> FontWeight.SemiBold
+        fallback.weight > FontWeight.Bold.weight -> FontWeight.Bold
+        else -> fallback
+    }
 }
 
 private data class NativeLineBalanceChild(
@@ -1531,15 +1678,135 @@ private fun nativeEndsWithBreakPunctuation(text: String): Boolean {
     return char in NATIVE_BREAK_PUNCTUATION
 }
 
-private data class NativeTimedLyricPlan(
+private fun nativeAppleDisplayTimedLine(line: PipoLyricLine): PipoLyricLine {
+    if (line.chars.isEmpty()) return line
+    var changed = false
+    val displayChars = line.chars.map { token ->
+        val displayText = nativeAppleSyllableDisplayText(token.text)
+        if (displayText == token.text) {
+            token
+        } else {
+            changed = true
+            token.copy(text = displayText)
+        }
+    }
+    if (!changed) return line
+    return line.copy(
+        text = displayChars.joinToString(separator = "") { it.text },
+        chars = displayChars,
+    )
+}
+
+private fun nativeAppleSyllableDisplayText(text: String): String {
+    val contentEnd = text.indexOfLast { !it.isWhitespace() && !it.isISOControl() } + 1
+    if (contentEnd <= 0) return text
+    val hasTrailingWhitespace = contentEnd < text.length
+    val rawContent = text.substring(0, contentEnd)
+    val hasParentheses = rawContent.indexOf('(') >= 0 || rawContent.indexOf(')') >= 0
+    if (!hasParentheses && !hasTrailingWhitespace) return text
+    return buildString(text.length) {
+        rawContent.forEach { ch ->
+            if (!nativeAppleStripsSyllableChar(ch)) append(ch)
+        }
+        // Apple Music Web stores inter-word spacing as `hasTrailingWhitespace` on the
+        // outer group and renders it with `::after { margin-right: 0.3ch }`; it is not
+        // part of the `.syllable` data-content or letter timeline. A thin space gives
+        // Android Text a close layout gap without letting the timing segment include
+        // a full normal-space advance.
+        if (hasTrailingWhitespace && isNotEmpty()) append(NATIVE_APPLE_TRAILING_WORD_SPACE)
+    }
+}
+
+private class NativeTimedLyricPlan(
     val layout: TextLayoutResult,
     val segments: List<NativeLyricSegment>,
+    val fontPx: Float,
+    val fadeWidth: Float,
+    val rowTop: FloatArray,
+    val rowBottom: FloatArray,
+    val segClipLeft: FloatArray,
+    val segClipRight: FloatArray,
+    val segSlow: Array<NativeSlowShape>,
+    val glyphBoxLeft: FloatArray,
+    val glyphBoxRight: FloatArray,
+    val glyphStyle: TextStyle,
+    val glyphLayouts: Array<TextLayoutResult?>,
+    val segmentLayouts: Array<TextLayoutResult?>,
+    val segmentInkLeft: FloatArray,
 )
+
+// 逐帧绘制要用的所有静态几何（段裁切边界、慢词字形盒、行上下沿、宽度参数）在排版
+// 完成时一次算好：draw 每帧跑在 UI 线程，旧实现 per-frame 的布局查询与小对象分配
+//（每段 new Bounds/SlowShape、每字 getBoundingBox + 字符串拼 key、filter 列表）
+// 是稳定的 GC 压力与 CPU 热源——这正是“歌词页发热/掉帧”的组成部分。
+private fun nativeTimedLyricPlan(
+    layout: TextLayoutResult,
+    chars: List<PipoLyricChar>,
+    sourceChars: List<PipoLyricChar>,
+    density: Density,
+): NativeTimedLyricPlan {
+    val segments = nativeLyricSegments(layout, chars, sourceChars)
+    val style = layout.layoutInput.style
+    val fontPx = with(density) { style.fontSize.toPx() }
+    val fadeWidth = nativeWordFadeWidth(layout, fontPx)
+    val segClipLeft = FloatArray(segments.size)
+    val segClipRight = FloatArray(segments.size)
+    // 悬伸/抗锯齿裁切余量在排版期一次性烘焙进段裁切带，并在函数内夹到词间留白中点，
+    // 避免逐帧绘制时再对相邻段无条件加 pad 造成裁切带重叠（上浮错相位重影）。
+    val glyphClipPad = fontPx * NATIVE_GLYPH_HORIZONTAL_CLIP_PAD_EM
+    segments.forEachIndexed { idx, _ ->
+        val bounds = nativeSegmentClipBounds(layout, segments, idx, fadeWidth, glyphClipPad)
+        segClipLeft[idx] = bounds.left
+        segClipRight[idx] = bounds.right
+    }
+    val text = layout.layoutInput.text.text
+    val glyphBoxLeft = FloatArray(text.length) { Float.NaN }
+    val glyphBoxRight = FloatArray(text.length) { Float.NaN }
+    segments.forEach { segment ->
+        for (i in segment.startChar until segment.endChar) {
+            if (i !in text.indices) continue
+            val ch = text[i]
+            if (ch.isWhitespace() || ch.isISOControl()) continue
+            val rawBox = layout.getBoundingBox(i)
+            if (rawBox.right <= rawBox.left) continue
+            val box = nativeSlowGlyphVisualBox(
+                layout = layout,
+                segment = segment,
+                index = i,
+                fallbackLeft = rawBox.left,
+                fallbackRight = rawBox.right,
+            ) ?: continue
+            glyphBoxLeft[i] = box.left
+            glyphBoxRight[i] = box.right
+        }
+    }
+    return NativeTimedLyricPlan(
+        layout = layout,
+        segments = segments,
+        fontPx = fontPx,
+        fadeWidth = fadeWidth,
+        rowTop = FloatArray(layout.lineCount) { layout.getLineTop(it) },
+        rowBottom = FloatArray(layout.lineCount) { layout.getLineBottom(it) },
+        segClipLeft = segClipLeft,
+        segClipRight = segClipRight,
+        segSlow = Array(segments.size) { idx ->
+            nativeSlowWordShape(
+                displayToken = segments[idx].timing,
+                sourceToken = segments[idx].sourceTiming,
+            )
+        },
+        glyphBoxLeft = glyphBoxLeft,
+        glyphBoxRight = glyphBoxRight,
+        glyphStyle = style.copy(textAlign = TextAlign.Start),
+        glyphLayouts = arrayOfNulls(text.length),
+        segmentLayouts = arrayOfNulls(segments.size),
+        segmentInkLeft = FloatArray(segments.size) { Float.NaN },
+    )
+}
 
 private fun DrawScope.drawNativeTimedLyric(
     plan: NativeTimedLyricPlan,
     glyphMeasurer: TextMeasurer,
-    glyphLayoutCache: MutableMap<String, TextLayoutResult>,
     positionMs: Long,
     focusMotion: Float,
     fg: Color,
@@ -1550,7 +1817,6 @@ private fun DrawScope.drawNativeTimedLyric(
     motionScale: Float,
     pastFade: Float = 0f,
     effectsEnabled: Boolean,
-    accent: Color,
 ) {
     val layout = plan.layout
     val segments = plan.segments
@@ -1558,202 +1824,273 @@ private fun DrawScope.drawNativeTimedLyric(
         drawText(layout, color = if (isPast) nativeSolidLineColor(fg) else fgUnsung)
         return
     }
-    val activeUnsung = if (isPast) nativeSolidLineColor(fg) else fgUnsung
-    // pastFade：行唱完后的出场窗口里从满亮已唱色渐变到静态已唱色（与静态路径无缝衔接）。
-    val activeSung = lerp(fg, nativeSolidLineColor(fg), pastFade.coerceIn(0f, 1f))
-    val fadeWidth = nativeWordFadeWidth(layout)
-    val front = nativeLyricFront(segments, positionMs, fadeWidth)
-        drawNativeSegmentSweepText(
-            layout = layout,
-            glyphMeasurer = glyphMeasurer,
-            glyphLayoutCache = glyphLayoutCache,
-            segments = segments,
-        front = front,
+    // Apple Web current timed gradient:
+    // rgba(gradient-color, .85) -> rgba(gradient-color, .5). 这里不再沿用
+    // 全局 fg/fgUnsung 的封面色策略，避免扫色边界在 1.0 -> 0.4x 之间显得硬跳。
+    val activeUnsung = if (isPast) nativeSolidLineColor(fg) else nativeTimedGradientUnsungColor(fg)
+    // pastFade：行唱完后的出场窗口里从 Apple timed 已唱色渐变到静态已唱色（与静态路径无缝衔接）。
+    val activeSung = lerp(nativeTimedGradientSungColor(fg), nativeSolidLineColor(fg), pastFade.coerceIn(0f, 1f))
+    drawNativeSegmentSweepText(
+        plan = plan,
+        glyphMeasurer = glyphMeasurer,
         fg = activeSung,
         activeUnsung = activeUnsung,
-        fadeWidth = fadeWidth,
         isBackgroundVocal = isBackgroundVocal,
         positionMs = positionMs,
         focusMotion = focusMotion,
         motionScale = motionScale,
         effectsEnabled = effectsEnabled,
-        accent = accent,
     )
 }
 
 private fun DrawScope.drawNativeSegmentSweepText(
-    layout: TextLayoutResult,
+    plan: NativeTimedLyricPlan,
     glyphMeasurer: TextMeasurer,
-    glyphLayoutCache: MutableMap<String, TextLayoutResult>,
-    segments: List<NativeLyricSegment>,
-    front: NativeLyricFront,
     fg: Color,
     activeUnsung: Color,
-    fadeWidth: Float,
     isBackgroundVocal: Boolean,
     positionMs: Long,
     focusMotion: Float,
     motionScale: Float,
     effectsEnabled: Boolean,
-    accent: Color,
 ) {
-    val fontPx = layout.layoutInput.style.fontSize.toPx()
-    val verticalClipPad = fontPx * NATIVE_GLYPH_VERTICAL_CLIP_PAD_EM
+    val layout = plan.layout
+    val segments = plan.segments
+    val fontPx = plan.fontPx
+    val liftEm = if (isBackgroundVocal) NATIVE_BG_WORD_LIFT_EM else NATIVE_MAIN_WORD_LIFT_EM
+    val mScale = motionScale.coerceIn(0f, 1f)
+    val sungLiftPx = -fontPx * liftEm * mScale
+
     segments.forEachIndexed { index, segment ->
-        val lineTop = layout.getLineTop(segment.line)
-        val lineBottom = layout.getLineBottom(segment.line)
-        val progress = nativeSegmentFillProgress(segment, positionMs)
-        val bounds = nativeSegmentClipBounds(layout, segments, index, fadeWidth)
-        val slow = nativeSlowWordShape(segment.timing, index == segments.lastIndex)
-        val slowFocusPreview = focusMotion > 0.001f && front.index < 0 && index == 0
-        if (effectsEnabled && (nativeShouldDrawSlowGlyphs(slow, segment.timing, positionMs) || slowFocusPreview)) {
+        val slow = plan.segSlow[index]
+        // Apple Web 在当前行 manageAnimations() 时会先把所有 `.emphasis`
+        // 拆成 `.letter`，再给每个 letter 挂 keyframe；未到 data-delay 前只是
+        // letterState 的起始值（scale=1/y=0/gradient=-20），不会先以整词路径绘制。
+        // Android 也让慢词在整个 current/timed 生命周期都走逐字母路径，避免
+        // token.start 那一帧从整词 Text 切到逐字 Text 造成轻微跳动。
+        if (effectsEnabled && slow.amount > 0f) {
             drawNativeSlowSegmentText(
-                layout = layout,
+                plan = plan,
                 glyphMeasurer = glyphMeasurer,
-                glyphLayoutCache = glyphLayoutCache,
-                segment = segment,
-                bounds = bounds,
+                segmentIndex = index,
                 slow = slow,
                 motionPositionMs = positionMs,
-                focusMotion = focusMotion,
-                progress = progress,
                 fg = fg,
                 activeUnsung = activeUnsung,
-                fadeWidth = fadeWidth,
-                isBackgroundVocal = isBackgroundVocal,
                 motionScale = motionScale,
-                accent = accent,
             )
             return@forEachIndexed
         }
-        val liftEm = if (isBackgroundVocal) NATIVE_BG_WORD_LIFT_EM else NATIVE_MAIN_WORD_LIFT_EM
-        val liftPx = -fontPx * liftEm *
-            NATIVE_WORD_FLOAT_EASE.transform(progress.coerceIn(0f, 1f)) *
-            motionScale.coerceIn(0f, 1f)
-        val topLeft = Offset(0f, liftPx)
-
-        drawNativeSweepTextSlice(
-            layout = layout,
-            clipLeft = bounds.left,
-            clipTop = lineTop - verticalClipPad,
-            clipRight = bounds.right,
-            clipBottom = lineBottom + verticalClipPad,
+        val progress = nativeSegmentFillProgress(segment, positionMs)
+        val band = nativeSegmentSweepBandFor(
             segment = segment,
             progress = progress,
+        )
+        val liftT = nativeSegmentLiftProgress(segment, positionMs)
+        val solidX = nativeBandSolidX(band, segment.line)
+        val rampEndX = nativeBandRampEndX(band, segment.line)
+        val fadeEndX = nativeBandFadeEndX(band, segment.line)
+        // Apple Web 是每个 word/syllable 自己的渐变时间轴：下一词开唱不会改写前一词的
+        // 颜色或位移状态。这里只按本段 progress/lift 分类，避免跨词前沿导致抢跑抖动。
+        val kind = when {
+            progress <= NATIVE_SWEEP_PROGRESS_EPS && liftT <= 0.001f -> 1
+            progress >= 0.999f && liftT >= 0.999f -> 2
+            else -> 0
+        }
+        // Apple Web paints each `.syllable` as an inline-block, but all blocks
+        // still live in the same browser line box. Android's isolated per-word
+        // TextLayout can land on slightly different font metrics, which shows
+        // up as horizontal cracks on multi-line lyrics during lift/scale. Keep
+        // one shared paragraph layout for glyph pixels, and only clip/move the
+        // current syllable's visual lane.
+        val liftPx = if (kind == 2) sungLiftPx else -fontPx * liftEm * liftT * mScale
+        val lineClipTop = plan.rowTop[segment.line]
+        val lineClipBottom = plan.rowBottom[segment.line]
+        drawNativeSweepTextSlice(
+            plan = plan,
+            contentLeft = segment.left,
+            contentRight = segment.right,
+            // 段裁切带已在排版期烘焙了悬伸余量并夹到词间留白中点；此处直接使用，
+            // 不再无条件加 pad，避免相邻段裁切带重叠导致上浮错相位时的边界重影。
+            clipLeft = plan.segClipLeft[index],
+            clipTop = lineClipTop,
+            clipRight = plan.segClipRight[index],
+            clipBottom = lineClipBottom,
+            solidX = solidX,
+            rampEndX = rampEndX,
+            fadeEndX = fadeEndX,
             fg = fg,
             activeUnsung = activeUnsung,
-            fadeWidth = fadeWidth,
-            topLeft = topLeft,
-            positionMs = positionMs,
-            accent = accent,
+            topLeft = Offset(0f, liftPx),
         )
     }
 }
 
+// 段级切片绘制：颜色坐标来自当前 word/syllable 自己的 Apple Web 渐变带。
+// solidX 是已唱色 stop，fadeEndX 是未唱色 stop；带外两侧用 Clamp 落到纯已唱/纯未唱。
 private fun DrawScope.drawNativeSweepTextSlice(
-    layout: TextLayoutResult,
+    plan: NativeTimedLyricPlan,
+    contentLeft: Float,
+    contentRight: Float,
     clipLeft: Float,
     clipTop: Float,
     clipRight: Float,
     clipBottom: Float,
-    segment: NativeLyricSegment,
-    progress: Float,
+    solidX: Float,
+    rampEndX: Float,
+    fadeEndX: Float,
     fg: Color,
     activeUnsung: Color,
-    fadeWidth: Float,
     topLeft: Offset,
-    positionMs: Long,
-    accent: Color,
 ) {
-    if (clipRight <= clipLeft || clipBottom <= clipTop) return
-    val p = progress.coerceIn(0f, 1f)
-    clipRect(clipLeft, clipTop, clipRight, clipBottom) {
+    if (contentRight <= contentLeft || clipRight <= clipLeft || clipBottom <= clipTop) return
+    val drawTopLeft = topLeft
+    // 关键：垂直裁切带必须跟随上浮位移一起平移。文本样式是 Trim.None+Center，行内 leading≈0，
+    // 上浮 liftPx 时字形顶部本会越过固定的 rowTop[line] 行边界被裁掉（多行时第二行起的行间边界
+    // 尤为明显，y/j/g 等会“裂开”）。裁切带与内容同步平移 drawTopLeft.y 后，字形在带内相对位置
+    // 不变即不再被切；又因裁切带与内容是刚性平移，相邻行像素仍落在带外，不会产生重影。
+    nativeClipTextRect(clipLeft, clipTop + drawTopLeft.y, clipRight, clipBottom + drawTopLeft.y) {
         when {
-            p <= NATIVE_SWEEP_PROGRESS_EPS || positionMs <= segment.timing.startMs -> {
-                drawText(layout, color = activeUnsung, topLeft = topLeft)
-            }
-            p >= 0.999f -> drawText(layout, color = fg, topLeft = topLeft)
-            else -> {
-                val segmentWidth = (segment.right - segment.left).coerceAtLeast(1f)
-                val sweepX = (segment.left + (segment.right - segment.left) * p)
-                    .coerceIn(segment.left, segment.right)
-                val transitionWidth = maxOf(
-                    segmentWidth * NATIVE_SWEEP_TRANSITION_FRACTION,
-                    fadeWidth * NATIVE_SWEEP_TRANSITION_MIN_EM,
+            solidX >= contentRight -> drawText(plan.layout, color = fg, topLeft = drawTopLeft)
+            fadeEndX <= contentLeft -> drawText(plan.layout, color = activeUnsung, topLeft = drawTopLeft)
+            rampEndX <= solidX + 0.5f -> {
+                val edge = solidX.coerceIn(contentLeft, contentRight)
+                val edgeBrush = nativeSweepTransitionBrush(
+                    fg = fg,
+                    activeUnsung = activeUnsung,
+                    startX = edge - drawTopLeft.x,
+                    endX = edge - drawTopLeft.x + 1f,
                 )
-                val fadeEndX = sweepX + transitionWidth
-                drawText(layout, color = activeUnsung, topLeft = topLeft)
-                if (sweepX > clipLeft) {
-                    clipRect(
-                        clipLeft,
-                        clipTop,
-                        minOf(sweepX, clipRight),
-                        clipBottom,
-                    ) {
-                        drawText(layout, color = fg, topLeft = topLeft)
-                    }
-                }
-                if (fadeEndX > clipLeft && sweepX < clipRight) {
-                    val fadeLeft = sweepX.coerceAtLeast(clipLeft)
-                    val fadeRight = fadeEndX.coerceAtMost(clipRight)
-                    val fadeBrush = nativeSweepTransitionBrush(
-                        fg = fg,
-                        accent = accent,
-                        startX = fadeLeft,
-                        endX = fadeRight,
-                    )
-                    clipRect(
-                        fadeLeft,
-                        clipTop,
-                        fadeRight,
-                        clipBottom,
-                    ) {
-                        drawText(
-                            layout,
-                            brush = fadeBrush,
-                            topLeft = topLeft,
-                        )
-                    }
-                }
+                drawText(plan.layout, brush = edgeBrush, topLeft = drawTopLeft, alpha = 1f)
+            }
+            else -> {
+                val brush = nativeSweepTransitionBrush(
+                    fg = fg,
+                    activeUnsung = activeUnsung,
+                    startX = solidX - drawTopLeft.x,
+                    endX = rampEndX - drawTopLeft.x,
+                )
+                // 单次渐变填充：每个像素只画一次，颜色 = Apple Web 同一条两端渐变
+                // 在该 x 的取值，不叠加额外颜色层。Clamp 让
+                // 带外两侧自然落在纯亮/纯未唱。
+                // alpha 必须显式传 1f：本文本布局的基色是 Transparent（静态路径不可见），
+                // drawText(brush) 默认 alpha=NaN 会沿用画笔现有 alpha=0 —— 渐变层因此
+                // 从第一版起整层隐形（“分界线”的真正物理根源，模拟器逐像素实锤）。
+                drawText(plan.layout, brush = brush, topLeft = drawTopLeft, alpha = 1f)
             }
         }
     }
 }
 
-private fun nativeSweepTransitionBrush(
-    fg: Color,
-    accent: Color,
-    startX: Float,
-    endX: Float,
-): Brush {
-    val safeEndX = endX.coerceAtLeast(startX + 1f)
-    // 自然的交接：fg → 轻微 accent 染色 → 透明（落到底色 unsung），alpha 单调递减。
-    // 之前 20%~82% 一整段高饱和 accent 平台 + 0.82 凹陷 = 一条色带，观感突兀。
-    val mid = lerp(fg, nativeSweepAccentColor(fg, accent), NATIVE_SWEEP_ACCENT_BLEND)
-    return Brush.horizontalGradient(
-        colorStops = arrayOf<Pair<Float, Color>>(
-            0f to fg,
-            NATIVE_SWEEP_ACCENT_STOP to mid,
-            1f to Color.Transparent,
-        ),
-        startX = startX,
-        endX = safeEndX,
-        tileMode = TileMode.Clamp,
+private fun nativeSegmentTextLayout(
+    plan: NativeTimedLyricPlan,
+    glyphMeasurer: TextMeasurer,
+    segmentIndex: Int,
+): TextLayoutResult? {
+    if (segmentIndex !in plan.segmentLayouts.indices) return null
+    plan.segmentLayouts[segmentIndex]?.let { return it }
+    val segment = plan.segments.getOrNull(segmentIndex) ?: return null
+    val text = plan.layout.layoutInput.text.text
+    if (segment.startChar !in 0..text.length || segment.endChar !in 0..text.length || segment.startChar >= segment.endChar) {
+        return null
+    }
+    val spanText = text.substring(segment.startChar, segment.endChar)
+    if (spanText.isEmpty()) return null
+    return runCatching {
+        glyphMeasurer.measure(
+            text = AnnotatedString(spanText),
+            style = plan.glyphStyle,
+            softWrap = false,
+            overflow = TextOverflow.Visible,
+            maxLines = 1,
+        )
+    }.getOrNull()?.also { spanLayout ->
+        plan.segmentLayouts[segmentIndex] = spanLayout
+        plan.segmentInkLeft[segmentIndex] = nativeLayoutInkLeft(spanLayout, spanText)
+    }
+}
+
+private fun nativeLayoutInkLeft(
+    layout: TextLayoutResult,
+    text: String,
+): Float {
+    var left = Float.POSITIVE_INFINITY
+    for (index in text.indices) {
+        if (text[index].isWhitespace() || text[index].isISOControl()) continue
+        val box = layout.getBoundingBox(index)
+        if (box.right > box.left) {
+            left = minOf(left, box.left)
+        }
+    }
+    return if (left.isFinite()) left else 0f
+}
+
+// Apple Web ordinary syllable 的 --gradient-progress 从 -20% 线性走到 100%，
+// 未唱色 stop 永远在它后面 20%。这里按当前段墨迹宽度复刻这条局部渐变，
+// 不再让下一词的时间轴牵动上一词或后一词。
+private class NativeSweepBand(
+    val line: Int,
+    val solidX: Float,
+    val rampEndX: Float,
+    val fadeEndX: Float,
+)
+
+private fun nativeSegmentSweepBandFor(
+    segment: NativeLyricSegment,
+    progress: Float,
+): NativeSweepBand? {
+    val p = progress.coerceIn(0f, 1f)
+    if (p <= 0f) return null
+    val width = (segment.right - segment.left).coerceAtLeast(1f)
+    val solidX = segment.left + width * (p * NATIVE_APPLE_SWEEP_TRAVEL_RATIO - NATIVE_APPLE_SWEEP_LEAD_RATIO)
+    val rampEndX = segment.left + width * (p * NATIVE_APPLE_SWEEP_TRAVEL_RATIO)
+    val fadeEndX = rampEndX.coerceAtMost(segment.right)
+    return NativeSweepBand(
+        line = segment.line,
+        solidX = solidX,
+        rampEndX = rampEndX,
+        fadeEndX = fadeEndX,
     )
 }
 
-private fun nativeSweepAccentColor(fg: Color, accent: Color): Color {
-    val effective = if (accent == Color.Unspecified || accent.alpha <= 0.001f) PipoColors.Accent else accent
-    // 封面取色过灰/过白时，交接色会与 fg 融为一体（“有时候看不见”的来源之一）：
-    // 色度不足就向品牌强调色靠拢，保证渐变始终可感知。
-    val chroma = maxOf(effective.red, effective.green, effective.blue) -
-        minOf(effective.red, effective.green, effective.blue)
-    val vivid = if (chroma < NATIVE_SWEEP_ACCENT_MIN_CHROMA) {
-        lerp(effective, PipoColors.Accent, 0.65f)
-    } else {
-        effective
-    }
-    return vivid.copy(alpha = (fg.alpha * NATIVE_SWEEP_ACCENT_ALPHA).coerceIn(0f, 1f))
+// 把带坐标解析到任意视觉行：带所在行之前的行=全唱（+∞），之后的行=全未唱（−∞）。
+private fun nativeBandSolidX(band: NativeSweepBand?, line: Int): Float = when {
+    band == null -> Float.NEGATIVE_INFINITY
+    line < band.line -> Float.POSITIVE_INFINITY
+    line > band.line -> Float.NEGATIVE_INFINITY
+    else -> band.solidX
+}
+
+private fun nativeBandFadeEndX(band: NativeSweepBand?, line: Int): Float = when {
+    band == null -> Float.NEGATIVE_INFINITY
+    line < band.line -> Float.POSITIVE_INFINITY
+    line > band.line -> Float.NEGATIVE_INFINITY
+    else -> band.fadeEndX
+}
+
+private fun nativeBandRampEndX(band: NativeSweepBand?, line: Int): Float = when {
+    band == null -> Float.NEGATIVE_INFINITY
+    line < band.line -> Float.POSITIVE_INFINITY
+    line > band.line -> Float.NEGATIVE_INFINITY
+    else -> band.rampEndX
+}
+
+// Apple Web sweep: one linear-gradient between active and inactive alpha stops.
+private fun nativeSweepTransitionBrush(
+    fg: Color,
+    activeUnsung: Color,
+    startX: Float,
+    endX: Float,
+): Brush {
+    return Brush.horizontalGradient(
+        colorStops = arrayOf(
+            0f to fg,
+            1f to activeUnsung,
+        ),
+        startX = startX,
+        endX = endX.coerceAtLeast(startX + 1f),
+        tileMode = TileMode.Clamp,
+    )
 }
 
 @Composable
@@ -1771,30 +2108,34 @@ private fun NativeInterludeDots(
             interlude = interlude,
             positionMs = nativeRenderPositionMs(clockState.value) + offsetMs,
         )
-        if (progress.scale <= 0.001f || progress.globalOpacity <= 0.001f) return@Canvas
+        if (progress.scale <= 0.001f) return@Canvas
         val dot = dotSize.toPx()
         val gap = dotGap.toPx()
         val radius = dot / 2f
-        val scaledRadius = radius * progress.scale
         val centerY = size.height / 2f
         val centers = floatArrayOf(
             radius,
             radius + dot + gap,
             radius + (dot + gap) * 2f,
         )
-        centers.forEachIndexed { idx, centerX ->
-            drawCircle(
-                color = color.copy(alpha = progress.dotAlphas[idx]),
-                radius = scaledRadius,
-                center = Offset(centerX, centerY),
-            )
+        scale(
+            scaleX = progress.scale,
+            scaleY = progress.scale,
+            pivot = Offset(0f, centerY),
+        ) {
+            centers.forEachIndexed { idx, centerX ->
+                drawCircle(
+                    color = color.copy(alpha = progress.dotAlphas[idx]),
+                    radius = radius,
+                    center = Offset(centerX, centerY),
+                )
+            }
         }
     }
 }
 
 private data class NativeInterludeProgress(
     val scale: Float,
-    val globalOpacity: Float,
     val dotAlphas: FloatArray,
 )
 
@@ -1804,63 +2145,46 @@ private fun nativeInterludeProgress(
 ): NativeInterludeProgress {
     val duration = (interlude.endMs - interlude.startMs).coerceAtLeast(1L).toFloat()
     val current = (positionMs - interlude.startMs).toFloat().coerceIn(0f, duration)
-    val breatheDuration = duration / kotlin.math.ceil(duration / NATIVE_INTERLUDE_BREATHE_TARGET_MS).coerceAtLeast(1f)
-    var scale = kotlin.math.sin(1.5 * Math.PI - (current / breatheDuration) * 2.0).toFloat() / 20f + 1f
-    var globalOpacity = 1f
-
-    if (current < 2_000f) {
-        scale *= nativeEaseOutExpo(current / 2_000f)
-    }
-    if (current < 500f) {
-        globalOpacity = 0f
-    } else if (current < 1_000f) {
-        globalOpacity *= (current - 500f) / 500f
-    }
     val remaining = duration - current
-    if (remaining < 750f) {
-        scale *= 1f - nativeEaseInOutBack((750f - remaining) / 750f / 2f)
+    val scale = if (remaining in 0f..NATIVE_INTERLUDE_ENDING_WINDOW_MS) {
+        val phase = (current % NATIVE_INTERLUDE_HEARTBEAT_END_MS) / NATIVE_INTERLUDE_HEARTBEAT_END_MS
+        1.1f + 0.3f * nativeCssEaseIn(phase)
+    } else {
+        val phase = (current % NATIVE_INTERLUDE_HEARTBEAT_MS) / NATIVE_INTERLUDE_HEARTBEAT_MS
+        if (phase < 0.5f) {
+            1f + 0.2f * nativeCssEaseIn(phase / 0.5f)
+        } else {
+            1.2f - 0.2f * nativeCssEaseIn((phase - 0.5f) / 0.5f)
+        }
     }
-    if (remaining < 375f) {
-        globalOpacity *= (remaining / 375f).coerceIn(0f, 1f)
-    }
-
-    val dotsDuration = (duration - 750f).coerceAtLeast(1f)
-    scale = scale.coerceAtLeast(0f) * 0.7f
-    val dot0 = nativeInterludeDotAlpha(current, dotsDuration, 0f) * globalOpacity
-    val dot1 = nativeInterludeDotAlpha(current, dotsDuration, dotsDuration / 3f) * globalOpacity
-    val dot2 = nativeInterludeDotAlpha(current, dotsDuration, dotsDuration / 3f * 2f) * globalOpacity
+    val dotStepMs = (duration / NATIVE_INTERLUDE_DOT_COUNT).coerceAtLeast(1f)
+    val dot0 = nativeAppleInterludeDotAlpha(current, dotStepMs, 0)
+    val dot1 = nativeAppleInterludeDotAlpha(current, dotStepMs, 1)
+    val dot2 = nativeAppleInterludeDotAlpha(current, dotStepMs, 2)
     return NativeInterludeProgress(
         scale = scale,
-        globalOpacity = globalOpacity,
         dotAlphas = floatArrayOf(dot0.coerceIn(0f, 1f), dot1.coerceIn(0f, 1f), dot2.coerceIn(0f, 1f)),
     )
 }
 
-private fun nativeInterludeDotAlpha(
+private fun nativeAppleInterludeDotAlpha(
     current: Float,
-    dotsDuration: Float,
-    delay: Float,
+    dotStepMs: Float,
+    dotIndex: Int,
 ): Float {
-    val value = (((current - delay) * 3f) / dotsDuration) * 0.75f
-    return maxOf(0.25f, value).coerceAtMost(1f)
+    val threshold = dotStepMs * dotIndex
+    // Apple Web toggles `.dot--current`, sets an inline
+    // `transition-duration:${(end-begin)/3}ms`, and only declares
+    // `transition-property:opacity`, so the opacity ramp uses CSS's default
+    // `ease` timing-function.
+    val t = NATIVE_CSS_DEFAULT_EASE.transform(((current - threshold) / dotStepMs).coerceIn(0f, 1f))
+    return NATIVE_INTERLUDE_DOT_INACTIVE_ALPHA +
+        (1f - NATIVE_INTERLUDE_DOT_INACTIVE_ALPHA) * t
 }
 
-private fun nativeEaseOutExpo(x: Float): Float {
+private fun nativeCssEaseIn(x: Float): Float {
     val t = x.coerceIn(0f, 1f)
-    return if (t >= 1f) 1f else (1f - Math.pow(2.0, (-10f * t).toDouble()).toFloat())
-}
-
-private fun nativeEaseInOutBack(x: Float): Float {
-    val t = x.coerceIn(0f, 1f)
-    val c1 = 1.70158f
-    val c2 = c1 * 1.525f
-    return if (t < 0.5f) {
-        val p = 2f * t
-        (p * p * ((c2 + 1f) * p - c2)) / 2f
-    } else {
-        val p = 2f * t - 2f
-        (p * p * ((c2 + 1f) * p + c2) + 2f) / 2f
-    }
+    return NATIVE_CSS_EASE_IN.transform(t)
 }
 
 private data class NativeSegmentBounds(
@@ -1873,20 +2197,34 @@ private fun nativeSegmentClipBounds(
     segments: List<NativeLyricSegment>,
     index: Int,
     fadeWidth: Float,
+    glyphPad: Float,
 ): NativeSegmentBounds {
     val segment = segments[index]
     val prev = segments.getOrNull(index - 1)?.takeIf { it.line == segment.line }
     val next = segments.getOrNull(index + 1)?.takeIf { it.line == segment.line }
     val lineLeft = layout.getLineLeft(segment.line)
     val lineRight = layout.getLineRight(segment.line)
+    // 词间留白处：本段允许向留白内吃 glyphPad 的悬伸/抗锯齿余量，但裁切线绝不越过
+    // 留白中点去碰相邻词的墨迹。旧实现把 glyphPad 无脑加在中点两侧，使相邻两段的
+    // 裁切带相互重叠 2×pad；当两词上浮相位不同（一个已浮起、一个还在原位）时，
+    // 重叠区会把同一字形按两种 y 各画一遍 —— 这就是上浮时“文字左右边界被裁掉一点/
+    // 出现重影、浮完才正常”的根因。改为夹到中点：相邻裁切带正好在留白中线相接、
+    // 互不重叠，既保留单侧悬伸余量又彻底消除错相位重影。开放边（行首/行尾）仍给
+    // 充足的 fadeWidth。
     val left = when {
         prev == null -> lineLeft - fadeWidth
-        prev.right < segment.left -> (prev.right + segment.left) / 2f
+        prev.right < segment.left -> {
+            val mid = (prev.right + segment.left) / 2f
+            (segment.left - glyphPad).coerceAtLeast(mid)
+        }
         else -> segment.left
     }
     val right = when {
         next == null -> lineRight + fadeWidth
-        segment.right < next.left -> (segment.right + next.left) / 2f
+        segment.right < next.left -> {
+            val mid = (segment.right + next.left) / 2f
+            (segment.right + glyphPad).coerceAtMost(mid)
+        }
         else -> segment.right
     }
     return NativeSegmentBounds(
@@ -1895,268 +2233,300 @@ private fun nativeSegmentClipBounds(
     )
 }
 
-private fun DrawScope.nativeWordFadeWidth(layout: TextLayoutResult): Float {
+private fun nativeWordFadeWidth(layout: TextLayoutResult, fontPx: Float): Float {
     val lineHeightPx = (0 until layout.lineCount).maxOfOrNull { line ->
         (layout.getLineBottom(line) - layout.getLineTop(line)).toDouble()
     }?.toFloat()
-    val fallback = layout.layoutInput.style.fontSize.toPx()
-    return ((lineHeightPx ?: fallback).coerceAtLeast(fallback) * NATIVE_WORD_FADE_WIDTH_RATIO)
+    return ((lineHeightPx ?: fontPx).coerceAtLeast(fontPx) * NATIVE_WORD_FADE_WIDTH_RATIO)
         .coerceAtLeast(1f)
 }
 
-private fun nativeShouldDrawSlowGlyphs(
-    slow: NativeSlowShape,
-    token: PipoLyricChar,
-    positionMs: Long,
-): Boolean {
-    if (slow.amount <= 0f || slow.animateDurationMs <= 0f) return false
-    val start = token.startMs - NATIVE_SLOW_SWEEP_PREVIEW_LEAD_MS
-    val end = token.startMs + token.durationMs.coerceAtLeast(1L) + NATIVE_SLOW_SWEEP_GLOW_TAIL_MS
-    return positionMs in start..end
-}
-
 private fun DrawScope.drawNativeSlowSegmentText(
-    layout: TextLayoutResult,
+    plan: NativeTimedLyricPlan,
     glyphMeasurer: TextMeasurer,
-    glyphLayoutCache: MutableMap<String, TextLayoutResult>,
-    segment: NativeLyricSegment,
-    bounds: NativeSegmentBounds,
+    segmentIndex: Int,
     slow: NativeSlowShape,
     motionPositionMs: Long,
-    focusMotion: Float,
-    progress: Float,
     fg: Color,
     activeUnsung: Color,
-    fadeWidth: Float,
-    isBackgroundVocal: Boolean,
     motionScale: Float,
-    accent: Color,
 ) {
-    // 慢词逐字行波：Apple Music 更像低幅度 rolling wave，而不是单字弹跳。
-    // 波峰稍宽、前后都缓入缓出，扫过后自然落回基线。
-    val fontPx = layout.layoutInput.style.fontSize.toPx()
-    val p = progress.coerceIn(0f, 1f)
-    val lineTop = layout.getLineTop(segment.line)
-    val lineBottom = layout.getLineBottom(segment.line)
-    val glyphCenterY = (lineTop + lineBottom) * 0.5f
+    // Apple Web emphasis 逐字母 keyframe：
+    // 1) start -> +500ms：scale 1->1.05, y 0->-2.05px, gradient -20->90, shadow 0->10px/.4
+    // 2) +500ms -> +1000ms：scale 1.05->1, y -2.05->-2px, gradient 90->100, shadow 10->4px/0
+    // createSyllable 会先 replace(/[()]/g, "") 再拆 .letter；括号不参与 letter 时间轴。
+    val layout = plan.layout
+    val segment = plan.segments[segmentIndex]
+    val fontPx = plan.fontPx
+    val lineTop = plan.rowTop[segment.line]
+    val lineBottom = plan.rowBottom[segment.line]
     val mScale = motionScale.coerceIn(0f, 1f)
-    val baseLiftEm = if (isBackgroundVocal) NATIVE_BG_WORD_LIFT_EM else NATIVE_MAIN_WORD_LIFT_EM
-    val segmentWidth = (segment.right - segment.left).coerceAtLeast(1f)
-    val transitionWidth = maxOf(
-        segmentWidth * NATIVE_SWEEP_TRANSITION_FRACTION,
-        fadeWidth * NATIVE_SWEEP_TRANSITION_MIN_EM,
-    ).coerceAtLeast(1f)
-    // 波的宽度（前沿附近多大范围参与顶起）。
-    val trailPx = NATIVE_SLOW_COMET_TRAIL_DP.dp.toPx()
-    val leadPx = NATIVE_SLOW_COMET_LEAD_DP.dp.toPx()
-    val peakLagPx = NATIVE_SLOW_COMET_PEAK_DP.dp.toPx()
-    val sweepMotion = nativeSlowSweepMotion(segment, p, motionPositionMs, trailPx, leadPx)
-    val sweepX = sweepMotion.x
-    val emphasisScale = sweepMotion.emphasisScale
-
-    val durationStrength = nativeSlowDurationGlowStrength(segment.timing.durationMs)
-    val glowMax = if (isBackgroundVocal) NATIVE_SLOW_SHADOW_BG_ALPHA_MAX else NATIVE_SLOW_SHADOW_MAIN_ALPHA_MAX
-    val glowAlpha = (durationStrength * glowMax * NATIVE_SLOW_SHADOW_STABLE_GAIN * mScale *
-        (0.45f + 0.55f * focusMotion.coerceIn(0f, 1f))).coerceIn(0f, 1f)
-    val glowBlurPx = fontPx *
-        (NATIVE_SLOW_SHADOW_BLUR_MIN_EM + durationStrength * NATIVE_SLOW_SHADOW_BLUR_GAIN_EM) *
-        NATIVE_SLOW_SHADOW_STABLE_BLUR_GAIN
 
     val text = layout.layoutInput.text.text
-    val glyphStyle = layout.layoutInput.style.copy(textAlign = TextAlign.Start)
-    val glyphIndices = (segment.startChar until segment.endChar).filter { index ->
-        index in text.indices && !text[index].isWhitespace() && !text[index].isISOControl()
-    }
+    val clipTop = lineTop - fontPx
+    val clipBottom = lineBottom + fontPx
+    val glyphCenterY = (lineTop + lineBottom) * 0.5f
+    val textClipPadX = fontPx * NATIVE_GLYPH_HORIZONTAL_CLIP_PAD_EM
+    val maxShadowClipPad = fontPx / NATIVE_APPLE_WEB_LINE_FONT_PX *
+        NATIVE_SLOW_SHADOW_PEAK_WEB_PX *
+        NATIVE_SLOW_SHADOW_CLIP_RADIUS_MULTIPLIER
+    val glowClipLeft = segment.left - maxShadowClipPad - textClipPadX
+    val glowClipRight = segment.right + maxShadowClipPad + textClipPadX
 
-    for (i in glyphIndices) {
-        val ch = text[i]
-        val rawBox = layout.getBoundingBox(i)
-        if (rawBox.right <= rawBox.left) continue
-        val box = nativeSlowGlyphVisualBox(
-            layout = layout,
-            segment = segment,
+    val segStartMs = nativeSegmentSlowSyllableStartMs(segment)
+    val segDurationMs = (nativeSegmentSlowSyllableEndMs(segment) - segStartMs)
+        .coerceAtLeast(1L).toFloat()
+    val empGain = slow.amount * mScale
+
+    val letterCount = nativeAppleLetterTimelineUnits(segment.timing.text)
+    val letterStepMs = segDurationMs / letterCount.toFloat()
+
+    var glyphOrdinal = nativeAppleLetterOrdinalBefore(
+        text = text,
+        start = segment.tokenStartChar,
+        end = segment.startChar,
+    )
+    for (i in segment.startChar until segment.endChar) {
+        if (i >= plan.glyphBoxLeft.size) break
+        if (nativeAppleStripsSyllableChar(text[i])) continue
+        val boxLeft = plan.glyphBoxLeft[i]
+        if (boxLeft.isNaN()) continue
+        val boxRight = plan.glyphBoxRight[i]
+        val letterStartMs = segStartMs + letterStepMs * glyphOrdinal
+        glyphOrdinal++
+        val letterState = nativeAppleSlowLetterState(
+            elapsedMs = motionPositionMs.toFloat() - letterStartMs,
+            fontPx = fontPx,
+            gain = empGain,
+        )
+        val glyphCenter = (boxLeft + boxRight) * 0.5f
+        val glyphWidth = (boxRight - boxLeft).coerceAtLeast(1f)
+        val solidX = boxLeft + glyphWidth * (letterState.gradientPercent / 100f)
+        val rampEndX = boxLeft + glyphWidth *
+            ((letterState.gradientPercent + NATIVE_APPLE_SWEEP_LEAD_RATIO * 100f) / 100f)
+        val fadeEndX = rampEndX.coerceAtMost(boxRight)
+        val glyphLayout = nativeSlowGlyphLayout(
+            plan = plan,
+            glyphMeasurer = glyphMeasurer,
+            text = text,
             index = i,
-            fallbackLeft = rawBox.left,
-            fallbackRight = rawBox.right,
         ) ?: continue
-        val center = box.center
-        // 上浮仍按字母中心取样；颜色绘制走连续 sweep helper，避免整字跳色。
-        val sung = nativeSmoothStep((sweepX - center) / transitionWidth + 0.5f)
-        // 字母动效直接由当前 sweep 前沿采样，和 token.progress(positionMs) 同相；
-        // 不再套固定 1s 包络，否则短词/快节奏会显得慢半拍。
-        val wave = nativeAppleMusicSlowWave(box.left, box.right, sweepX, trailPx, leadPx, peakLagPx) * emphasisScale
-        val glowWave = nativeSlowProgressGlowCoverage(box.left, box.right, sweepX, fontPx) * emphasisScale
-        val liftPx = -fontPx * (baseLiftEm * sung + slow.amount * NATIVE_SLOW_LIFT_EM_GAIN * wave) * mScale
-        val glyphScale = 1f + slow.amount * NATIVE_SLOW_SCALE_GAIN * wave * mScale
-        val glyphText = ch.toString()
-        val glyphLayout = glyphLayoutCache.getOrPut("$i:$glyphText") {
-            glyphMeasurer.measure(
-                text = AnnotatedString(glyphText),
-                style = glyphStyle,
-                softWrap = false,
-                maxLines = 1,
-                skipCache = true,
+        val glyphBox = glyphLayout.getBoundingBox(0)
+
+        fun DrawScope.drawGlyph(lineTopLeft: Offset) {
+            val glyphTopLeft = Offset(
+                x = boxLeft - glyphBox.left + lineTopLeft.x,
+                // 用 baseline 对齐而非 line-top 对齐：慢词逐字母走“单字符独立布局”，它永远按
+                // 首行度量（首行通常 trim 掉顶部 leading）；而整段布局第 2、3 行的 line box 含
+                // 完整顶部 leading。按 getLineTop 对齐时首行恰好对得上，但从第二行起单字符字形
+                // 贴 line box 顶绘制、比同行快词整体偏上（“一行没事、两三行从第二行起错位”的根因）。
+                // baseline 不受 leading/trim 影响，对齐到整段对应行 baseline 即与快词同底；
+                // 这里只改 y 参考点，不动单字符布局本身。
+                y = layout.getLineBaseline(segment.line) - glyphLayout.getLineBaseline(0) + lineTopLeft.y,
+            )
+            if (letterState.shadowOpacity > 0.004f && letterState.shadowBlurPx > 0.2f) {
+                drawNativeSlowGlyphGlow(
+                    glyphLayout = glyphLayout,
+                    topLeft = glyphTopLeft,
+                    blurPx = letterState.shadowBlurPx,
+                    opacity = letterState.shadowOpacity,
+                    clipTop = clipTop,
+                    clipBottom = clipBottom,
+                    glowLeft = glowClipLeft,
+                    glowRight = glowClipRight,
+                )
+            }
+            drawNativeSlowGlyphSweepText(
+                glyphLayout = glyphLayout,
+                glyphLeft = boxLeft,
+                glyphRight = boxRight,
+                topLeft = glyphTopLeft,
+                solidX = solidX,
+                rampEndX = rampEndX,
+                fadeEndX = fadeEndX,
+                fg = fg,
+                activeUnsung = activeUnsung,
             )
         }
-        val shadow = if (glowAlpha > 0.003f && glowBlurPx > 0.2f && glowWave > 0.02f) {
-            Shadow(
-                color = fg.copy(alpha = (glowAlpha * glowWave).coerceIn(0f, 1f)),
-                offset = Offset.Zero,
-                blurRadius = glowBlurPx,
+
+        if (letterState.scale <= 1.0005f) {
+            drawGlyph(
+                lineTopLeft = Offset(0f, letterState.translateYPx),
             )
         } else {
-            null
-        }
-        translate(left = 0f, top = liftPx) {
-            scale(glyphScale, glyphScale, pivot = Offset(center, glyphCenterY)) {
-                drawNativeSlowGlyphSweepText(
-                    glyphLayout = glyphLayout,
-                    glyphLeft = box.left,
-                    glyphRight = box.right,
-                    clipTop = lineTop - fontPx,
-                    clipBottom = lineBottom + fontPx,
-                    topLeft = Offset(box.left, lineTop),
-                    tokenStarted = p > NATIVE_SWEEP_PROGRESS_EPS && motionPositionMs > segment.timing.startMs,
-                    sweepX = sweepX,
-                    fadeEndX = sweepX + transitionWidth,
-                    fg = fg,
-                    activeUnsung = activeUnsung,
-                    accent = accent,
-                    shadow = shadow,
-                )
+            translate(left = 0f, top = letterState.translateYPx) {
+                scale(
+                    scaleX = letterState.scale,
+                    scaleY = letterState.scale,
+                    pivot = Offset(glyphCenter, glyphCenterY),
+                ) {
+                    drawGlyph(
+                        lineTopLeft = Offset.Zero,
+                    )
+                }
             }
         }
     }
+
+}
+
+private data class NativeSlowLetterState(
+    val scale: Float,
+    val translateYPx: Float,
+    val gradientPercent: Float,
+    val shadowBlurPx: Float,
+    val shadowOpacity: Float,
+)
+
+private fun nativeAppleSlowLetterState(
+    elapsedMs: Float,
+    fontPx: Float,
+    gain: Float,
+): NativeSlowLetterState {
+    val normalizedGain = gain.coerceIn(0f, 1f)
+    if (elapsedMs <= 0f) {
+        return NativeSlowLetterState(
+            scale = 1f,
+            translateYPx = 0f,
+            gradientPercent = -20f,
+            shadowBlurPx = 0f,
+            shadowOpacity = 0f,
+        )
+    }
+    val firstMs = NATIVE_SLOW_LETTER_FIRST_PHASE_MS.toFloat()
+    val totalMs = NATIVE_SLOW_LETTER_TOTAL_MS.toFloat()
+    val cssPxToLocal = fontPx / NATIVE_APPLE_WEB_LINE_FONT_PX
+    val state = if (elapsedMs < firstMs) {
+        val t = (elapsedMs / firstMs).coerceIn(0f, 1f)
+        NativeSlowLetterState(
+            scale = 1f + (NATIVE_SLOW_SCALE_PEAK - 1f) * t * normalizedGain,
+            translateYPx = -NATIVE_SLOW_LIFT_PEAK_WEB_PX * cssPxToLocal * t * normalizedGain,
+            gradientPercent = -20f + (90f + 20f) * t,
+            shadowBlurPx = NATIVE_SLOW_SHADOW_PEAK_WEB_PX * cssPxToLocal * t,
+            shadowOpacity = NATIVE_SLOW_SHADOW_PEAK_ALPHA * t * normalizedGain,
+        )
+    } else if (elapsedMs < totalMs) {
+        val t = ((elapsedMs - firstMs) / (totalMs - firstMs)).coerceIn(0f, 1f)
+        NativeSlowLetterState(
+            scale = 1f + (NATIVE_SLOW_SCALE_PEAK - 1f) * (1f - t) * normalizedGain,
+            translateYPx = -(
+                NATIVE_SLOW_LIFT_PEAK_WEB_PX +
+                    (NATIVE_SLOW_LIFT_SETTLE_WEB_PX - NATIVE_SLOW_LIFT_PEAK_WEB_PX) * t
+                ) * cssPxToLocal * normalizedGain,
+            gradientPercent = 90f + (100f - 90f) * t,
+            shadowBlurPx = (NATIVE_SLOW_SHADOW_PEAK_WEB_PX +
+                (NATIVE_SLOW_SHADOW_SETTLE_WEB_PX - NATIVE_SLOW_SHADOW_PEAK_WEB_PX) * t) * cssPxToLocal,
+            shadowOpacity = NATIVE_SLOW_SHADOW_PEAK_ALPHA * (1f - t) * normalizedGain,
+        )
+    } else {
+        NativeSlowLetterState(
+            scale = 1f,
+            translateYPx = -NATIVE_SLOW_LIFT_SETTLE_WEB_PX * cssPxToLocal * normalizedGain,
+            gradientPercent = 100f,
+            shadowBlurPx = NATIVE_SLOW_SHADOW_SETTLE_WEB_PX * cssPxToLocal,
+            shadowOpacity = 0f,
+        )
+    }
+    return state.copy(
+        gradientPercent = state.gradientPercent.coerceIn(-20f, 100f),
+        shadowOpacity = state.shadowOpacity.coerceIn(0f, NATIVE_SLOW_SHADOW_PEAK_ALPHA),
+    )
 }
 
 private fun DrawScope.drawNativeSlowGlyphSweepText(
     glyphLayout: TextLayoutResult,
     glyphLeft: Float,
     glyphRight: Float,
-    clipTop: Float,
-    clipBottom: Float,
     topLeft: Offset,
-    tokenStarted: Boolean,
-    sweepX: Float,
+    solidX: Float,
+    rampEndX: Float,
     fadeEndX: Float,
     fg: Color,
     activeUnsung: Color,
-    accent: Color,
-    shadow: Shadow?,
 ) {
-    if (glyphRight <= glyphLeft || clipBottom <= clipTop) return
-    if (!tokenStarted || fadeEndX <= glyphLeft) {
-        drawText(glyphLayout, color = activeUnsung, topLeft = topLeft)
-        return
-    }
-    if (sweepX >= glyphRight) {
-        drawText(glyphLayout, color = fg, topLeft = topLeft, shadow = shadow)
-        return
-    }
-
-    drawText(glyphLayout, color = activeUnsung, topLeft = topLeft)
-
-    if (sweepX > glyphLeft) {
-        val sungRight = minOf(sweepX, glyphRight)
-        if (sungRight > glyphLeft) {
-            clipRect(glyphLeft, clipTop, sungRight, clipBottom) {
-                drawText(glyphLayout, color = fg, topLeft = topLeft, shadow = shadow)
-            }
-        }
-    }
-
-    if (fadeEndX > glyphLeft && sweepX < glyphRight) {
-        val fadeLeft = sweepX.coerceAtLeast(glyphLeft)
-        val fadeRight = fadeEndX.coerceAtMost(glyphRight)
-        if (fadeRight > fadeLeft) {
-            val fadeBrush = nativeSweepTransitionBrush(
+    if (glyphRight <= glyphLeft) return
+    when {
+        solidX >= glyphRight -> drawText(glyphLayout, color = fg, topLeft = topLeft)
+        fadeEndX <= glyphLeft -> drawText(glyphLayout, color = activeUnsung, topLeft = topLeft)
+        else -> {
+            val brush = nativeSweepTransitionBrush(
                 fg = fg,
-                accent = accent,
-                startX = fadeLeft - glyphLeft,
-                endX = fadeRight - glyphLeft,
+                activeUnsung = activeUnsung,
+                startX = solidX - topLeft.x,
+                endX = rampEndX.coerceAtLeast(solidX + 1f) - topLeft.x,
             )
-            clipRect(fadeLeft, clipTop, fadeRight, clipBottom) {
-                drawText(
-                    glyphLayout,
-                    brush = fadeBrush,
-                    topLeft = topLeft,
-                    shadow = shadow,
-                )
-            }
+            drawText(glyphLayout, brush = brush, topLeft = topLeft, alpha = 1f)
         }
     }
 }
 
-private fun DrawScope.drawNativeSlowSweepGlow(
-    layout: TextLayoutResult,
-    glyphMeasurer: TextMeasurer,
-    segment: NativeLyricSegment,
-    bounds: NativeSegmentBounds,
-    sweepX: Float,
+// “自发光”双层光晕：内圈窄而亮（贴着字形边缘的灼亮感），外圈宽而淡（快速衰减的
+// 辉光）。单层大半径阴影只有均匀的雾感、没有亮核，看起来就是字后垫了团模糊背景。
+// 文字本体由 sweep 路径绘制，这里只铺光：填充用近零 alpha 让 shadowLayer 单独
+// 成像，光形完全来自字形轮廓，所以不会污染相邻字符的笔画。Apple 的
+// text-shadow 挂在 `.letter` 上，不会给每个字母外面再套一个贴边硬裁剪；Android
+// 也使用词级 glow clip，避免慢词上浮时出现竖向断边。
+private fun DrawScope.drawNativeSlowGlyphGlow(
+    glyphLayout: TextLayoutResult,
+    topLeft: Offset,
+    blurPx: Float,
+    opacity: Float,
     clipTop: Float,
     clipBottom: Float,
-    liftedTop: Float,
-    glowAlpha: Float,
-    glowBlurPx: Float,
-    positionMs: Long,
+    glowLeft: Float,
+    glowRight: Float,
 ) {
-    if (glowAlpha <= 0.003f || glowBlurPx <= 0.2f) return
-    val tokenEndMs = segment.timing.startMs + segment.timing.durationMs.coerceAtLeast(1L)
-    val tailProgress = if (positionMs <= tokenEndMs) {
-        1f
-    } else {
-        (1f - (positionMs - tokenEndMs).toFloat() / NATIVE_SLOW_SWEEP_GLOW_TAIL_MS.toFloat())
-            .coerceIn(0f, 1f)
-    }
-    if (tailProgress <= 0.001f) return
-    val trailPx = NATIVE_SLOW_COMET_TRAIL_DP.dp.toPx()
-    val leadPx = NATIVE_SLOW_COMET_LEAD_DP.dp.toPx()
-    val peakLagPx = NATIVE_SLOW_COMET_PEAK_DP.dp.toPx()
-    val text = layout.layoutInput.text.text
-    val glyphStyle = layout.layoutInput.style.copy(textAlign = TextAlign.Start)
-    clipRect(
-        left = bounds.left,
-        top = clipTop,
-        right = bounds.right,
-        bottom = clipBottom,
-    ) {
-        for (index in segment.startChar until segment.endChar) {
-            if (index !in text.indices) continue
-            val ch = text[index]
-            if (ch.isWhitespace() || ch.isISOControl()) continue
-            val box = layout.getBoundingBox(index)
-            if (box.right <= box.left) continue
-            val glowE = nativeAppleMusicSlowWave(
-                left = box.left,
-                right = box.right,
-                sweepX = sweepX,
-                trailPx = trailPx,
-                leadPx = leadPx,
-                peakLagPx = peakLagPx,
-            )
-            if (glowE <= 0.01f) continue
-            val shadow = Shadow(
-                color = Color.White.copy(alpha = (glowAlpha * glowE * tailProgress).coerceIn(0f, 1f)),
+    if (opacity <= 0.004f || blurPx <= 0.2f) return
+    if (glowRight <= glowLeft || clipBottom <= clipTop) return
+    val carrier = Color.White.copy(alpha = NATIVE_SLOW_GLOW_FILL_ALPHA)
+    val shiftedClipTop = clipTop + topLeft.y
+    val shiftedClipBottom = clipBottom + topLeft.y
+    nativeClipTextRect(glowLeft, shiftedClipTop, glowRight, shiftedClipBottom) {
+        drawText(
+            glyphLayout,
+            color = carrier,
+            topLeft = topLeft,
+            shadow = Shadow(
+                color = Color.White.copy(alpha = opacity.coerceIn(0f, 1f)),
                 offset = Offset.Zero,
-                blurRadius = glowBlurPx,
-            )
-            val barelyVisibleFill = Color.White.copy(
-                alpha = (NATIVE_SLOW_COMET_FILL_ALPHA * glowE * tailProgress).coerceIn(0f, 1f),
-            )
-            val glyphLayout = glyphMeasurer.measure(
-                text = AnnotatedString(ch.toString()),
-                style = glyphStyle,
-                softWrap = false,
-                maxLines = 1,
-            )
-            drawText(
-                glyphLayout,
-                color = barelyVisibleFill,
-                topLeft = Offset(box.left, layout.getLineTop(segment.line) + liftedTop),
-                shadow = shadow,
-            )
-        }
+                blurRadius = blurPx,
+            ),
+        )
     }
+}
+
+private fun nativeSlowGlyphLayout(
+    plan: NativeTimedLyricPlan,
+    glyphMeasurer: TextMeasurer,
+    text: String,
+    index: Int,
+): TextLayoutResult? {
+    if (index !in plan.glyphLayouts.indices || index !in text.indices) return null
+    plan.glyphLayouts[index]?.let { return it }
+    return runCatching {
+        glyphMeasurer.measure(
+            text = AnnotatedString(text[index].toString()),
+            style = plan.glyphStyle,
+            softWrap = false,
+            overflow = TextOverflow.Visible,
+            maxLines = 1,
+        )
+    }.getOrNull()?.also { plan.glyphLayouts[index] = it }
+}
+
+private inline fun DrawScope.nativeClipTextRect(
+    left: Float,
+    top: Float,
+    right: Float,
+    bottom: Float,
+    block: DrawScope.() -> Unit,
+) {
+    val safeLeft = kotlin.math.floor(left.toDouble()).toFloat()
+    val safeTop = kotlin.math.floor(top.toDouble()).toFloat()
+    val safeRight = kotlin.math.ceil(right.toDouble()).toFloat()
+    val safeBottom = kotlin.math.ceil(bottom.toDouble()).toFloat()
+    if (safeRight <= safeLeft || safeBottom <= safeTop) return
+    clipRect(safeLeft, safeTop, safeRight, safeBottom, block = block)
 }
 
 private fun nativeSmoothStep(x: Float): Float {
@@ -2170,78 +2540,31 @@ private fun nativePositionFocus(
     spanPx: Float,
 ): Float {
     val span = spanPx.coerceAtLeast(1f)
-    // 不对称焦点：焦点及其上方（已唱的句子）保持满字号——唱完的行直接滚上去，
-    // 不再边滚边缩（缩小会让列表观感抖一下）；只有下方未唱到的行按距离缩小、随到达放大。
+    // 不对称焦点：焦点及其上方保持满幅词内 motion；只有下方未唱到的行按距离渐入
+    // 词内预备动效。行级缩放另按 Apple Web 的 is-current scale(1.1) 独立处理。
     val delta = rowAnchor - focusAnchor
     if (delta <= 0f) return 1f
     val raw = (1f - delta / span).coerceIn(0f, 1f)
     return nativeSmoothStep(raw)
 }
 
-private fun nativeRowScale(positionFocus: Float): Float {
-    return NATIVE_INACTIVE_SCALE + (1f - NATIVE_INACTIVE_SCALE) * positionFocus.coerceIn(0f, 1f)
-}
-
-private data class NativeSlowSweepMotion(
-    val x: Float,
-    val emphasisScale: Float,
-)
-
-private fun nativeSlowSweepMotion(
-    segment: NativeLyricSegment,
-    progress: Float,
-    positionMs: Long,
-    trailPx: Float,
-    leadPx: Float,
-): NativeSlowSweepMotion {
-    val segmentWidth = (segment.right - segment.left).coerceAtLeast(1f)
-    val p = progress.coerceIn(0f, 1f)
-    val baseX = segment.left + segmentWidth * p
-    val tokenEndMs = segment.timing.startMs + segment.timing.durationMs.coerceAtLeast(1L)
-    if (positionMs <= tokenEndMs) {
-        return NativeSlowSweepMotion(x = baseX, emphasisScale = 1f)
-    }
-    val tail = ((positionMs - tokenEndMs).toFloat() / NATIVE_SLOW_SWEEP_GLOW_TAIL_MS.toFloat())
-        .coerceIn(0f, 1f)
-    val exit = nativeSmoothStep(tail)
-    val exitDistance = trailPx + leadPx
-    return NativeSlowSweepMotion(
-        x = baseX + exitDistance * exit,
-        emphasisScale = 1f - exit,
-    )
-}
-
-private fun nativeAppleMusicSlowWave(
-    left: Float,
-    right: Float,
-    sweepX: Float,
-    trailPx: Float,
-    leadPx: Float,
-    peakLagPx: Float,
+// 行级缩放专用的“对称”焦点：只有最贴近滚动焦点的行≈1（放大满），上方/下方都按距离
+// 平滑衰减到 0（原尺寸）。与 nativePositionFocus（不对称、上方恒 1，供词内 motion）不同——
+// 若行缩放用那个不对称版，所有已唱过的上方行都会被放大。这里用 |rowAnchor-focusAnchor|
+// 对称衰减，并 smoothStep 平滑，保证只有当前行大、缩放随滚动位移连续变化。
+private fun nativeScaleFocus(
+    rowAnchor: Float,
+    focusAnchor: Float,
+    spanPx: Float,
 ): Float {
-    if (right <= left) return 0f
-    val startX = sweepX - trailPx
-    val peakX = sweepX - peakLagPx
-    val endX = sweepX + leadPx
+    val span = spanPx.coerceAtLeast(1f)
+    val raw = (1f - kotlin.math.abs(rowAnchor - focusAnchor) / span).coerceIn(0f, 1f)
+    return nativeSmoothStep(raw)
+}
 
-    fun smoother(value: Float): Float {
-        val t = value.coerceIn(0f, 1f)
-        return t * t * t * (t * (t * 6f - 15f) + 10f)
-    }
-
-    fun sample(x: Float): Float {
-        return when {
-            x <= startX || x >= endX -> 0f
-            x <= peakX -> smoother((x - startX) / (peakX - startX).coerceAtLeast(1f))
-            else -> smoother((endX - x) / (endX - peakX).coerceAtLeast(1f))
-        }
-    }
-
-    val q1 = left + (right - left) * 0.25f
-    val mid = (left + right) * 0.5f
-    val q3 = left + (right - left) * 0.75f
-    val coverage = (sample(q1) + sample(mid) * 1.4f + sample(q3)) / 3.4f
-    return nativeSmoothStep(coverage).coerceIn(0f, 1f)
+private fun nativeRowScale(positionFocus: Float): Float {
+    return 1f + (NATIVE_CURRENT_LINE_SCALE - 1f) *
+        positionFocus.coerceIn(0f, NATIVE_LINE_TRANSFORM_PROGRESS_MAX)
 }
 
 private data class NativeSlowGlyphVisualBox(
@@ -2265,40 +2588,27 @@ private fun nativeSlowGlyphVisualBox(
     val endX = layout.getHorizontalPosition((index + 1).coerceAtMost(textLength), usePrimaryDirection = true)
     val advanceLeft = minOf(startX, endX).coerceIn(segment.left, segment.right)
     val advanceRight = maxOf(startX, endX).coerceIn(segment.left, segment.right)
-    if (advanceRight - advanceLeft >= NATIVE_SLOW_GLYPH_MIN_ADVANCE_PX) {
-        return NativeSlowGlyphVisualBox(advanceLeft, advanceRight)
-    }
     val fallbackClampedLeft = fallbackLeft.coerceIn(segment.left, segment.right)
     val fallbackClampedRight = fallbackRight.coerceIn(segment.left, segment.right)
-    if (fallbackClampedRight - fallbackClampedLeft >= NATIVE_SLOW_GLYPH_MIN_ADVANCE_PX) {
-        return NativeSlowGlyphVisualBox(fallbackClampedLeft, fallbackClampedRight)
+    val inkLeft = minOf(advanceLeft, fallbackClampedLeft)
+    val inkRight = maxOf(advanceRight, fallbackClampedRight)
+    if (inkRight - inkLeft >= NATIVE_SLOW_GLYPH_MIN_ADVANCE_PX) {
+        return NativeSlowGlyphVisualBox(inkLeft, inkRight)
     }
     return null
 }
 
-private fun nativeSlowProgressGlowCoverage(
-    glyphLeft: Float,
-    glyphRight: Float,
-    sweepX: Float,
-    fontPx: Float,
-): Float {
-    if (glyphRight <= glyphLeft) return 0f
-    val glyphWidth = glyphRight - glyphLeft
-    val edgePad = (fontPx * NATIVE_SLOW_GLOW_EDGE_PAD_EM).coerceAtLeast(1f)
-    if (sweepX < glyphLeft - edgePad || sweepX > glyphRight + edgePad) return 0f
-    val center = (glyphLeft + glyphRight) * 0.5f
-    val halfWidth = (glyphWidth * 0.5f + edgePad).coerceAtLeast(1f)
-    val raw = (1f - kotlin.math.abs(sweepX - center) / halfWidth).coerceIn(0f, 1f)
-    return nativeSmoothStep(raw)
-}
 
 private data class NativeLyricSegment(
     val timing: PipoLyricChar,
+    val sourceTiming: PipoLyricChar,
     val line: Int,
     val left: Float,
     val right: Float,
     val segmentStartProgress: Float,
     val segmentEndProgress: Float,
+    val tokenStartChar: Int,
+    val tokenEndChar: Int,
     val startChar: Int,
     val endChar: Int,
 )
@@ -2306,21 +2616,23 @@ private data class NativeLyricSegment(
 private fun nativeLyricSegments(
     layout: TextLayoutResult,
     chars: List<PipoLyricChar>,
+    sourceChars: List<PipoLyricChar>,
 ): List<NativeLyricSegment> {
     val text = layout.layoutInput.text.text
     if (text.isEmpty() || chars.isEmpty()) return emptyList()
     val segments = ArrayList<NativeLyricSegment>(chars.size)
     var cursor = 0
-    chars.forEach { timing ->
+    chars.forEachIndexed { index, timing ->
+        val sourceTiming = sourceChars.getOrNull(index) ?: timing
         val start = cursor.coerceAtMost(text.length)
         val end = (cursor + timing.text.length).coerceAtMost(text.length)
         cursor = end
-        if (start >= end) return@forEach
+        if (start >= end) return@forEachIndexed
         var segStart = start
         while (segStart < end) {
             val line = layout.getLineForOffset(segStart)
             val lineEnd = minOf(end, layout.getLineEnd(line, visibleEnd = true).coerceAtLeast(segStart + 1))
-            nativeAddSegment(segments, layout, timing, segStart, lineEnd, start, end, line)
+            nativeAddSegment(segments, layout, timing, sourceTiming, segStart, lineEnd, start, end, line)
             segStart = lineEnd
         }
     }
@@ -2331,60 +2643,84 @@ private fun nativeAddSegment(
     out: MutableList<NativeLyricSegment>,
     layout: TextLayoutResult,
     timing: PipoLyricChar,
+    sourceTiming: PipoLyricChar,
     start: Int,
     end: Int,
     tokenStart: Int,
     tokenEnd: Int,
     line: Int,
 ) {
+    val text = layout.layoutInput.text.text
     var left = Float.POSITIVE_INFINITY
     var right = Float.NEGATIVE_INFINITY
     for (i in start until end) {
+        // 空格不计入段边界：YRC 词 token 常带尾随空格（"we " + "just"），把空格算进
+        // 上一段会让相邻段的裁切线贴在下一个字母的原点上——'j' 这类负左边距字形的
+        // 钩尖越过裁切线、被按邻段的上浮量绘制，上浮时字形“前角裂开”。只按可见
+        // 墨迹算边界后，裁切线落在词间空隙正中，两侧字形的悬伸都够不到。
+        if (i in text.indices && (text[i].isWhitespace() || text[i].isISOControl())) continue
         val box = layout.getBoundingBox(i)
         if (box.right <= box.left) continue
         left = minOf(left, box.left)
         right = maxOf(right, box.right)
     }
     if (left.isFinite() && right.isFinite() && right > left) {
-        val tokenLength = (tokenEnd - tokenStart).coerceAtLeast(1)
-        val startProgress = ((start - tokenStart).toFloat() / tokenLength.toFloat()).coerceIn(0f, 1f)
-        val endProgress = ((end - tokenStart).toFloat() / tokenLength.toFloat()).coerceIn(startProgress, 1f)
-        out.add(NativeLyricSegment(timing, line, left, right, startProgress, endProgress, start, end))
+        // Apple puts timing on the whole `.syllable` span (`data-delay` + `data-duration`).
+        // We may split the same token only for Android line geometry, but every piece must keep
+        // the token's full animation clock; otherwise a wrapped/trimmed word gets compressed and
+        // looks like it sweeps in a single frame.
+        out.add(NativeLyricSegment(timing, sourceTiming, line, left, right, 0f, 1f, tokenStart, tokenEnd, start, end))
     }
 }
 
-private data class NativeLyricFront(
-    val index: Int,
-    val progress: Float,
-    val x: Float,
-    val line: Int,
-)
+    // Apple Web ordinary syllable：颜色按 data-delay/data-duration 线性扫色；
+    // 位移单独从 delay + 100ms 开始，到 end + 100ms 完成。短 YRC timing 需要兜底时，
+    // 上浮不能复用扫色的较长窗口，否则前一个词的轻微上浮会拖进下一个词，形成抖动。
+    private fun nativeSegmentLiftProgress(
+        segment: NativeLyricSegment,
+        positionMs: Long,
+    ): Float {
+        return nativeRegularWordLiftEase01(
+            nativeSegmentTimelineProgress(
+                segment = segment,
+                positionMs = positionMs - NATIVE_WORD_LIFT_DELAY_MS,
+                shortTokenMode = NativeShortTokenVisualMode.Lift,
+            ),
+        )
+    }
 
-private fun nativeLyricFront(
-    segments: List<NativeLyricSegment>,
-    positionMs: Long,
-    fadeWidth: Float,
-): NativeLyricFront {
-    val index = segments.indexOfLast { it.timing.startMs <= positionMs }
-    if (index < 0) return NativeLyricFront(-1, 0f, Float.NEGATIVE_INFINITY, 0)
-    val current = segments[index]
-    val next = segments.getOrNull(index + 1)
-    val progress = nativeTokenMaskProgress(current.timing, positionMs)
-    val sameLineNext = next?.takeIf { it.line == current.line }
-    val targetX = sameLineNext?.left ?: (current.right + fadeWidth * 0.5f)
-    return NativeLyricFront(
-        index = index,
-        progress = progress,
-        x = current.left + (targetX - current.left) * progress,
-        line = current.line,
-    )
+// Apple Web ordinary syllable keyframe uses ease: 1 here; keep it linear so
+// adjacent words do not get phase-shifted by a second easing curve.
+private fun nativeRegularWordLiftEase01(progress: Float): Float {
+    return progress.coerceIn(0f, 1f)
 }
 
-private fun nativeSegmentFillProgress(
+    private fun nativeSegmentFillProgress(
+        segment: NativeLyricSegment,
+        positionMs: Long,
+    ): Float {
+        return nativeSegmentTimelineProgress(
+            segment = segment,
+            positionMs = positionMs,
+            shortTokenMode = NativeShortTokenVisualMode.Sweep,
+        )
+    }
+
+private enum class NativeShortTokenVisualMode {
+    Sweep,
+    Lift,
+}
+
+private fun nativeSegmentTimelineProgress(
     segment: NativeLyricSegment,
     positionMs: Long,
+    shortTokenMode: NativeShortTokenVisualMode,
 ): Float {
-    val tokenProgress = nativeTokenMaskProgress(segment.timing, positionMs).coerceIn(0f, 1f)
+    val tokenProgress = nativeTokenMaskProgress(
+        token = segment.timing,
+        positionMs = positionMs,
+        shortTokenMode = shortTokenMode,
+    ).coerceIn(0f, 1f)
     val start = segment.segmentStartProgress
     val end = segment.segmentEndProgress
     if (tokenProgress <= start) return 0f
@@ -2395,44 +2731,146 @@ private fun nativeSegmentFillProgress(
 private fun nativeTokenMaskProgress(
     token: PipoLyricChar,
     positionMs: Long,
+    shortTokenMode: NativeShortTokenVisualMode,
 ): Float {
-    return token.progress(positionMs)
+    // Apple Web gives every `.syllable` one linear data-delay/data-duration
+    // timeline:
+    // - gradient: delay -> delay + duration
+    // - y: delay + 100ms -> delay + duration + 100ms
+    //
+    // Keep Android's visible sweep/lift on that same whole-token clock. YRC
+    // timingParts remain in the parsed data for effective duration and quality
+    // checks, but they must not bend the visible fill curve; even a small
+    // per-part correction can make dense English words jump at syllable
+    // boundaries, while Apple renders the word as one continuous `.syllable`.
+    return nativeAppleSyllableProgress(token, positionMs)
 }
 
-private fun nativeTimingTextUnits(text: String): Int {
-    val visible = text.count { !it.isWhitespace() && !it.isISOControl() }
-    return visible.takeIf { it > 0 } ?: text.length.coerceAtLeast(1)
+private fun nativeTokenVisualEndMs(
+    token: PipoLyricChar,
+    mode: NativeShortTokenVisualMode,
+): Long {
+    return nativeAppleSyllableEndMs(token)
+}
+
+private fun nativeAppleSyllableDurationMs(token: PipoLyricChar): Long {
+    return (nativeAppleSyllableEndMs(token) - token.startMs).coerceAtLeast(1L)
+}
+
+private fun nativeAppleSyllableEndMs(token: PipoLyricChar): Long {
+    return (token.startMs + token.durationMs.coerceAtLeast(1L)).coerceAtLeast(token.startMs + 1L)
+}
+
+private fun nativeSlowSyllableDurationMs(token: PipoLyricChar): Long {
+    // Apple Web uses `word.end - word.begin` for emphasis. Android sometimes
+    // merges split YRC fragments into one visual word; the effective duration
+    // is the closest local equivalent to Apple's full word begin/end.
+    return token.effectiveDurationMs()
+}
+
+private fun nativeAppleSyllableProgress(token: PipoLyricChar, positionMs: Long): Float {
+    val startMs = token.startMs
+    val endMs = nativeAppleSyllableEndMs(token)
+    if (positionMs <= startMs) return 0f
+    if (positionMs >= endMs) return 1f
+    return ((positionMs - startMs).toFloat() / (endMs - startMs).toFloat()).coerceIn(0f, 1f)
+}
+
+private fun nativeSegmentAppleSyllableStartMs(segment: NativeLyricSegment): Long {
+    val token = segment.timing
+    val duration = nativeAppleSyllableDurationMs(token).toFloat()
+    return token.startMs + (duration * segment.segmentStartProgress).toLong()
+}
+
+private fun nativeSegmentAppleSyllableEndMs(segment: NativeLyricSegment): Long {
+    val token = segment.timing
+    val duration = nativeAppleSyllableDurationMs(token).toFloat()
+    return token.startMs + (duration * segment.segmentEndProgress).toLong()
+}
+
+private fun nativeSegmentSlowSyllableStartMs(segment: NativeLyricSegment): Long {
+    val token = segment.sourceTiming
+    val duration = nativeSlowSyllableDurationMs(token).toFloat()
+    return token.startMs + (duration * segment.segmentStartProgress).toLong()
+}
+
+private fun nativeSegmentSlowSyllableEndMs(segment: NativeLyricSegment): Long {
+    val token = segment.sourceTiming
+    val end = token.effectiveEndMs()
+    val duration = nativeSlowSyllableDurationMs(token).toFloat()
+    return (token.startMs + duration * segment.segmentEndProgress)
+        .toLong()
+        .coerceAtMost(end)
+        .coerceAtLeast(token.startMs + 1L)
+}
+
+private fun nativeSegmentVisualStartMs(segment: NativeLyricSegment): Long {
+    val token = segment.timing
+    val duration = (nativeTokenVisualEndMs(token, NativeShortTokenVisualMode.Sweep) - token.startMs)
+        .coerceAtLeast(1L)
+        .toFloat()
+    return token.startMs + (duration * segment.segmentStartProgress).toLong()
+}
+
+private fun nativeSegmentVisualEndMs(segment: NativeLyricSegment): Long {
+    val token = segment.timing
+    val duration = (nativeTokenVisualEndMs(token, NativeShortTokenVisualMode.Sweep) - token.startMs)
+        .coerceAtLeast(1L)
+        .toFloat()
+    return token.startMs + (duration * segment.segmentEndProgress).toLong()
+}
+
+private fun nativeAppleEmphasisContentUnits(text: String): Int {
+    // Apple's word object carries trailing spaces as `hasTrailingWhitespace`; `content.length`
+    // does not include that visual gap. YRC keeps spaces attached to the token, so strip only
+    // trailing whitespace before applying the >=1s && <=7 emphasis gate.
+    return text.dropLastWhile { it.isWhitespace() || it.isISOControl() }.length.coerceAtLeast(1)
+}
+
+private fun nativeAppleLetterTimelineUnits(text: String): Int {
+    // `data-content` is already whitespace-free in Apple Web; exclude attached YRC
+    // trailing spaces here so slow-letter wave timing is not divided by an invisible unit.
+    return text.count {
+        !nativeAppleStripsSyllableChar(it) && !it.isWhitespace() && !it.isISOControl()
+    }.coerceAtLeast(1)
+}
+
+private fun nativeAppleLetterOrdinalBefore(text: String, start: Int, end: Int): Int {
+    val safeStart = start.coerceIn(0, text.length)
+    val safeEnd = end.coerceIn(safeStart, text.length)
+    var count = 0
+    for (index in safeStart until safeEnd) {
+        val ch = text[index]
+        if (!nativeAppleStripsSyllableChar(ch) && !ch.isWhitespace() && !ch.isISOControl()) {
+            count++
+        }
+    }
+    return count
+}
+
+private fun nativeAppleStripsSyllableChar(ch: Char): Boolean {
+    return ch == '(' || ch == ')'
 }
 
 private data class NativeSlowShape(
     val amount: Float,
-    val blur: Float,
-    val animateDurationMs: Float,
 )
 
-private fun nativeSlowWordShape(token: PipoLyricChar, isLast: Boolean): NativeSlowShape {
-    val rawDuration = token.durationMs.coerceAtLeast(1L).toFloat()
-    if (rawDuration < NATIVE_SLOW_WORD_MIN_DURATION_MS.toFloat()) return NativeSlowShape(0f, 0f, 0f)
-    val duration = maxOf(NATIVE_SLOW_WORD_MIN_DURATION_MS.toFloat(), rawDuration)
-    var animateDuration = duration
-    var amount = duration / 2000f
-    amount = if (amount > 1f) kotlin.math.sqrt(amount) else amount * amount * amount
-    var blur = duration / 3000f
-    blur = if (blur > 1f) kotlin.math.sqrt(blur) else blur * blur * blur
-    amount = maxOf(amount, 0.32f)
-    blur = maxOf(blur, 0.25f)
-    amount *= 0.58f
-    blur *= 0.50f
-    if (isLast) {
-        amount *= 1.25f
-        blur *= 1.25f
-        animateDuration *= 1.12f
-    }
-    return NativeSlowShape(
-        amount = amount.coerceAtMost(0.95f),
-        blur = blur.coerceAtMost(0.8f),
-        animateDurationMs = animateDuration,
-    )
+// Apple Web shouldBeEmphasized 用原始 content；但 createSyllable 会把显示文本
+// replace(/[()]/g, "") 后再拆 .letter。两条路径分开，避免括号既显示出来，
+// 又因为去括号后的长度把慢词阈值算错。
+private fun nativeSlowWordShape(
+    displayToken: PipoLyricChar,
+    sourceToken: PipoLyricChar,
+): NativeSlowShape {
+    if (!nativeIsAppleSlowWord(sourceToken)) return NativeSlowShape(0f)
+    if (displayToken.text.isEmpty()) return NativeSlowShape(0f)
+    return NativeSlowShape(amount = 1f)
+}
+
+private fun nativeIsAppleSlowWord(token: PipoLyricChar): Boolean {
+    return nativeSlowSyllableDurationMs(token) >= NATIVE_SLOW_WORD_MIN_DURATION_MS &&
+        nativeAppleEmphasisContentUnits(token.text) <= NATIVE_SLOW_WORD_MAX_UNITS
 }
 
 private fun nativeIsCjkText(text: String): Boolean {
@@ -2450,24 +2888,25 @@ private fun nativeVisibleGlyphCount(text: String): Int {
 }
 
 private fun nativeLineOpacity(
-    isActive: Boolean,
+    fadeOutPastLine: Boolean,
 ): Float {
-    return when {
-        isActive -> NATIVE_BUFFERED_OPACITY
-        else -> NATIVE_NON_DYNAMIC_OPACITY
-    }
+    // Apple Web does not dim whole lyric rows with opacity in the live
+    // component: `.line` changes color, and the named fade-out animation is
+    // paused with a default end opacity of 1. Keep row opacity neutral so the
+    // text color/gradient alpha is not multiplied a second time.
+    return if (fadeOutPastLine) 0f else 1f
 }
 
 private fun nativeSolidLineColor(fg: Color): Color {
     return fg.copy(alpha = fg.alpha * NATIVE_SOLID_LINE_ALPHA)
 }
 
-private fun nativeSlowDurationGlowStrength(durationMs: Long): Float {
-    val raw = ((durationMs - NATIVE_SLOW_WORD_MIN_DURATION_MS).toFloat() / NATIVE_SLOW_SHADOW_FULL_DURATION_SPAN_MS)
-        .coerceIn(0f, 1f)
-    val eased = kotlin.math.sqrt(raw)
-    return NATIVE_SLOW_SHADOW_MIN_DURATION_STRENGTH +
-        (NATIVE_SLOW_SHADOW_MAX_DURATION_STRENGTH - NATIVE_SLOW_SHADOW_MIN_DURATION_STRENGTH) * eased
+private fun nativeTimedGradientSungColor(fg: Color): Color {
+    return fg.copy(alpha = fg.alpha * NATIVE_GRADIENT_ACTIVE_ALPHA)
+}
+
+private fun nativeTimedGradientUnsungColor(fg: Color): Color {
+    return fg.copy(alpha = fg.alpha * NATIVE_GRADIENT_INACTIVE_ALPHA)
 }
 
 private data class NativeMaskAlpha(
@@ -2483,7 +2922,7 @@ private fun nativeMaskAlpha(
     gradient: Boolean,
 ): NativeMaskAlpha {
     return if (gradient) {
-        NativeMaskAlpha(bright = 1f, dark = NATIVE_ACTIVE_UNSUNG_ALPHA)
+        NativeMaskAlpha(bright = NATIVE_GRADIENT_ACTIVE_ALPHA, dark = NATIVE_GRADIENT_INACTIVE_ALPHA)
     } else {
         NativeMaskAlpha(bright = NATIVE_SOLID_LINE_ALPHA, dark = NATIVE_SOLID_LINE_ALPHA)
     }
@@ -2491,57 +2930,46 @@ private fun nativeMaskAlpha(
 
 @Composable
 private fun rememberNativeMaskAlpha(target: NativeMaskAlpha): NativeMaskAlpha {
-    val bright = remember { Animatable(target.bright) }
-    val dark = remember { Animatable(target.dark) }
-
-    LaunchedEffect(target.bright, target.dark) {
-        var lastFrame = withFrameNanos { it }
-        while (
-            kotlin.math.abs(bright.value - target.bright) > 0.001f ||
-            kotlin.math.abs(dark.value - target.dark) > 0.001f
-        ) {
-            val now = withFrameNanos { it }
-            val deltaSeconds = ((now - lastFrame).toDouble() / 1_000_000_000.0)
-                .coerceIn(0.0, 0.05)
-                .toFloat()
-            lastFrame = now
-            bright.snapTo(nativeAlphaStep(bright.value, target.bright, deltaSeconds))
-            dark.snapTo(nativeAlphaStep(dark.value, target.dark, deltaSeconds))
-        }
-        bright.snapTo(target.bright)
-        dark.snapTo(target.dark)
-    }
-
-    return NativeMaskAlpha(bright = bright.value, dark = dark.value)
-}
-
-private fun nativeAlphaStep(current: Float, target: Float, deltaSeconds: Float): Float {
-    val speed = if (target > current) NATIVE_MASK_ALPHA_ATTACK_SPEED else NATIVE_MASK_ALPHA_RELEASE_SPEED
-    val factor = 1f - kotlin.math.exp((-speed * deltaSeconds).toDouble()).toFloat()
-    return current + (target - current) * factor
+    // Apple Web puts current-line color on `.line { transition: color 0.1s }`
+    // and uses fixed current gradient endpoints (.85/.5). Keep Android's
+    // draw-path alpha on that same 100ms CSS easing instead of the old
+    // asymmetric exponential release, which left a visible color tail on
+    // overlapping fast lines.
+    val bright by animateFloatAsState(
+        targetValue = target.bright,
+        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_CSS_DEFAULT_EASE),
+        label = "nativeLyricMaskBright",
+    )
+    val dark by animateFloatAsState(
+        targetValue = target.dark,
+        animationSpec = tween(durationMillis = NATIVE_LINE_COLOR_FADE_MS, easing = NATIVE_CSS_DEFAULT_EASE),
+        label = "nativeLyricMaskDark",
+    )
+    return NativeMaskAlpha(bright = bright, dark = dark)
 }
 
 private fun nativeLineBlur(
-    itemIndex: Int,
-    scrollToIndex: Int,
-    latestIndex: Int,
-    isActive: Boolean,
-    isUserDragging: Boolean,
-    isCompact: Boolean,
+    hasLineFocus: Boolean,
+    isFirstLine: Boolean,
+    isUserInteracting: Boolean,
 ): Float {
-    if (isUserDragging || isActive) return 0f
-    val focusIndex = maxOf(scrollToIndex, latestIndex)
-    var blurLevel = if (itemIndex >= focusIndex) {
-        0.35f + (itemIndex - focusIndex) * 1.15f
+    // Apple Web applies `filter: blur(var(--inactive-gaussian-blur, 0))` to
+    // non-current synced lines, but its selector excludes the first synced line
+    // (`:has(.is-first)`). It also clears blur while the user is manually scrolling.
+    return if (hasLineFocus || isFirstLine || isUserInteracting) {
+        0f
     } else {
-        0.55f + kotlin.math.abs(scrollToIndex - itemIndex) * 0.75f
+        NATIVE_INACTIVE_GAUSSIAN_BLUR_DP
     }
-    if (isCompact) blurLevel *= 0.8f
-    return blurLevel.coerceAtMost(4f)
 }
 
-private fun nativeTranslationColor(fg: Color): Color {
-    return fg.copy(alpha = NATIVE_SUBLINE_OPACITY)
+private fun nativeSublineColor(role: PipoLyricRole, fg: Color): Color {
+    val alpha = if (role == PipoLyricRole.Romaji) {
+        NATIVE_SUPPLEMENTARY_OPACITY
+    } else {
+        NATIVE_SUBLINE_OPACITY
+    }
+    return fg.copy(alpha = alpha)
 }
 
 private fun nativeHasStaticSubline(line: PipoLyricLine): Boolean {
@@ -2550,23 +2978,13 @@ private fun nativeHasStaticSubline(line: PipoLyricLine): Boolean {
     }
 }
 
-private fun nativeIsCompanionActive(line: PipoLyricLine, positionMs: Long): Boolean {
-    return positionMs >= LyricTiming.audioStartMs(line) && positionMs < nativeCompanionEndMs(line)
-}
-
-private fun nativeIsCompanionVisible(line: PipoLyricLine, positionMs: Long): Boolean {
-    val startMs = LyricTiming.audioStartMs(line) - NATIVE_BG_APPEAR_LEAD_MS
-    val endMs = nativeCompanionEndMs(line) + NATIVE_BG_DISAPPEAR_TAIL_MS
-    return positionMs in startMs until endMs
-}
-
 private fun nativeIsCompanionPast(line: PipoLyricLine, positionMs: Long): Boolean {
     return positionMs >= nativeCompanionEndMs(line)
 }
 
 private fun nativeCompanionEndMs(line: PipoLyricLine): Long {
-    val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs }
-    return maxOf(charEnd ?: line.startMs, line.startMs + line.durationMs)
+    val charEnd = line.chars.maxOfOrNull { it.startMs + it.durationMs.coerceAtLeast(1L) }
+    return charEnd ?: (line.startMs + line.durationMs)
 }
 
 private data class NativeTimelineSnapshot(
@@ -2583,75 +3001,113 @@ private data class NativeInterlude(
     val isNextDuet: Boolean,
 )
 
+// 时间轴快照由帧时钟驱动的 derivedStateOf 每帧重算：行起止时间在这里一次预计算
+//（nativeLineAudioEndMs 每次调用都要 chars+companions 拼接/扫描——放在每帧就是
+// 主线程的稳定 GC 与 CPU 热源），快照本身在内容不变时复用同一实例，稳态零分配。
+private class NativeTimelineCache(lines: List<PipoLyricLine>) {
+    val startMs = LongArray(lines.size) { nativeTimelineStartMs(lines, it) }
+    val endMs = LongArray(lines.size) { nativeTimelineEndMs(lines, it) }
+    var activeScratch = IntArray(8)
+    var lastSnapshot: NativeTimelineSnapshot? = null
+}
+
 private fun nativeTimelineSnapshot(
     lines: List<PipoLyricLine>,
+    cache: NativeTimelineCache,
     positionMs: Long,
     targetPositionMs: Long = positionMs,
 ): NativeTimelineSnapshot {
     if (lines.isEmpty()) return NativeTimelineSnapshot(0, emptySet(), 0, null)
-    val hot = LinkedHashSet<Int>()
-    lines.forEachIndexed { idx, _ ->
-        val start = nativeTimelineStartMs(lines, idx)
-        val end = nativeTimelineEndMs(lines, idx)
-        if (positionMs >= start && positionMs < end) {
-            hot.add(idx)
-        }
-    }
+    val starts = cache.startMs
+    val ends = cache.endMs
+    val n = starts.size
+    // hot 行里取 start 最大者（同 start 保留先出现的，与原 maxByOrNull 一致）。
+    var cueIndex = -1
+    var cueStartMs = Long.MIN_VALUE
     var targetStartedIndex = -1
-    lines.forEachIndexed { idx, _ ->
-        if (targetPositionMs >= nativeTimelineStartMs(lines, idx)) {
-            targetStartedIndex = idx
-        }
-    }
     var latestStartedIndex = -1
-    lines.forEachIndexed { idx, _ ->
-        if (positionMs >= nativeTimelineStartMs(lines, idx)) {
-            latestStartedIndex = idx
+    for (idx in 0 until n) {
+        val start = starts[idx]
+        if (positionMs >= start && positionMs < ends[idx] && start > cueStartMs) {
+            cueIndex = idx
+            cueStartMs = start
         }
+        if (targetPositionMs >= start) targetStartedIndex = idx
+        if (positionMs >= start) latestStartedIndex = idx
     }
-    val active = LinkedHashSet<Int>()
-    val currentCueIndex = hot.maxByOrNull { idx -> nativeTimelineStartMs(lines, idx) }
-    val currentCueStartMs = currentCueIndex?.let { nativeTimelineStartMs(lines, it) }
-    if (currentCueIndex != null && currentCueStartMs != null) {
-        hot.forEach { idx ->
-            val start = nativeTimelineStartMs(lines, idx)
-            if (start >= currentCueStartMs - NATIVE_SAME_CUE_START_GRACE_MS) {
-                active.add(idx)
+    var activeCount = 0
+    if (cueIndex >= 0) {
+        val graceStart = cueStartMs - NATIVE_SAME_CUE_START_GRACE_MS
+        for (idx in 0 until n) {
+            val start = starts[idx]
+            if (positionMs >= start && positionMs < ends[idx] && start >= graceStart) {
+                if (activeCount == cache.activeScratch.size) {
+                    cache.activeScratch = cache.activeScratch.copyOf(activeCount * 2)
+                }
+                cache.activeScratch[activeCount++] = idx
             }
         }
     }
-    val target = if (currentCueIndex != null) {
-        currentCueIndex
-    } else if (targetStartedIndex >= 0) {
-        targetStartedIndex
-    } else {
-        latestStartedIndex.coerceAtLeast(0)
+    // 前瞻还没开唱的下一句：clock+lead 已越过其 start、而它本体还没开始（start>clock）
+    // 时，即使上一句仍在唱（cue 命中）也提前把滚动焦点切过去——滚动要在开唱前就位。
+    // 否则连唱衔接的歌里 cue 永远压住前瞻，切句必然慢半拍。注意已唱完的短插句
+    // （start<=clock）不算 upcoming，焦点仍回到还在唱的长句（cue 优先）。
+    val upcomingIndex = targetStartedIndex.takeIf { it >= 0 && starts[it] > positionMs }
+    val target = when {
+        upcomingIndex != null -> upcomingIndex
+        cueIndex >= 0 -> cueIndex
+        targetStartedIndex >= 0 -> targetStartedIndex
+        else -> latestStartedIndex.coerceAtLeast(0)
     }
-    val latest = maxOf(active.maxOrNull() ?: target, target)
+    val activeMax = if (activeCount > 0) cache.activeScratch[activeCount - 1] else target
+    val latest = maxOf(activeMax, target).coerceIn(lines.indices)
     val coercedTarget = target.coerceIn(lines.indices)
-    return NativeTimelineSnapshot(
+    val interlude = nativeCurrentInterlude(lines, starts, ends, positionMs, coercedTarget)
+
+    val last = cache.lastSnapshot
+    if (last != null &&
+        last.targetIndex == coercedTarget &&
+        last.latestIndex == latest &&
+        last.interlude == interlude &&
+        last.activeIndices.size == activeCount &&
+        nativeActiveSetMatches(last.activeIndices, cache.activeScratch, activeCount)
+    ) {
+        return last
+    }
+    val active = LinkedHashSet<Int>(maxOf(4, activeCount * 2))
+    for (k in 0 until activeCount) {
+        active.add(cache.activeScratch[k])
+    }
+    val snapshot = NativeTimelineSnapshot(
         targetIndex = coercedTarget,
         activeIndices = active,
-        latestIndex = latest.coerceIn(lines.indices),
-        interlude = nativeCurrentInterlude(lines, positionMs, coercedTarget),
+        latestIndex = latest,
+        interlude = interlude,
     )
+    cache.lastSnapshot = snapshot
+    return snapshot
+}
+
+private fun nativeActiveSetMatches(set: Set<Int>, scratch: IntArray, count: Int): Boolean {
+    for (k in 0 until count) {
+        if (scratch[k] !in set) return false
+    }
+    return true
 }
 
 private fun nativeCurrentInterlude(
     lines: List<PipoLyricLine>,
+    starts: LongArray,
+    ends: LongArray,
     positionMs: Long,
     currentIndex: Int,
 ): NativeInterlude? {
     val currentTime = positionMs + 20L
     fun checkGap(anchorIndex: Int): NativeInterlude? {
         if (anchorIndex < -1 || anchorIndex >= lines.lastIndex) return null
-        val gapStart = if (anchorIndex == -1) {
-            0L
-        } else {
-            nativeTimelineEndMs(lines, anchorIndex)
-        }
+        val gapStart = if (anchorIndex == -1) 0L else ends[anchorIndex]
         val nextIndex = anchorIndex + 1
-        val nextStart = nativeTimelineStartMs(lines, nextIndex)
+        val nextStart = starts[nextIndex]
         val gapEnd = maxOf(gapStart, nextStart - 250L)
         if (gapEnd - gapStart < NATIVE_INTERLUDE_MIN_GAP_MS) return null
         if (gapEnd > currentTime && gapStart < currentTime) {
@@ -2689,44 +3145,58 @@ private fun nativeLineAudioStartMs(line: PipoLyricLine): Long {
 
 private fun nativeLineAudioEndMs(line: PipoLyricLine): Long {
     val timedCompanions = line.companionLines.filter { it.role == PipoLyricRole.Companion }
-    val charEnd = (line.chars + timedCompanions.flatMap { it.chars })
-        .maxOfOrNull { it.startMs + it.durationMs }
+    val timedChars = line.chars + timedCompanions.flatMap { it.chars }
+    val charEnd = timedChars.maxOfOrNull { it.startMs + it.durationMs.coerceAtLeast(1L) }
     val lineEnd = maxOf(
         line.startMs + line.durationMs,
         timedCompanions.maxOfOrNull { it.startMs + it.durationMs } ?: line.startMs,
     )
-    return maxOf(charEnd ?: lineEnd, lineEnd)
+    return charEnd ?: lineEnd
 }
 
 @Composable
-private fun rememberNativeVisibleInterlude(
-    interlude: NativeInterlude?,
-    currentTimeMs: () -> Long,
-    sessionKey: String,
-): NativeInterlude? {
-    var activeKey by remember(sessionKey) { mutableStateOf<String?>(null) }
-    var visibleStartMs by remember(sessionKey) { mutableLongStateOf(0L) }
-    val interludeKey = interlude?.let {
-        "${it.anchorLineIndex}:${it.startMs}:${it.endMs}:${it.isNextDuet}"
-    }
+private fun rememberNativeAppleLineClockMs(
+    lineStartMs: Long,
+    lineKey: String,
+    localIsActive: Boolean,
+    isPlaying: Boolean,
+    rawPositionState: State<Long>,
+    wordTimelineOffsetMs: Long,
+): State<Float> {
+    val out = remember(lineKey) { mutableFloatStateOf(lineStartMs.toFloat()) }
+    val playingState = rememberUpdatedState(isPlaying)
 
-    LaunchedEffect(sessionKey, interludeKey) {
-        if (interlude == null || interludeKey == null) {
-            activeKey = null
-            visibleStartMs = 0L
-        } else {
-            activeKey = interludeKey
-            // 时钟作为 provider 只在间奏边界读一次：拿到“此刻”做点亮起点，
-            // 不把每帧时钟当 composition 参数传（否则整列逐帧重组）。
-            visibleStartMs = maxOf(interlude.startMs, currentTimeMs())
+    LaunchedEffect(lineKey, localIsActive, wordTimelineOffsetMs) {
+        var anchorTimeMs = (rawPositionState.value + wordTimelineOffsetMs)
+            .coerceAtLeast(lineStartMs)
+            .toFloat()
+        out.floatValue = anchorTimeMs
+        if (!localIsActive) return@LaunchedEffect
+
+        var anchorFrameNanos = withFrameNanos { it }
+        while (true) {
+            val frameNanos = withFrameNanos { it }
+            if (!playingState.value) {
+                anchorTimeMs = out.floatValue
+                anchorFrameNanos = frameNanos
+                continue
+            }
+
+            val localTimeMs = anchorTimeMs + (frameNanos - anchorFrameNanos) / 1_000_000f
+            val rawTimeMs = rawPositionState.value.toFloat() + wordTimelineOffsetMs
+            if (kotlin.math.abs(rawTimeMs - localTimeMs) > NATIVE_APPLE_LINE_CLOCK_RESET_MS) {
+                // Apple Web 的 TimeGroup 用 performance.now() 连续推进；只有 seek/大跳位
+                // 这类 >1s 的播放位置变化才重锚，普通播放器 position 抖动不再打进词级动画。
+                anchorTimeMs = rawTimeMs.coerceAtLeast(lineStartMs.toFloat())
+                anchorFrameNanos = frameNanos
+                out.floatValue = anchorTimeMs
+            } else {
+                out.floatValue = localTimeMs.coerceAtLeast(lineStartMs.toFloat())
+            }
         }
     }
 
-    return if (interlude != null && activeKey == interludeKey && visibleStartMs > 0L) {
-        interlude.copy(startMs = visibleStartMs)
-    } else {
-        interlude
-    }
+    return out
 }
 
 @Composable
@@ -2745,6 +3215,7 @@ private fun rememberNativeLyricClockMs(
     val canExtrapolate = remember(sessionKey) {
         mutableStateOf(rawPositionMs > NATIVE_CLOCK_START_GUARD_MS)
     }
+    val pendingBackwardAlign = remember(sessionKey) { mutableStateOf(false) }
 
     LaunchedEffect(rawPositionMs, isPlaying, sessionKey) {
         val nowMs = System.nanoTime() / 1e6
@@ -2762,22 +3233,74 @@ private fun rememberNativeLyricClockMs(
             canExtrapolate.value || nextRaw > NATIVE_CLOCK_START_GUARD_MS
         }
         if (shouldReset) {
+            pendingBackwardAlign.value = false
             baseMs.doubleValue = reportedBase
             resetToken.longValue += 1L
-            out.floatValue = nextRaw
+            // 暂停态的小幅差值交给帧环的暂停回拢缓动（避免一帧覆盖它）；
+            // 大幅差值=真实跳位（暂停中 seek），仍即时对齐。
+            if (isPlaying || kotlin.math.abs(nextRaw - out.floatValue) > NATIVE_CLOCK_PAUSE_EASE_MAX_MS) {
+                out.floatValue = nextRaw
+            }
         } else if (kotlin.math.abs(drift) <= NATIVE_CLOCK_JITTER_BAND_MS) {
             // 抖动带内的微小偏差：温和吸收，避免锯齿。
+            pendingBackwardAlign.value = false
             baseMs.doubleValue += drift * NATIVE_CLOCK_BASE_SLEW
-        } else {
-            // 数据权威：超出抖动带立刻对齐报告值（扫色必须跟声音）。
-            // 视觉向后的回退由帧循环降速滑行消化，不会跳变。
+        } else if (drift > 0.0) {
+            // 数据权威：前向超出抖动带立刻对齐报告值（帧环限速追赶消化，扫色必须跟声音）。
+            pendingBackwardAlign.value = false
             baseMs.doubleValue = reportedBase
+        } else {
+            // 后向 45~280ms：单报告去抖。源切换/坐标换算偶发的单样本回退不再直接
+            // 打进画面（那是“扫色无故倒退一截”的来源）；连续第二个报告仍要求回退
+            // 才对齐——真实回退只多等一个报告（~33ms），数据权威不变，之后的视觉
+            // 回退仍由帧环按既定档位消化（≤120ms 降速滑行、更大直接对齐）。
+            if (!pendingBackwardAlign.value) {
+                pendingBackwardAlign.value = true
+            } else {
+                pendingBackwardAlign.value = false
+                baseMs.doubleValue = reportedBase
+            }
         }
     }
 
     LaunchedEffect(isPlaying, sessionKey) {
         if (!isPlaying) {
-            out.floatValue = latestRawMs.floatValue
+            // 暂停/rebuffer：平滑时钟可能领先数据一小截。一帧瞬移回数据位置就是
+            // “停住瞬间扫色倒退一下”，小幅差值改用短缓动回拢。暂停期间持续监听
+            // resetToken（数据效果每次报告都会重锚），暂停中的 seek/重定位同样
+            // 经这里评估：小幅缓动、大幅直接对齐——不会停留在过期位置。
+            var settledToken = resetToken.longValue - 1L
+            while (isActive) {
+                if (settledToken != resetToken.longValue) {
+                    settledToken = resetToken.longValue
+                    val from = out.floatValue
+                    val target0 = latestRawMs.floatValue
+                    val diff = target0 - from
+                    if (kotlin.math.abs(diff) <= NATIVE_CLOCK_PAUSE_EASE_MIN_MS ||
+                        kotlin.math.abs(diff) > NATIVE_CLOCK_PAUSE_EASE_MAX_MS
+                    ) {
+                        out.floatValue = target0
+                    } else {
+                        val startNanos = withFrameNanos { it }
+                        while (isActive) {
+                            val now = withFrameNanos { it }
+                            if (resetToken.longValue != settledToken &&
+                                kotlin.math.abs(latestRawMs.floatValue - target0) > 2f
+                            ) {
+                                // 回拢途中又跳位 → 跳出，外层按新数据重新评估。
+                                break
+                            }
+                            val t = (((now - startNanos) / 1_000_000f) / NATIVE_CLOCK_PAUSE_EASE_DURATION_MS)
+                                .coerceIn(0f, 1f)
+                            out.floatValue = from + diff * nativeSmoothStep(t)
+                            if (t >= 1f) break
+                        }
+                        settledToken = resetToken.longValue - 1L
+                        continue
+                    }
+                }
+                withFrameNanos { }
+            }
             return@LaunchedEffect
         }
         var smoothed = out.floatValue
@@ -2815,8 +3338,28 @@ private fun rememberNativeLyricClockMs(
                 val target = (frame / 1e6 + baseMs.doubleValue).toFloat().coerceAtLeast(0f)
                 val diff = target - smoothed
                 smoothed = when {
-                    // 目标在前 → 直接采用（target 本身已平滑，不再做追赶滤波引入滞后）。
-                    diff >= 0f -> target
+                    diff >= 0f -> {
+                        // 残余前向偏差（target 自身每帧前进 dt，扣除后才是 base 前跳量）。
+                        val gap = diff - dtMs
+                        if (gap <= NATIVE_CLOCK_FORWARD_FREE_MS || gap > NATIVE_CLOCK_FORWARD_SNAP_MS) {
+                            // 稳态（gap≈0）保持逐帧贴住 target；超大前跳（卡顿恢复级）仍即时对齐，
+                            // 长时间画面落后于声音比一次跳变更糟。
+                            target
+                        } else {
+                            // 中等前跳（base 越过抖动带的对齐，典型 45~280ms）：限速追赶——
+                            // 每帧最多加 STEP_MAX 的额外行程，几帧内贴上。单帧跳变消失，
+                            // 音画误差单调递减且峰值不超过原跳变量。这不是被否决过的
+                            // “无界慢追赶”：步长有下限（0.45x dt）有上限，收敛 ≤0.2s。
+                            val step = minOf(
+                                gap,
+                                minOf(
+                                    NATIVE_CLOCK_FORWARD_STEP_MAX_MS,
+                                    maxOf(dtMs * NATIVE_CLOCK_FORWARD_MIN_RATE, gap * NATIVE_CLOCK_FORWARD_FRACTION),
+                                ),
+                            )
+                            smoothed + dtMs + step
+                        }
+                    }
                     // 明显回退（数据权威向下校正较多）→ 一次性对齐。旧的 0.4x 降速滑行在
                     // 回退几百毫秒时要拖 1-2 秒的“慢动作”，用户感知为速度不对/像在重放。
                     diff < -NATIVE_CLOCK_BACKWARD_SNAP_MS -> target
@@ -2830,11 +3373,7 @@ private fun rememberNativeLyricClockMs(
     return out
 }
 
-private fun nativeScrollSpringSpec(
-    lines: List<PipoLyricLine>,
-    activeIdx: Int,
-    isInterludeActive: Boolean,
-): AnimationSpec<Float> {
+private fun nativeScrollAnimationSpec(isInterludeActive: Boolean): AnimationSpec<Float> {
     if (isInterludeActive) {
         return spring(
             dampingRatio = nativeDampingRatio(
@@ -2844,20 +3383,17 @@ private fun nativeScrollSpringSpec(
             stiffness = NATIVE_INTERLUDE_SCROLL_STIFFNESS,
         )
     }
-    // Apple 的切句是 spring 质感：起步快（无 ease-in 顿挫）、临界阻尼软着陆、无回弹。
-    // 行间隔越短 stiffness 越高（快歌跟得上），抒情歌则更舒缓。
-    val interval = if (activeIdx in lines.indices && activeIdx - 1 in lines.indices) {
-        nativeTimelineStartMs(lines, activeIdx) - nativeTimelineStartMs(lines, activeIdx - 1)
-    } else {
-        420L
-    }
-    val clamped = interval.coerceIn(100L, 800L).toFloat()
-    val ratio = 1f - (clamped - 100f) / 700f
-    val stiffness = NATIVE_SCROLL_SPRING_STIFFNESS_MIN +
-        ratio * (NATIVE_SCROLL_SPRING_STIFFNESS_MAX - NATIVE_SCROLL_SPRING_STIFFNESS_MIN)
+    // Apple Music 风格的弹簧式列表滚动：换下原 350ms easeInOutQuad tween。
+    // spring 自带的物理减速到位 + 轻微弹性，正是 Apple Music 歌词整列滚动的体感；
+    // 且 spring.animateTo 在目标漂移（当前行 padding 收展改变滚动目标）时会带着当前
+    // 速度连续过渡，不像 tween 重启那样会有顿挫。阻尼比≈0.9：能感到“被弹簧拉过去”的
+    // 加速度感，又几乎不过冲、不来回晃，避免歌词上下回弹晃眼。
     return spring(
-        dampingRatio = NATIVE_SCROLL_SPRING_DAMPING_RATIO,
-        stiffness = stiffness,
+        dampingRatio = nativeDampingRatio(
+            stiffness = NATIVE_LINE_SCROLL_STIFFNESS,
+            damping = NATIVE_LINE_SCROLL_DAMPING,
+        ),
+        stiffness = NATIVE_LINE_SCROLL_STIFFNESS,
     )
 }
 
@@ -2965,6 +3501,7 @@ private fun nativeRowMetrics(
     transProgress: Float,
     mainRowHeights: Map<Int, Int>,
     transFullHeights: Map<Int, Int>,
+    transMaxHeights: Map<Int, Int>,
 ): NativeRowMetrics {
     val safeLineCount = lineCount.coerceAtLeast(0)
     val mainHeights = IntArray(safeLineCount)
@@ -2976,9 +3513,13 @@ private fun nativeRowMetrics(
     val safeTransProgress = transProgress.coerceAtLeast(0f)
     for (idx in 0 until safeLineCount) {
         val mainHeight = (mainRowHeights[idx] ?: safeEstimated).coerceAtLeast(1)
-        val transHeight = ((transFullHeights[idx] ?: 0).coerceAtLeast(0) * safeTransProgress)
-            .roundToInt()
-            .coerceAtLeast(0)
+        val fullTransHeight = (transFullHeights[idx] ?: 0).coerceAtLeast(0)
+        val maxTransHeight = (transMaxHeights[idx] ?: fullTransHeight).coerceAtLeast(0)
+        val transHeight = nativeAppleSublineCollapsedHeight(
+            fullHeightPx = fullTransHeight,
+            maxHeightPx = maxTransHeight,
+            progress = safeTransProgress,
+        )
         mainHeights[idx] = mainHeight
         transHeights[idx] = transHeight
         mainPrefix[idx + 1] = mainPrefix[idx] + mainHeight
@@ -2992,6 +3533,18 @@ private fun nativeRowMetrics(
         transPrefix = transPrefix,
         renderPrefix = renderPrefix,
     )
+}
+
+private fun nativeAppleSublineCollapsedHeight(
+    fullHeightPx: Int,
+    maxHeightPx: Int,
+    progress: Float,
+): Int {
+    val full = fullHeightPx.coerceAtLeast(0)
+    if (full <= 0) return 0
+    val maxHeight = maxHeightPx.coerceAtLeast(1)
+    val animatedMax = (maxHeight * progress.coerceIn(0f, 1f)).roundToInt()
+    return minOf(full, animatedMax).coerceAtLeast(0)
 }
 
 private fun nativeUpperBound(values: FloatArray, value: Float, size: Int): Int {
@@ -3041,18 +3594,20 @@ private fun nativeLineWidthPx(
     aspect: Float,
 ): Float {
     val available = (containerWidthPx.toFloat() - horizontalPaddingPx * 2f).coerceAtLeast(1f)
-    return if (available <= compactWidthPx) {
+    val visualWidth = if (available <= compactWidthPx) {
         available
     } else {
         available * aspect.coerceIn(0.2f, 1f)
     }
+    val maxCurrentScale = 1f + (NATIVE_CURRENT_LINE_SCALE - 1f) *
+        NATIVE_LINE_TRANSFORM_PROGRESS_MAX
+    val safeScaledWidth = (available - NATIVE_LINE_SCALE_EDGE_GUARD_PX)
+        .coerceAtLeast(1f) / maxCurrentScale
+    return visualWidth.coerceAtMost(safeScaledWidth).coerceAtLeast(1f)
 }
 
-private fun nativeInterludeDotSizePx(
-    fontPx: Float,
-    viewportHeightPx: Float,
-): Float {
-    return (viewportHeightPx * 0.01f).coerceIn(fontPx * 0.5f, fontPx * 3f)
+private fun nativeInterludeDotSizePx(fontPx: Float): Float {
+    return fontPx * NATIVE_INTERLUDE_DOT_SIZE_EM
 }
 
 private fun nativeRowEnterProgress(enterProgress: Float, distance: Int): Float {
@@ -3060,16 +3615,6 @@ private fun nativeRowEnterProgress(enterProgress: Float, distance: Int): Float {
     val delay = (distance * 0.035f).coerceAtMost(0.32f)
     val raw = ((enterProgress - delay) / (1f - delay)).coerceIn(0f, 1f)
     return 1f - (1f - raw).let { it * it * it }
-}
-
-private fun nativeScrollMotionProgress(
-    fromCenter: Float,
-    targetCenter: Float,
-    currentCenter: Float,
-): Float {
-    val distance = targetCenter - fromCenter
-    if (kotlin.math.abs(distance) < 1f) return 1f
-    return ((currentCenter - fromCenter) / distance).coerceIn(0f, 1f)
 }
 
 private fun nativeLyricSessionKey(sessionId: String?, lines: List<PipoLyricLine>): String {
@@ -3082,9 +3627,9 @@ private fun nativeRenderPositionMs(clockMs: Float): Long {
     return (clockMs + NATIVE_RENDER_PIPELINE_LEAD_MS).toLong().coerceAtLeast(0L)
 }
 
-private fun Float.pow(power: Float): Float = Math.pow(this.toDouble(), power.toDouble()).toFloat()
-
-private val NATIVE_WORD_FLOAT_EASE = CubicBezierEasing(0f, 0f, 0.58f, 1f)
+// CSS default timing-function for `transition: color 0.1s`.
+private val NATIVE_CSS_DEFAULT_EASE = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f)
+private val NATIVE_CSS_EASE_IN = CubicBezierEasing(0.42f, 0f, 1f, 1f)
 private val NATIVE_LINE_SWITCH_EASE = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
 private val NATIVE_BREAK_PUNCTUATION = setOf(
     ',',
@@ -3121,15 +3666,19 @@ private const val NATIVE_ACTIVE_LINE_EXTRA_UPSHIFT_DP = 80f
 private const val NATIVE_EFFECTS_ENABLE_ENTER_PROGRESS = 0.985f
 private const val NATIVE_ROW_CLICK_ENTER_PROGRESS = 0.995f
 private const val NATIVE_ROW_CLICK_MIN_ALPHA = 0.05f
-private const val NATIVE_INACTIVE_SCALE = 0.952f
-// 行透明度切换：100ms 观感是“啪”一下，Apple 的行亮度交接 ≈220ms 柔和但不拖。
-private const val NATIVE_LINE_SWITCH_MS = 220
+private const val NATIVE_CURRENT_LINE_SCALE = 1.10f
+private const val NATIVE_CURRENT_LINE_PADDING_EM = 12f / 22f
+private const val NATIVE_LINE_TRANSFORM_PROGRESS_MAX = 1f
+private const val NATIVE_LINE_SWITCH_MS = 100
+private const val NATIVE_LINE_FADE_OUT_DELAY_MS = 0
+private const val NATIVE_LINE_FADE_OUT_MS = 1_000
 
-/** 静态文本色 focus/past 通道的渐变时长（激活增亮、唱过变暗），与切句滚动节奏匹配。 */
-private const val NATIVE_LINE_COLOR_FADE_MS = 280
+/** Apple Web line color transition: color 0.1s. */
+private const val NATIVE_LINE_COLOR_FADE_MS = 100
 private const val NATIVE_INITIAL_REVEAL_MS = 90
 private const val NATIVE_ROW_SCALE_FOCUS_SPAN_ROWS = 1.15f
 private const val NATIVE_LINE_WIDTH_ASPECT = 0.8f
+private const val NATIVE_LINE_SCALE_EDGE_GUARD_PX = 2f
 private const val NATIVE_COMPACT_WIDTH_DP = 768f
 private const val NATIVE_INITIAL_RENDER_RADIUS_LINES = 10
 // 渲染窗口缓冲行数保持原安全宽度：后续行提前拿到 text layout / timed plan，
@@ -3137,84 +3686,87 @@ private const val NATIVE_INITIAL_RENDER_RADIUS_LINES = 10
 private const val NATIVE_RENDER_WINDOW_BUFFER_ROWS = 7
 private const val NATIVE_RENDER_WINDOW_BUFFER_VIEWPORT_FRACTION = 0.45f
 private const val NATIVE_WORD_FADE_WIDTH_RATIO = 1.0f
-// 交接带宽度以行高为基准恒定（≈0.7×行高），不随词宽变化：
-// 之前 max(词宽×0.24, 0.22em) → 中文单字几乎看不见、英文长词一大条色带。
-private const val NATIVE_SWEEP_TRANSITION_FRACTION = 0.10f
-private const val NATIVE_SWEEP_TRANSITION_MIN_EM = 0.70f
 private const val NATIVE_SWEEP_PROGRESS_EPS = 0.001f
-// 交接色：accent 以 BLEND 比例掺入 fg（不再整段高饱和平台），STOP 处达到峰值后渐隐。
-private const val NATIVE_SWEEP_ACCENT_STOP = 0.40f
-private const val NATIVE_SWEEP_ACCENT_BLEND = 0.55f
-private const val NATIVE_SWEEP_ACCENT_MIN_CHROMA = 0.12f
-private const val NATIVE_SWEEP_ACCENT_ALPHA = 0.95f
-private const val NATIVE_SLOW_GLYPH_CLIP_PAD_EM = 0.22f
-private const val NATIVE_SLOW_GLYPH_CLIP_BLUR_GAIN = 0.25f
+// Apple Web syllable gradient: --gradient-progress 从 -20% 走到 100%，未唱 stop 后移 20%。
+private const val NATIVE_APPLE_SWEEP_LEAD_RATIO = 0.20f
+private const val NATIVE_APPLE_SWEEP_TRAVEL_RATIO = 1.20f
+// Apple Web ordinary syllable 的 y 动画比颜色晚 100ms。
+private const val NATIVE_WORD_LIFT_DELAY_MS = 100L
+// Apple Web constants: 75px is topOffset; currentIndex lookahead is currentPlaybackMillis + 250ms.
+private const val NATIVE_SCROLL_FOCUS_LEAD_MS = 250L
 private const val NATIVE_SLOW_GLYPH_MIN_ADVANCE_PX = 0.5f
-private const val NATIVE_GLYPH_VERTICAL_CLIP_PAD_EM = 0.12f
-private const val NATIVE_SLOW_GLYPH_DESCENDER_EXTRA_EM = 0.10f
-// 慢词只看当前 token/词的总时长，不再按字母数拆平均时长。
-private const val NATIVE_SLOW_WORD_MIN_DURATION_MS = 600L
-// 慢词 rolling wave 高度：Apple Music 风格是低幅漂浮，不是单字弹跳。
-private const val NATIVE_SLOW_LIFT_EM_GAIN = 0.025f
-// 只保留一点呼吸式放大，避免字母尺寸变化造成跳动感。
-private const val NATIVE_SLOW_SCALE_GAIN = 0.052f
-private const val NATIVE_SLOW_SHADOW_FULL_DURATION_SPAN_MS = 2_600f
-private const val NATIVE_SLOW_SHADOW_MIN_DURATION_STRENGTH = 0.70f
-private const val NATIVE_SLOW_SHADOW_MAX_DURATION_STRENGTH = 1.0f
-private const val NATIVE_SLOW_SHADOW_MAIN_ALPHA_MAX = 0.42f
-private const val NATIVE_SLOW_SHADOW_BG_ALPHA_MAX = 0.16f
-private const val NATIVE_SLOW_SHADOW_BLUR_MIN_EM = 0.10f
-private const val NATIVE_SLOW_SHADOW_BLUR_GAIN_EM = 0.32f
-private const val NATIVE_SLOW_SHADOW_STABLE_GAIN = 0.92f
-private const val NATIVE_SLOW_SHADOW_STABLE_BLUR_GAIN = 0.95f
-private const val NATIVE_SLOW_GLOW_EDGE_PAD_EM = 0.08f
-private const val NATIVE_SLOW_COMET_FILL_ALPHA = 0.001f
-private const val NATIVE_SLOW_COMET_TRAIL_DP = 56f
-private const val NATIVE_SLOW_COMET_LEAD_DP = 18f
-private const val NATIVE_SLOW_COMET_PEAK_DP = 10f
-private const val NATIVE_SLOW_SWEEP_PREVIEW_LEAD_MS = 120L
-private const val NATIVE_SLOW_SWEEP_GLOW_TAIL_MS = 280L
-private const val NATIVE_MAIN_WORD_LIFT_EM = 0.070f
-private const val NATIVE_BG_WORD_LIFT_EM = 0.065f
-private const val NATIVE_DUET_INSET_ASPECT = 0.15f
-private const val NATIVE_BUFFERED_OPACITY = 1.0f
-private const val NATIVE_NON_DYNAMIC_OPACITY = 0.40f
+// Apple Web current .syllable/.letter adds 0.75px horizontal padding/inset on a 22px line.
+// Android clips a reused TextLayout slice rather than a DOM glyph box, so keep a small
+// antialias/scale guard to avoid r/j-style overhangs being shaved during lift/scale.
+private const val NATIVE_GLYPH_HORIZONTAL_CLIP_PAD_EM = 1.25f / 22f
+private const val NATIVE_APPLE_TRAILING_WORD_SPACE = "\u2009"
+// ===== 慢词 = Apple Web emphasis letter keyframes =====
+// Apple Web shouldBeEmphasized：词长 >= 1s 且文本单位 <= 7。
+private const val NATIVE_SLOW_WORD_MIN_DURATION_MS = 1_000L
+private const val NATIVE_SLOW_WORD_MAX_UNITS = 7
+private const val NATIVE_APPLE_WEB_LINE_FONT_PX = 22f
+private const val NATIVE_SLOW_LETTER_FIRST_PHASE_MS = 500L
+private const val NATIVE_SLOW_LETTER_TOTAL_MS = 1_000L
+private const val NATIVE_SLOW_SCALE_PEAK = 1.05f
+private const val NATIVE_SLOW_LIFT_PEAK_WEB_PX = 2.05f
+private const val NATIVE_SLOW_LIFT_SETTLE_WEB_PX = 2.0f
+private const val NATIVE_SLOW_SHADOW_PEAK_WEB_PX = 10f
+private const val NATIVE_SLOW_SHADOW_SETTLE_WEB_PX = 4f
+private const val NATIVE_SLOW_SHADOW_PEAK_ALPHA = 0.40f
+private const val NATIVE_SLOW_SHADOW_CLIP_RADIUS_MULTIPLIER = 3f
+// Low alpha carrier used only to make Skia emit the Apple-style text-shadow glyph mask.
+// It stays visually hidden under the gradient text, but avoids the shadow being optimized away.
+private const val NATIVE_SLOW_GLOW_FILL_ALPHA = 0.015f
+// Apple Web ordinary syllable y: 0 -> -2px on the 22px line font.
+private const val NATIVE_MAIN_WORD_LIFT_EM = 2f / 22f
+private const val NATIVE_BG_WORD_LIFT_EM = 2f / 22f
+// Apple Web: `.display-synced-line.is-duet .line { width: 60% }`.
+// Android keeps the row container full-width for hit testing/alignment, then
+// reserves the opposite 40% as padding so v1/v2 lines land on the same side as
+// Apple's left/right duet columns.
 private const val NATIVE_SOLID_LINE_ALPHA = 0.40f
-private const val NATIVE_ACTIVE_UNSUNG_ALPHA = 0.54f
-private const val NATIVE_COMPACT_LAYOUT_DP = 1024f
-private const val NATIVE_BG_WRAPPER_MIN_SCALE = 0.80f
-private const val NATIVE_BG_HIDDEN_SLIDE_RATIO = 0.80f
-private const val NATIVE_BG_APPEAR_LEAD_MS = 160L
-private const val NATIVE_BG_DISAPPEAR_TAIL_MS = 260L
-private const val NATIVE_BG_SLIDE_STIFFNESS = 90f
-private const val NATIVE_BG_SLIDE_DAMPING = 15f
-private const val NATIVE_SUBLINE_OPACITY = 0.42f
-private const val NATIVE_SUBLINE_WRAPPER_MIN_SCALE = 0.92f
-private const val NATIVE_SUBLINE_HIDDEN_SLIDE_DP = 8f
-private const val NATIVE_SUBLINE_HIDDEN_SLIDE_RATIO = 0.18f
-private const val NATIVE_SUBLINE_SLIDE_STIFFNESS = 110f
-private const val NATIVE_SUBLINE_SLIDE_DAMPING = 17f
-private const val NATIVE_SUBLINE_FONT_SCALE = 0.50f
-private const val NATIVE_SUBLINE_LINE_HEIGHT_SCALE = 0.75f
-private const val NATIVE_MASK_ALPHA_ATTACK_SPEED = 50.0f
-private const val NATIVE_MASK_ALPHA_RELEASE_SPEED = 7.0f
-private const val NATIVE_WORD_EXIT_FLOAT_MS = 0L
+private const val NATIVE_GRADIENT_ACTIVE_ALPHA = 0.85f
+private const val NATIVE_GRADIENT_INACTIVE_ALPHA = 0.50f
+// Apple Web `.background-vocals { margin-top: 20px }`(22px 字号≈0.91em）在本端 Trim.None 排版下
+// 会与主歌词行盒的 descent 叠加，看起来像“整整空了一行”。收紧到约 0.34em，让副词紧贴主歌词下方。
+private const val NATIVE_BG_MARGIN_TOP_EM = 7.5f / 22f
+// 副词出现动画：淡入 + 上滑 + 撑开列表高度的时长/缓动/位移量。ease-out 让高度撑开收尾平滑、不突兀。
+private const val NATIVE_BG_REVEAL_MS = 360
+private val NATIVE_BG_REVEAL_EASE = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)
+private const val NATIVE_BG_REVEAL_SLIDE_EM = 6f / 22f
+private const val NATIVE_BG_FONT_SCALE = 14f / 22f
+private const val NATIVE_BG_LINE_HEIGHT_SCALE = (14f * 1.2f) / (22f * 1.1818182f)
+private const val NATIVE_SUBLINE_OPACITY = 0.45f
+private const val NATIVE_SUPPLEMENTARY_OPACITY = 1f
+private const val NATIVE_SUBLINE_ANIMATION_MS = 600
+// Apple Web revealTranslations: secondary y [-10, 0] CSS px on the 22px line font.
+// Static-supplementary/pronunciation uses the same y [-10, 0]; inline ruby supplementary uses -20,
+// but Android currently maps x-roman to a whole-line static subline, not per-word ruby.
+private const val NATIVE_SUBLINE_HIDDEN_SLIDE_WEB_PX = 10f
+private const val NATIVE_SUBLINE_MAX_HEIGHT_WEB_PX = 50f
+private const val NATIVE_SUBLINE_VISIBLE_MARGIN_TOP_EM = 0.2f
+private const val NATIVE_SUBLINE_FONT_SCALE = 13f / 22f
+private const val NATIVE_SUBLINE_LINE_HEIGHT_SCALE = (13f * 1.2f) / (22f * 1.1818182f)
+private const val NATIVE_SUPPLEMENTARY_FONT_SCALE = 15f / 22f
+private const val NATIVE_SUPPLEMENTARY_LINE_HEIGHT_SCALE = (15f * 1.2f) / (22f * 1.1818182f)
+private const val NATIVE_INACTIVE_GAUSSIAN_BLUR_DP = 0f
+private const val NATIVE_BLUR_TRANSITION_MS = 250
 private const val NATIVE_MANUAL_HOLD_MS = 2_800L
 private const val NATIVE_TAP_CONFIRM_WINDOW_MS = 2_800L
-private const val NATIVE_INTERLUDE_MIN_GAP_MS = 4_000L
+private const val NATIVE_INTERLUDE_MIN_GAP_MS = 9_000L
 private const val NATIVE_SAME_CUE_START_GRACE_MS = 32L
-private const val NATIVE_INTERLUDE_BREATHE_TARGET_MS = 1_500f
-private const val NATIVE_INTERLUDE_DOT_GAP_EM = 0.25f
+private const val NATIVE_INTERLUDE_DOT_COUNT = 3f
+private const val NATIVE_INTERLUDE_DOT_SIZE_EM = 10f / 22f
+private const val NATIVE_INTERLUDE_DOT_GAP_RATIO = 0.5f
+private const val NATIVE_INTERLUDE_DOT_INACTIVE_ALPHA = 0.30f
+private const val NATIVE_INTERLUDE_HEARTBEAT_MS = 5_000f
+private const val NATIVE_INTERLUDE_HEARTBEAT_END_MS = 1_000f
+private const val NATIVE_INTERLUDE_ENDING_WINDOW_MS = 1_500f
 private const val NATIVE_INTERLUDE_MARGIN_EM = 0.40f
 private const val NATIVE_SCROLL_SNAP_DISTANCE_PX = 1_200f
 private const val NATIVE_LAYOUT_TARGET_SNAP_DISTANCE_PX = 80f
-// 切句 spring（Apple 质感）：临界阻尼无回弹；行间隔 100~800ms 自适应映射 stiffness。
-private const val NATIVE_SCROLL_SPRING_STIFFNESS_MIN = 190f
-private const val NATIVE_SCROLL_SPRING_STIFFNESS_MAX = 260f
-private const val NATIVE_SCROLL_SPRING_DAMPING_RATIO = 1.0f
-// 级联滚动：目标行下方每行递增的进度延迟（占总程比例）与上限。
-private const val NATIVE_SCROLL_STAGGER_PER_ROW = 0.045f
-private const val NATIVE_SCROLL_STAGGER_MAX = 0.18f
+// Apple Web scrollTop 本身是 350ms，但 current / previous / inactive 行状态不同。
+// Android 这里保持整列同相，避免逐行延迟在快切时互相叠加抖动。
 private const val NATIVE_MANUAL_TOP_BOUNCE_FRACTION = 0.18f
 private const val NATIVE_MANUAL_BOTTOM_BOUNCE_FRACTION = 0.70f
 private const val NATIVE_MANUAL_RESTORE_STIFFNESS = 150f
@@ -3223,12 +3775,16 @@ private const val NATIVE_SEEK_SCROLL_STIFFNESS = 230f
 private const val NATIVE_SEEK_SCROLL_DAMPING = 28f
 private const val NATIVE_INTERLUDE_SCROLL_STIFFNESS = 90f
 private const val NATIVE_INTERLUDE_SCROLL_DAMPING = 15f
+// 常规切句滚动（Apple Music 弹簧式）：stiffness 决定速度（180 ≈ 原 350ms tween 的到位体感），
+// damping=24 → 阻尼比≈0.89，轻微弹性、基本不过冲。想更“弹”可降 damping，想更稳可升 damping。
+private const val NATIVE_LINE_SCROLL_STIFFNESS = 180f
+private const val NATIVE_LINE_SCROLL_DAMPING = 24f
 private const val NATIVE_OVERFLOW_PENALTY_MULTIPLIER = 1_000.0
 private const val NATIVE_CJK_BREAK_PENALTY_RATIO = 0.15
 private const val NATIVE_NORMAL_BREAK_PENALTY_RATIO = 0.50
 private const val NATIVE_SPACE_BREAK_REWARD_RATIO = 0.40
 private const val NATIVE_PUNCTUATION_BREAK_REWARD_RATIO = 0.60
-private const val NATIVE_RENDER_PIPELINE_LEAD_MS = 45f
+private const val NATIVE_RENDER_PIPELINE_LEAD_MS = 0f
 private const val NATIVE_CLOCK_FRAME_RESET_MS = 1_500f
 private const val NATIVE_CLOCK_BACKWARD_RESET_MS = 300f
 private const val NATIVE_CLOCK_START_GUARD_MS = 900L
@@ -3239,8 +3795,21 @@ private const val NATIVE_CLOCK_START_HEADROOM_MS = 120f
 /** 回退校正超过该值就一次性对齐（不再慢动作滑行）——保证任何时刻速度都是 1x。 */
 private const val NATIVE_CLOCK_BACKWARD_SNAP_MS = 120f
 // 数据锚定时钟：|偏差| 超过 SNAP 直接重锚（seek/卡顿）；否则每次报告把 base 拉近 SLEW 比例。
-// 视觉轻微超前时按 GLIDE 速度降速滑行（0.4×）等数据追上，不回跳不冻结。
+// 视觉轻微超前时按 GLIDE 速度降速滑行等数据追上，不回跳不冻结。
 private const val NATIVE_CLOCK_BASE_SNAP_MS = 280.0
 private const val NATIVE_CLOCK_JITTER_BAND_MS = 45.0
 private const val NATIVE_CLOCK_BASE_SLEW = 0.35
-private const val NATIVE_CLOCK_OVERRUN_GLIDE_SPEED = 0.4f
+private const val NATIVE_CLOCK_OVERRUN_GLIDE_SPEED = 0.82f
+private const val NATIVE_APPLE_LINE_CLOCK_RESET_MS = 1_000f
+// 前向限速追赶：gap ≤ FREE 视为稳态噪声直接贴 target；gap > SNAP（卡顿恢复级）即时对齐；
+// 中间档每帧额外行程 = clamp(gap×FRACTION, dt×MIN_RATE, STEP_MAX)——单帧前跳消失，收敛 ≤0.2s。
+private const val NATIVE_CLOCK_FORWARD_FREE_MS = 3f
+private const val NATIVE_CLOCK_FORWARD_SNAP_MS = 300f
+private const val NATIVE_CLOCK_FORWARD_STEP_MAX_MS = 14f
+private const val NATIVE_CLOCK_FORWARD_MIN_RATE = 0.45f
+private const val NATIVE_CLOCK_FORWARD_FRACTION = 0.18f
+// 暂停/rebuffer 瞬间的回拢缓动：≤MAX 的视觉超前在 DURATION 内平滑贴回数据位置
+//（不让扫色在停住的同一帧倒退一截）；≤MIN 视为已对齐、>MAX 视为真实跳位直接对齐。
+private const val NATIVE_CLOCK_PAUSE_EASE_MAX_MS = 160f
+private const val NATIVE_CLOCK_PAUSE_EASE_MIN_MS = 8f
+private const val NATIVE_CLOCK_PAUSE_EASE_DURATION_MS = 140f

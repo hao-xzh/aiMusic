@@ -7,6 +7,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Handler
@@ -94,6 +95,23 @@ class PipoPlaybackService : MediaLibraryService() {
     private var lastExternalFocusInterruptionAtMs = 0L
     private var audioFocusRequest: AudioFocusRequest? = null
     private var playbackCallbackRegistered = false
+    /** 等系统 AUDIOFOCUS_GAIN 回调的连续探测次数 —— 防"对方静默弃焦点、GAIN 永远不来"的死等 */
+    private var focusGainWaitProbes = 0
+    private var trackCacheWarmer: TrackCacheWarmer? = null
+    // —— 网络恢复回调:兜底重试放弃 / 等网络期间注册,网络一回来立刻续播。
+    // 没有它,后台弱网卡死只能等用户回前台(前台那套 20s 自愈是 UI 帧驱动的)。 ——
+    private var networkRecoveryArmed = false
+    private val networkRecoveryCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            mainHandler.post { onNetworkRecovered("available") }
+        }
+
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                mainHandler.post { onNetworkRecovered("validated") }
+            }
+        }
+    }
     private val audioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
@@ -350,9 +368,10 @@ class PipoPlaybackService : MediaLibraryService() {
             .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
             .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
             .build()
+        // 不声明 willPauseWhenDucked：通知音等短暂事件由系统自动压低音量(auto-duck)，
+        // 不进我们的自定义暂停路径 —— 之前声明了却既不暂停也不压音量，通知音全音量叠播。
         audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(platformMusicAttrs)
-            .setWillPauseWhenDucked(true)
             .setAcceptsDelayedFocusGain(false)
             .setOnAudioFocusChangeListener(audioFocusChangeListener, mainHandler)
             .build()
@@ -446,6 +465,9 @@ class PipoPlaybackService : MediaLibraryService() {
                         cancelBufferStallCheck()
                         resetBufferStallAttempts()
                         updateServiceUrlRefreshTriedOnTransition(mediaItem?.mediaId, reason)
+                        // 换曲(含 URL 重签 replace):丢掉旧 URI 的整曲预热,起新曲的
+                        trackCacheWarmer?.cancel()
+                        trackCacheWarmer?.maybeWarmCurrent(this@apply)
                         // 响度对齐:按新当前轨的整曲 rmsDb 设主 player 衰减增益。clip 的 mediaId
                         // ("automix:…")查不到 features → null → 中性(clip 已在 Rust 内部对齐)。
                         playbackGain.applyForRms(
@@ -456,9 +478,27 @@ class PipoPlaybackService : MediaLibraryService() {
                         smartAutoMixer?.onMediaItemTransition(mediaItem, reason)
                     }
 
+                    override fun onPositionDiscontinuity(
+                        oldPosition: Player.PositionInfo,
+                        newPosition: Player.PositionInfo,
+                        reason: Int,
+                    ) {
+                        // seek（含歌词点跳回放旧段）会把 position 拉回历史最高水位之下。
+                        // 进度看门狗的基线"只认创新高"，不随 seek 重置的话，重放旧区间会被
+                        // 误判为 4s 无前进 → 每 4s 原地重踢（seekTo+prepare）：音频打嗝、
+                        // isPlaying 抖动、歌词扫色跳段，直到重新越过旧水位才停
+                        // （诊断日志里 progress_stall_rekick attempt=1 连环就是它）。
+                        // 真实卡死不受影响：重踢自身的 seek 重置基线后位置仍冻结，4s 照样再触发。
+                        if (reason == Player.DISCONTINUITY_REASON_SEEK ||
+                            reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
+                        ) {
+                            if (this@apply.playWhenReady) armProgressWatchdog(this@apply)
+                        }
+                    }
+
                     override fun onPlayerError(error: PlaybackException) {
-                        // 控制层在线时仍优先由 PlayerViewModel 重签 URL；服务层只兜底坏源，
-                        // 防止后台播放卡在同一个失效地址并触发前台服务崩溃。
+                        // 错误恢复唯一权威在服务层(后台也活着)。ViewModel 只记日志不插手,
+                        // 否则两层对同一错误各自 replace+seek+prepare,一次故障打断两次。
                         DiagnosticsLogStore.record(
                             area = "playback_service",
                             event = "player_error",
@@ -471,6 +511,8 @@ class PipoPlaybackService : MediaLibraryService() {
                         notificationPlayer?.armRecoveryWindow()
                         if (isLikelyTransientNetworkError(error)) {
                             lastTransientNetworkErrorAtMs = SystemClock.elapsedRealtime()
+                            // 网络类错误:挂上网络恢复回调,网络一回来立刻重踢续播
+                            armNetworkRecovery("transient-error")
                         }
                         if (isLikelyBadSource(error)) {
                             recoverBadSourceOrSkip(this@apply, error)
@@ -509,6 +551,8 @@ class PipoPlaybackService : MediaLibraryService() {
                                     // 到 READY = 这一刻加载是通的:撤掉待检查、重置该首的重踢预算。
                                     cancelBufferStallCheck()
                                     resetBufferStallAttempts()
+                                    // 开始整曲灌缓存(幂等):整曲落盘后当前曲播放彻底脱离网络
+                                    trackCacheWarmer?.maybeWarmCurrent(this@apply)
                                 } else if (playWhenReady && mediaItemCount > 0) {
                                     // 进入 BUFFERING 且想播 —— 排一个延时检查,后台静默卡死时兜底重踢。
                                     scheduleBufferStallCheck(this@apply)
@@ -606,6 +650,7 @@ class PipoPlaybackService : MediaLibraryService() {
                         if (isPlaying) {
                             requestAudioFocusForPlayback("is-playing")
                             clearAudioFocusAutoResume("playing")
+                            disarmNetworkRecovery()
                             notificationPlayer?.clearRecoveryWindow()
                             mediaSession?.let { session ->
                                 updateNotificationSafely(session, true, "playing")
@@ -652,6 +697,8 @@ class PipoPlaybackService : MediaLibraryService() {
             featuresStore = PipoGraph.audioFeaturesStore,
             crossfadeController = crossfadeController,
         )
+
+        trackCacheWarmer = TrackCacheWarmer(this, serviceScope)
 
         // 通知栏 / 锁屏的"点击区"指回主 Activity —— 没有这条，状态栏播放卡片被
         // 点击后系统找不到目标，整个通知体验不通畅。
@@ -978,7 +1025,7 @@ class PipoPlaybackService : MediaLibraryService() {
             if (!player.playWhenReady || player.mediaItemCount == 0) return@post
             if (player.playbackState == Player.STATE_IDLE) {
                 // Media3 默认通知在 IDLE 时会被 cancel。恢复期先 prepare 到 BUFFERING,
-                // 保住前台媒体会话；真正换 URL / 跳坏歌仍由 PlayerViewModel 决定。
+                // 保住前台媒体会话；真正换 URL / 跳坏歌由服务端坏源恢复链路决定。
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "keep_alive_prepare",
@@ -1018,6 +1065,7 @@ class PipoPlaybackService : MediaLibraryService() {
         if (player.mediaItemCount == 0 || player.currentMediaItem == null) return
         resumeAfterAudioFocusLoss = true
         waitingForAudioFocusGain = waitForAudioFocusGain
+        focusGainWaitProbes = 0
         if (observedExternalAudio) {
             externalAudioObservedSincePause = true
         }
@@ -1131,6 +1179,7 @@ class PipoPlaybackService : MediaLibraryService() {
             AudioManager.AUDIOFOCUS_GAIN -> {
                 hasAudioFocus = true
                 waitingForAudioFocusGain = false
+                focusGainWaitProbes = 0
                 maybeResumeAfterExternalAudioStops("audio-focus-gain")
             }
             AudioManager.AUDIOFOCUS_LOSS -> {
@@ -1189,8 +1238,20 @@ class PipoPlaybackService : MediaLibraryService() {
             return
         }
         if (waitingForAudioFocusGain && !hasAudioFocus) {
-            scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "wait-focus-gain")
-            return
+            focusGainWaitProbes += 1
+            if (focusGainWaitProbes <= FOCUS_GAIN_WAIT_PROBE_LIMIT) {
+                scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "wait-focus-gain")
+                return
+            }
+            // 系统的 AUDIOFOCUS_GAIN 回调等不到(对方静默弃焦/部分 OEM 不派发)。
+            // 外部声音已停,别无限死等 —— 放下等待标记,走下面"主动重新请求焦点"恢复。
+            // 之前这里会每 1.5s 空转直到用户回前台手动播放("后台暂停打开 app 才好"一例)。
+            waitingForAudioFocusGain = false
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "audio_focus_gain_wait_timeout",
+                fields = playerFields(player) + mapOf("probes" to focusGainWaitProbes),
+            )
         }
         val now = SystemClock.elapsedRealtime()
         if (externalAudioQuietSinceMs == 0L) {
@@ -1424,7 +1485,12 @@ class PipoPlaybackService : MediaLibraryService() {
                         "neteaseId" to neteaseId,
                     ),
                 )
-                scheduleBadSourceSkip(player, error)
+                if (shouldWaitForNetworkBeforeSkipping()) {
+                    // 重签拿不到 URL 多半是没网,这时跳下一首同样是死的 —— 原地等网络回来续播
+                    holdStalledTrackForNetwork(player, "bad-source-refresh-empty", startPositionMs)
+                } else {
+                    scheduleBadSourceSkip(player, error)
+                }
                 return@launch
             }
 
@@ -1628,7 +1694,8 @@ class PipoPlaybackService : MediaLibraryService() {
             bufferStallAttempts = 0
         }
         if (bufferStallAttempts >= BUFFER_STALL_MAX_ATTEMPTS) {
-            // 连踢几次都没活 —— 八成网络真没了,停手,交给报错恢复 / 网络回来(READY)/ 回前台,别 prepare 风暴
+            // 连踢几次都没活 —— 八成网络真没了,停手别 prepare 风暴。
+            // 挂上网络恢复回调:网络一回来 onNetworkRecovered 立刻重踢续播,不用等回前台。
             DiagnosticsLogStore.record(
                 area = "playback_service",
                 event = "buffer_stall_give_up",
@@ -1637,6 +1704,7 @@ class PipoPlaybackService : MediaLibraryService() {
                     "bufferedMs" to bufferedNow,
                 ),
             )
+            armNetworkRecovery("buffer-stall-give-up")
             return
         }
         bufferStallAttempts += 1
@@ -1849,6 +1917,7 @@ class PipoPlaybackService : MediaLibraryService() {
         lastProgressAtMs = now
         bufferStallAttemptMediaId = player.currentMediaItem?.mediaId
         bufferStallAttempts = 0
+        armNetworkRecovery("hold-$reason")
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "silent_stall_wait_network",
@@ -1876,6 +1945,74 @@ class PipoPlaybackService : MediaLibraryService() {
         val caps = manager.getNetworkCapabilities(network) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private fun armNetworkRecovery(reason: String) {
+        if (networkRecoveryArmed) return
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching { manager.registerDefaultNetworkCallback(networkRecoveryCallback) }
+            .onSuccess {
+                networkRecoveryArmed = true
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "network_recovery_armed",
+                    fields = mapOf("reason" to reason),
+                )
+            }
+            .onFailure { err ->
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "network_recovery_arm_failed",
+                    fields = mapOf(
+                        "reason" to reason,
+                        "errorType" to err::class.java.simpleName,
+                        "message" to err.message,
+                    ),
+                )
+            }
+    }
+
+    private fun disarmNetworkRecovery() {
+        if (!networkRecoveryArmed) return
+        networkRecoveryArmed = false
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching { manager.unregisterNetworkCallback(networkRecoveryCallback) }
+    }
+
+    /**
+     * 网络恢复(或注册时网络本就在)的单发重踢:还想播且卡在 IDLE/BUFFERING 就
+     * seek 原位 + prepare 续播,并解锁该曲的 URL 重签额度让坏源恢复可以再跑一轮。
+     * 单发后立即注销;若依旧卡死,看门狗/给 up 路径会再次 arm,形成低频重试环。
+     */
+    private fun onNetworkRecovered(trigger: String) {
+        if (!networkRecoveryArmed) return
+        if (!isActiveNetworkReady()) return
+        val player = mediaSession?.player ?: return
+        if (!player.playWhenReady || player.mediaItemCount == 0) {
+            disarmNetworkRecovery()
+            return
+        }
+        val stalled = player.playbackState == Player.STATE_IDLE ||
+            player.playbackState == Player.STATE_BUFFERING
+        if (!stalled) {
+            disarmNetworkRecovery()
+            return
+        }
+        disarmNetworkRecovery()
+        resetBufferStallAttempts()
+        player.currentMediaItem?.mediaId?.let { serviceUrlRefreshTried.remove(it) }
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "network_recovered_rekick",
+            fields = playerFields(player) + mapOf("trigger" to trigger),
+        )
+        notificationPlayer?.armRecoveryWindow()
+        runCatching {
+            player.seekTo(player.currentPosition.coerceAtLeast(0L))
+            player.prepare()
+            player.play()
+        }
+        armProgressWatchdog(player)
     }
 
     private fun updateNotificationSafely(
@@ -1965,6 +2102,9 @@ class PipoPlaybackService : MediaLibraryService() {
         smartAutoMixer = null
         crossfadeController?.release()
         crossfadeController = null
+        trackCacheWarmer?.cancel()
+        trackCacheWarmer = null
+        disarmNetworkRecovery()
         cancelBufferStallCheck()
         cancelProgressWatchdog()
         badSourceRefreshJob?.cancel()
@@ -2001,6 +2141,8 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val PROGRESS_STALL_REKICK_LIMIT = 2
         private const val TRANSIENT_NETWORK_SKIP_DEFER_MS = 60_000L
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
+        /** 等系统 GAIN 回调最多探测次数(×1.5s),超过即放弃死等、主动重新请求焦点 */
+        private const val FOCUS_GAIN_WAIT_PROBE_LIMIT = 4
         private const val AUDIO_FOCUS_PAUSE_CONFIRM_MS = 350L
         private const val EXTERNAL_AUDIO_PAUSE_FLAG_CLEAR_MS = 500L
         private const val EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS = 1_200L
@@ -2027,7 +2169,15 @@ private fun isLikelyBadSource(error: PlaybackException): Boolean = when (error.e
     PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
     PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
     PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
-    PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> true
+    PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+    // 内容本身坏(容器解析/解码失败):可能是 CDN 上的坏副本,重签 URL 换源一次,
+    // 还坏就跳下一首。以前由 ViewModel 直接跳,恢复权收归服务后并入坏源链路。
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+    PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED,
+    PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+    PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED,
+    PlaybackException.ERROR_CODE_DECODING_FAILED,
+    PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED -> true
     else -> false
 }
 

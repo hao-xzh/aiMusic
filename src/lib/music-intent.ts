@@ -500,13 +500,7 @@ function inferQueueAction(
   const albumHints = unique([...intent.textHints.albums]);
 
   if (artistHints.length > 0 || albumHints.length > 0) return "replace";
-  if (/(插一首|插首|插播|加一首|加首|来一首|来首)/.test(q) && trackHints.length >= 1) {
-    return "insert";
-  }
-  if (
-    trackHints.length === 1 &&
-    /^(放|播|听一下|听听|play\s)|^(给我)?(放|播).{1,16}$/.test(q)
-  ) {
+  if (/(下一首|下首|插一首|插首|插播|加一首|加首|排到下一首|等这首|听完)/.test(q) && trackHints.length >= 1) {
     return "insert";
   }
   return "replace";

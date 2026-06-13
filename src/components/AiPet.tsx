@@ -22,6 +22,7 @@ import {
 } from "react";
 import { usePlayer } from "@/lib/player-state";
 import { cdn } from "@/lib/cdn";
+import { netease } from "@/lib/tauri";
 import { announceAi } from "@/lib/ai-announcer";
 import { getAppSettingsSnapshot, useAppSettings } from "@/lib/app-settings";
 import "./AiPet.css";
@@ -30,6 +31,7 @@ import {
   generateDailyGreeting,
   shouldGreetToday,
   markGreeted,
+  type AgentAction,
   type ChatMessage,
 } from "@/lib/pet-agent";
 
@@ -435,6 +437,105 @@ export function AiPet() {
     el.scrollTop = el.scrollHeight;
   }, [messages, pending]);
 
+  const executeAgentActions = useCallback(
+    async (actions: AgentAction[], fallbackText: string): Promise<string> => {
+      let activeTrack: { id: number; title: string } | null = player.current?.neteaseId
+        ? { id: player.current.neteaseId, title: player.current.title }
+        : null;
+      const status: string[] = [];
+      let played = false;
+
+      for (const action of actions) {
+        try {
+          if (action.type === "play_queue") {
+            const [head, ...rest] = action.tracks;
+            if (!head) throw new Error("没有可播歌曲");
+            await player.playNetease(head, [head, ...rest], {
+              smooth: false,
+              continuous: action.continuous ?? null,
+            });
+            activeTrack = { id: head.id, title: head.name };
+            played = true;
+            if (fallbackText === "我来。") status.push(`放了：${head.name}`);
+            continue;
+          }
+
+          if (action.type === "insert_next") {
+            const [head] = action.tracks;
+            if (!head) throw new Error("没有可插播歌曲");
+            await player.insertNextBatch(action.tracks, {
+              jumpToInserted: action.jumpToInserted,
+            });
+            if (action.jumpToInserted) activeTrack = { id: head.id, title: head.name };
+            status.push(action.jumpToInserted ? `插了：${head.name}` : `排到下一首：${head.name}`);
+            continue;
+          }
+
+          if (action.type === "skip") {
+            player.next();
+            activeTrack = null;
+            status.push("换一首。");
+            continue;
+          }
+
+          if (action.type === "previous") {
+            player.prev();
+            activeTrack = null;
+            status.push("回上一首。");
+            continue;
+          }
+
+          if (action.type === "pause") {
+            player.pause();
+            status.push("暂停了。");
+            continue;
+          }
+
+          if (action.type === "resume") {
+            await player.resume();
+            status.push("继续。");
+            continue;
+          }
+
+          if (action.type === "like_current") {
+            if (!activeTrack) throw new Error("现在没在放歌");
+            await netease.likeSong(activeTrack.id, action.like);
+            player.setAiStatus(action.like ? "收藏好了" : "取消收藏了");
+            status.push(action.like ? `收藏好了：${activeTrack.title}` : `取消收藏了：${activeTrack.title}`);
+            continue;
+          }
+
+          if (action.type === "like_track") {
+            await netease.likeSong(action.track.id, action.like);
+            status.push(action.like ? `收藏好了：${action.track.name}` : `取消收藏了：${action.track.name}`);
+            continue;
+          }
+
+          if (action.type === "modify_playlist_current") {
+            if (!activeTrack) throw new Error("现在没在放歌");
+            await netease.playlistModifyTracks(
+              action.playlistId,
+              action.add ? "add" : "del",
+              [activeTrack.id],
+            );
+            status.push(action.add ? `已加入「${action.playlistName}」` : `已移出「${action.playlistName}」`);
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const done = status.length > 0 ? `${status.join("，")}。但` : "";
+          return `${done}没做成：${msg}`;
+        }
+      }
+
+      if (fallbackText && fallbackText !== "我来。") {
+        const sideStatus = played ? status.filter((item) => !item.startsWith("放了：")) : status;
+        return sideStatus.length > 0 ? `${fallbackText} ${sideStatus.join("，")}` : fallbackText;
+      }
+      return status.join("，") || fallbackText || "好了。";
+    },
+    [player],
+  );
+
   const send = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
@@ -458,30 +559,32 @@ export function AiPet() {
               }
             : null,
         });
-        const assistantMsg: ChatMessage = {
-          role: "assistant",
-          // res.text 永远有人格 reply（pet-agent 已经保证）。极端兜底 "嗯。"
-          text: res.text || "嗯。",
-          play: res.play ?? undefined,
-        };
-        setMessages([...next, assistantMsg]);
-        announceAi(assistantMsg.text, { kind: "pet", ttlMs: 5600 });
-
-        // 触发播放
-        if (res.play && res.resolvedTracks.length > 0) {
+        let finalText = res.text || "嗯。";
+        if (res.actions && res.actions.length > 0) {
+          finalText = await executeAgentActions(res.actions, finalText);
+        } else if (res.play && res.resolvedTracks.length > 0) {
           const [head, ...rest] = res.resolvedTracks;
           if (res.queueAction === "insert") {
             await player.insertNext(head);
-            return;
+          } else {
+            // pet-agent 内部已经跑过 smoothQueue，不要再来一遍
+            // 传 continuous: 队列接近末尾时 player 自己会调它续杯。
+            // null 时 player 走普通模式（modulo 循环老队列）—— 适合用户明说"排5首"那种场景
+            await player.playNetease(head, [head, ...rest], {
+              smooth: false,
+              continuous: res.continuous ?? null,
+            });
           }
-          // pet-agent 内部已经跑过 smoothQueue，不要再来一遍
-          // 传 continuous: 队列接近末尾时 player 自己会调它续杯。
-          // null 时 player 走普通模式（modulo 循环老队列）—— 适合用户明说"排5首"那种场景
-          await player.playNetease(head, [head, ...rest], {
-            smooth: false,
-            continuous: res.continuous ?? null,
-          });
         }
+        const assistantMsg: ChatMessage = {
+          role: "assistant",
+          // res.text 永远有人格 reply（pet-agent 已经保证）。极端兜底 "嗯。"
+          text: finalText,
+          play: res.play ?? undefined,
+          actions: res.actions,
+        };
+        setMessages([...next, assistantMsg]);
+        announceAi(assistantMsg.text, { kind: "pet", ttlMs: 5600 });
       } catch (e) {
         console.warn("[pipo] pet send failed", e);
         setMessages([
@@ -492,7 +595,7 @@ export function AiPet() {
         setPending(false);
       }
     },
-    [messages, pending, player],
+    [messages, pending, player, executeAgentActions],
   );
 
   return (

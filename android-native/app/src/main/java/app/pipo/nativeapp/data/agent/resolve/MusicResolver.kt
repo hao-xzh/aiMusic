@@ -5,6 +5,7 @@ import app.pipo.nativeapp.data.BehaviorPreferenceSnapshot
 import app.pipo.nativeapp.data.CandidateRanker
 import app.pipo.nativeapp.data.CandidateRecall
 import app.pipo.nativeapp.data.ContinuousQueueSource
+import app.pipo.nativeapp.data.FunctionalMusicFilter
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetIntent
 import app.pipo.nativeapp.data.PipoGraph
@@ -105,15 +106,32 @@ class MusicResolver(
                 )
             }
             PlayMode.InsertNext -> {
-                action.target?.let { trackResolver.resolve(it, scopedTracks, allowOnline = allowOnline).track }?.let(::listOf)
-                    ?: rankForIntent(
+                // desiredCount=1 仍是“下一首插某首”；>1 是批量插播（这首听完放 X 的歌/
+                // 某专辑/下一首开始听 Y）：目标歌（若有）打头，其余按意图排序补齐。
+                val desired = action.desiredCount.coerceIn(1, 30)
+                val head = action.target?.let { trackResolver.resolve(it, scopedTracks, allowOnline = allowOnline).track }
+                when {
+                    head != null && desired <= 1 -> listOf(head)
+                    head != null -> mergeUnique(
+                        listOf(head),
+                        rankForIntent(
+                            intentFor(action, plan, scopedTracks),
+                            input,
+                            scopedTracks,
+                            desired,
+                            action.primaryGoal.artistScope,
+                            allowOnline = allowOnline,
+                        ),
+                    ).take(desired)
+                    else -> rankForIntent(
                         intentFor(action, plan, scopedTracks),
                         input,
                         scopedTracks,
-                        desired = 1,
-                        artistScope = action.primaryGoal.artistScope,
+                        desired,
+                        action.primaryGoal.artistScope,
                         allowOnline = allowOnline,
-                    ).take(1)
+                    ).take(desired)
+                }
             }
             PlayMode.ReplaceQueue -> {
                 val explicitCount = CommandTextSignals.explicitDesiredCount(plan.userText)
@@ -379,17 +397,25 @@ class MusicResolver(
             .filter { it.isNotBlank() }
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
-        // 分批并行搜（批内 3 个并行，凑够 desired 不开下一批）。query 按「具体歌→歌手→风格」
+        // 分批并行搜（批内 3 个并行，凑够目标不开下一批）。query 按「具体歌→歌手→风格」
         // 优先级排序，合并仍按该顺序取，结果语义与串行一致；wall-time 约为串行的 1/3。
+        // 多收一倍做新鲜度池：搜索接口固定返回相同 top-N，若只收 desired 张，
+        // 用户短时间重复同一风格要求时会拿到一模一样的歌单；收 2x 后把近期推过的
+        // 沉底，优先给没推过的。
+        val poolTarget = desired * 2
+        val allowFunctional = FunctionalMusicFilter.mentionsFunctional(
+            listOf(intent.queryText) + intent.hardGenres + intent.musicHintsGenres +
+                intent.refStyles + intent.aiMainStyles,
+        )
         for (batch in queries.chunked(3)) {
-            if (out.size >= desired) break
+            if (out.size >= poolTarget) break
             val hitsPerQuery = coroutineScope {
                 batch.map { query ->
                     async { runCatching { repository.searchTracks(query, limit = 20) }.getOrDefault(emptyList()) }
                 }.awaitAll()
             }
             for (hits in hitsPerQuery) {
-                if (out.size >= desired) break
+                if (out.size >= poolTarget) break
                 val scopedHits = when {
                     artistScope == ArtistScope.Strict && artistKeys.isNotEmpty() ->
                         hits.filter { artistMatchesAny(it.artist, artistKeys) }
@@ -398,12 +424,40 @@ class MusicResolver(
                     else -> hits
                 }
                 for (track in scopedHits) {
+                    // 情绪词搜索的助眠/养生流水线内容不进候选（明确要纯音乐/点名歌手除外）。
+                    if (!allowFunctional &&
+                        FunctionalMusicFilter.isFunctional(track.title, track.artist) &&
+                        !artistMatchesAny(track.artist, artistKeys)
+                    ) {
+                        continue
+                    }
                     if (seen.add(TrackDedupe.songKey(track))) out.add(track)
-                    if (out.size >= desired) break
+                    if (out.size >= poolTarget) break
                 }
             }
         }
-        return out
+        return demoteRecentlyRecommended(out).take(desired)
+    }
+
+    /** 近期（24h/7d）推荐过的沉底：池子够大时等于换一批新歌；池子太小时仍允许重复兜底。 */
+    private fun demoteRecentlyRecommended(tracks: List<NativeTrack>): List<NativeTrack> {
+        if (tracks.size <= 1) return tracks
+        val recent = runCatching { PipoGraph.recommendationLog.recentContext() }.getOrNull() ?: return tracks
+        if (recent.last24hTrackIds.isEmpty() && recent.last7dTrackIds.isEmpty()) return tracks
+        val fresh = ArrayList<NativeTrack>(tracks.size)
+        val weekStale = ArrayList<NativeTrack>()
+        val dayStale = ArrayList<NativeTrack>()
+        for (track in tracks) {
+            val id = track.neteaseId
+            when {
+                id == null -> fresh.add(track)
+                id in recent.last24hTrackIds -> dayStale.add(track)
+                id in recent.last7dTrackIds -> weekStale.add(track)
+                else -> fresh.add(track)
+            }
+        }
+        if (dayStale.isEmpty() && weekStale.isEmpty()) return tracks
+        return fresh + weekStale + dayStale
     }
 
     private fun continuousSourceFor(
@@ -429,9 +483,30 @@ class MusicResolver(
             }
         }
         val seedQueries = buildContinuationSearchQueries(intent).ifEmpty { listOf(plan.userText) }
-        return ContinuousQueueSource { excludeIds ->
-            searchContinuation(seedQueries, artistScope, artistKeys, excludeIds)
+        val allowFunctional = FunctionalMusicFilter.mentionsFunctional(
+            listOf(intent.queryText, plan.userText) + intent.hardGenres + intent.musicHintsGenres +
+                intent.refStyles + intent.aiMainStyles,
+        )
+        val preferLatin = intent.hardLanguages.any { lang ->
+            "英" in lang || lang.lowercase().startsWith("eng")
         }
+        return ContinuousQueueSource { excludeIds ->
+            searchContinuation(seedQueries, artistScope, artistKeys, excludeIds, allowFunctional, preferLatin)
+        }
+    }
+
+    /** 标题+歌手以拉丁字母为主（粗粒度语言判定，仅用于排序偏好，不做硬过滤）。 */
+    private fun titleMostlyLatin(track: NativeTrack): Boolean {
+        val text = "${track.title} ${track.artist}"
+        var latin = 0
+        var cjk = 0
+        for (ch in text) {
+            when {
+                ch in 'a'..'z' || ch in 'A'..'Z' -> latin++
+                Character.UnicodeScript.of(ch.code) == Character.UnicodeScript.HAN -> cjk++
+            }
+        }
+        return latin > cjk
     }
 
     private suspend fun searchContinuation(
@@ -439,6 +514,8 @@ class MusicResolver(
         artistScope: ArtistScope,
         artistKeys: List<String>,
         excludeIds: Set<Long>,
+        allowFunctional: Boolean,
+        preferLatin: Boolean,
     ): List<NativeTrack> {
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
@@ -463,17 +540,33 @@ class MusicResolver(
                 for (track in scopedHits) {
                     val id = track.neteaseId
                     if (id != null && id in excludeIds) continue
+                    // 续杯是无人值守的：情绪词搜索返回的助眠/养生流水线内容必须挡掉
+                    //（点名歌手的结果放行），否则一次续杯就把电台灌满纯音乐。
+                    if (!allowFunctional &&
+                        FunctionalMusicFilter.isFunctional(track.title, track.artist) &&
+                        !artistMatchesAny(track.artist, artistKeys)
+                    ) {
+                        continue
+                    }
                     if (seen.add(TrackDedupe.songKey(track))) out.add(track)
                     if (out.size >= CONTINUATION_WANT_COUNT * 2) break
                 }
             }
         }
+        // 英文意图的电台：拉丁字面的结果优先（中文流行/功能性内容沉底），稳定分区不打乱组内顺序。
+        if (preferLatin) {
+            val (latin, other) = out.partition { titleMostlyLatin(it) }
+            out.clear()
+            out.addAll(latin)
+            out.addAll(other)
+        }
         val deduped = TrackDedupe.capSameTitle(out)
-        return when (artistScope) {
+        val ordered = when (artistScope) {
             ArtistScope.Strict -> deduped
             ArtistScope.Focus -> diversifyByArtistButPreserveFocus(deduped, artistKeys)
             ArtistScope.Similar -> diversifyByArtist(deduped)
-        }.take(CONTINUATION_WANT_COUNT)
+        }
+        return demoteRecentlyRecommended(ordered).take(CONTINUATION_WANT_COUNT)
     }
 
     private fun buildContinuationSearchQueries(intent: PetIntent): List<String> {

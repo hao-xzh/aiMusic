@@ -252,9 +252,9 @@ function BehaviorStat({ label, value, accent }: { label: string; value: string; 
 const behaviorBlock: React.CSSProperties = {
   marginTop: 24,
   padding: "clamp(14px, 2.6vw, 20px)",
-  borderRadius: 14,
+  borderRadius: 0,
   border: "1px solid rgba(233,239,255,0.08)",
-  background: "rgba(12,16,24,0.55)",
+  background: "rgba(10,13,20,0.55)",
 };
 
 const libraryQueueRow: React.CSSProperties = {
@@ -267,7 +267,7 @@ const libraryQueueRow: React.CSSProperties = {
 const microBtn: React.CSSProperties = {
   height: 30,
   padding: "0 12px",
-  borderRadius: 999,
+  borderRadius: 0,
   border: "1px solid rgba(155,227,198,0.22)",
   background: "rgba(155,227,198,0.08)",
   color: "#9be3c6",
@@ -679,7 +679,7 @@ function Status({ text }: { text: string }) {
     <div
       style={{
         padding: "14px 18px",
-        borderRadius: 12,
+        borderRadius: 0,
         background: "rgba(155,227,198,0.06)",
         border: "1px solid rgba(155,227,198,0.2)",
         color: "#9be3c6",
@@ -750,10 +750,10 @@ function PickRow({
           alt=""
           width={44}
           height={44}
-          style={{ width: 44, height: 44, borderRadius: 6, objectFit: "cover", flexShrink: 0 }}
+          style={{ width: 44, height: 44, borderRadius: 0, objectFit: "cover", flexShrink: 0 }}
         />
       ) : (
-        <div style={{ width: 44, height: 44, borderRadius: 6, background: "rgba(155,227,198,0.12)", flexShrink: 0 }} />
+        <div style={{ width: 44, height: 44, borderRadius: 0, background: "rgba(155,227,198,0.12)", flexShrink: 0 }} />
       )}
       <div style={{ flex: 1, minWidth: 0 }}>
         <div
@@ -806,20 +806,21 @@ const discoveryHeader: React.CSSProperties = {
 };
 
 const primaryBtn: React.CSSProperties = {
-  padding: "9px 18px",
-  borderRadius: 999,
-  border: "1px solid rgba(155,227,198,0.5)",
-  background: "rgba(155,227,198,0.16)",
-  color: "#9be3c6",
-  fontSize: 13,
+  padding: "8px 14px",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.92)",
+  background: "rgba(233,239,255,0.94)",
+  color: "#05060a",
+  fontSize: 12,
   fontWeight: 600,
+  letterSpacing: 0.8,
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
 
 const errorBlock: React.CSSProperties = {
   padding: "12px 16px",
-  borderRadius: 12,
+  borderRadius: 0,
   background: "rgba(255,180,180,0.08)",
   border: "1px solid rgba(255,180,180,0.25)",
   color: "#ffb4b4",
@@ -832,15 +833,15 @@ const pickRowStyle: React.CSSProperties = {
   alignItems: "center",
   gap: 12,
   padding: "10px 12px",
-  borderRadius: 12,
-  background: "rgba(12,16,24,0.55)",
+  borderRadius: 0,
+  background: "rgba(10,13,20,0.55)",
   border: "1px solid rgba(233,239,255,0.06)",
 };
 
 const playBtn: React.CSSProperties = {
   width: 36,
   height: 36,
-  borderRadius: 999,
+  borderRadius: 0,
   border: "1px solid rgba(155,227,198,0.4)",
   background: "rgba(155,227,198,0.1)",
   color: "#9be3c6",
@@ -860,7 +861,7 @@ const voteGroup: React.CSSProperties = {
 const voteBtn: React.CSSProperties = {
   height: 28,
   padding: "0 9px",
-  borderRadius: 999,
+  borderRadius: 0,
   border: "1px solid rgba(233,239,255,0.10)",
   background: "rgba(255,255,255,0.04)",
   color: "rgba(233,239,255,0.62)",
@@ -980,7 +981,7 @@ function ChipRow({ chips, accent }: { chips: string[]; accent?: boolean }) {
           key={i}
           style={{
             padding: "6px 12px",
-            borderRadius: 999,
+            borderRadius: 0,
             border: accent
               ? "1px solid rgba(255,210,138,0.4)"
               : "1px solid rgba(233,239,255,0.18)",
@@ -1024,18 +1025,18 @@ const emptyCard: React.CSSProperties = {
   textAlign: "center",
   background: "rgba(12,16,24,0.55)",
   border: "1px solid rgba(233,239,255,0.08)",
-  borderRadius: 16,
+  borderRadius: 0,
   marginTop: 30,
 };
 
 const ctaBtn: React.CSSProperties = {
   display: "inline-block",
   marginTop: 18,
-  padding: "10px 22px",
-  borderRadius: 999,
-  border: "1px solid rgba(155,227,198,0.5)",
-  background: "rgba(155,227,198,0.14)",
-  color: "#9be3c6",
+  padding: "8px 14px",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.92)",
+  background: "rgba(233,239,255,0.94)",
+  color: "#05060a",
   textDecoration: "none",
   fontSize: 13,
   fontWeight: 600,
@@ -1093,7 +1094,7 @@ const sectionTitle: React.CSSProperties = {
 const weightTrack: React.CSSProperties = {
   flex: 1,
   height: 6,
-  borderRadius: 999,
+  borderRadius: 0,
   background: "rgba(233,239,255,0.06)",
   overflow: "hidden",
 };
@@ -1101,7 +1102,7 @@ const weightTrack: React.CSSProperties = {
 const weightFill: React.CSSProperties = {
   height: "100%",
   background: "rgba(245,247,255,0.85)",
-  borderRadius: 999,
+  borderRadius: 0,
   transition: "width 320ms ease",
 };
 
@@ -1114,8 +1115,8 @@ const weightLabel: React.CSSProperties = {
 };
 
 const secondaryBtn: React.CSSProperties = {
-  padding: "9px 18px",
-  borderRadius: 999,
+  padding: "8px 14px",
+  borderRadius: 0,
   border: "1px solid rgba(233,239,255,0.18)",
   background: "transparent",
   color: "#e9efff",

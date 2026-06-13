@@ -6,8 +6,8 @@
 //! 多 provider 设计：
 //!   - 每个 provider 有自己的一份 `ProviderSlot`（key + 选中的 model）
 //!   - 顶层 `provider` 字段记录当前用谁；切 provider 不会清掉别家的 key，让用户能反复切回去
-//!   - base_url 写死在 `default_base_url()`（全部 OpenAI 兼容），不暴露给用户改 ——
-//!     避免用户填错把流量打到不存在的端点
+//!   - 官方 provider 的 base_url 走 `default_base_url()`；自定义 provider 允许用户填
+//!     OpenAI-compatible 中转站地址
 //!
 //! 兼容老配置：
 //!   早版本只存了 `deepseek_api_key + model + base_url` 三个 flat 字段。读到老 schema
@@ -26,6 +26,7 @@ pub enum Provider {
     Deepseek,
     Openai,
     XiaomiMimo,
+    Custom,
 }
 
 impl Provider {
@@ -35,6 +36,7 @@ impl Provider {
             Provider::Deepseek => "deepseek",
             Provider::Openai => "openai",
             Provider::XiaomiMimo => "xiaomi-mimo",
+            Provider::Custom => "custom",
         }
     }
 }
@@ -44,6 +46,8 @@ pub struct ProviderSlot {
     #[serde(default)]
     pub api_key: Option<String>,
     pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl ProviderSlot {
@@ -51,13 +55,14 @@ impl ProviderSlot {
         Self {
             api_key: None,
             model: default_model.to_string(),
+            base_url: None,
         }
     }
 }
 
 /// 用户可配置的 AI 参数。
 ///
-/// 注意：base_url 不再可改 —— 走 default_base_url(provider)，前端只暴露 provider + model。
+/// 注意：官方 provider 的 base_url 不暴露给用户改；自定义 provider 会使用 slot.base_url。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
     #[serde(default = "default_provider")]
@@ -66,10 +71,16 @@ pub struct AiConfig {
     pub openai: ProviderSlot,
     #[serde(rename = "xiaomi_mimo")]
     pub xiaomi_mimo: ProviderSlot,
+    #[serde(default = "default_custom_slot")]
+    pub custom: ProviderSlot,
 }
 
 fn default_provider() -> Provider {
     Provider::Deepseek
+}
+
+fn default_custom_slot() -> ProviderSlot {
+    ProviderSlot::new(default_model(Provider::Custom))
 }
 
 impl Default for AiConfig {
@@ -79,6 +90,7 @@ impl Default for AiConfig {
             deepseek: ProviderSlot::new(default_model(Provider::Deepseek)),
             openai: ProviderSlot::new(default_model(Provider::Openai)),
             xiaomi_mimo: ProviderSlot::new(default_model(Provider::XiaomiMimo)),
+            custom: default_custom_slot(),
         }
     }
 }
@@ -96,6 +108,38 @@ pub fn default_base_url(provider: Provider) -> &'static str {
         Provider::Deepseek => "https://api.deepseek.com",
         Provider::Openai => "https://api.openai.com/v1",
         Provider::XiaomiMimo => "https://api.xiaomimimo.com/v1",
+        Provider::Custom => "",
+    }
+}
+
+/// 自定义 provider 的地址规整：允许用户粘 base_url，也允许粘完整 chat endpoint。
+pub fn normalize_base_url(input: &str) -> Result<String, String> {
+    let mut s = input.trim().trim_end_matches('/').to_string();
+    if s.is_empty() {
+        return Err("请求地址不能为空".into());
+    }
+    if !(s.starts_with("https://") || s.starts_with("http://")) {
+        return Err("请求地址必须以 http:// 或 https:// 开头".into());
+    }
+    let suffix = "/chat/completions";
+    if s.to_ascii_lowercase().ends_with(suffix) {
+        let new_len = s.len() - suffix.len();
+        s.truncate(new_len);
+        s = s.trim_end_matches('/').to_string();
+    }
+    if s.is_empty() || s == "http:/" || s == "https:/" {
+        return Err("请求地址不完整".into());
+    }
+    Ok(s)
+}
+
+pub fn effective_base_url(provider: Provider, slot: &ProviderSlot) -> Option<String> {
+    if provider == Provider::Custom {
+        slot.base_url
+            .as_deref()
+            .and_then(|s| normalize_base_url(s).ok())
+    } else {
+        Some(default_base_url(provider).to_string())
     }
 }
 
@@ -105,6 +149,7 @@ pub fn default_model(provider: Provider) -> &'static str {
         Provider::Deepseek => "deepseek-v4-flash",
         Provider::Openai => "gpt-5.5",
         Provider::XiaomiMimo => "mimo-v2-flash",
+        Provider::Custom => "gpt-4o-mini",
     }
 }
 
@@ -117,6 +162,7 @@ pub fn default_embedding_model(provider: Provider) -> Option<&'static str> {
         Provider::Deepseek => None,
         Provider::Openai => Some("text-embedding-3-small"),
         Provider::XiaomiMimo => None,
+        Provider::Custom => Some("text-embedding-3-small"),
     }
 }
 
@@ -139,6 +185,14 @@ pub fn known_models(provider: Provider) -> &'static [(&'static str, &'static str
             ("mimo-v2-pro", "MiMo V2 Pro · 旗舰 · 1M 上下文"),
             ("mimo-v2-omni", "MiMo V2 Omni · 多模态"),
             ("mimo-v2-flash", "MiMo V2 Flash · 性价比"),
+        ],
+        Provider::Custom => &[
+            ("gpt-4o-mini", "GPT-4o Mini · 中转常见"),
+            ("gpt-4o", "GPT-4o · 中转常见"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.5-mini", "GPT-5.5 Mini"),
+            ("deepseek-chat", "DeepSeek Chat · 中转常见"),
+            ("deepseek-reasoner", "DeepSeek Reasoner · 中转常见"),
         ],
     }
 }
@@ -181,18 +235,17 @@ impl AiConfigStore {
 
     /// 当前激活 provider 的运行时三元组：(api_key, base_url, model)
     /// chat 调用都走这个，统一一处。
-    pub fn active(&self) -> (Option<String>, &'static str, String) {
+    pub fn active(&self) -> (Option<String>, Option<String>, String) {
         let cfg = self.snapshot();
         let slot = match cfg.provider {
             Provider::Deepseek => cfg.deepseek,
             Provider::Openai => cfg.openai,
             Provider::XiaomiMimo => cfg.xiaomi_mimo,
+            Provider::Custom => cfg.custom,
         };
-        (
-            slot.api_key.filter(|s| !s.trim().is_empty()),
-            default_base_url(cfg.provider),
-            slot.model,
-        )
+        let base_url = effective_base_url(cfg.provider, &slot);
+        let api_key = slot.api_key.filter(|s| !s.trim().is_empty());
+        (api_key, base_url, slot.model)
     }
 
     pub fn update<F: FnOnce(&mut AiConfig)>(&self, f: F) -> Result<()> {

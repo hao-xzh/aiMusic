@@ -359,12 +359,16 @@ class RecommendEngine(
         val out = LinkedHashMap<String, NativeTrack>()  // songKey -> track
         val anchorArtistKey = anchor?.firstArtistKey()
         val artistCount = HashMap<String, Int>()
+        // mood/genre seed 在网易搜索里会捞回助眠/养生流水线内容；除非用户正在听的
+        // 锚点本身就是功能性音乐（那继续推同类才对），一律挡掉。
+        val anchorFunctional = anchor != null && FunctionalMusicFilter.isFunctional(anchor.title, anchor.artist)
         for (seed in seeds) {
             if (out.size >= wantCount * 3) break
             val hits = runCatching { repository.searchTracks(seed, limit = 12) }.getOrDefault(emptyList())
             for (t in hits) {
                 val ne = t.neteaseId ?: continue
                 if (ne in excludeIds) continue
+                if (!anchorFunctional && FunctionalMusicFilter.isFunctional(t.title, t.artist)) continue
                 val sk = TrackDedupe.songKey(t)
                 if (sk in out) continue
                 val ak = t.firstArtistKey()

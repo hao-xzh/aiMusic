@@ -179,6 +179,28 @@ pub async fn netease_search(
         .map_err(to_err)
 }
 
+#[tauri::command]
+pub async fn netease_like_song(
+    state: NeteaseState<'_>,
+    id: i64,
+    like: bool,
+) -> Result<bool, String> {
+    state.like_song(id, like).await.map_err(to_err)
+}
+
+#[tauri::command]
+pub async fn netease_playlist_modify_tracks(
+    state: NeteaseState<'_>,
+    playlist_id: i64,
+    op: String,
+    track_ids: Vec<i64>,
+) -> Result<bool, String> {
+    state
+        .playlist_modify_tracks(playlist_id, &op, &track_ids)
+        .await
+        .map_err(to_err)
+}
+
 /// 退出登录。当前实现只是丢掉 cookie jar，用 new() 建一个新的。
 /// 因为 Arc<NeteaseClient> 被 Tauri 当作 managed state，没法原地替换；
 /// 这里先返回一个提示，让前端自己 state reset —— 持久化/清空在 Phase 1 做。

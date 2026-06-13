@@ -33,7 +33,14 @@ import {
 import { audio, cache, netease, wrapAudioUrl, type TrackInfo } from "./tauri";
 import { cdn } from "./cdn";
 import { parseLrc, type LrcLine } from "./lrc";
-import { parseYrc, type YrcLine } from "./yrc";
+import { parseAmllTtml } from "./amll-ttml";
+import {
+  attachTimedCompanionLines,
+  lrcLinesToYrcLines,
+  parseYrc,
+  stripLeadingLyricCredits,
+  type YrcLine,
+} from "./yrc";
 import {
   judgeTransition,
   DEFAULT_JUDGMENT,
@@ -193,6 +200,10 @@ const PLAYBACK_LEVELS = ["lossless", "exhigh", "higher", "standard"] as const;
 type PlaybackLevel = (typeof PLAYBACK_LEVELS)[number];
 const SONG_URL_TIMEOUT_MS = 15_000;
 const SONG_URL_CACHE_TTL_MS = 20 * 60_000;
+const AMLL_TTML_BASE_URL = "https://raw.githubusercontent.com/amll-dev/amll-ttml-db/main/ncm-lyrics/";
+const AMLL_TTML_CACHE_PREFIX = "amll_ttml:ncm:";
+const AMLL_TTML_MISS = "__MISS_404__";
+const AMLL_TTML_TIMEOUT_MS = 6_000;
 
 type SongUrlCacheEntry = {
   url: string;
@@ -210,6 +221,64 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
   } finally {
     if (timeoutId != null) clearTimeout(timeoutId);
   }
+}
+
+async function loadAmllLyricsFor(neteaseId: number): Promise<YrcLine[] | null> {
+  const key = `${AMLL_TTML_CACHE_PREFIX}${neteaseId}`;
+  try {
+    const cached = await cache.getState(key);
+    if (cached === AMLL_TTML_MISS) return null;
+    if (cached) {
+      const parsed = parseAmllTtml(cached);
+      if (parsed.length > 0) return stripLeadingLyricCredits(parsed);
+    }
+  } catch {}
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AMLL_TTML_TIMEOUT_MS);
+  try {
+    const resp = await fetch(`${AMLL_TTML_BASE_URL}${neteaseId}.ttml`, {
+      signal: controller.signal,
+      headers: {
+        Accept: "application/ttml+xml,application/xml,text/xml,*/*",
+      },
+    });
+    if (resp.status === 404) {
+      cache.setState(key, AMLL_TTML_MISS).catch(() => {});
+      return null;
+    }
+    if (!resp.ok) return null;
+    const text = await resp.text();
+    const parsed = parseAmllTtml(text);
+    if (parsed.length === 0) return null;
+    cache.setState(key, text).catch(() => {});
+    return stripLeadingLyricCredits(parsed);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function mergeNeteaseLyricData(data: {
+  lyric: string | null;
+  translation?: string | null;
+  yrc?: string | null;
+}): { lines: LrcLine[]; yrcLines: YrcLine[] } {
+  const lines = stripLeadingLyricCredits(parseLrc(data.lyric));
+  const translations = parseLrc(data.translation ?? null);
+  const yrcLines = stripLeadingLyricCredits(parseYrc(data.yrc ?? null));
+  if (translations.length === 0) return { lines, yrcLines };
+  if (yrcLines.length > 0) {
+    return {
+      lines,
+      yrcLines: attachTimedCompanionLines(yrcLines, translations, "translation"),
+    };
+  }
+  return {
+    lines,
+    yrcLines: attachTimedCompanionLines(lrcLinesToYrcLines(lines), translations, "translation"),
+  };
 }
 
 export type Track = {
@@ -270,6 +339,11 @@ export type PlayNeteaseOptions = {
   continuous?: ContinuousQueueSource | null;
 };
 
+export type InsertNextOptions = {
+  /** true = 插完立刻切过去；false = 只排到当前歌后面。默认保持旧行为 true。 */
+  jumpToInserted?: boolean;
+};
+
 export type PlayerAPI = PlayerState & {
   playNetease: (
     t: TrackInfo,
@@ -277,7 +351,8 @@ export type PlayerAPI = PlayerState & {
     opts?: PlayNeteaseOptions,
   ) => Promise<void>;
   warmTrackUrls: (tracks: TrackInfo[], limit?: number) => void;
-  insertNext: (t: TrackInfo) => Promise<void>;
+  insertNext: (t: TrackInfo, opts?: InsertNextOptions) => Promise<void>;
+  insertNextBatch: (tracks: TrackInfo[], opts?: InsertNextOptions) => Promise<void>;
   pause: () => void;
   resume: () => void;
   toggle: () => void;
@@ -957,6 +1032,22 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     if (!track.neteaseId) return;
     const neteaseId = track.neteaseId;
     const fail = { lyric: "", yrc: null, instrumental: false, uncollected: true };
+    const amllLines = await loadAmllLyricsFor(neteaseId);
+    if (amllLines && amllLines.length > 0) {
+      setState((s) => {
+        if (s.current?.neteaseId !== neteaseId) return s;
+        return {
+          ...s,
+          lyric: {
+            lines: [],
+            yrcLines: amllLines,
+            instrumental: false,
+            uncollected: false,
+          },
+        };
+      });
+      return;
+    }
     let data;
     try {
       const cached = await cache.getLyric(neteaseId);
@@ -968,11 +1059,12 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     }
     setState((s) => {
       if (s.current?.neteaseId !== neteaseId) return s;
+      const parsed = mergeNeteaseLyricData(data!);
       return {
         ...s,
         lyric: {
-          lines: parseLrc(data!.lyric),
-          yrcLines: parseYrc(data!.yrc ?? null),
+          lines: parsed.lines,
+          yrcLines: parsed.yrcLines,
           instrumental: data!.instrumental,
           uncollected: data!.uncollected,
         },
@@ -1325,36 +1417,49 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     [playTrackInternal],
   );
 
-  const insertNext = useCallback(
-    async (t: TrackInfo) => {
-      const inserted = neteaseToTrack(t);
+  const insertNextBatch = useCallback(
+    async (tracks: TrackInfo[], opts?: InsertNextOptions) => {
+      const incoming = tracks.filter(Boolean);
+      if (incoming.length === 0) return;
+      const inserted = incoming.map(neteaseToTrack);
       const { current, queue } = stateRef.current;
+      const jumpToInserted = opts?.jumpToInserted ?? true;
 
       if (!current || queue.length === 0) {
-        await playNetease(t, [t], { smooth: false });
+        await playNetease(incoming[0], incoming, { smooth: false });
         return;
       }
 
       const currentIdx = queue.findIndex((item) => item.id === current.id);
       if (currentIdx < 0) {
-        await playNetease(t, [t], { smooth: false });
+        await playNetease(incoming[0], incoming, { smooth: false });
         return;
       }
 
-      // 单曲插队保留原队列和续杯 source：播完插入歌后，自动回到原本的下一首。
-      const withoutDuplicate = queue.filter((item) => item.id !== inserted.id);
+      // 插队保留原队列和续杯 source：播完插入段后，自动回到原本的下一首。
+      const insertedIds = new Set(inserted.map((item) => item.id));
+      const withoutDuplicate = queue.filter((item) => !insertedIds.has(item.id));
       const currentIdxAfterDedupe = withoutDuplicate.findIndex((item) => item.id === current.id);
       const insertAt = currentIdxAfterDedupe + 1;
       const nextQueue = [
         ...withoutDuplicate.slice(0, insertAt),
-        inserted,
+        ...inserted,
         ...withoutDuplicate.slice(insertAt),
       ];
       setState((s) => ({ ...s, queue: nextQueue }));
       cache.setState(LAST_QUEUE_KEY, JSON.stringify(nextQueue)).catch(() => {});
-      await playTrackInternal(inserted, { manualCut: true });
+      if (jumpToInserted) {
+        await playTrackInternal(inserted[0], { manualCut: true });
+      }
     },
     [playNetease, playTrackInternal],
+  );
+
+  const insertNext = useCallback(
+    async (t: TrackInfo, opts?: InsertNextOptions) => {
+      await insertNextBatch([t], opts);
+    },
+    [insertNextBatch],
   );
 
   const pause = useCallback(() => {
@@ -1737,6 +1842,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       playNetease,
       warmTrackUrls,
       insertNext,
+      insertNextBatch,
       pause,
       resume,
       toggle,
@@ -1748,7 +1854,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       like,
       dislike,
     }),
-    [state, playNetease, warmTrackUrls, insertNext, pause, resume, toggle, next, prev, seek, setAiStatus, setMood, like, dislike],
+    [state, playNetease, warmTrackUrls, insertNext, insertNextBatch, pause, resume, toggle, next, prev, seek, setAiStatus, setMood, like, dislike],
   );
 
   return <PlayerCtx.Provider value={api}>{children}</PlayerCtx.Provider>;

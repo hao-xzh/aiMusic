@@ -23,7 +23,8 @@ export type YrcChar = {
   timingParts?: YrcTimingPart[];
 };
 
-export type YrcLineRole = "primary" | "companion" | "translation";
+export type YrcLineRole = "primary" | "companion" | "translation" | "romaji";
+export type YrcLineAlignment = "start" | "end";
 
 export type YrcLine = {
   /** 行起点秒 */
@@ -36,6 +37,7 @@ export type YrcLine = {
   chars: YrcChar[];
   companionLines?: YrcLine[];
   role?: YrcLineRole;
+  alignment?: YrcLineAlignment;
 };
 
 const LINE_HEADER_RE = /^\[(\d+),(\d+)\]/;
@@ -399,8 +401,107 @@ function yrcAudioStart(line: YrcLine): number {
 
 function yrcAudioEnd(line: YrcLine): number {
   const charEnd = Math.max(0, ...line.chars.map((char) => char.startSec + Math.max(0.001, char.durSec)));
-  return Math.max(line.time + Math.max(0, line.durSec), charEnd || line.time);
+  const companionEnd = Math.max(0, ...(line.companionLines ?? []).map(yrcAudioEnd));
+  return Math.max(line.time + Math.max(0, line.durSec), charEnd || line.time, companionEnd || line.time);
 }
+
+export function lrcLinesToYrcLines(lines: readonly { time: number; text: string }[]): YrcLine[] {
+  return lines
+    .filter((line) => line.text.trim().length > 0)
+    .map((line, idx) => {
+      const nextTime = lines[idx + 1]?.time;
+      return {
+        time: line.time,
+        durSec: Math.max(0.4, (nextTime ?? line.time + 4) - line.time),
+        text: line.text,
+        chars: [],
+        role: "primary" as const,
+      };
+    });
+}
+
+export function attachTimedCompanionLines(
+  primaryLines: readonly YrcLine[],
+  companionLines: readonly { time: number; text: string }[],
+  role: Exclude<YrcLineRole, "primary">,
+): YrcLine[] {
+  if (primaryLines.length === 0 || companionLines.length === 0) return [...primaryLines];
+  const next = primaryLines.map((line) => ({
+    ...line,
+    companionLines: [...(line.companionLines ?? [])],
+  }));
+  for (const companion of companionLines) {
+    const text = companion.text.trim();
+    if (!text) continue;
+    const hostIndex = findLineCompanionHostIndex(companion.time, next);
+    if (hostIndex < 0) continue;
+    const host = next[hostIndex]!;
+    host.companionLines = [
+      ...(host.companionLines ?? []),
+      {
+        time: companion.time,
+        durSec: host.durSec,
+        text,
+        chars: [],
+        role,
+      },
+    ];
+  }
+  return next;
+}
+
+function findLineCompanionHostIndex(time: number, primaryLines: readonly YrcLine[]): number {
+  let bestIndex = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  primaryLines.forEach((line, idx) => {
+    const start = yrcAudioStart(line);
+    const end = primaryLines[idx + 1] ? yrcAudioStart(primaryLines[idx + 1]!) : yrcAudioEnd(line) + 1.2;
+    const windowStart = start - 0.3;
+    const windowEnd = Math.max(windowStart, end - 0.001);
+    if (time < windowStart || time > windowEnd) return;
+    const distance = Math.abs(time - start);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = idx;
+    }
+  });
+  return bestIndex;
+}
+
+export function stripLeadingLyricCredits<T extends { time: number; text: string }>(lines: readonly T[]): T[] {
+  if (lines.length === 0) return [...lines];
+  let drop = 0;
+  let sawKeywordCredit = false;
+  lines.forEach((line, idx) => {
+    if (idx !== drop) return;
+    const text = line.text.trim();
+    const prevTime = idx > 0 ? lines[idx - 1]!.time : 0;
+    let isCredit = false;
+    if (
+      CREDIT_PREFIX_RE.test(text) ||
+      CREDIT_PREFIX_SHORT_RE.test(text) ||
+      ENGLISH_CREDIT_PREFIX_RE.test(text)
+    ) {
+      sawKeywordCredit = true;
+      isCredit = true;
+    } else if (idx === 0 && line.time <= 1 && TITLE_HEADER_RE.test(text)) {
+      isCredit = true;
+    } else if (sawKeywordCredit && line.time - prevTime <= 3 && GENERIC_LABEL_RE.test(text)) {
+      isCredit = true;
+    }
+    if (isCredit) drop = idx + 1;
+  });
+  if (drop === 0 || drop >= lines.length) return [...lines];
+  return lines.slice(drop);
+}
+
+const CREDIT_PREFIX_RE =
+  /^[（(\[【]?\s*(作词|作詞|填词|填詞|作曲|谱曲|譜曲|编曲|編曲|制作人|製作人|监制|監製|出品人|出品|发行|發行|录音师|錄音師|录音室|錄音室|录音棚|錄音棚|录音|錄音|混音师|混音師|混音|母带|母帶|和声|和聲|合声|合聲|配唱|演唱|原唱|翻唱|演奏|吉他|贝斯|貝斯|贝司|键盘|鍵盤|钢琴|鋼琴|弦乐|弦樂|打击乐|打擊樂|人声|人聲|制作|製作|企划|企劃|统筹|統籌|文案|封面|插画|插畫|设计|設計|总监|總監|工程师|工程師)[一-鿿A-Za-z ./&-]{0,20}[:：]/;
+const CREDIT_PREFIX_SHORT_RE = /^[（(\[【]?\s*(词|詞|曲|鼓|OP|SP)\s*[A-Za-z ./&-]{0,16}[:：]/;
+const ENGLISH_CREDIT_PREFIX_RE =
+  /^(lyrics?|lyricist|written|composers?|composed|arrangers?|arranged|producers?|produced|mix(?:ing|ed)?|master(?:ing|ed)?|record(?:ing|ed)?|vocals?|backing vocals?|guitars?|bass|drums?|keyboards?|piano|strings|engineer(?:ed)?|label|published?|publisher)\s*(?:by)?\s*[:：]/i;
+const TITLE_HEADER_RE = /^\S[^:：]{0,40}\s[-—–]\s.{1,40}$/;
+const GENERIC_LABEL_RE = /^[^:：。，！？!?,]{1,16}[:：].{0,60}$/;
 
 function isAsciiWordFragment(value: string): boolean {
   let hasAsciiWord = false;

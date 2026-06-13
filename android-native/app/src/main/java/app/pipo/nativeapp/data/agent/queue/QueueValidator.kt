@@ -164,7 +164,10 @@ class QueueValidator(
         if (play == null) return
         val target: TrackRequirement? = when (play.mode) {
             PlayMode.PlayNow -> CommandTextSignals.artistTrackTarget(userText) ?: CommandTextSignals.connectiveLeadTrack(userText)
-            PlayMode.InsertNext -> CommandTextSignals.insertNextTrack(userText)
+            // 批量插播（“这首听完放 X 的歌/下一首开始听 Y”）原话里没有具体歌名，
+            // 正则会把“开始听taylor”这类短语误当歌名 → 首曲必然对不上而被阻断。
+            // 只对单曲插播做文本目标校验；结构化 target 的校验在 validateStructuredTarget 不受影响。
+            PlayMode.InsertNext -> if (play.tracks.size > 1) null else CommandTextSignals.insertNextTrack(userText)
             PlayMode.ReplaceQueue -> null
         }
         val first = play.tracks.firstOrNull()

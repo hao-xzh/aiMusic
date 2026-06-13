@@ -33,7 +33,7 @@
  */
 
 import { ai, cache, netease } from "./tauri";
-import type { TrackInfo } from "./tauri";
+import type { PlaylistInfo, TrackInfo } from "./tauri";
 import { getMemoryDigest, recordUserUtterance } from "./pet-memory";
 import { loadTasteProfile } from "./taste-profile";
 import { getAppContext, describeContext } from "./context";
@@ -70,6 +70,8 @@ export type ChatMessage = {
   text: string;
   /** 如果这条 assistant 消息触发了播放，附上播放计划 */
   play?: PlayPlan;
+  /** 桌面执行型 agent 的真实动作列表。 */
+  actions?: AgentAction[];
 };
 
 export type PlayPlan = {
@@ -77,6 +79,32 @@ export type PlayPlan = {
   /** 内部播放计划摘要；极简 UI 不展示。 */
   reason: string;
 };
+
+export type AgentAction =
+  | {
+      type: "play_queue";
+      mode: "replace" | "play_now";
+      tracks: TrackInfo[];
+      continuous?: ContinuousSource | null;
+    }
+  | {
+      type: "insert_next";
+      tracks: TrackInfo[];
+      /** false = 只排到下一首；true = 立刻切过去。 */
+      jumpToInserted: boolean;
+    }
+  | { type: "skip" }
+  | { type: "previous" }
+  | { type: "pause" }
+  | { type: "resume" }
+  | { type: "like_current"; like: boolean }
+  | { type: "like_track"; like: boolean; track: TrackInfo }
+  | {
+      type: "modify_playlist_current";
+      add: boolean;
+      playlistId: number;
+      playlistName: string;
+    };
 
 // ---------- 每日首开问候 ----------
 
@@ -242,7 +270,294 @@ export type AgentResponse = {
   queueAction?: "insert" | "replace";
   /** 续杯式推荐：队列接近末尾时由 player-state 调用，返回下一批同口味的歌 */
   continuous?: ContinuousSource | null;
+  /** Android 同款的真实执行动作；AiPet 只按这里落地，不靠文案猜动作。 */
+  actions?: AgentAction[];
 };
+
+function emptyAgentResponse(text: string, actions: AgentAction[] = []): AgentResponse {
+  return {
+    text,
+    play: null,
+    resolvedTracks: [],
+    actions: actions.length > 0 ? actions : undefined,
+  };
+}
+
+async function planDirectAgentResponse(input: AgentInput): Promise<AgentResponse | null> {
+  const text = input.userText.trim();
+  if (!text) return emptyAgentResponse("嗯。");
+
+  const playlistModify = await buildModifyPlaylistAction(text);
+  if (playlistModify && !hasPlaybackBeforeSideEffect(text)) {
+    if (typeof playlistModify === "string") return emptyAgentResponse(playlistModify);
+    return emptyAgentResponse("我来。", [playlistModify]);
+  }
+
+  const playlistPlayback = await buildPlaylistPlaybackResponse(text);
+  if (playlistPlayback) return playlistPlayback;
+
+  const control = detectPlaybackControlAction(text);
+  if (control && (!containsMusicPlaybackRequest(text) || isPurePlaybackControlRequest(text))) {
+    return emptyAgentResponse("我来。", [control]);
+  }
+
+  const likeCurrent = detectLikeCurrentAction(text);
+  if (likeCurrent && !containsMusicPlaybackRequest(text)) {
+    return emptyAgentResponse("我来。", [likeCurrent]);
+  }
+
+  const namedLike = await buildNamedLikeAction(text);
+  if (namedLike && !containsMusicPlaybackRequest(text)) {
+    if (typeof namedLike === "string") return emptyAgentResponse(namedLike);
+    return emptyAgentResponse("我来。", [namedLike]);
+  }
+
+  return null;
+}
+
+async function planPostPlaybackActions(input: AgentInput): Promise<AgentAction[]> {
+  const text = input.userText.trim();
+  if (!containsMusicPlaybackRequest(text)) return [];
+  const out: AgentAction[] = [];
+
+  const modify = await buildModifyPlaylistAction(text);
+  if (modify && typeof modify !== "string") out.push(modify);
+
+  const likeCurrent = detectLikeCurrentAction(text);
+  if (likeCurrent) out.push(likeCurrent);
+
+  const namedLike = await buildNamedLikeAction(text);
+  if (namedLike && typeof namedLike !== "string") out.push(namedLike);
+
+  return dedupeActions(out);
+}
+
+function containsMusicPlaybackRequest(text: string): boolean {
+  const q = text.toLowerCase();
+  if (/(下一首|下首|插播|插一首|插首|排到下一首|等这首|听完)/.test(q)) return true;
+  return /(播放|放|播|听|想听|来点|来一首|来首|排一组|排个|换一组|打开).{0,24}(歌|歌单|播放列表|音乐|专辑|artist|playlist|track)?/.test(q);
+}
+
+function hasPlaybackBeforeSideEffect(text: string): boolean {
+  const idx = text.search(/(?:再|然后|并且|同时|顺便|接着|再把|再将)/);
+  if (idx < 0) return false;
+  return containsMusicPlaybackRequest(text.slice(0, idx));
+}
+
+function shouldJumpToInserted(text: string): boolean {
+  const q = text.toLowerCase();
+  if (/(不要打断|别打断|听完|等这首|下一首|下首|排到下一首|插到下一首)/.test(q)) {
+    return false;
+  }
+  if (/(现在|马上|立刻|直接|立即|切过去|先放|先播)/.test(q)) return true;
+  // 对齐 Android：插播默认排在当前歌后面，不打断当前播放。
+  return false;
+}
+
+function detectPlaybackControlAction(text: string): AgentAction | null {
+  const q = text.toLowerCase();
+  if (/(暂停|停一下|先停|pause)/.test(q)) return { type: "pause" };
+  if (/(继续|接着放|恢复播放|resume)/.test(q)) return { type: "resume" };
+  if (/(上一首|上一曲|上一支|previous|prev)/.test(q)) return { type: "previous" };
+  if (/(下一首|下一曲|跳过|换一首|切下一首|next)/.test(q)) return { type: "skip" };
+  return null;
+}
+
+function isPurePlaybackControlRequest(text: string): boolean {
+  const q = text.toLowerCase().replace(/[。,.!！?？\s]/g, "");
+  return /^(暂停|停一下|先停|pause|继续|接着放|恢复播放|resume|上一首|上一曲|上一支|previous|prev|下一首|下一曲|跳过|换一首|切下一首|next)$/.test(q);
+}
+
+function detectLikeCurrentAction(text: string): AgentAction | null {
+  const q = text.toLowerCase();
+  const currentRef = /(这首|这歌|当前|现在这首|正在放|正在播|它)/.test(q);
+  if (/(取消收藏|取消红心|取消喜欢|不喜欢)/.test(q) && currentRef) {
+    return { type: "like_current", like: false };
+  }
+  if (/(收藏|喜欢|红心|like)/.test(q) && (currentRef || /^(收藏|喜欢|红心|like)$/i.test(q.trim()))) {
+    return { type: "like_current", like: true };
+  }
+  return null;
+}
+
+async function buildNamedLikeAction(text: string): Promise<AgentAction | string | null> {
+  const q = text.trim();
+  if (!/(收藏|喜欢|红心|like|取消收藏|取消红心|取消喜欢|不喜欢)/i.test(q)) return null;
+  if (detectLikeCurrentAction(q)) return null;
+  if (/歌单|播放列表/.test(q)) return null;
+  const like = !/(取消收藏|取消红心|取消喜欢|不喜欢)/.test(q);
+  const target = extractNamedLikeTarget(q);
+  if (!target) return null;
+  const track = await resolveBestOnlineTrack(target);
+  if (!track) return `没找到「${target}」。`;
+  return { type: "like_track", like, track };
+}
+
+function extractNamedLikeTarget(text: string): string {
+  const quoted = extractQuotedName(text);
+  if (quoted) return quoted;
+  const patterns = [
+    /(?:把|将)\s*([^，。,.!！?？]{1,40}?)(?:取消收藏|收藏|取消红心|红心|取消喜欢|喜欢|like)/i,
+    /(?:取消收藏|收藏|取消红心|红心|取消喜欢|喜欢|like)\s*([^，。,.!！?？]{1,40})/i,
+  ];
+  for (const pattern of patterns) {
+    const hit = text.match(pattern)?.[1]?.trim();
+    if (!hit) continue;
+    const cleaned = hit
+      .replace(/^(一下|这首|当前|现在这首|正在放的?)/, "")
+      .replace(/(这首|这歌|歌曲|歌|音乐|一下)$/g, "")
+      .trim();
+    if (cleaned && cleaned.length >= 1) return cleaned;
+  }
+  return "";
+}
+
+async function buildModifyPlaylistAction(text: string): Promise<AgentAction | string | null> {
+  const q = text.trim();
+  if (!/歌单|播放列表/.test(q)) return null;
+  const add = /(加入|加到|添加到|添加进|放进|收进|存到)/.test(q);
+  const remove = /(移出|移除|删除|删掉|拿掉|去掉|从.+删|从.+移)/.test(q);
+  if (!add && !remove) return null;
+  const name = extractPlaylistNameForModify(q);
+  if (!name) return "要操作哪个歌单？";
+  const playlists = await loadUserPlaylistsSafe();
+  if (typeof playlists === "string") return playlists;
+  const playlist = matchPlaylist(playlists, name);
+  if (!playlist) return `没找到歌单「${name}」。`;
+  return {
+    type: "modify_playlist_current",
+    add,
+    playlistId: playlist.id,
+    playlistName: playlist.name,
+  };
+}
+
+async function buildPlaylistPlaybackResponse(text: string): Promise<AgentResponse | null> {
+  const name = extractPlaylistPlaybackName(text);
+  if (!name) return null;
+  const playlists = await loadUserPlaylistsSafe();
+  if (typeof playlists === "string") return emptyAgentResponse(playlists);
+  const playlist = matchPlaylist(playlists, name);
+  if (!playlist) return emptyAgentResponse(`没找到歌单「${name}」。`);
+  const detail = await netease.playlistDetail(playlist.id).catch(() => null);
+  const tracks = detail?.tracks?.slice(0, 200) ?? [];
+  if (tracks.length === 0) return emptyAgentResponse(`「${playlist.name}」里没拿到可播的歌。`);
+  const action: AgentAction = {
+    type: "play_queue",
+    mode: "replace",
+    tracks,
+    continuous: null,
+  };
+  return {
+    text: `打开「${detail?.name || playlist.name}」。`,
+    play: {
+      trackIds: tracks.map((track) => track.id),
+      reason: "playlist",
+    },
+    resolvedTracks: tracks,
+    queueAction: "replace",
+    continuous: null,
+    actions: [action],
+  };
+}
+
+async function loadUserPlaylistsSafe(): Promise<PlaylistInfo[] | string> {
+  const account = await netease.account().catch(() => null);
+  if (!account) return "先登录网易云，我才能操作真实歌单。";
+  const playlists = await netease.userPlaylists(account.userId, 1000).catch(() => null);
+  if (!playlists) return "歌单列表没拉到。";
+  return playlists;
+}
+
+function matchPlaylist(playlists: PlaylistInfo[], query: string): PlaylistInfo | null {
+  const q = normalizeForMatch(query.replace(/^我的/, ""));
+  if (!q) return null;
+  return playlists.find((p) => normalizeForMatch(p.name) === q)
+    ?? playlists.find((p) => normalizeForMatch(p.name).includes(q))
+    ?? playlists.find((p) => q.includes(normalizeForMatch(p.name)))
+    ?? null;
+}
+
+function extractPlaylistPlaybackName(text: string): string {
+  if (/(加入|加到|添加到|添加进|放进|收进|存到|移出|移除|删除|删掉|拿掉|去掉)/.test(text)) return "";
+  const quoted = extractQuotedName(text);
+  if (quoted && /歌单|播放列表/.test(text)) return quoted;
+  const patterns = [
+    /(?:打开|播放|放|听)\s*(?:我的|已有|收藏|网易云)?\s*([^，。,.!！?？]{1,40}?)(?:歌单|播放列表)/,
+    /(?:打开|播放|放|听)\s*(?:我的|已有|收藏|网易云)?\s*[《「“"]([^》」”"]{1,40})[》」”"]\s*(?:歌单|播放列表)?/,
+  ];
+  for (const pattern of patterns) {
+    const hit = pattern.exec(text)?.[1]?.trim();
+    const cleaned = sanitizePlaylistName(hit ?? "");
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+function extractPlaylistNameForModify(text: string): string {
+  const quoted = extractQuotedName(text);
+  if (quoted) return quoted;
+  const patterns = [
+    /(?:加入|加到|添加到|添加进|放进|收进|存到)\s*(?:我的|已有|收藏|网易云)?\s*([^，。,.!！?？]{1,40}?)(?:歌单|播放列表)/,
+    /(?:从)\s*(?:我的|已有|收藏|网易云)?\s*([^，。,.!！?？]{1,40}?)(?:歌单|播放列表).*(?:移出|移除|删除|删掉|拿掉|去掉)/,
+    /(?:移出|移除|删除|删掉|拿掉|去掉).{0,8}(?:我的|已有|收藏|网易云)?\s*([^，。,.!！?？]{1,40}?)(?:歌单|播放列表)/,
+  ];
+  for (const pattern of patterns) {
+    const hit = pattern.exec(text)?.[1]?.trim();
+    const cleaned = sanitizePlaylistName(hit ?? "");
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+function extractQuotedName(text: string): string {
+  return text.match(/[《「“"]([^》」”"]{1,60})[》」”"]/)?.[1]?.trim() ?? "";
+}
+
+function sanitizePlaylistName(raw: string): string {
+  return raw
+    .replace(/^(我的|已有|收藏|网易云)/, "")
+    .replace(/(这个|那个|这张|那张|里面|里|中|的)$/g, "")
+    .trim();
+}
+
+async function resolveBestOnlineTrack(query: string): Promise<TrackInfo | null> {
+  const hits = await netease.search(query, 10).catch(() => []);
+  if (hits.length === 0) return null;
+  const q = normalizeForMatch(query);
+  return hits
+    .filter((track) => {
+      const title = normalizeForMatch(track.name);
+      if (!q || !title) return true;
+      return title.includes(q) || q.includes(title) || q.includes(normalizeForMatch(track.artists.map((a) => a.name).join("")));
+    })
+    .sort((a, b) => trackVariantWeight(a.name) - trackVariantWeight(b.name))[0]
+    ?? hits[0]
+    ?? null;
+}
+
+function dedupeActions(actions: AgentAction[]): AgentAction[] {
+  const seen = new Set<string>();
+  const out: AgentAction[] = [];
+  for (const action of actions) {
+    const key = actionKey(action);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(action);
+  }
+  return out;
+}
+
+function actionKey(action: AgentAction): string {
+  switch (action.type) {
+    case "like_current": return `like_current:${action.like}`;
+    case "like_track": return `like_track:${action.like}:${action.track.id}`;
+    case "modify_playlist_current": return `playlist:${action.add}:${action.playlistId}`;
+    case "insert_next": return `insert:${action.tracks.map((t) => t.id).join(",")}:${action.jumpToInserted}`;
+    case "play_queue": return `play:${action.mode}:${action.tracks[0]?.id ?? 0}`;
+    default: return action.type;
+  }
+}
 
 /**
  * 主入口。
@@ -266,6 +581,16 @@ export type AgentResponse = {
  * 同时人格 reply 现在和意图同源生成，不会出现"AI 嘴上说放歌但不放"或反过来。
  */
 export async function chat(input: AgentInput): Promise<AgentResponse> {
+  // 用户说话先写入跨 session 记忆(在 AI 调用前 fire-and-forget,
+  // 这样如果用户连续发话,后面的 AI 调用看得到前面的话作为上下文)
+  if (!input.skipMemory) {
+    void recordUserUtterance(input.userText);
+  }
+
+  const direct = await planDirectAgentResponse(input);
+  if (direct) return direct;
+  const postPlaybackActions = await planPostPlaybackActions(input);
+
   const ctx = getAppContext();
   // 顺手把天气也拉一份(memo'd, 几乎免费)给到上下文,
   // 让"下雨/晴/冷/热"成为人格回复可以借力的锚点之一。
@@ -273,12 +598,6 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
   // 跨 session 记忆: 偏好艺人 / 跳过率 / 上次说过什么 / 听过多少首
   // 让 Pipo 不再每次启动都失忆。
   const memoryDigest = await getMemoryDigest().catch(() => "");
-
-  // 用户说话先写入跨 session 记忆(在 AI 调用前 fire-and-forget,
-  // 这样如果用户连续发话,后面的 AI 调用看得到前面的话作为上下文)
-  if (!input.skipMemory) {
-    void recordUserUtterance(input.userText);
-  }
 
   // ---- 阶段 1：人格 + 意图（一次 LLM 调用）----
   const intent = await parseMusicIntent(input.userText, {
@@ -367,6 +686,14 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
       resolvedTracks: [picked],
       queueAction: "insert",
       continuous: null,
+      actions: dedupeActions([
+        {
+          type: "insert_next",
+          tracks: [picked],
+          jumpToInserted: shouldJumpToInserted(input.userText),
+        },
+        ...postPlaybackActions,
+      ]),
     };
   }
 
@@ -473,6 +800,14 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
       resolvedTracks: [picked],
       queueAction: "insert",
       continuous: null,
+      actions: dedupeActions([
+        {
+          type: "insert_next",
+          tracks: [picked],
+          jumpToInserted: shouldJumpToInserted(input.userText),
+        },
+        ...postPlaybackActions,
+      ]),
     };
   }
 
@@ -556,6 +891,15 @@ export async function chat(input: AgentInput): Promise<AgentResponse> {
     resolvedTracks: smoothed,
     queueAction: "replace",
     continuous,
+    actions: dedupeActions([
+      {
+        type: "play_queue",
+        mode: "replace",
+        tracks: smoothed,
+        continuous,
+      },
+      ...postPlaybackActions,
+    ]),
   };
 }
 

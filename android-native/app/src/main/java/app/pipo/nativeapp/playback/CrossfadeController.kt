@@ -50,6 +50,8 @@ internal class CrossfadeController(
         val resumePositionMs: Long,
         val crossfadeMs: Long,
         val startedAtMs: Long,
+        /** 主队列里 next 条目的头裁剪量（源坐标）：接管 seek 前必须换算，否则跳位。 */
+        val nextItemClipStartMs: Long = 0L,
         var auxReadyDelayMs: Long? = null,
         var fadeStartedAtMs: Long? = null,
         var takingOver: Boolean = false,
@@ -133,6 +135,9 @@ internal class CrossfadeController(
             resumePositionMs = resumeMs,
             crossfadeMs = crossfadeMs,
             startedAtMs = SystemClock.elapsedRealtime(),
+            // nextMediaItem 是主队列里的原条目（带头裁剪）；aux 用 buildUpon 覆盖了
+            // 裁剪所以播的是源坐标，主播放器接管时必须减回这个差值。
+            nextItemClipStartMs = nextMediaItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L),
         )
         DiagnosticsLogStore.record(
             area = "automix",
@@ -222,14 +227,17 @@ internal class CrossfadeController(
         handler.removeCallbacks(tickRunnable)
         val handoffStartedAtMs = SystemClock.elapsedRealtime()
         val actualResumeMs = actualResumePositionMs(a)
+        // actualResumeMs 是源坐标（aux 覆盖裁剪后从源位置播）；主队列条目带头裁剪
+        //（条目 0 点 = 源 clipStart），不换算就 seek 会让交接瞬间内容前跳 clipStart。
+        val mainSeekMs = (actualResumeMs - a.nextItemClipStartMs).coerceAtLeast(0L)
         runCatching {
             mainPlayer.volume = 0f
             if (mainPlayer.currentMediaItem?.mediaId == a.nextId) {
                 // A 已在 next(early-transition):同 item 内直接 seek 到接续点
-                mainPlayer.seekTo(actualResumeMs)
+                mainPlayer.seekTo(mainSeekMs)
             } else {
                 // 常规:A 还在当前曲,主动跳到 next 的接续点(跳过当前曲剩余的极小尾巴)
-                mainPlayer.seekTo(a.nextIndex, actualResumeMs)
+                mainPlayer.seekTo(a.nextIndex, mainSeekMs)
             }
             if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
                 mainPlayer.prepare()

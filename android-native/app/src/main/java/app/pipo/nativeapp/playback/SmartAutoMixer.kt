@@ -456,10 +456,15 @@ internal class SmartAutoMixer(
         mainPlayer.volume = 0f
         running.phase = MixPhase.WaitingForNext
         resetTempoLock(plan, "jump")
+        // 入场点（entryCue）是源音频坐标；队列里的条目已做头静音裁剪（0 点 = 源 headMs）。
+        // 直接用源坐标 seek 会把头静音跳两次（最深可达数秒），落点越过节拍/人声入点，
+        // 接歌“切太深”。换算到条目坐标后再 seek；预缓冲也从条目 0 点开始，
+        // 落点贴近 0 还能命中 gapless 预读，缩短静音洞。
+        val seekPositionMs = nextItemClippedPosition(plan, plan.nextStartPositionMs)
         if (mainPlayer.currentMediaItem?.mediaId == plan.nextId) {
-            mainPlayer.seekTo(plan.nextStartPositionMs)
+            mainPlayer.seekTo(seekPositionMs)
         } else {
-            mainPlayer.seekTo(plan.nextIndex, plan.nextStartPositionMs)
+            mainPlayer.seekTo(plan.nextIndex, seekPositionMs)
         }
         if (mainPlayer.playbackState == Player.STATE_IDLE || mainPlayer.playbackState == Player.STATE_ENDED) {
             mainPlayer.prepare()
@@ -540,8 +545,13 @@ internal class SmartAutoMixer(
         val nextItem = mainPlayer.getMediaItemAt(nextIndex)
         val currentTrack = currentItem.toNativeTrack() ?: return null
         val nextTrack = nextItem.toNativeTrack() ?: return null
+        // 特征时长与元数据不符 = 特征是从截断/不同版本音频上分析的，它描述的
+        // outro/intro 根本不是这条音频的真实首尾——在这种特征上做切歌决策，
+        // 就是“人声没唱完就切”的来源之一。当缺失处理（走活体幅度兜底）。
         val currentFeatures = featuresStore.get(currentTrack.id)
+            ?.takeIf { featuresDurationAgrees(it, currentTrack, "current") }
         val nextFeatures = featuresStore.get(nextTrack.id)
+            ?.takeIf { featuresDurationAgrees(it, nextTrack, "next") }
         val currentDurationMs = mainPlayer.duration.takeIf { it > 0 && it != C.TIME_UNSET } ?: 0L
         val currentClipSourceDurationMs = currentDurationMs +
             currentItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
@@ -1427,6 +1437,36 @@ internal class SmartAutoMixer(
         )
     }
 
+    /** 源音频坐标 → 已裁剪媒体条目坐标（条目 0 点 = 源 clipStart）。未裁剪条目恒等。 */
+    private fun nextItemClippedPosition(plan: AutoMixPlan, sourcePositionMs: Long): Long {
+        val clipStartMs = plan.nextMediaItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
+        return (sourcePositionMs - clipStartMs).coerceAtLeast(0L)
+    }
+
+    private fun featuresDurationAgrees(
+        features: AudioFeatures,
+        track: NativeTrack,
+        side: String,
+    ): Boolean {
+        val metaMs = track.durationMs.takeIf { it > 0L } ?: return true
+        val featureMs = (features.durationS * 1000).toLong()
+        val agrees = abs(metaMs - featureMs) <= FEATURE_DURATION_AGREEMENT_MS
+        if (!agrees) {
+            DiagnosticsLogStore.record(
+                area = "automix",
+                event = "stale_features_ignored",
+                fields = mapOf(
+                    "side" to side,
+                    "trackId" to track.id,
+                    "title" to track.title,
+                    "featureDurationMs" to featureMs,
+                    "metadataDurationMs" to metaMs,
+                ),
+            )
+        }
+        return agrees
+    }
+
     private fun nextIndex(currentIndex: Int): Int? {
         if (currentIndex + 1 < mainPlayer.mediaItemCount) return currentIndex + 1
         if (mainPlayer.repeatMode == Player.REPEAT_MODE_ALL && mainPlayer.mediaItemCount > 1) return 0
@@ -1635,6 +1675,9 @@ internal class SmartAutoMixer(
         private const val MAIN_ONLY_TRANSITION_MODE = "main-only-next"
         private const val COMPLETED_PAIR_COOLDOWN_MS = 15_000L
         private const val MIN_CURRENT_DURATION_MS = 35_000L
+
+        /** 特征时长与元数据时长允许的最大偏差：超出说明特征来自截断/不同版本音频。 */
+        private const val FEATURE_DURATION_AGREEMENT_MS = 2_500L
         private const val MIN_TRACK_DURATION_S = 35.0
         private const val MIN_BPM_CONFIDENCE = 0.28
         private const val MIN_TONAL_CONFIDENCE = 0.025

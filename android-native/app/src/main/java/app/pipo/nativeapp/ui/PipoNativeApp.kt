@@ -592,23 +592,26 @@ private fun SkipCorrectionEffect(
 
                     override suspend fun insertNext(
                         actionId: String,
-                        track: NativeTrack,
+                        tracks: List<NativeTrack>,
                         jumpToInserted: Boolean,
                     ): ActionExecutionResult {
+                        if (tracks.isEmpty()) {
+                            return ActionExecutionResult(actionId, "insert_next", success = false, message = "这次没排出能插播的歌。")
+                        }
                         val request = AgentQueueRequest(
                             requestId = actionId,
                             sourceUserText = hintLine,
                             operation = QueueOperation.InsertNext,
-                            tracks = listOf(track),
+                            tracks = tracks,
                             jumpToInserted = jumpToInserted,
-                            desiredCount = 1,
+                            desiredCount = tracks.size,
                         )
                         return when (val commit = onApplyAgentQueueRequest(request)) {
                             is QueueCommitResult.Success -> ActionExecutionResult(
                                 actionId = actionId,
                                 type = "insert_next",
                                 success = true,
-                                message = "纠偏单曲已接收",
+                                message = if (tracks.size == 1) "纠偏单曲已接收" else "纠偏插播队列已接收",
                                 tracks = commit.plan.tracks,
                                 queueSnapshot = commit.plan.tracks,
                                 insert = true,
@@ -618,7 +621,7 @@ private fun SkipCorrectionEffect(
                                 actionId = actionId,
                                 type = "insert_next",
                                 success = false,
-                                message = commit.messages.joinToString("、").ifBlank { "纠偏单曲没有被播放器接收" },
+                                message = commit.messages.joinToString("、").ifBlank { "纠偏插播没有被播放器接收" },
                                 errorMessage = commit.reason,
                             )
                         }

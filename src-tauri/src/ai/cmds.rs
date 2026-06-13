@@ -7,6 +7,7 @@
 //!   - `ai_set_api_key`      — 给某 provider 写 key（key 不上传、不回传）
 //!   - `ai_clear_api_key`    — 清空某 provider 的 key
 //!   - `ai_set_model`        — 给某 provider 选模型（持久化）
+//!   - `ai_set_base_url`     — 给自定义 provider 写 OpenAI 兼容请求地址
 //!   - `ai_ping` / `ai_chat` — 都走当前激活 provider
 //!
 //! 设计细节：
@@ -19,7 +20,8 @@ use serde::Serialize;
 use tauri::State;
 
 use super::config::{
-    default_base_url, default_model, known_models, AiConfigStore, Provider, ProviderSlot,
+    effective_base_url, default_model, known_models, normalize_base_url, AiConfigStore, Provider,
+    ProviderSlot,
 };
 use super::openai_compat::{self, ChatMessage};
 
@@ -52,7 +54,7 @@ pub struct ProviderView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiConfigPublic {
-    /// 当前激活 provider 的 id（"deepseek" / "openai" / "xiaomi-mimo"）
+    /// 当前激活 provider 的 id（"deepseek" / "openai" / "xiaomi-mimo" / "custom"）
     pub active_provider: String,
     pub providers: Vec<ProviderView>,
 }
@@ -62,6 +64,7 @@ fn provider_label(p: Provider) -> &'static str {
         Provider::Deepseek => "DeepSeek",
         Provider::Openai => "OpenAI",
         Provider::XiaomiMimo => "小米 MiMo",
+        Provider::Custom => "自定义",
     }
 }
 
@@ -70,6 +73,7 @@ fn parse_provider(id: &str) -> Result<Provider, String> {
         "deepseek" => Ok(Provider::Deepseek),
         "openai" => Ok(Provider::Openai),
         "xiaomi-mimo" => Ok(Provider::XiaomiMimo),
+        "custom" => Ok(Provider::Custom),
         other => Err(format!("未知 provider: {other}")),
     }
 }
@@ -86,7 +90,7 @@ fn slot_view<'a>(p: Provider, slot: &'a ProviderSlot) -> ProviderView {
         has_key: key_preview.is_some(),
         key_preview,
         model: slot.model.clone(),
-        base_url: default_base_url(p).to_string(),
+        base_url: effective_base_url(p, slot).unwrap_or_default(),
     }
 }
 
@@ -97,6 +101,7 @@ pub fn ai_get_config(state: AiState<'_>) -> AiConfigPublic {
         slot_view(Provider::Deepseek, &cfg.deepseek),
         slot_view(Provider::Openai, &cfg.openai),
         slot_view(Provider::XiaomiMimo, &cfg.xiaomi_mimo),
+        slot_view(Provider::Custom, &cfg.custom),
     ];
     AiConfigPublic {
         active_provider: cfg.provider.as_key().to_string(),
@@ -170,11 +175,30 @@ pub fn ai_set_model(state: AiState<'_>, provider: String, model: String) -> Resu
         .map_err(to_err)
 }
 
+#[tauri::command]
+pub fn ai_set_base_url(
+    state: AiState<'_>,
+    provider: String,
+    base_url: String,
+) -> Result<(), String> {
+    let p = parse_provider(&provider)?;
+    if p != Provider::Custom {
+        return Err("只有自定义 provider 支持修改请求地址".into());
+    }
+    let normalized = normalize_base_url(&base_url)?;
+    state
+        .update(|c| {
+            slot_mut(c, p).base_url = Some(normalized);
+        })
+        .map_err(to_err)
+}
+
 fn slot_mut(c: &mut super::config::AiConfig, p: Provider) -> &mut ProviderSlot {
     match p {
         Provider::Deepseek => &mut c.deepseek,
         Provider::Openai => &mut c.openai,
         Provider::XiaomiMimo => &mut c.xiaomi_mimo,
+        Provider::Custom => &mut c.custom,
     }
 }
 
@@ -186,15 +210,16 @@ pub async fn ai_ping(state: AiState<'_>) -> Result<String, String> {
         let cfg = state.snapshot();
         format!("还没填 {} 的 API key", provider_label(cfg.provider))
     })?;
-    // active provider 可能跟 default model 不一致，用用户选的 model
-    let _ = (base_url, &model);
-
+    let base_url = base_url.ok_or_else(|| {
+        let cfg = state.snapshot();
+        format!("还没填 {} 的请求地址", provider_label(cfg.provider))
+    })?;
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: "用不超过 12 个汉字跟我打个招呼，像电台 DJ 的开场白。".into(),
     }];
 
-    openai_compat::chat(&key, base_url, &model, &messages, 0.8, 80)
+    openai_compat::chat(&key, &base_url, &model, &messages, 0.8, 80)
         .await
         .map_err(to_err)
 }
@@ -214,6 +239,10 @@ pub async fn ai_chat(
         let cfg = state.snapshot();
         format!("还没填 {} 的 API key", provider_label(cfg.provider))
     })?;
+    let base_url = base_url.ok_or_else(|| {
+        let cfg = state.snapshot();
+        format!("还没填 {} 的请求地址", provider_label(cfg.provider))
+    })?;
 
     let mut messages: Vec<ChatMessage> = Vec::new();
     if let Some(sys) = system.filter(|s| !s.trim().is_empty()) {
@@ -229,7 +258,7 @@ pub async fn ai_chat(
 
     openai_compat::chat(
         &key,
-        base_url,
+        &base_url,
         &model,
         &messages,
         temperature.unwrap_or(0.8),

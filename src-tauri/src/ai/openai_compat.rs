@@ -1,6 +1,6 @@
 //! OpenAI 兼容 chat/completions 调用。
 //!
-//! 三家 provider 都是 OpenAI-compatible（DeepSeek / OpenAI / 小米 MiMo）：
+//! 这些 provider 都是 OpenAI-compatible（DeepSeek / OpenAI / 小米 MiMo / 自定义中转）：
 //!   - POST `{base_url}/chat/completions`
 //!   - `Authorization: Bearer <api_key>`
 //!   - body: `{ model, messages, temperature, max_tokens, stream }`
@@ -14,6 +14,8 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const CHAT_TIMEOUT_SECS: u64 = 180;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
@@ -87,7 +89,7 @@ pub async fn chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(CHAT_TIMEOUT_SECS))
         .build()
         .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
 
@@ -168,7 +170,7 @@ pub async fn chat_tools(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(CHAT_TIMEOUT_SECS))
         .build()
         .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
 

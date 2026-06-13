@@ -62,14 +62,17 @@ pub fn run() {
             netease_song_urls,
             netease_song_lyric,
             netease_search,
+            netease_like_song,
+            netease_playlist_modify_tracks,
             netease_is_logged_in,
-            // ai (multi-provider: deepseek / openai / xiaomi-mimo)
+            // ai (multi-provider: deepseek / openai / xiaomi-mimo / custom)
             ai_get_config,
             ai_list_models,
             ai_set_provider,
             ai_set_api_key,
             ai_clear_api_key,
             ai_set_model,
+            ai_set_base_url,
             ai_ping,
             ai_chat,
             // cache

@@ -80,6 +80,10 @@ const IMMERSIVE_DIM_FS = IMMERSIVE_ACTIVE_FS;
 const IMMERSIVE_ROWS = 7;
 const FLIP_DURATION_MS = 620;
 const FLIP_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
+const APPLE_LYRIC_COLOR_MS = 100;
+const APPLE_LYRIC_FILTER_MS = 250;
+const APPLE_LYRIC_LAYOUT_MS = 400;
+const APPLE_LYRIC_LIST_EASE = "ease-in-out";
 // 关闭走另一组参数：用户离场时希望"先动起来 → 落到位"的爽快感，
 // 跟开场的"慢慢settle"不一样。
 //   - 时长更短（看起来更有"撤退感"，避免回拽感）
@@ -109,13 +113,22 @@ const EMP_FULL_DURATION_SEC = 2.0;
 const EMP_AMP_FLOOR = 0.7;
 const EMP_PEAK_SCALE = 0.05;
 const EMP_FLOAT_PEAK_PX = 3.2;
-const EMP_FLOAT_RAMP = 1.3;
+const EMP_FLOAT_RISE_LEAD = 1.15;
+const EMP_FLOAT_RELEASE_TRAIL = 1.75;
+const EMP_FLOAT_PEAK_DIST = 0.12;
 const EMP_GLOW_OPACITY = 0.4;
 const EMP_GLOW_BLUR_PX = 8;
 const EMP_GLOW_TRAIL_PX = 34;
 const EMP_GLOW_LEAD_PX = 8;
 const EMP_GLOW_PEAK_PX = 6;
 const EMP_MIN_SEC_PER_GLYPH = 0.18;
+const REGULAR_WORD_LIFT_PX = 0.95;
+const WORD_CONTINUITY_MAX_GAP_SEC = 0.11;
+const WORD_CONTINUITY_HANDOFF_SEC = 0.16;
+const WORD_CONTINUITY_HANDOFF_FRACTION = 0.76;
+const WORD_CONTINUITY_ATTACK_SEC = 0.01;
+const WORD_CONTINUITY_LIFT_CARRY = 0.4;
+const WORD_FLOAT_EASE_BLEND = 0.3;
 
 
 // ============== 主组件 ==============
@@ -360,6 +373,9 @@ function ImmersiveLyrics({
     () => computeLayout(isDesktop, topRgb, seamRgb, leftRgb, rightRgb, fgColor, fgDimColor),
     [isDesktop, topRgb, seamRgb, leftRgb, rightRgb, fgColor, fgDimColor],
   );
+  const lyricFgColor = isDesktop ? "rgba(255, 255, 255, 0.92)" : layout.fgColor;
+  const lyricFgDimColor = isDesktop ? "rgba(255, 255, 255, 0.40)" : layout.fgDimColor;
+  const lyricFgUnsungColor = isDesktop ? "rgba(255, 255, 255, 0.58)" : fgUnsungColor;
 
   useEffect(() => {
     if (open) setPhase((p) => (p === "open" ? "open" : "opening"));
@@ -614,12 +630,8 @@ function ImmersiveLyrics({
         background: "transparent",
       }}
     >
-      {/* 背景：Apple Music 风的"色彩云"。
-            做法：取封面顶/底/右沿的采样色，在屏幕三个不同位置画 radial gradient
-            互相叠加。结果是封面色调温柔铺满整屏，没有可见的图样残留。
-            *关键差异*：不再用 blur 过的封面图当背景层 —— 之前 blur(140px) 即使再
-            重也带 pattern 残留，跟前景 sharp 封面拼一起总有"两张图叠"的视觉断层。
-            纯色 radial 叠合 + 前景封面边缘 fade 到透明，浑然一体（跟 Android 端一致）。 */}
+      {/* 背景：真实封面重度模糊铺底 + 采样色 radial 柔化。
+            模糊封面负责"同源融合"，采样色负责压掉图案残留和接缝。 */}
       <div
         ref={backdropRef}
         aria-hidden
@@ -640,14 +652,32 @@ function ImmersiveLyrics({
           ].join(", "),
         }}
       >
-        {/* 顶层柔化：再涂一遍采样色 gradient，把 radial 之间的色彩断层进一步柔化 */}
+        {coverUrl && (
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              inset: layout.isDesktop ? "-10%" : "-7%",
+              backgroundImage: `url(${coverUrl})`,
+              backgroundSize: "cover",
+              backgroundPosition: "center",
+              filter: layout.isDesktop
+                ? "blur(92px) saturate(1.42) brightness(0.92)"
+                : "blur(58px) saturate(1.28) brightness(0.96)",
+              opacity: layout.isDesktop ? 0.62 : 0.48,
+              transform: layout.isDesktop ? "scale(1.08)" : "scale(1.06)",
+              pointerEvents: "none",
+            }}
+          />
+        )}
+        {/* 顶层柔化：再涂一遍采样色 gradient，把封面图案残留和 radial 断层进一步压平 */}
         <div
           aria-hidden
           style={{
             position: "absolute",
             inset: 0,
             background: layout.bgGradient,
-            opacity: 0.18,
+            opacity: layout.isDesktop ? 0.36 : 0.18,
             pointerEvents: "none",
           }}
         />
@@ -664,7 +694,7 @@ function ImmersiveLyrics({
             ...layout.cover,
             zIndex: 1,
             pointerEvents: "none",
-            opacity: layout.isDesktop ? 0 : 0.36,
+            opacity: layout.isDesktop ? 0.44 : 0.36,
             backgroundImage: `url(${coverUrl})`,
             backgroundSize: "cover",
             backgroundPosition: "center",
@@ -828,9 +858,10 @@ function ImmersiveLyrics({
           isPlaying={isPlaying}
           sessionId={current?.id}
           meta={lyric}
-          fgColor={layout.fgColor}
-          fgDimColor={layout.fgDimColor}
-          fgUnsungColor={fgUnsungColor}
+          desktopAppleMotion={isDesktop}
+          fgColor={lyricFgColor}
+          fgDimColor={lyricFgDimColor}
+          fgUnsungColor={lyricFgUnsungColor}
           onSeekToSec={player.seek}
         />
       </div>
@@ -936,18 +967,18 @@ function computeLayout(
     };
   }
   // ---- 桌面 side-by-side：cover 左、lyric 右 ----
-  // 把 (cover + gap + title-block) 作为一组整体在视口内垂直居中，
-  // title / 控件不再叠在封面上，而是落在封面正下方。
-  const W = "min(46vw, 70vh, 540px)";
-  const titleBlockH = "clamp(92px, 12vh, 122px)";
-  // gap 调大 —— 把 title 块整体往下推，原先 "下面留白偏多" 是因为 cover 居中
-  // 后下方空间没被用掉；加大 gap 让组合块底部更贴近视口下部，视觉重心更稳
-  const gapBelow = "clamp(36px, 5.4vh, 60px)";
-  const totalH = `calc(${W} + ${gapBelow} + ${titleBlockH})`;
-  const top = `calc((100vh - ${totalH}) / 2)`;
-  const left = "clamp(24px, 6vw, 80px)";
-  const lyricLeft = `calc(${left} + ${W} + clamp(40px, 6vw, 100px))`;
-  const lyricRight = "clamp(24px, 6vw, 80px)";
+  // 桌面端封面本体先上下居中，标题 / 控件作为封面延伸落在下方。
+  // 如果视口高度不够，再用 clamp 给标题留出最低安全区，避免底部被裁掉。
+  const W = "min(42vw, 70vh, 540px)";
+  const titleBlockH = "clamp(78px, 10vh, 112px)";
+  const gapBelow = "clamp(22px, 4vh, 42px)";
+  const top = `clamp(24px, calc((100vh - ${W}) / 2), calc(100vh - ${W} - ${gapBelow} - ${titleBlockH} - 20px))`;
+  const left = "clamp(22px, 5vw, 76px)";
+  const lyricGap = "clamp(36px, 5vw, 86px)";
+  const lyricLeft = `calc(${left} + ${W} + ${lyricGap})`;
+  const lyricRight = "clamp(22px, 4.4vw, 72px)";
+  const lyricTop = "clamp(52px, 9.5vh, 88px)";
+  const lyricWidth = `min(calc(100vw - ${lyricLeft} - ${lyricRight}), clamp(620px, 44vw, 920px))`;
   // title 块跟封面同宽：左边沿对齐封面左、右边沿对齐封面右。
   //   - title 文本（左 flex-grow）天然贴封面左边
   //   - 按钮（右 flex-shrink-0）天然落在封面右边
@@ -962,10 +993,10 @@ function computeLayout(
       width: W,
     },
     lyric: {
-      top: "8vh",
+      top: lyricTop,
       left: lyricLeft,
-      width: `calc(100vw - ${lyricLeft} - ${lyricRight})`,
-      height: "84vh",
+      width: lyricWidth,
+      height: `calc(100vh - (${lyricTop}) - clamp(46px, 7vh, 72px))`,
     },
     // 桌面封面：保持主体清晰，只拉长上 / 左 / 右边缘退场。
     // 底部沿用较长退场，避免重新引入底部硬边。
@@ -1318,6 +1349,7 @@ function LyricColumn({
   isPlaying,
   sessionId,
   meta,
+  desktopAppleMotion,
   fgColor,
   fgDimColor,
   fgUnsungColor,
@@ -1331,6 +1363,7 @@ function LyricColumn({
   meta:
     | { lines: LrcLine[]; yrcLines: YrcLine[]; instrumental: boolean; uncollected: boolean }
     | null;
+  desktopAppleMotion: boolean;
   fgColor: string;
   fgDimColor: string;
   fgUnsungColor: string;
@@ -1347,6 +1380,7 @@ function LyricColumn({
     activeFs: IMMERSIVE_ACTIVE_FS,
     dimFs: IMMERSIVE_DIM_FS,
     immersive: true,
+    desktopAppleMotion,
     fgColor,
     fgDimColor,
     fgUnsungColor,
@@ -1368,8 +1402,10 @@ function LyricColumn({
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
       scrollIdx={view.scrollIdx}
-      // 跟 Android-native 一致：焦点行落在容器顶约 11%，上方只露一行历史歌词。
+      // 跟 Android-native 一致：焦点行偏上；桌面大屏再整体下移 108px，
+      // 避免锚点贴近上方，歌词主体在视觉上悬得太高。
       focusFraction={0.11}
+      focusOffsetPx={desktopAppleMotion ? 108 : 0}
       outerStyle={{
         ...immersiveLyricFrame,
         WebkitMaskImage:
@@ -1445,6 +1481,7 @@ function MeasuredLyricColumn({
   scrollIdx,
   /** 焦点行落在容器纵向多少位置（0..1）。compact = 0.5（居中），immersive = 0.22（偏上） */
   focusFraction = 0.5,
+  focusOffsetPx = 0,
   outerStyle,
   innerExtraStyle,
   transitionMs,
@@ -1453,6 +1490,7 @@ function MeasuredLyricColumn({
   activeIdx: number;
   scrollIdx?: number;
   focusFraction?: number;
+  focusOffsetPx?: number;
   outerStyle: React.CSSProperties;
   innerExtraStyle: React.CSSProperties;
   transitionMs: number;
@@ -1474,8 +1512,8 @@ function MeasuredLyricColumn({
     const containerH = outer.clientHeight;
     const top = target.offsetTop;
     const h = target.offsetHeight;
-    setTranslateY(containerH * focusFraction - top - h / 2);
-  }, [focusFraction]);
+    setTranslateY(containerH * focusFraction + focusOffsetPx - top - h / 2);
+  }, [focusFraction, focusOffsetPx]);
 
   useLayoutEffect(() => {
     measureAndPlace();
@@ -1483,18 +1521,23 @@ function MeasuredLyricColumn({
 
   useLayoutEffect(() => {
     const outer = outerRef.current;
+    const inner = innerRef.current;
     if (!outer) return;
-    let timer: number | null = null;
-    const ro = new ResizeObserver(() => {
-      if (timer != null) window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        timer = null;
+    let rafId: number | null = null;
+    const scheduleMeasure = () => {
+      if (rafId != null) window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
         measureAndPlace();
-      }, 90);
+      });
+    };
+    const ro = new ResizeObserver(() => {
+      scheduleMeasure();
     });
     ro.observe(outer);
+    if (inner) ro.observe(inner);
     return () => {
-      if (timer != null) window.clearTimeout(timer);
+      if (rafId != null) window.cancelAnimationFrame(rafId);
       ro.disconnect();
     };
   }, [measureAndPlace]);
@@ -1512,7 +1555,7 @@ function MeasuredLyricColumn({
           transition:
             transitionMs >= 700
               ? "none"
-              : `transform ${transitionMs}ms cubic-bezier(0.4, 0, 0.2, 1)`,
+              : `transform ${transitionMs}ms ${APPLE_LYRIC_LIST_EASE}`,
           willChange: "transform",
           ...innerExtraStyle,
         }}
@@ -1543,6 +1586,7 @@ type LyricViewParams = {
   // active 行内 "未唱" 字符颜色（介于 fg 和 fgDim 之间的中亮度）。
   // 不传则 fallback 到 fgDimColor。
   fgUnsungColor?: string;
+  desktopAppleMotion?: boolean;
   onSeekToSec?: (sec: number) => void;
 };
 
@@ -1670,7 +1714,7 @@ function useLyricView(p: LyricViewParams): {
   /** 应当被滚到焦点位置的行 —— 只保留 100ms 轻预滚动，避免视觉先切句。 */
   scrollIdx: number;
 } {
-  const useYrc = p.yrcLines.some((line) => line.chars.length > 0);
+  const useYrc = p.yrcLines.some((line) => line.chars.length > 0 || (line.companionLines?.length ?? 0) > 0);
   const lyricLines = useMemo(
     () => (useYrc ? p.yrcLines : p.lines),
     [useYrc, p.lines, p.yrcLines],
@@ -1746,6 +1790,7 @@ function useLyricView(p: LyricViewParams): {
           activeFs={p.activeFs}
           dimFs={p.dimFs}
           immersive={p.immersive ?? false}
+          desktopAppleMotion={p.desktopAppleMotion ?? false}
           fgColor={fg}
           fgDimColor={fgDim}
           fgUnsungColor={fgUnsung}
@@ -1776,6 +1821,7 @@ function useLyricView(p: LyricViewParams): {
           activeFs={p.activeFs}
           dimFs={p.dimFs}
           immersive={p.immersive ?? false}
+          desktopAppleMotion={p.desktopAppleMotion ?? false}
           fgColor={fg}
           fgDimColor={fgDim}
           fgUnsungColor={fgUnsung}
@@ -1846,6 +1892,7 @@ type RowCommon = {
   activeFs: string;
   dimFs: string;
   immersive: boolean;
+  desktopAppleMotion: boolean;
   fgColor: string;
   fgDimColor: string;
   fgUnsungColor: string;
@@ -1863,23 +1910,24 @@ const YrcRow = React.memo(function YrcRow({
   activeFs,
   dimFs,
   immersive,
+  desktopAppleMotion,
   fgColor,
   fgDimColor,
   fgUnsungColor,
   seekSec,
   onSeekToSec,
 }: RowCommon & { line: YrcLine; positionSec?: number }) {
-  // immersive 下非 active 行用 fgColor + 容器 opacity 压暗（统一颜色 + 透明度），
-  // compact 仍用 fgDimColor（旧行为，保留视觉熟悉感）。
-  const inactiveColor = immersive ? fgColor : fgDimColor;
+  // desktop Apple 风用固定暗行颜色 + blur；其它 immersive 仍用 fgColor + opacity 压暗。
+  // compact 继续用 fgDimColor，保留旧的紧凑歌词带视觉。
+  const inactiveColor = desktopAppleMotion ? fgDimColor : immersive ? fgColor : fgDimColor;
   return (
     <div
       data-active={isActive ? "1" : "0"}
       data-scroll-target={isScrollTarget ? "1" : "0"}
       onClick={onSeekToSec && seekSec != null ? () => onSeekToSec(seekSec) : undefined}
-      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance)}
+      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance, desktopAppleMotion)}
     >
-      <div style={lineInner(immersive)}>
+      <div style={lineInner(immersive, line.alignment)}>
         {isActive ? (
           <div style={activeLyricStack}>
             <YrcActiveLine
@@ -1889,21 +1937,34 @@ const YrcRow = React.memo(function YrcRow({
               fgUnsungColor={fgUnsungColor}
             />
             {immersive &&
-              (line.companionLines ?? []).map((companion, idx) =>
-                shouldRenderCompanionLyric(companion, positionSec ?? 0) &&
-                !isCompanionLyricPast(companion, positionSec ?? 0) ? (
+              (line.companionLines ?? []).map((companion, idx) => {
+                const companionPositionSec = positionSec ?? 0;
+                const companionActive = isCompanionLyricActive(companion, companionPositionSec);
+                return shouldRenderCompanionLyric(companion, companionPositionSec) &&
+                !isCompanionLyricPast(companion, companionPositionSec) ? (
                   <span
                     key={`${companion.time}-${idx}`}
                     style={companionLyricStyle(
-                      isCompanionLyricActive(companion, positionSec ?? 0),
+                      companionActive,
                       fgColor,
                       fgUnsungColor,
+                      desktopAppleMotion,
+                      companion.role ?? "companion",
                     )}
                   >
-                    {companion.text}
+                    {companionActive && companion.chars.length > 0 ? (
+                      <YrcActiveLine
+                        line={companion}
+                        positionSec={companionPositionSec}
+                        fgColor={fgColor}
+                        fgUnsungColor={fgUnsungColor}
+                      />
+                    ) : (
+                      companion.text
+                    )}
                   </span>
-                ) : null,
-              )}
+                ) : null;
+              })}
           </div>
         ) : (
           <span
@@ -1930,6 +1991,7 @@ const LrcRow = React.memo(function LrcRow({
   activeFs,
   dimFs,
   immersive,
+  desktopAppleMotion,
   fgColor,
   fgDimColor,
   fgUnsungColor,
@@ -1937,13 +1999,13 @@ const LrcRow = React.memo(function LrcRow({
   onSeekToSec,
 }: RowCommon & { text: string; progress: number }) {
   void progress;
-  const inactiveColor = immersive ? fgColor : fgDimColor;
+  const inactiveColor = desktopAppleMotion ? fgDimColor : immersive ? fgColor : fgDimColor;
   return (
     <div
       data-active={isActive ? "1" : "0"}
       data-scroll-target={isScrollTarget ? "1" : "0"}
       onClick={onSeekToSec && seekSec != null ? () => onSeekToSec(seekSec) : undefined}
-      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance)}
+      style={lineFrame(isActive, rowH, activeFs, dimFs, immersive, distance, desktopAppleMotion)}
     >
       <div style={lineInner(immersive)}>
         {isActive ? (
@@ -1971,6 +2033,7 @@ const LrcRow = React.memo(function LrcRow({
 const activeLyricStack: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
+  width: "100%",
   gap: 2,
 };
 
@@ -1978,14 +2041,21 @@ function companionLyricStyle(
   active: boolean,
   fgColor: string,
   fgUnsungColor: string,
+  desktopAppleMotion: boolean,
+  role: string,
 ): React.CSSProperties {
+  const isTimedCompanion = role === "companion";
   return {
     display: "block",
     color: active ? mixCssColor(fgUnsungColor, fgColor, 0.62) : fgUnsungColor,
-    fontSize: "0.76em",
+    fontSize: isTimedCompanion ? "0.76em" : "0.72em",
     lineHeight: 1.28,
     fontWeight: 650,
     whiteSpace: "break-spaces",
+    textAlign: "inherit",
+    transition: desktopAppleMotion
+      ? `color ${APPLE_LYRIC_COLOR_MS}ms ${APPLE_LYRIC_LIST_EASE}, opacity ${APPLE_LYRIC_FILTER_MS}ms linear, height ${APPLE_LYRIC_LAYOUT_MS}ms linear, margin-top ${APPLE_LYRIC_LAYOUT_MS}ms linear`
+      : "color 170ms cubic-bezier(0.25, 0.1, 0.25, 1), opacity 170ms cubic-bezier(0.25, 0.1, 0.25, 1)",
   };
 }
 
@@ -2018,14 +2088,14 @@ function YrcActiveLine({
   const chars = line.chars;
   if (chars.length === 0) {
     return (
-      <span style={{ color: fgColor, whiteSpace: "break-spaces" }}>
+      <span style={{ ...activeLyricLine, color: fgColor }}>
         {line.text}
       </span>
     );
   }
 
   return (
-    <>
+    <span style={activeLyricLine}>
       {chars.map((char, idx) => {
         if (shouldUseSlowEmphasis(char)) {
           return (
@@ -2041,10 +2111,8 @@ function YrcActiveLine({
         const progress = charProgress(char, positionSec);
         const beingSung = progress > 0 && progress < 1;
         const sung = progress >= 1;
-        const elapsed = Math.max(0, positionSec - char.startSec);
-        const riseSec = Math.max(0.28, Math.min(char.durSec, 0.9));
-        const liftT = easeOutCss(Math.min(1, elapsed / riseSec));
-        const liftPx = -0.95 * liftT;
+        const liftT = regularLyricLiftProgress(chars, idx, positionSec);
+        const liftPx = -REGULAR_WORD_LIFT_PX * liftT;
         const stop = Math.min(100, Math.max(0, progress * 100));
         const fadeStart = Math.max(0, stop - 0.5);
         const fadeEnd = Math.min(100, stop + 5);
@@ -2069,9 +2137,17 @@ function YrcActiveLine({
           </span>
         );
       })}
-    </>
+    </span>
   );
 }
+
+const activeLyricLine: React.CSSProperties = {
+  display: "block",
+  width: "100%",
+  maxWidth: "100%",
+  whiteSpace: "break-spaces",
+  textAlign: "inherit",
+};
 
 function YrcSlowEmphasisToken({
   char,
@@ -2102,7 +2178,7 @@ function YrcSlowEmphasisToken({
         const letterIdx = visibleIndex++;
         const letterCenter = letterIdx + 0.5;
         const letterDist = glowSweep - letterCenter;
-        const floatT = rawLinear >= 0 ? floatRamp(letterDist) : 0;
+        const floatT = rawLinear >= 0 ? appleFloatBreath01(letterDist) : 0;
         const bandT = appleBandCoverage01(letterDist);
         const glowT = appleCometCoverage01(letterDist) * empGain;
         const colorT = smootherStep(Math.max(0, Math.min(1, (letterDist + 0.85) / 1.7)));
@@ -2134,6 +2210,44 @@ function easeOutCss(t: number): number {
   return 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
 }
 
+function regularLyricLiftProgress(chars: YrcChar[], idx: number, positionSec: number): number {
+  const char = chars[idx];
+  if (!char) return 0;
+  const base = regularWordLiftEase(regularTokenLiftProgress(char, positionSec));
+  const prev = chars[idx - 1];
+  if (!prev || prev.text.includes("\n") || positionSec < char.startSec) return base;
+  const prevEndSec = prev.startSec + Math.max(0.001, prev.durSec);
+  const gapSec = Math.max(0, char.startSec - prevEndSec);
+  if (gapSec > WORD_CONTINUITY_MAX_GAP_SEC) return base;
+
+  const durSec = Math.max(0.001, char.durSec);
+  const handoffSec = Math.max(
+    0.001,
+    Math.min(WORD_CONTINUITY_HANDOFF_SEC, durSec * WORD_CONTINUITY_HANDOFF_FRACTION),
+  );
+  const elapsedSec = positionSec - char.startSec;
+  if (elapsedSec >= handoffSec) return base;
+
+  const gapT = 1 - Math.max(0, Math.min(1, gapSec / WORD_CONTINUITY_MAX_GAP_SEC));
+  const gapStrength = smootherStep(gapT);
+  const attackSec = Math.max(0.001, Math.min(WORD_CONTINUITY_ATTACK_SEC, handoffSec * 0.18));
+  const attack = smootherStep(elapsedSec / attackSec);
+  const release = 1 - smootherStep(elapsedSec / handoffSec);
+  const carry = attack * release * gapStrength * WORD_CONTINUITY_LIFT_CARRY;
+  return Math.max(base, carry);
+}
+
+function regularTokenLiftProgress(char: YrcChar, positionSec: number): number {
+  if (positionSec <= char.startSec) return 0;
+  return Math.max(0, Math.min(1, (positionSec - char.startSec) / Math.max(0.001, char.durSec)));
+}
+
+function regularWordLiftEase(progress: number): number {
+  const p = Math.max(0, Math.min(1, progress));
+  const eased = easeOutCss(p);
+  return p + (eased - p) * WORD_FLOAT_EASE_BLEND;
+}
+
 function shouldUseSlowEmphasis(char: YrcChar): boolean {
   if (char.durSec < EMP_MIN_DURATION_SEC) return false;
   return char.durSec / visibleLyricGlyphCount(char.text) >= EMP_MIN_SEC_PER_GLYPH;
@@ -2152,8 +2266,14 @@ function emphasisAmp(durationSec: number): number {
   return EMP_AMP_FLOOR + (1 - EMP_AMP_FLOOR) * ramp;
 }
 
-function floatRamp(dist: number): number {
-  return smootherStep(Math.max(0, Math.min(1, (dist + EMP_FLOAT_RAMP) / (2 * EMP_FLOAT_RAMP))));
+function appleFloatBreath01(dist: number): number {
+  if (dist <= -EMP_FLOAT_RISE_LEAD || dist >= EMP_FLOAT_RELEASE_TRAIL) return 0;
+  if (dist <= EMP_FLOAT_PEAK_DIST) {
+    return smootherStep(
+      (dist + EMP_FLOAT_RISE_LEAD) / (EMP_FLOAT_RISE_LEAD + EMP_FLOAT_PEAK_DIST),
+    );
+  }
+  return 1 - smootherStep((dist - EMP_FLOAT_PEAK_DIST) / (EMP_FLOAT_RELEASE_TRAIL - EMP_FLOAT_PEAK_DIST));
 }
 
 function appleBandCoverage01(dist: number): number {
@@ -2209,27 +2329,40 @@ function lineFrame(
   dimFs: string,
   immersive: boolean,
   distance: number,
+  desktopAppleMotion = false,
 ): React.CSSProperties {
   // transition 写在"目标态"上，进 / 出 active 用不同时间窗。
   // immersive 不再变 fontSize（active/inactive 同号），但仍保留 transition
   // 兼容 compact 模式以及未来重新启用尺寸切换的可能。
-  const transition = isActive
-    ? "font-size 170ms cubic-bezier(0.25, 0.1, 0.25, 1), opacity 170ms cubic-bezier(0.25, 0.1, 0.25, 1), filter 140ms cubic-bezier(0.25, 0.1, 0.25, 1), color 170ms cubic-bezier(0.25, 0.1, 0.25, 1)"
+  const transition = desktopAppleMotion
+    ? `color ${APPLE_LYRIC_COLOR_MS}ms ${APPLE_LYRIC_LIST_EASE}, ` +
+      `transform ${APPLE_LYRIC_COLOR_MS}ms ${APPLE_LYRIC_LIST_EASE}, ` +
+      `padding ${APPLE_LYRIC_COLOR_MS}ms ${APPLE_LYRIC_LIST_EASE}, ` +
+      `height ${APPLE_LYRIC_LAYOUT_MS}ms linear, ` +
+      `margin-top ${APPLE_LYRIC_LAYOUT_MS}ms linear, ` +
+      `opacity ${APPLE_LYRIC_FILTER_MS}ms linear, ` +
+      `filter ${APPLE_LYRIC_FILTER_MS}ms linear`
     : "font-size 170ms cubic-bezier(0.25, 0.1, 0.25, 1), opacity 170ms cubic-bezier(0.25, 0.1, 0.25, 1), filter 140ms cubic-bezier(0.25, 0.1, 0.25, 1), color 170ms cubic-bezier(0.25, 0.1, 0.25, 1)";
   const immersiveOpacity = isActive
     ? 1
-    : distance === 1
-      ? 0.36
-      : distance === 2
-        ? 0.27
-        : distance === 3
-          ? 0.2
-          : distance === 4
-            ? 0.15
-            : 0.11;
-  const immersiveBlur = !immersive || isActive || distance <= 1
+    : desktopAppleMotion
+      ? 1
+      : distance === 1
+        ? 0.36
+        : distance === 2
+          ? 0.27
+          : distance === 3
+            ? 0.2
+            : distance === 4
+              ? 0.15
+              : 0.11;
+  const immersiveBlur = !immersive || isActive
     ? "none"
-    : `blur(${distance === 2 ? 1.2 : 2}px)`;
+    : desktopAppleMotion
+      ? "blur(2px)"
+      : distance <= 1
+        ? "none"
+        : `blur(${distance === 2 ? 1.2 : 2}px)`;
 
   return {
     // 用 minHeight 而非 height —— 长歌词换行后行高自然增长，不会跟下一行重叠。
@@ -2249,8 +2382,8 @@ function lineFrame(
     lineHeight: immersive ? 1.56 : undefined,
     transformOrigin: "left center",
     filter: immersiveBlur,
-    // 非 active 行：immersive 显著压暗（0.32）形成强对比；compact 保留较亮
-    // （0.42）让 3 行带子整体可读。
+    // 非 active 行：desktop Apple 风主要靠暗行颜色 + blur；其它 immersive
+    // 仍用 opacity 形成对比；compact 保留较亮（0.42）让 3 行带子整体可读。
     opacity: immersive ? immersiveOpacity : isActive ? 1 : 0.42,
     overflow: "visible",
     padding: immersive ? "10px 4px" : "2px 12px",
@@ -2260,15 +2393,18 @@ function lineFrame(
   };
 }
 
-function lineInner(immersive = false): React.CSSProperties {
+function lineInner(immersive = false, alignment: "start" | "end" = "start"): React.CSSProperties {
   return {
+    width: "100%",
+    minWidth: 0,
     whiteSpace: "normal",
     overflow: "visible",
     textOverflow: "clip",
     maxWidth: "100%",
     lineHeight: immersive ? 1.56 : 1.35,
-    overflowWrap: "anywhere",
-    wordBreak: "break-word",
+    overflowWrap: immersive ? "normal" : "anywhere",
+    wordBreak: immersive ? "normal" : "break-word",
+    textAlign: alignment === "end" ? "right" : immersive ? "left" : "center",
   };
 }
 

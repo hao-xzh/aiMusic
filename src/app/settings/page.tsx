@@ -13,7 +13,6 @@ import {
 } from "@/lib/tauri";
 import { useAppSettings } from "@/lib/app-settings";
 import { BackButton } from "@/components/BackButton";
-import { DotText } from "@/components/DotText";
 import { usePlatform } from "@/lib/use-platform";
 import {
   useAnalysisProgress,
@@ -53,27 +52,8 @@ export default function SettingsPage() {
   return (
     <>
       <SettingsTopBar />
-      <div
-        style={{
-          padding: "clamp(54px, 7vh, 72px) clamp(12px, 4vw, 24px) 60px",
-          maxWidth: 760,
-          margin: "0 auto",
-          width: "100%",
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "center",
-            marginTop: "clamp(12px, 3vh, 24px)",
-            marginBottom: 6,
-          }}
-        >
-          <DotText text="设置" fontSize={48} grid={4} dotRadius={1.6} />
-        </div>
-        <div style={subtitle}>
-          Pipo 把你的账号、播放规则、AI 口吻都攒在本地。
-        </div>
+      <div style={pageWrap}>
+        <PageHeading title="SETTINGS" subtitle="账号、播放和 AI 都在本机。" />
 
         <Section title="音乐来源" label="SOURCE">
           <NeteaseRow me={me} err={err} />
@@ -87,72 +67,72 @@ export default function SettingsPage() {
           <AudioCacheRow />
         </Section>
 
-      <Section title="外观" label="LOOK">
-        <Toggle
-          label="隐藏点阵纹理"
-          desc="去掉播放页全屏的点阵叠加，只保留封面模糊背景"
-          value={appSettings.hideDotPattern}
-          onChange={(v) => updateAppSettings({ hideDotPattern: v })}
-        />
-        <Toggle
-          label="隐藏 AI 圆球"
-          desc="不显示右下角圆球和绳子，只在封面上冒一句"
-          value={appSettings.hideAiPetOrb}
-          onChange={(v) => updateAppSettings({ hideAiPetOrb: v })}
-        />
-      </Section>
+        <Section title="外观" label="LOOK">
+          <Toggle
+            label="隐藏点阵纹理"
+            desc="去掉播放页全屏的点阵叠加，只保留封面模糊背景"
+            value={appSettings.hideDotPattern}
+            onChange={(v) => updateAppSettings({ hideDotPattern: v })}
+          />
+          <Toggle
+            label="隐藏 AI 圆球"
+            desc="不显示右下角圆球和绳子，只在封面上冒一句"
+            value={appSettings.hideAiPetOrb}
+            onChange={(v) => updateAppSettings({ hideAiPetOrb: v })}
+          />
+        </Section>
 
-      <Section title="播放规则" label="RULES">
-        <Toggle
-          label="主动安排一段"
-          desc="启动后按时间、天气和近期听感自动排一小段"
-          value={appSettings.smartSessionPlanner}
-          onChange={(v) => updateAppSettings({ smartSessionPlanner: v })}
-        />
-        <Toggle
-          label="工作时段自动播放"
-          desc="09:00 – 18:30，偏专注、不吵"
-          value={appSettings.workdayAutoplay}
-          onChange={(v) => updateAppSettings({ workdayAutoplay: v })}
-        />
-        <Toggle
-          label="午休换放松歌单"
-          desc="12:00 – 13:30"
-          value={appSettings.lunchRelaxMode}
-          onChange={(v) => updateAppSettings({ lunchRelaxMode: v })}
-        />
-        <Toggle
-          label="深夜降低推荐节奏"
-          desc="22:30 之后"
-          value={appSettings.lateNightCalmMode}
-          onChange={(v) => updateAppSettings({ lateNightCalmMode: v })}
-        />
-        <PromptedRadioRule
-          value={appSettings.promptedRadioRule}
-          onChange={(value) => updateAppSettings({ promptedRadioRule: value })}
-        />
-      </Section>
+        <Section title="播放规则" label="RULES">
+          <Toggle
+            label="主动安排一段"
+            desc="启动后按时间、天气和近期听感自动排一小段"
+            value={appSettings.smartSessionPlanner}
+            onChange={(v) => updateAppSettings({ smartSessionPlanner: v })}
+          />
+          <Toggle
+            label="工作时段自动播放"
+            desc="09:00 – 18:30，偏专注、不吵"
+            value={appSettings.workdayAutoplay}
+            onChange={(v) => updateAppSettings({ workdayAutoplay: v })}
+          />
+          <Toggle
+            label="午休换放松歌单"
+            desc="12:00 – 13:30"
+            value={appSettings.lunchRelaxMode}
+            onChange={(v) => updateAppSettings({ lunchRelaxMode: v })}
+          />
+          <Toggle
+            label="深夜降低推荐节奏"
+            desc="22:30 之后"
+            value={appSettings.lateNightCalmMode}
+            onChange={(v) => updateAppSettings({ lateNightCalmMode: v })}
+          />
+          <PromptedRadioRule
+            value={appSettings.promptedRadioRule}
+            onChange={(value) => updateAppSettings({ promptedRadioRule: value })}
+          />
+        </Section>
 
-      <Section title="关于你" subtitle="自述事实" label="ABOUT YOU">
-        <UserFactsRow />
-      </Section>
+        <Section title="关于你" subtitle="自述事实" label="ABOUT YOU">
+          <UserFactsRow />
+        </Section>
 
-      <Section title="AI 接入" label="AI">
-        <AiProvidersRow />
-      </Section>
+        <Section title="AI 接入" label="AI">
+          <AiProvidersRow />
+        </Section>
 
-      <Section title="AI 解说" label="NARRATION">
-        <Toggle
-          label="封面短提示"
-          desc="只出现一句，自动消失"
-          value={appSettings.aiNarration}
-          onChange={(v) => updateAppSettings({ aiNarration: v })}
-        />
-      </Section>
+        <Section title="AI 解说" label="NARRATION">
+          <Toggle
+            label="封面短提示"
+            desc="只出现一句，自动消失"
+            value={appSettings.aiNarration}
+            onChange={(v) => updateAppSettings({ aiNarration: v })}
+          />
+        </Section>
 
-      <div style={footerNote}>
-        登录 cookie & API key 仅保存在本机 · 不上传
-      </div>
+        <div style={footerNote}>
+          登录 cookie & API key 仅保存在本机 · 不上传
+        </div>
       </div>
     </>
   );
@@ -221,10 +201,10 @@ function PromptedRadioRule({
 
 const smallTextarea: React.CSSProperties = {
   width: "100%",
-  padding: "9px 11px",
-  background: "rgba(255,255,255,0.04)",
-  border: "1px solid rgba(255,255,255,0.08)",
-  borderRadius: 8,
+  padding: "10px 12px",
+  background: "rgba(10,13,20,0.72)",
+  border: "1px solid rgba(233,239,255,0.08)",
+  borderRadius: 0,
   color: "rgba(233,239,255,0.92)",
   fontSize: 13,
   lineHeight: 1.55,
@@ -236,16 +216,17 @@ const smallTextarea: React.CSSProperties = {
 
 // ---------- 多 provider AI 接入 ----------
 //
-// 三家 provider 共用一份调用协议（OpenAI 兼容），但前端要让用户：
+// 多家 provider 共用一份调用协议（OpenAI 兼容），但前端要让用户：
 //   1) 切 provider（顶部 tab）
 //   2) 填 / 改 / 清 当前 provider 的 key（key 永远不回传完整值）
 //   3) 选模型（dropdown，从后端 ai.listModels(provider) 拿，按官方梯队从高到低）
-//   4) 测试当前 provider+模型 是否能跑通（ai.ping）
+//   4) 自定义 provider 额外填中转站请求地址
+//   5) 测试当前 provider+模型 是否能跑通（ai.ping）
 //
-// 切 provider 不会动别家的 key —— 用户能在 DeepSeek / OpenAI / 小米 MiMo 之间反复切。
+// 切 provider 不会动别家的 key —— 用户能在 DeepSeek / OpenAI / 小米 MiMo / 自定义之间反复切。
 // 选完模型后端立刻持久化，下次启动也记得。
 
-const PROVIDER_LINKS: Record<ProviderId, { label: string; url: string }> = {
+const PROVIDER_LINKS: Record<ProviderId, { label: string; url?: string }> = {
   deepseek: {
     label: "platform.deepseek.com",
     url: "https://platform.deepseek.com/api_keys",
@@ -258,6 +239,9 @@ const PROVIDER_LINKS: Record<ProviderId, { label: string; url: string }> = {
     label: "platform.xiaomimimo.com",
     url: "https://platform.xiaomimimo.com/",
   },
+  custom: {
+    label: "OpenAI 兼容中转站",
+  },
 };
 
 function AiProvidersRow() {
@@ -266,6 +250,8 @@ function AiProvidersRow() {
     {} as Record<ProviderId, ModelOption[]>,
   );
   const [editingDraft, setEditingDraft] = useState<string | null>(null);
+  const [baseUrlDraft, setBaseUrlDraft] = useState("");
+  const [savingBaseUrl, setSavingBaseUrl] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [reply, setReply] = useState<string | null>(null);
@@ -275,7 +261,10 @@ function AiProvidersRow() {
     try {
       const c = await ai.getConfig();
       setCfg(c);
-      // 第一次加载时把三家的模型列表都拉一下，切 provider 时不需再等网络
+      const activeProvider =
+        c.providers.find((p) => p.id === c.activeProvider) ?? c.providers[0];
+      setBaseUrlDraft(activeProvider?.baseUrl ?? "");
+      // 第一次加载时把全部 provider 的模型列表都拉一下，切 provider 时不需再等网络
       if (Object.keys(models).length === 0) {
         const entries = await Promise.all(
           c.providers.map(async (p) => {
@@ -362,6 +351,21 @@ function AiProvidersRow() {
     }
   };
 
+  const saveBaseUrl = async () => {
+    if (active.id !== "custom") return;
+    setSavingBaseUrl(true);
+    setErr(null);
+    setReply(null);
+    try {
+      await ai.setBaseUrl(active.id, baseUrlDraft);
+      await refresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingBaseUrl(false);
+    }
+  };
+
   const test = async () => {
     setTesting(true);
     setErr(null);
@@ -381,61 +385,51 @@ function AiProvidersRow() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-      {/* Provider 切换 —— pill tab 形式 */}
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {cfg.providers.map((p) => {
-          const isActive = p.id === active.id;
-          return (
-            <button
-              key={p.id}
-              onClick={() => void switchProvider(p.id)}
-              style={{
-                padding: "7px 14px",
-                borderRadius: 999,
-                border: isActive
-                  ? "1px solid rgba(155,227,198,0.6)"
-                  : "1px solid rgba(233,239,255,0.14)",
-                background: isActive ? "rgba(155,227,198,0.16)" : "transparent",
-                color: isActive ? "#9be3c6" : "rgba(233,239,255,0.7)",
-                fontSize: 12,
-                fontWeight: isActive ? 600 : 500,
-                cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                transition: "background 160ms ease, color 160ms ease, border-color 160ms ease",
-              }}
-            >
-              {p.label}
-              {p.hasKey && (
-                <span
-                  aria-hidden
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: 999,
-                    background: "#9be3c6",
-                  }}
-                />
-              )}
-            </button>
-          );
-        })}
+      <div style={controlRow}>
+        <div style={controlLabel}>服务商</div>
+        <select
+          value={active.id}
+          onChange={(e) => void switchProvider(e.target.value as ProviderId)}
+          style={{ ...selectStyle, minWidth: 210 }}
+        >
+          {cfg.providers.map((p) => (
+            <option key={p.id} value={p.id} style={{ background: "#0a0d14", color: "#e9efff" }}>
+              {p.label}{p.hasKey ? " · key" : ""}
+            </option>
+          ))}
+        </select>
       </div>
 
       {/* 当前 provider 介绍 */}
       <div style={{ color: "#8a93a8", fontSize: 12, lineHeight: 1.55 }}>
-        去{" "}
-        <a
-          href={link.url}
-          target="_blank"
-          rel="noreferrer"
-          style={{ color: "#9be3c6" }}
-        >
-          {link.label}
-        </a>{" "}
-        创建 API key，贴在下面。DJ 旁白、AI 选曲会走当前选中的 provider。所有 key 本机 0600 存储，不上传。
+        {link.url ? (
+          <>
+            去{" "}
+            <a
+              href={link.url}
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: "#9be3c6" }}
+            >
+              {link.label}
+            </a>{" "}
+            创建 API key，贴在下面。
+          </>
+        ) : (
+          <>填入中转站的 OpenAI 兼容请求地址和 API key。</>
+        )}
+        DJ 旁白、AI 选曲会走当前选中的 provider。所有 key 本机 0600 存储，不上传。
       </div>
+
+      {active.id === "custom" && (
+        <BaseUrlRow
+          value={baseUrlDraft}
+          endpoint={active.baseUrl}
+          saving={savingBaseUrl}
+          onChange={setBaseUrlDraft}
+          onSave={saveBaseUrl}
+        />
+      )}
 
       {/* API key 录入区 */}
       <KeyRow
@@ -472,7 +466,7 @@ function AiProvidersRow() {
         <div
           style={{
             padding: "10px 14px",
-            borderRadius: 10,
+            borderRadius: 0,
             background: "rgba(155,227,198,0.08)",
             border: "1px solid rgba(155,227,198,0.3)",
             color: "#c9f0dc",
@@ -489,7 +483,7 @@ function AiProvidersRow() {
         <div
           style={{
             padding: "8px 12px",
-            borderRadius: 10,
+            borderRadius: 0,
             background: "rgba(255,180,180,0.08)",
             border: "1px solid rgba(255,180,180,0.25)",
             color: "#ffb4b4",
@@ -510,14 +504,93 @@ const keyInputStyle: React.CSSProperties = {
   flex: 1,
   minWidth: 180,
   padding: "10px 14px",
-  borderRadius: 10,
-  border: "1px solid rgba(233,239,255,0.15)",
-  background: "rgba(14,18,28,0.6)",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.10)",
+  background: "rgba(10,13,20,0.72)",
   color: "#e9efff",
   fontSize: 13,
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
   outline: "none",
 };
+
+const controlRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  flexWrap: "wrap",
+};
+
+const controlLabel: React.CSSProperties = {
+  color: "#8a93a8",
+  fontSize: 12,
+  minWidth: 48,
+};
+
+const selectStyle: React.CSSProperties = {
+  flex: 1,
+  minWidth: 200,
+  padding: "9px 12px",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.10)",
+  background: "rgba(10,13,20,0.72)",
+  color: "#e9efff",
+  fontSize: 13,
+  outline: "none",
+  fontFamily: "inherit",
+  appearance: "none",
+  backgroundImage:
+    "linear-gradient(45deg, transparent 50%, rgba(233,239,255,0.55) 50%), linear-gradient(135deg, rgba(233,239,255,0.55) 50%, transparent 50%)",
+  backgroundPosition: "calc(100% - 18px) 50%, calc(100% - 12px) 50%",
+  backgroundSize: "6px 6px, 6px 6px",
+  backgroundRepeat: "no-repeat",
+  paddingRight: 32,
+  cursor: "pointer",
+};
+
+function trimEndpoint(v: string) {
+  return v.trim().replace(/\/+$/, "");
+}
+
+function BaseUrlRow({
+  value,
+  endpoint,
+  saving,
+  onChange,
+  onSave,
+}: {
+  value: string;
+  endpoint: string;
+  saving: boolean;
+  onChange: (v: string) => void;
+  onSave: () => void;
+}) {
+  const changed = trimEndpoint(value) !== trimEndpoint(endpoint);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+      <div style={controlRow}>
+        <div style={controlLabel}>地址</div>
+        <input
+          type="url"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="https://your-relay.example.com/v1"
+          spellCheck={false}
+          style={{ ...keyInputStyle, minWidth: 280 }}
+        />
+        <button
+          onClick={onSave}
+          disabled={saving || !value.trim() || !changed}
+          style={primaryBtn}
+        >
+          {saving ? "保存中…" : "保存地址"}
+        </button>
+      </div>
+      <div style={{ color: "#6c7489", fontSize: 11, lineHeight: 1.45, paddingLeft: 58 }}>
+        支持 OpenAI 兼容 Base URL；如果粘贴完整 /chat/completions，后端会自动规整。
+      </div>
+    </div>
+  );
+}
 
 function KeyRow({
   provider,
@@ -601,94 +674,144 @@ function ModelPicker({
 }: {
   active: ProviderView;
   options: ModelOption[];
-  onChange: (model: string) => void;
+  onChange: (model: string) => void | Promise<void>;
 }) {
+  const [draft, setDraft] = useState(active.model);
+  const [savingDraft, setSavingDraft] = useState(false);
+
+  useEffect(() => {
+    setDraft(active.model);
+  }, [active.id, active.model]);
+
   // 后端选中的 model 可能是用户改过的、不在 known_models 里。
   // 这种情况我们仍然要让用户看见当前值，所以构造一个合并列表（已选模型在前）。
   const selectedInList = options.some((o) => o.id === active.model);
   const merged: ModelOption[] = selectedInList
     ? options
     : [{ id: active.model, label: `${active.model}（自定义）` }, ...options];
+  const isCustom = active.id === "custom";
+  const canSaveCustomModel =
+    isCustom && draft.trim().length > 0 && draft.trim() !== active.model;
+
+  const saveDraft = async () => {
+    const model = draft.trim();
+    if (!model || model === active.model) return;
+    setSavingDraft(true);
+    try {
+      await onChange(model);
+    } finally {
+      setSavingDraft(false);
+    }
+  };
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-      <div style={{ color: "#8a93a8", fontSize: 12, minWidth: 36 }}>模型</div>
-      <select
-        value={active.model}
-        onChange={(e) => onChange(e.target.value)}
-        style={{
-          flex: 1,
-          minWidth: 200,
-          padding: "9px 12px",
-          borderRadius: 10,
-          border: "1px solid rgba(233,239,255,0.15)",
-          background: "rgba(14,18,28,0.6)",
-          color: "#e9efff",
-          fontSize: 13,
-          outline: "none",
-          fontFamily: "inherit",
-          appearance: "none",
-          backgroundImage:
-            "linear-gradient(45deg, transparent 50%, rgba(233,239,255,0.5) 50%), linear-gradient(135deg, rgba(233,239,255,0.5) 50%, transparent 50%)",
-          backgroundPosition:
-            "calc(100% - 18px) 50%, calc(100% - 12px) 50%",
-          backgroundSize: "6px 6px, 6px 6px",
-          backgroundRepeat: "no-repeat",
-          paddingRight: 32,
-          cursor: "pointer",
-        }}
-      >
-        {merged.map((o) => (
-          <option key={o.id} value={o.id} style={{ background: "#0a0d14", color: "#e9efff" }}>
-            {o.label} · {o.id}
-          </option>
-        ))}
-      </select>
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={controlRow}>
+        <div style={controlLabel}>模型</div>
+        <select
+          value={active.model}
+          onChange={(e) => void onChange(e.target.value)}
+          style={selectStyle}
+        >
+          {merged.map((o) => (
+            <option key={o.id} value={o.id} style={{ background: "#0a0d14", color: "#e9efff" }}>
+              {o.label} · {o.id}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {isCustom && (
+        <div style={controlRow}>
+          <div style={controlLabel}>ID</div>
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="gpt-4o-mini"
+            spellCheck={false}
+            style={{ ...keyInputStyle, minWidth: 220 }}
+          />
+          <button
+            onClick={() => void saveDraft()}
+            disabled={savingDraft || !canSaveCustomModel}
+            style={ghostBtn}
+          >
+            {savingDraft ? "保存中…" : "保存模型"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
 const primaryBtn: React.CSSProperties = {
-  padding: "9px 18px",
-  borderRadius: 999,
-  border: "1px solid rgba(155,227,198,0.5)",
-  background: "rgba(155,227,198,0.14)",
-  color: "#9be3c6",
-  fontSize: 13,
+  padding: "8px 14px",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.92)",
+  background: "rgba(233,239,255,0.94)",
+  color: "#05060a",
+  fontSize: 12,
   fontWeight: 600,
+  letterSpacing: 0.8,
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
 
 const ghostBtn: React.CSSProperties = {
-  padding: "9px 16px",
-  borderRadius: 999,
-  border: "1px solid rgba(233,239,255,0.18)",
+  padding: "8px 14px",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.10)",
   background: "transparent",
   color: "#e9efff",
-  fontSize: 13,
+  fontSize: 12,
+  fontWeight: 600,
+  letterSpacing: 0.8,
   cursor: "pointer",
   whiteSpace: "nowrap",
+};
+
+const ghostLinkBtn: React.CSSProperties = {
+  ...ghostBtn,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  textDecoration: "none",
 };
 
 const dangerBtn: React.CSSProperties = {
-  padding: "9px 16px",
-  borderRadius: 999,
+  padding: "8px 14px",
+  borderRadius: 0,
   border: "1px solid rgba(255,180,180,0.3)",
   background: "transparent",
   color: "#ffb4b4",
-  fontSize: 13,
+  fontSize: 12,
+  fontWeight: 600,
+  letterSpacing: 0.8,
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
 
-// Section —— 每一组设置都是一张「软玻璃卡」：
-//   header 行：中文标题 +（可选）描述 +（可选）右侧 mono 大写 brand label
-//   body：卡片内 padding，flex column。
-//
-// 多子节点时（譬如「播放规则」里的 4 个 Toggle）自动给相邻子节点之间加一道
-// 1px hairline 分隔；只有一个子节点（譬如某个 Row 组件自己内部已 flex 排版）
-// 则不加，避免 row 内部被切成奇怪几段。
+const sectionOrder: Record<string, string> = {
+  SOURCE: "01",
+  ANALYSIS: "02",
+  CACHE: "03",
+  LOOK: "04",
+  RULES: "05",
+  "ABOUT YOU": "06",
+  AI: "07",
+  NARRATION: "08",
+};
+
+function PageHeading({ title, subtitle }: { title: string; subtitle: string }) {
+  return (
+    <header style={pageHeading}>
+      <div style={pageTitle}>{title}</div>
+      <div style={pageSubtitle}>{subtitle}</div>
+    </header>
+  );
+}
+
+// Section —— 对齐 Android SettingsSectionHeader：编号 / 大写 label / 1px 分割线。
 function Section({
   title,
   subtitle,
@@ -702,26 +825,24 @@ function Section({
 }) {
   const items = Children.toArray(children);
   const multi = items.length > 1;
+  const code = label ?? title.toUpperCase();
   return (
     <section style={sectionBlock}>
       <div style={sectionHeader}>
+        <div style={sectionIndex}>{sectionOrder[code] ?? "00"}</div>
+        <div style={sectionSlash}>/</div>
+        <div style={sectionLabel}>{code}</div>
         <div style={sectionTitle}>{title}</div>
         {subtitle && <div style={sectionSubtitleInline}>{subtitle}</div>}
-        {label && <div style={sectionLabel}>{label}</div>}
       </div>
-      <div style={sectionCard}>
+      <div style={divider} />
+      <div style={sectionBody}>
         {multi
           ? items.map((c, i) => (
               <div
                 key={i}
                 style={
-                  i === 0
-                    ? undefined
-                    : {
-                        borderTop: "1px solid rgba(233,239,255,0.06)",
-                        paddingTop: 6,
-                        marginTop: 6,
-                      }
+                  i === 0 ? undefined : { borderTop: "1px solid rgba(233,239,255,0.08)" }
                 }
               >
                 {c}
@@ -733,32 +854,72 @@ function Section({
   );
 }
 
-const subtitle: React.CSSProperties = {
-  textAlign: "center",
-  color: "#8a93a8",
-  marginBottom: "clamp(22px, 4vh, 34px)",
+const pageWrap: React.CSSProperties = {
+  padding: "clamp(64px, 8vh, 78px) clamp(18px, 5vw, 34px) 64px",
+  maxWidth: 820,
+  margin: "0 auto",
+  width: "100%",
+};
+
+const pageHeading: React.CSSProperties = {
+  paddingTop: "clamp(8px, 2vh, 18px)",
+  paddingBottom: 18,
+};
+
+const pageTitle: React.CSSProperties = {
+  color: "#e9efff",
+  fontSize: 20,
+  fontWeight: 800,
+  letterSpacing: 4,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const pageSubtitle: React.CSSProperties = {
+  color: "rgba(233,239,255,0.42)",
+  marginTop: 8,
   fontSize: 13,
   lineHeight: 1.55,
 };
 
 const sectionBlock: React.CSSProperties = {
-  marginBottom: 22,
+  marginBottom: 28,
 };
 
 const sectionHeader: React.CSSProperties = {
   display: "flex",
   alignItems: "baseline",
-  gap: 10,
-  marginBottom: 10,
-  paddingLeft: 4,
-  paddingRight: 4,
+  gap: 8,
+  paddingTop: 10,
+  paddingBottom: 8,
+};
+
+const sectionIndex: React.CSSProperties = {
+  color: "rgba(233,239,255,0.42)",
+  fontSize: 11,
+  fontWeight: 800,
+  letterSpacing: 2,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const sectionSlash: React.CSSProperties = {
+  color: "rgba(233,239,255,0.22)",
+  fontSize: 11,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+};
+
+const sectionLabel: React.CSSProperties = {
+  color: "#e9efff",
+  fontSize: 12,
+  fontWeight: 800,
+  letterSpacing: 3,
+  textTransform: "uppercase",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
 };
 
 const sectionTitle: React.CSSProperties = {
-  color: "#f5f7ff",
-  fontSize: 16,
-  fontWeight: 600,
-  letterSpacing: -0.1,
+  color: "rgba(233,239,255,0.42)",
+  fontSize: 12,
+  marginLeft: 4,
 };
 
 const sectionSubtitleInline: React.CSSProperties = {
@@ -767,23 +928,15 @@ const sectionSubtitleInline: React.CSSProperties = {
   fontWeight: 400,
 };
 
-const sectionLabel: React.CSSProperties = {
-  marginLeft: "auto",
-  color: "rgba(155,227,198,0.55)",
-  fontSize: 10,
-  letterSpacing: 2.4,
-  textTransform: "uppercase",
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+const divider: React.CSSProperties = {
+  height: 1,
+  background: "rgba(233,239,255,0.08)",
+  width: "100%",
 };
 
-const sectionCard: React.CSSProperties = {
-  background: "rgba(255,255,255,0.025)",
-  border: "1px solid rgba(233,239,255,0.06)",
-  borderRadius: 16,
-  padding: "16px 18px",
+const sectionBody: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
-  gap: 14,
 };
 
 const footerNote: React.CSSProperties = {
@@ -816,22 +969,18 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
         <Link
           href="/login"
           style={{
-            padding: "8px 16px",
-            borderRadius: 999,
+            ...ghostLinkBtn,
             border: connected
-              ? "1px solid rgba(155,227,198,0.5)"
-              : "1px solid rgba(233,239,255,0.2)",
-            background: connected ? "rgba(155,227,198,0.14)" : "transparent",
-            color: connected ? "#9be3c6" : "#e9efff",
-            textDecoration: "none",
-            fontSize: 13,
+              ? "1px solid rgba(155,227,198,0.46)"
+              : ghostLinkBtn.border,
+            color: connected ? "#9be3c6" : ghostLinkBtn.color,
           }}
         >
           {connected ? "换账号" : "扫码登录"}
         </Link>
       </div>
 
-      {/* 登录之后，直接给一个大 CTA：进入我的歌单 */}
+      {/* 登录之后，直接给一个入口：进入我的歌单 */}
       {connected && (
         <Link
           href="/distill"
@@ -839,10 +988,10 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            padding: "14px 18px",
-            borderRadius: 14,
+            padding: "13px 14px",
+            borderRadius: 0,
             border: "1px solid rgba(155,227,198,0.4)",
-            background: "rgba(155,227,198,0.08)",
+            background: "rgba(155,227,198,0.055)",
             textDecoration: "none",
             color: "#e9efff",
           }}
@@ -960,15 +1109,15 @@ function AnalysisRow() {
             {eta && <span style={{ color: "#6c7489" }}> · 约 {eta}</span>}
           </div>
           <div style={{
-            height: 6,
-            borderRadius: 999,
+            height: 5,
+            borderRadius: 0,
             background: "rgba(233,239,255,0.08)",
             overflow: "hidden",
           }}>
             <div style={{
               height: "100%",
               width: `${pct}%`,
-              background: "linear-gradient(90deg, #9be3c6, #c9f0dc)",
+              background: "#9be3c6",
               transition: "width 240ms ease",
             }} />
           </div>
@@ -1010,7 +1159,7 @@ function AnalysisRow() {
       {err && (
         <div style={{
           padding: "8px 12px",
-          borderRadius: 10,
+          borderRadius: 0,
           background: "rgba(255,180,180,0.08)",
           border: "1px solid rgba(255,180,180,0.25)",
           color: "#ffb4b4",
@@ -1148,9 +1297,9 @@ function AudioCacheRow() {
                   style={{
                     width: 110,
                     padding: "9px 12px",
-                    borderRadius: 10,
-                    border: "1px solid rgba(233,239,255,0.15)",
-                    background: "rgba(14,18,28,0.6)",
+                    borderRadius: 0,
+                    border: "1px solid rgba(233,239,255,0.10)",
+                    background: "rgba(10,13,20,0.72)",
                     color: "#e9efff",
                     fontSize: 13,
                     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -1197,7 +1346,7 @@ function AudioCacheRow() {
         <div
           style={{
             padding: "8px 12px",
-            borderRadius: 10,
+            borderRadius: 0,
             background: "rgba(255,180,180,0.08)",
             border: "1px solid rgba(255,180,180,0.25)",
             color: "#ffb4b4",
@@ -1222,7 +1371,7 @@ function CacheUsageBar({ used, max }: { used: number; max: number }) {
         flex: 1,
         minWidth: 140,
         height: 6,
-        borderRadius: 999,
+        borderRadius: 0,
         background: "rgba(233,239,255,0.08)",
         overflow: "hidden",
       }}
@@ -1232,7 +1381,7 @@ function CacheUsageBar({ used, max }: { used: number; max: number }) {
           width: `${pct}%`,
           height: "100%",
           background: color,
-          borderRadius: 999,
+          borderRadius: 0,
           transition: "width 240ms ease, background 240ms ease",
         }}
       />
@@ -1379,9 +1528,9 @@ function UserFactsRow() {
         style={{
           width: "100%",
           padding: "10px 12px",
-          background: "rgba(255,255,255,0.04)",
-          border: "1px solid rgba(255,255,255,0.08)",
-          borderRadius: 8,
+          background: "rgba(10,13,20,0.72)",
+          border: "1px solid rgba(233,239,255,0.08)",
+          borderRadius: 0,
           color: "rgba(233,239,255,0.92)",
           fontSize: 13,
           lineHeight: 1.6,
@@ -1409,14 +1558,15 @@ function UserFactsRow() {
             disabled={!dirty || saving}
             style={{
               padding: "7px 16px",
-              borderRadius: 999,
+              borderRadius: 0,
               border: dirty
-                ? "1px solid rgba(155,227,198,0.6)"
-                : "1px solid rgba(233,239,255,0.12)",
-              background: dirty ? "rgba(155,227,198,0.16)" : "transparent",
-              color: dirty ? "#9be3c6" : "rgba(233,239,255,0.4)",
+                ? "1px solid rgba(233,239,255,0.92)"
+                : "1px solid rgba(233,239,255,0.10)",
+              background: dirty ? "rgba(233,239,255,0.94)" : "transparent",
+              color: dirty ? "#05060a" : "rgba(233,239,255,0.4)",
               fontSize: 12,
               fontWeight: 600,
+              letterSpacing: 0.8,
               cursor: dirty && !saving ? "pointer" : "default",
               transition: "background 160ms ease, color 160ms ease, border-color 160ms ease",
             }}

@@ -39,15 +39,15 @@ export function BackButton({ href, label = "返回" }: Props) {
   );
 }
 
-// 30x30 透明 icon button，跟 distill 顶部 chipStyle 同款
+// 30x30 直角线框 icon button，跟 Android 内页设置风格统一。
 const chip: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
   width: 30,
   height: 30,
-  borderRadius: 8,
-  border: "none",
+  borderRadius: 0,
+  border: "1px solid rgba(233,239,255,0.10)",
   background: "transparent",
   color: "rgba(245,247,255,0.86)",
   cursor: "pointer",

@@ -31,6 +31,10 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.APP_MUSIC" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="app.pipo.nativeapp.action.LYRIC_SANDBOX" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
 
         <service

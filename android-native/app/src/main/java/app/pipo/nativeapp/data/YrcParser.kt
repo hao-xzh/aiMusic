@@ -34,8 +34,8 @@ object YrcParser {
                 val tokenDur = m.groupValues[2].toLongOrNull() ?: return@forEach
                 val text = m.groupValues[3]
                 if (text.isEmpty()) return@forEach
-                // 把 token 切成单字 —— netease 的 yrc token 是词/音节级（中文 1-2 字、英文 1 词），
-                // 切到字级让 karaoke wipe 真正"逐字"。每个 char 均分原 token 的 duration。
+                // Apple Music Web 直接把歌词数据里的 word.content 渲染成一个 `.syllable`，
+                // 不会把中文 word 再拆成单字；英文异常粘连时仍按空格拆成多个 word。
                 // 空白和标点保留在它前一个非空白字符上，避免单独高亮一个空格闪烁。
                 val groups = splitIntoVisualChars(text)
                 if (groups.isEmpty()) return@forEach
@@ -63,7 +63,11 @@ object YrcParser {
                 chars = rawMergedChars,
                 lineStartMs = lineStart,
                 lineDurationMs = lineDur,
-                tightenInternalDurations = true,
+                // Apple Music Web 的 data-duration 直接取每个 word 自己的 begin/end；
+                // 不会把上一个 syllable 的 end 强行裁到下一个 syllable start。保留
+                // YRC 原始 token duration，避免密集英文词被压成一帧扫完；下方的行尾
+                // tail cap 仍处理“整行余量塞进最后一个 token”的异常数据。
+                tightenInternalDurations = false,
             )
             val text = if (mergedChars.isNotEmpty()) mergedChars.joinToString("") { it.text } else ""
             if (mergedChars.isEmpty() && text.isEmpty()) continue
@@ -439,8 +443,8 @@ private fun isAsciiWordJoiner(c: Char): Boolean {
 
 /**
  * 把 yrc token 切成"视觉字符 / 视觉单词"。规则：
- *   - 中日韩 (CJK) 字符：每个独立成字
- *   - ASCII 字母 / 数字：连续的当**一个 word**整体（不切！）—— 让英文按单词跳动而不是逐字母
+ *   - 中日韩 (CJK) 字符：保留同一个 YRC token 内的连续词组，不再二次切单字
+ *   - ASCII 字母 / 数字：连续的当**一个 word**整体（不切！）—— 让英文按单词动画而不是逐字母
  *   - 空白和标点：附着到它前一个 char 上（不单独成字，避免高亮闪烁）
  *
  * 之前 bug：注释说"不切"，代码却 startNew(c) 每个字母都新起一个，
@@ -456,18 +460,21 @@ fun splitIntoVisualChars(text: String): List<String> {
         if (out.isEmpty()) startNew(c) else out.last().append(c)
     }
     var lastWasAsciiWord = false
+    var lastWasCjkWord = false
     for (c in text) {
         val isCjk = isCjkWordChar(c)
         val isAsciiWord = isAsciiWordChar(c)
         when {
             isCjk -> {
-                startNew(c)
+                if (lastWasCjkWord) appendToLast(c) else startNew(c)
                 lastWasAsciiWord = false
+                lastWasCjkWord = true
             }
             isAsciiWord -> {
                 // 关键修复：连续 ASCII 字母 / 数字合并到上一个单元 → 一个英文单词整体跳
                 if (lastWasAsciiWord) appendToLast(c) else startNew(c)
                 lastWasAsciiWord = true
+                lastWasCjkWord = false
             }
             else -> {
                 // 空白 / 标点：附在前一个字符上，不单独成字。
@@ -475,6 +482,7 @@ fun splitIntoVisualChars(text: String): List<String> {
                 // 在单个 YRC token 内直接成为一个视觉单词，避免后续碎片抢走扫色速度。
                 appendToLast(c)
                 lastWasAsciiWord = lastWasAsciiWord && isAsciiInlineWordJoiner(c)
+                lastWasCjkWord = lastWasCjkWord && isCjkInlineWordJoiner(c)
             }
         }
     }
@@ -485,6 +493,10 @@ private fun isAsciiInlineWordJoiner(c: Char): Boolean {
     return c == '\'' || c == '’' || c == '-'
 }
 
+private fun isCjkInlineWordJoiner(c: Char): Boolean {
+    return c == '・' || c == '·'
+}
+
 /**
  * 算某个字在 positionMs 时刻的"播放进度"，用于 wipe 动画。
  *   - 还没到 → 0
@@ -492,8 +504,10 @@ private fun isAsciiInlineWordJoiner(c: Char): Boolean {
  *   - 正在唱 → 0..1
  */
 fun PipoLyricChar.progress(positionMs: Long): Float {
-    val linear = linearTokenProgress(positionMs)
     val parts = timingPartsForProgress()
+    val endMs = effectiveEndMs(parts)
+    if (positionMs >= endMs) return 1f
+    val linear = linearTokenProgress(positionMs, endMs)
     if (parts.size <= 1) return linear
 
     // 音节必须参与，但不能 100% 接管视觉进度。否则 ha-ha / 长词这类 token
@@ -501,15 +515,41 @@ fun PipoLyricChar.progress(positionMs: Long): Float {
     // 这里用整词线性进度做底，再叠加一部分音节进度修正：音节会影响快慢，
     // 但扫色/上浮仍是一条连续曲线。
     val syllable = timingPartProgress(parts, positionMs)
-    val influence = syllableProgressInfluence(text, parts)
+    val influence = timingPartProgressInfluence(this, parts)
     return (linear + (syllable - linear) * influence).coerceIn(0f, 1f)
 }
 
-private fun PipoLyricChar.linearTokenProgress(positionMs: Long): Float {
+private fun PipoLyricChar.linearTokenProgress(positionMs: Long, endMs: Long = rawEndMs()): Float {
     if (positionMs <= startMs) return 0f
-    if (positionMs >= startMs + durationMs) return 1f
-    if (durationMs <= 0L) return 1f
-    return ((positionMs - startMs).toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    if (positionMs >= endMs) return 1f
+    val duration = (endMs - startMs).coerceAtLeast(1L)
+    return ((positionMs - startMs).toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+}
+
+fun PipoLyricChar.effectiveEndMs(): Long = effectiveEndMs(timingPartsForProgress())
+
+fun PipoLyricChar.effectiveDurationMs(): Long = (effectiveEndMs() - startMs).coerceAtLeast(1L)
+
+private fun PipoLyricChar.effectiveEndMs(parts: List<PipoLyricTimingPart>): Long {
+    val rawEnd = rawEndMs()
+    if (parts.size <= 1) return rawEnd
+    val quality = timingPartQuality(this, parts)
+    if (!quality.reliable && !timingPartsCoverTokenText(this, parts)) return rawEnd
+    return timingPartsEffectiveEndMs(parts).coerceAtLeast(startMs + 1L)
+}
+
+private fun PipoLyricChar.rawEndMs(): Long = startMs + durationMs.coerceAtLeast(1L)
+
+private fun timingPartsEffectiveEndMs(parts: List<PipoLyricTimingPart>): Long {
+    var end = Long.MIN_VALUE
+    parts.forEachIndexed { index, part ->
+        val nextStartMs = parts.getOrNull(index + 1)?.startMs
+        val effectiveDurationMs = nextStartMs
+            ?.let { (it - part.startMs).coerceAtLeast(1L).coerceAtMost(part.durationMs.coerceAtLeast(1L)) }
+            ?: part.durationMs.coerceAtLeast(1L)
+        end = maxOf(end, part.startMs + effectiveDurationMs)
+    }
+    return end
 }
 
 private fun timingPartProgress(parts: List<PipoLyricTimingPart>, positionMs: Long): Float {
@@ -538,21 +578,132 @@ private fun timingPartProgress(parts: List<PipoLyricTimingPart>, positionMs: Lon
     return progress.coerceIn(0f, 1f)
 }
 
-private fun syllableProgressInfluence(
-    tokenText: String,
+private fun timingPartProgressInfluence(
+    token: PipoLyricChar,
     parts: List<PipoLyricTimingPart>,
 ): Float {
+    val tokenText = token.text
     val visibleGlyphs = tokenText.count(::isWordLikeChar).coerceAtLeast(1)
     val partDensity = parts.size.toFloat() / visibleGlyphs.toFloat()
-    // 音节进度按“字符数”分配区间，但各音节时长不均：短时长却覆盖多字母的音节会让进度陡增，
-    // 表现为扫色“跳一段”。这里大幅压低音节影响、以整词线性进度为主，保证扫色从头到尾连续丝滑，
-    // 音节仅作极轻微的快慢修正，不再造成可见跳变。（想完全线性可全部设 0f。）
-    return when {
-        // 很密的 parts ≈ 逐字母碎片，直接纯线性最丝滑。
-        partDensity >= 0.75f -> 0.0f
-        parts.size >= 6 -> 0.10f
-        else -> 0.15f
+    val quality = timingPartQuality(token, parts)
+    // Apple Music Web 给每个 .syllable 直接挂 data-delay/data-duration，然后普通词
+    // 按一个线性的 --gradient-progress 跑到底；它不会让内部字母/音节片段高权重改写
+    // 整个词的扫色速度。这里保留 timingParts 只做很轻的节奏修正，避免合并后的英文词
+    // 在片段边界突然跳一截，表现成“一整个单词一帧播完”。
+    val baseInfluence = when {
+        !quality.reliable -> 0.06f
+        partDensity >= 0.75f -> if (quality.tight) 0.08f else 0.04f
+        parts.size >= 6 -> if (quality.tight) 0.10f else 0.06f
+        else -> if (quality.tight) 0.14f else 0.08f
     }
+    return baseInfluence.coerceIn(0f, 0.16f)
+}
+
+private data class TimingPartQuality(
+    val reliable: Boolean,
+    val tight: Boolean,
+)
+
+private fun timingPartQuality(
+    token: PipoLyricChar,
+    parts: List<PipoLyricTimingPart>,
+): TimingPartQuality {
+    if (parts.size <= 1) return TimingPartQuality(reliable = false, tight = false)
+    val tokenStart = token.startMs
+    val tokenDuration = token.durationMs.coerceAtLeast(1L)
+    val tokenEnd = tokenStart + tokenDuration
+    var ordered = true
+    var previousStart = Long.MIN_VALUE
+    var previousEnd: Long? = null
+    var maxGap = 0L
+    parts.forEachIndexed { index, part ->
+        val start = part.startMs
+        val nextStartMs = parts.getOrNull(index + 1)?.startMs
+        val effectiveDurationMs = nextStartMs
+            ?.let { (it - part.startMs).coerceAtLeast(1L).coerceAtMost(part.durationMs.coerceAtLeast(1L)) }
+            ?: part.durationMs.coerceAtLeast(1L)
+        val end = start + effectiveDurationMs
+        if (start < previousStart) ordered = false
+        previousEnd?.let { maxGap = maxOf(maxGap, start - it) }
+        previousStart = start
+        previousEnd = end
+    }
+    val firstStart = parts.first().startMs
+    val lastEnd = previousEnd ?: parts.maxOf { it.startMs + it.durationMs.coerceAtLeast(1L) }
+    val coverage = ((lastEnd - firstStart).coerceAtLeast(1L).toFloat() / tokenDuration.toFloat())
+    val reliable = ordered &&
+        firstStart >= tokenStart - 90L &&
+        lastEnd <= tokenEnd + 180L &&
+        coverage in 0.35f..1.40f &&
+        maxGap <= maxOf(280L, tokenDuration / 2L)
+    val tight = reliable &&
+        firstStart >= tokenStart - 45L &&
+        lastEnd <= tokenEnd + 90L &&
+        coverage in 0.58f..1.18f &&
+        maxGap <= maxOf(180L, tokenDuration / 3L)
+    return TimingPartQuality(reliable = reliable, tight = tight)
+}
+
+private fun timingPartsCoverTokenText(
+    token: PipoLyricChar,
+    parts: List<PipoLyricTimingPart>,
+): Boolean {
+    val tokenUnits = token.text.count(::isWordLikeChar).coerceAtLeast(1)
+    val partUnits = parts.sumOf { part ->
+        part.text.count(::isWordLikeChar).takeIf { it > 0 } ?: 1
+    }
+    if (partUnits < (tokenUnits * 0.75f).toInt().coerceAtLeast(1)) return false
+    var ordered = true
+    var previousStart = Long.MIN_VALUE
+    parts.forEach { part ->
+        if (part.startMs < previousStart) ordered = false
+        previousStart = part.startMs
+    }
+    if (!ordered) return false
+    val firstStart = parts.first().startMs
+    val lastEnd = timingPartsEffectiveEndMs(parts)
+    val rawEnd = token.rawEndMs()
+    return firstStart >= token.startMs - 90L &&
+        lastEnd > token.startMs &&
+        lastEnd <= rawEnd + 180L
+}
+
+fun PipoLyricChar.progressVelocityPerMs(positionMs: Long): Float {
+    val parts = timingPartsForProgress()
+    if (parts.size <= 1) return 1f / effectiveDurationMs().toFloat()
+    return timingPartProgressVelocity(parts, positionMs)
+        .takeIf { it.isFinite() && it > 0f }
+        ?: (1f / effectiveDurationMs().toFloat())
+}
+
+private fun timingPartProgressVelocity(
+    parts: List<PipoLyricTimingPart>,
+    positionMs: Long,
+): Float {
+    val totalTextLength = parts.sumOf { it.text.length }.coerceAtLeast(1)
+    var consumed = 0
+    parts.forEachIndexed { idx, part ->
+        val partLength = part.text.length.coerceAtLeast(1)
+        val partStartProgress = consumed.toFloat() / totalTextLength.toFloat()
+        val partEndProgress = (consumed + partLength).toFloat() / totalTextLength.toFloat()
+        val nextStartMs = parts.getOrNull(idx + 1)?.startMs
+        val effectiveDurationMs = nextStartMs
+            ?.let { (it - part.startMs).coerceAtLeast(1L).coerceAtMost(part.durationMs.coerceAtLeast(1L)) }
+            ?: part.durationMs.coerceAtLeast(1L)
+        val partEndMs = part.startMs + effectiveDurationMs
+        if (positionMs < part.startMs) {
+            return if (idx == 0) {
+                (partEndProgress - partStartProgress) / effectiveDurationMs.toFloat()
+            } else {
+                0f
+            }
+        }
+        if (positionMs < partEndMs || idx == parts.lastIndex) {
+            return (partEndProgress - partStartProgress) / effectiveDurationMs.toFloat()
+        }
+        consumed += partLength
+    }
+    return 0f
 }
 
 fun PipoLyricChar.timingPartsForProgress(): List<PipoLyricTimingPart> {

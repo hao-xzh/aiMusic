@@ -71,21 +71,24 @@ class PlayerAgentExecutor(
 
     override suspend fun insertNext(
         actionId: String,
-        track: NativeTrack,
+        tracks: List<NativeTrack>,
         jumpToInserted: Boolean,
     ): ActionExecutionResult {
-        val resolvedTrack = resolvePlayableTarget(actionId, QueueOperation.InsertNext, track)
-            ?: return noPlayableSource(actionId, "insert_next", track)
+        val first = tracks.firstOrNull() ?: return noPlayableSource(actionId, "insert_next", null)
+        // 只预检第一首（批量时逐首预检太慢）；其余在播放层整批解析，失败的丢掉。
+        val resolvedFirst = resolvePlayableTarget(actionId, QueueOperation.InsertNext, first)
+            ?: return noPlayableSource(actionId, "insert_next", first)
+        val requestTracks = listOf(resolvedFirst) + tracks.drop(1)
         val request = AgentQueueRequest(
             requestId = actionId,
             sourceUserText = sourceUserText,
             operation = QueueOperation.InsertNext,
-            tracks = listOf(resolvedTrack),
+            tracks = requestTracks,
             continuous = null,
             jumpToInserted = jumpToInserted,
-            desiredCount = 1,
+            desiredCount = requestTracks.size,
             hardConstraints = QueueHardConstraints(
-                nextTrack = TrackRequirement(title = resolvedTrack.title, artist = resolvedTrack.artist, placement = TrackPlacement.Next),
+                nextTrack = TrackRequirement(title = resolvedFirst.title, artist = resolvedFirst.artist, placement = TrackPlacement.Next),
             ),
         )
         return resultForCommit(actionId, "insert_next", request, onApplyAgentQueueRequest(request), similar = false)
@@ -393,7 +396,8 @@ class PlayerAgentExecutor(
                     message = when (plan.operation) {
                         QueueOperation.InsertNext -> {
                             val title = summary.insertedTitle.ifBlank { tracks.firstOrNull()?.title.orEmpty() }
-                            if (plan.jumpToInserted) "切歌请求接上：$title" else "下一首给你接上：$title"
+                            val suffix = if (tracks.size > 1) " 等 ${tracks.size} 首" else ""
+                            if (plan.jumpToInserted) "切歌请求接上：$title$suffix" else "下一首给你接上：$title$suffix"
                         }
                         else -> {
                             val first = summary.firstTitle.ifBlank { tracks.firstOrNull()?.title.orEmpty() }
