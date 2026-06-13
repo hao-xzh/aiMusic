@@ -469,6 +469,7 @@ private object LrcParser {
         val points = lrc.lineSequence().flatMap { line ->
             val text = offsetTag.replace(stamp.replace(line, ""), "").trim()
             stamp.findAll(line).mapNotNull { match ->
+                if (!isRenderableLrcText(text)) return@mapNotNull null
                 val min = match.groupValues[1].toLongOrNull() ?: return@mapNotNull null
                 val sec = match.groupValues[2].toLongOrNull() ?: return@mapNotNull null
                 val frac = match.groupValues[3].padEnd(3, '0').take(3).toLongOrNull() ?: 0L
@@ -484,6 +485,14 @@ private object LrcParser {
         return points.mapIndexed { index, line ->
             val next = points.getOrNull(index + 1)?.startMs
             line.copy(durationMs = ((next ?: (line.startMs + 3200L)) - line.startMs).coerceAtLeast(500L))
+        }
+    }
+
+    private fun isRenderableLrcText(text: String): Boolean {
+        val compact = text.trim()
+        if (compact.isEmpty()) return false
+        return compact.any { ch ->
+            ch.isLetterOrDigit() || ch in '\u4e00'..'\u9fff' || ch in '\u3040'..'\u30ff' || ch in '\uac00'..'\ud7af'
         }
     }
 }

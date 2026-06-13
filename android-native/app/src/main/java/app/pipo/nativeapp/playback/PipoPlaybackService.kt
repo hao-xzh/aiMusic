@@ -82,6 +82,10 @@ class PipoPlaybackService : MediaLibraryService() {
     // 清零重试计数 → 永不升级、无限重踢(Good Days 日志里 attempt 一直=1 的根因)。
     private var maxReachedPositionMs: Long = -1L
     private var lastProgressAtMs: Long = 0L
+    private var progressStallAttemptMediaId: String? = null
+    private var progressStallAttempts: Int = 0
+    private var progressStallSkipAheadMediaId: String? = null
+    private var progressWatchdogInternalSeekUntilMs: Long = 0L
     private var lastTransientNetworkErrorAtMs: Long = 0L
     private var badSourceRefreshJob: Job? = null
     private var audioFocusResumeJob: Job? = null
@@ -492,6 +496,7 @@ class PipoPlaybackService : MediaLibraryService() {
                         if (reason == Player.DISCONTINUITY_REASON_SEEK ||
                             reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
                         ) {
+                            if (isProgressWatchdogInternalSeek()) return
                             if (this@apply.playWhenReady) armProgressWatchdog(this@apply)
                         }
                     }
@@ -1666,6 +1671,12 @@ class PipoPlaybackService : MediaLibraryService() {
         bufferStallAttempts = 0
     }
 
+    private fun resetProgressStallAttempts() {
+        progressStallAttemptMediaId = null
+        progressStallAttempts = 0
+        progressStallSkipAheadMediaId = null
+    }
+
     private fun evaluateBufferStall(
         player: Player,
         mediaId: String,
@@ -1739,6 +1750,7 @@ class PipoPlaybackService : MediaLibraryService() {
     private fun armProgressWatchdog(player: Player) {
         maxReachedPositionMs = player.currentPosition.coerceAtLeast(0L)
         lastProgressAtMs = SystemClock.elapsedRealtime()
+        resetProgressStallAttempts()
         scheduleProgressWatchdog(player)
     }
 
@@ -1754,11 +1766,21 @@ class PipoPlaybackService : MediaLibraryService() {
         progressWatchdogToken += 1L
     }
 
+    private fun markProgressWatchdogInternalSeek() {
+        progressWatchdogInternalSeekUntilMs =
+            SystemClock.elapsedRealtime() + PROGRESS_WATCHDOG_INTERNAL_SEEK_GRACE_MS
+    }
+
+    private fun isProgressWatchdogInternalSeek(): Boolean {
+        return SystemClock.elapsedRealtime() <= progressWatchdogInternalSeekUntilMs
+    }
+
     /**
      * 进度看门狗:只看 position 是否前进,不看 state。补 buffer_stall 的盲区 —— "buffering/ready 高频
      * 抖动但 position 不动"会把 buffer_stall 的检查定时器反复 cancel,导致永不重踢、无限卡死(用户遇到
      * 的"放着放着卡住、暂停加载暂停加载")。这里以 playWhenReady 为生命周期(抖动骗不过它),想播却
-     * ≥PROGRESS_STALL_THRESHOLD_MS 没前进就重踢续传(seek 原位 + prepare),复用 bufferStallAttempts 防风暴。
+     * ≥PROGRESS_STALL_THRESHOLD_MS 没前进就重踢续传(seek 原位 + prepare)。这里使用独立计数,
+     * 避免 READY/BUFFERING 抖动把 buffer stall 预算清零后,进度看门狗永远只停在 attempt=1。
      */
     private fun evaluateProgressWatchdog(player: Player) {
         if (!player.playWhenReady || player.mediaItemCount == 0) return // 暂停/空 → 歇着,等下次 arm
@@ -1775,46 +1797,85 @@ class PipoPlaybackService : MediaLibraryService() {
         if (positionNow > maxReachedPositionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) {
             maxReachedPositionMs = positionNow
             lastProgressAtMs = now
-            resetBufferStallAttempts()
+            resetProgressStallAttempts()
             scheduleProgressWatchdog(player)
             return
         }
         if (now - lastProgressAtMs >= PROGRESS_STALL_THRESHOLD_MS) {
-            if (bufferStallAttemptMediaId != mediaId) {
-                bufferStallAttemptMediaId = mediaId
-                bufferStallAttempts = 0
+            if (progressStallAttemptMediaId != mediaId) {
+                progressStallAttemptMediaId = mediaId
+                progressStallAttempts = 0
+                progressStallSkipAheadMediaId = null
             }
-            if (bufferStallAttempts < PROGRESS_STALL_REKICK_LIMIT) {
+            if (progressStallAttempts < PROGRESS_STALL_REKICK_LIMIT) {
                 // 先试轻量重踢:可能只是临时网络抖动,原地 seek + prepare 逼它续传
-                bufferStallAttempts += 1
+                progressStallAttempts += 1
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "progress_stall_rekick",
                     fields = playerFields(player) + mapOf(
-                        "attempt" to bufferStallAttempts,
+                        "attempt" to progressStallAttempts,
                         "positionMs" to positionNow,
                         "stalledMs" to (now - lastProgressAtMs),
                     ),
                 )
                 runCatching {
+                    markProgressWatchdogInternalSeek()
                     player.seekTo(positionNow)
                     player.prepare()
                 }
                 lastProgressAtMs = now // 给恢复时间,避免连环重踢
-            } else if (bufferStallAttempts == PROGRESS_STALL_REKICK_LIMIT) {
-                // 重踢几次还卡 = 不是临时抖动,是这首在该位置源/URL 拉不到数据(像 Good Days 卡 5s)。
+            } else if (progressStallSkipAheadMediaId != mediaId && tryProgressStallSkipAhead(player, mediaId, positionNow, now)) {
+                // Good Days 这类固定点坏片段,用户手动跳到 7~9s 能继续播；先自动小步前跳一次,
+                // 比直接重签 URL 或整首跳过更贴近用户期望。
+                lastProgressAtMs = now
+            } else {
+                // 重踢 / 小步前跳后还卡 = 不是临时抖动,是这首在该位置源/URL 拉不到数据。
                 // 升级:重签 URL → 换 URI 续播;拿不到 / 已重签过 → 跳到下一首。不再干重踢。
-                bufferStallAttempts += 1
+                progressStallAttempts += 1
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "progress_stall_escalate",
-                    fields = playerFields(player) + mapOf("positionMs" to positionNow),
+                    fields = playerFields(player) + mapOf(
+                        "attempt" to progressStallAttempts,
+                        "positionMs" to positionNow,
+                    ),
                 )
                 recoverSilentStall(player)
             }
             // 升级后交给 recoverSilentStall(进入 bad-source-recovery 窗口),这里不再插手
         }
         scheduleProgressWatchdog(player)
+    }
+
+    private fun tryProgressStallSkipAhead(player: Player, mediaId: String, positionMs: Long, now: Long): Boolean {
+        val durationMs = player.duration.takeIf { it > 0L && it != C.TIME_UNSET }
+        val maxTargetMs = durationMs?.let { it - PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS }
+        val targetMs = if (maxTargetMs != null) {
+            (positionMs + PROGRESS_STALL_SKIP_AHEAD_MS).coerceAtMost(maxTargetMs)
+        } else {
+            positionMs + PROGRESS_STALL_SKIP_AHEAD_MS
+        }
+        if (targetMs <= positionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) return false
+        progressStallSkipAheadMediaId = mediaId
+        progressStallAttempts += 1
+        maxReachedPositionMs = targetMs
+        DiagnosticsLogStore.record(
+            area = "playback_service",
+            event = "progress_stall_skip_ahead",
+            fields = playerFields(player) + mapOf(
+                "attempt" to progressStallAttempts,
+                "fromPositionMs" to positionMs,
+                "toPositionMs" to targetMs,
+                "stalledMs" to (now - lastProgressAtMs),
+            ),
+        )
+        runCatching {
+            markProgressWatchdogInternalSeek()
+            player.seekTo(targetMs)
+            player.prepare()
+        }
+        return true
     }
 
     /**
@@ -2137,8 +2198,11 @@ class PipoPlaybackService : MediaLibraryService() {
         // 进度看门狗:每 2s 看一次 position;想播却 ≥4s 没前进就判定卡住。
         private const val PROGRESS_WATCHDOG_INTERVAL_MS = 2_000L
         private const val PROGRESS_STALL_THRESHOLD_MS = 4_000L
-        // 先轻量重踢这么多次(原地 seek+prepare);还卡就升级到 URL 重签/跳过(源/URL 问题,重踢无用)。
-        private const val PROGRESS_STALL_REKICK_LIMIT = 2
+        // 进度卡死比单纯 BUFFERING 更确定；原地重踢一次仍不前进,就先小步前跳绕过坏片段。
+        private const val PROGRESS_STALL_REKICK_LIMIT = 1
+        private const val PROGRESS_STALL_SKIP_AHEAD_MS = 4_000L
+        private const val PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS = 1_500L
+        private const val PROGRESS_WATCHDOG_INTERNAL_SEEK_GRACE_MS = 1_000L
         private const val TRANSIENT_NETWORK_SKIP_DEFER_MS = 60_000L
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
         /** 等系统 GAIN 回调最多探测次数(×1.5s),超过即放弃死等、主动重新请求焦点 */
