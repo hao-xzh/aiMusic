@@ -1524,6 +1524,29 @@ class PlayerViewModel(
         return out
     }
 
+    private fun manualQueueFromSelection(
+        selected: NativeTrack,
+        contextQueue: List<NativeTrack>,
+    ): List<NativeTrack> {
+        val tail = contextQueue.filter { it.id != selected.id }
+        val orderedTail = if (preferredPlaybackMode == PlaybackQueueMode.ShufflePlay) {
+            tail.shuffledAvoidingSameOrder()
+        } else {
+            tail
+        }
+        return listOf(selected) + orderedTail
+    }
+
+    private fun List<NativeTrack>.shuffledAvoidingSameOrder(): List<NativeTrack> {
+        if (size < 2) return this
+        val originalIds = map { it.id }
+        var shuffled = shuffled()
+        if (shuffled.map { it.id } == originalIds) {
+            shuffled = shuffled()
+        }
+        return if (shuffled.map { it.id } == originalIds) drop(1) + first() else shuffled
+    }
+
     /**
      * 用户从歌单点了一首具体的歌：两阶段播 —— 先把"那一首"的 URL 单独解析后立刻开播
      * （200ms 内出声），然后后台去解析整个队列剩下歌的 URL + smooth-queue 排序，
@@ -1533,7 +1556,7 @@ class PlayerViewModel(
      * 表现为点歌后画面切到播放页、要等 2-5s 才出声 —— 这个 fix 把 perceived
      * latency 砍掉 ~90%。镜像 src/lib/player-state.tsx playNetease 的语义。
      *
-     * smooth=true 时走 SmoothQueue 重排（用户点的那首作为起点不动）。
+     * 随机模式只打乱用户点中歌曲之后的队列；顺序模式保留列表顺序。
      */
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun playTrack(
@@ -1543,10 +1566,7 @@ class PlayerViewModel(
         queueVersion: Long? = null,
     ) {
         if (queueVersion == null) {
-            val tracks = buildList {
-                add(track)
-                contextQueue.filterTo(this) { it.id != track.id }
-            }
+            val tracks = manualQueueFromSelection(track, contextQueue)
             val manualQueueVersion = PlaybackSessionClock.bump("manual_play_track")
             CommittedQueuePlanStore.clear()
             playTrack(track, tracks, smooth, queueVersion = manualQueueVersion)
