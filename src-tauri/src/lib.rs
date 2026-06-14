@@ -16,6 +16,7 @@ pub mod ai;
 pub mod audio;
 pub mod cache;
 pub mod cdn;
+pub mod media_export;
 pub mod netease;
 pub mod proxy;
 
@@ -27,6 +28,7 @@ use audio::cmds::*;
 use audio::AudioCache;
 use cache::cmds::*;
 use cache::CacheDb;
+use media_export::netease_export_mp3;
 use netease::cmds::*;
 use netease::NeteaseClient;
 use tauri::Manager;
@@ -66,6 +68,7 @@ pub fn run() {
             netease_like_song,
             netease_playlist_modify_tracks,
             netease_is_logged_in,
+            netease_export_mp3,
             // ai (multi-provider: deepseek / openai / xiaomi-mimo / custom)
             ai_get_config,
             ai_list_models,

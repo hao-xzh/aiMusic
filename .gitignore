@@ -25,3 +25,6 @@ android-native/local.properties
 *.exe
 *.apk
 *.aab
+
+# Local audio export output from the standalone tester
+netease-export/

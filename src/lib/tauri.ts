@@ -67,6 +67,27 @@ export type SongUrl = {
   size: number;
 };
 
+export type ExportedTrack = {
+  id: number;
+  path: string;
+  sourcePath?: string | null;
+  sourceFormat: string;
+  converted: boolean;
+  bytes: number;
+  openedFolder: boolean;
+  openFolderError?: string | null;
+};
+
+export type ExportMp3Args = {
+  id: number;
+  level?: string;
+  outDir?: string;
+  ffmpeg?: string;
+  overwrite?: boolean;
+  name?: string;
+  openFolder?: boolean;
+};
+
 export type QrStart = { key: string; qrContent: string };
 export type QrCheck = { code: number; message?: string | null; nickname?: string | null };
 
@@ -121,6 +142,8 @@ export const netease = {
   /** 关键词搜歌（type=1 单曲）—— 库外推荐流水线用 */
   search: (query: string, limit?: number) =>
     invoke<TrackInfo[]>("netease_search", { query, limit }),
+  exportMp3: (args: ExportMp3Args) =>
+    invoke<ExportedTrack>("netease_export_mp3", args),
   /** 收藏 / 取消收藏单曲，写到网易云红心歌单。 */
   likeSong: (id: number, like: boolean) =>
     invoke<boolean>("netease_like_song", { id, like }),

@@ -490,6 +490,9 @@ function DistillLibraryPage({
             >
               <SparkIcon />
             </button>
+            <Link href="/export" style={chipStyle(fg)} aria-label="曲库导出" title="曲库导出">
+              <DownloadIcon />
+            </Link>
             <Link href="/settings" style={chipStyle(fg)} aria-label="设置" title="设置">
               <GearIcon />
             </Link>
@@ -1485,6 +1488,16 @@ function SparkIcon() {
 }
 
 /** 顶部 titlebar 按钮：参考 Codex 桌面栏的轻量 icon button。 */
+function DownloadIcon() {
+  return (
+    <svg width={TOP_ICON_SIZE} height={TOP_ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={TOP_ICON_SW} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 4v10" />
+      <path d="M7.5 10.5 12 15l4.5-4.5" />
+      <path d="M5 20h14" />
+    </svg>
+  );
+}
+
 function chipStyle(fg: string): React.CSSProperties {
   return {
     display: "inline-flex",

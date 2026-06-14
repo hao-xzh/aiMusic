@@ -259,7 +259,7 @@ function CompactPlayer({
             style={{
               marginTop: "clamp(22px, 3.4vh, 32px)",
               display: "grid",
-              gridTemplateColumns: "1fr 1fr 1fr",
+              gridTemplateColumns: "repeat(4, 1fr)",
               placeItems: "center",
               paddingInline: 0,
               opacity: immersiveActive ? 0 : 1,
@@ -281,6 +281,9 @@ function CompactPlayer({
             </button>
             <Link href="/distill" aria-label="我的歌单" title="我的歌单" style={navIcon}>
               <ListIcon />
+            </Link>
+            <Link href="/export" aria-label="曲库导出" title="曲库导出" style={navIcon}>
+              <NavDownloadIcon />
             </Link>
             <Link href="/settings" aria-label="设置" title="设置" style={navIcon}>
               <NavGearIcon />
@@ -2796,6 +2799,16 @@ function ListIcon() {
       <path d="M3.5 6h11M3.5 12h11M3.5 18h7" />
       <path d="M19.5 4v9" />
       <ellipse cx="17.7" cy="14" rx="2.2" ry="1.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function NavDownloadIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 4v10" />
+      <path d="M7.5 10.5 12 15l4.5-4.5" />
+      <path d="M5 20h14" />
     </svg>
   );
 }
