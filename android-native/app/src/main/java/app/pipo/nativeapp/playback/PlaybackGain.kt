@@ -16,13 +16,18 @@ import kotlin.math.pow
  */
 class PlaybackGain {
     @Volatile
-    var gainLinear: Float = 1f
-        private set
+    private var trackGainLinear: Float = 1f
+
+    @Volatile
+    private var duckingGainLinear: Float = 1f
+
+    val gainLinear: Float
+        get() = (trackGainLinear * duckingGainLinear).coerceIn(MIN_LINEAR, 1f)
 
     /** 直接设衰减增益(dB,≤0);正值会被钳到 0(不放大)。 */
     fun setTrackGainDb(db: Float) {
         val clamped = db.coerceIn(MAX_CUT_DB, 0f)
-        gainLinear = 10.0.pow(clamped / 20.0).toFloat().coerceIn(MIN_LINEAR, 1f)
+        trackGainLinear = 10.0.pow(clamped / 20.0).toFloat().coerceIn(MIN_LINEAR, 1f)
     }
 
     /** 按当前轨整曲 rmsDb 设增益;null(如 transition clip 已内部对齐)→ 中性 1.0。 */
@@ -32,11 +37,17 @@ class PlaybackGain {
 
     /** 直接设线性增益(双 player crossfade 时,把上游算好的 next 响度增益设给辅助 player)。 */
     fun setLinear(linear: Float) {
-        gainLinear = linear.coerceIn(MIN_LINEAR, 1f)
+        trackGainLinear = linear.coerceIn(MIN_LINEAR, 1f)
+    }
+
+    /** 系统级声音避让增益;与曲目响度归一独立相乘,避免干扰 crossfade 的 player.volume。 */
+    fun setDuckingLinear(linear: Float) {
+        duckingGainLinear = linear.coerceIn(MIN_LINEAR, 1f)
     }
 
     fun reset() {
-        gainLinear = 1f
+        trackGainLinear = 1f
+        duckingGainLinear = 1f
     }
 
     companion object {
