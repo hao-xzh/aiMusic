@@ -897,6 +897,7 @@ internal fun AppleMusicLyricColumn(
                                 NativeInterludeRow(
                                     interlude = slot,
                                     isCurrent = slotIndex == playbackActiveSlotIdx && currentLineIdx < 0,
+                                    isPast = slotIndex < playbackActiveSlotIdx,
                                     clockState = clockState,
                                     color = fg,
                                     enterAlpha = rowEnter,
@@ -917,6 +918,7 @@ internal fun AppleMusicLyricColumn(
 private fun NativeInterludeRow(
     interlude: NativeLyricSlot.Interlude,
     isCurrent: Boolean,
+    isPast: Boolean,
     clockState: State<Float>,
     color: Color,
     enterAlpha: Float,
@@ -926,7 +928,7 @@ private fun NativeInterludeRow(
 ) {
     val density = LocalDensity.current
     val currentLineLayoutProgress by animateFloatAsState(
-        targetValue = if (isCurrent) 1f else 0f,
+        targetValue = if (isCurrent || isPast) 1f else 0f,
         animationSpec = tween(
             durationMillis = NATIVE_LINE_GEOMETRY_SWITCH_MS,
             easing = NATIVE_SCROLL_EASE_IN_OUT_QUAD,
@@ -940,9 +942,9 @@ private fun NativeInterludeRow(
         dotGapPx * (NATIVE_INTERLUDE_DOT_COUNT - 1f)
     val dotCanvasSizePx = dotSizePx * NATIVE_INTERLUDE_MAX_SCALE
     val dotsCanvasWidthPx = dotsGroupWidthPx * NATIVE_INTERLUDE_MAX_SCALE
-    val marginPx = fontPx * NATIVE_INTERLUDE_MARGIN_EM
+    val topMarginPx = fontPx * NATIVE_INTERLUDE_TOP_MARGIN_EM
     val currentPaddingPx = fontPx * NATIVE_CURRENT_LINE_PADDING_EM * currentLineLayoutProgress
-    val expandedHeightPx = (dotCanvasSizePx + marginPx * 2f + currentPaddingPx * 2f)
+    val expandedHeightPx = (topMarginPx + dotCanvasSizePx + currentPaddingPx * 2f)
         .roundToInt()
         .coerceAtLeast(1)
     val dotSizeDp = with(density) { dotSizePx.toDp() }
@@ -967,6 +969,7 @@ private fun NativeInterludeRow(
                 dotGap = dotGapDp,
                 width = dotsWidthDp,
                 height = dotCanvasSizeDp,
+                alignEnd = alignEnd,
             )
         },
     ) { measurables, constraints ->
@@ -980,7 +983,7 @@ private fun NativeInterludeRow(
             } else {
                 0
             }.coerceAtLeast(0)
-            val y = ((rowHeight - dotPlaceable.height) / 2).coerceAtLeast(0)
+            val y = (topMarginPx + currentPaddingPx).roundToInt().coerceAtLeast(0)
             dotPlaceable.place(x, y)
         }
     }
@@ -2779,6 +2782,7 @@ private fun NativeInterludeDots(
     dotGap: Dp,
     width: Dp,
     height: Dp,
+    alignEnd: Boolean,
 ) {
     Canvas(modifier = Modifier.size(width = width, height = height)) {
         val progress = nativeInterludeProgress(
@@ -2790,25 +2794,33 @@ private fun NativeInterludeDots(
         val gap = dotGap.toPx()
         val radius = dot / 2f
         val groupWidth = dot * NATIVE_INTERLUDE_DOT_COUNT + gap * (NATIVE_INTERLUDE_DOT_COUNT - 1f)
-        val startX = ((size.width - groupWidth) / 2f).coerceAtLeast(0f) + radius
+        val startX = if (alignEnd) {
+            size.width - groupWidth + radius
+        } else {
+            radius
+        }
         val centerY = size.height / 2f
         val centers = floatArrayOf(
             startX,
             startX + dot + gap,
             startX + (dot + gap) * 2f,
         )
-        centers.forEachIndexed { idx, centerX ->
-            drawCircle(
-                color = color.copy(alpha = progress.dotAlphas[idx] * progress.alpha),
-                radius = radius,
-                center = Offset(centerX, centerY),
-            )
+        val pivot = if (alignEnd) Offset(size.width, centerY) else Offset(0f, centerY)
+        scale(progress.scale, pivot = pivot) {
+            centers.forEachIndexed { idx, centerX ->
+                drawCircle(
+                    color = color.copy(alpha = progress.dotAlphas[idx] * progress.alpha),
+                    radius = radius,
+                    center = Offset(centerX, centerY),
+                )
+            }
         }
     }
 }
 
 private data class NativeInterludeProgress(
     val alpha: Float,
+    val scale: Float,
     val dotAlphas: FloatArray,
 )
 
@@ -2817,12 +2829,12 @@ private fun nativeInterludeProgress(
     positionMs: Long,
 ): NativeInterludeProgress {
     val duration = (interlude.endMs - interlude.startMs).coerceAtLeast(1L).toFloat()
-    val current = (positionMs - interlude.startMs).toFloat().coerceIn(0f, duration)
-    val remaining = duration - current
-    val alpha = if (remaining <= NATIVE_INTERLUDE_ENDING_FADE_MS) {
-        (remaining / NATIVE_INTERLUDE_ENDING_FADE_MS).coerceIn(0f, 1f)
+    val rawCurrent = (positionMs - interlude.startMs).toFloat()
+    val current = rawCurrent.coerceIn(0f, duration)
+    val alpha = if (rawCurrent >= duration) {
+        0f
     } else {
-        1f
+        1f - nativeAppleInterludeEndCollapse01(current, duration)
     }
     val dotStepMs = (duration / NATIVE_INTERLUDE_DOT_COUNT).coerceAtLeast(1f)
     val dot0 = nativeAppleInterludeDotAlpha(current, dotStepMs, 0)
@@ -2830,8 +2842,66 @@ private fun nativeInterludeProgress(
     val dot2 = nativeAppleInterludeDotAlpha(current, dotStepMs, 2)
     return NativeInterludeProgress(
         alpha = alpha,
+        scale = nativeAppleInterludeScale(
+            current = current,
+            duration = duration,
+            isCurrent = rawCurrent >= 0f && rawCurrent < duration,
+        ),
         dotAlphas = floatArrayOf(dot0.coerceIn(0f, 1f), dot1.coerceIn(0f, 1f), dot2.coerceIn(0f, 1f)),
     )
+}
+
+private fun nativeAppleInterludeScale(
+    current: Float,
+    duration: Float,
+    isCurrent: Boolean,
+): Float {
+    if (!isCurrent) return 1f
+    val remaining = duration - current
+    // Apple Music interlude preview: current runs a slow heartbeat; the ending
+    // swells from the heartbeat's exact boundary scale, then collapses right as
+    // Apple's +250ms current-line lookahead hands focus to the next lyric.
+    return if (remaining < NATIVE_INTERLUDE_ENDING_MS) {
+        val endingElapsed = (NATIVE_INTERLUDE_ENDING_MS - remaining).coerceAtLeast(0f)
+        if (endingElapsed <= NATIVE_INTERLUDE_END_GROW_MS) {
+            val t = NATIVE_CSS_EASE_IN.transform((endingElapsed / NATIVE_INTERLUDE_END_GROW_MS).coerceIn(0f, 1f))
+            val startScale = nativeAppleInterludeHeartbeatScale(
+                (duration - NATIVE_INTERLUDE_ENDING_MS).coerceAtLeast(0f),
+            )
+            startScale + (NATIVE_INTERLUDE_END_SCALE_PEAK - startScale) * t
+        } else {
+            val collapseRaw = ((endingElapsed - NATIVE_INTERLUDE_END_GROW_MS) / NATIVE_INTERLUDE_END_COLLAPSE_MS)
+                .coerceIn(0f, 1f)
+            val t = 1f - (1f - collapseRaw) * (1f - collapseRaw)
+            NATIVE_INTERLUDE_END_SCALE_PEAK * (1f - t)
+        }
+    } else {
+        nativeAppleInterludeHeartbeatScale(current)
+    }.coerceIn(0f, NATIVE_INTERLUDE_MAX_SCALE)
+}
+
+private fun nativeAppleInterludeHeartbeatScale(current: Float): Float {
+    val phase = nativeCyclicPhase(current, NATIVE_INTERLUDE_HEARTBEAT_MS)
+    return if (phase <= 0.5f) {
+        val t = NATIVE_CSS_EASE_IN.transform((phase / 0.5f).coerceIn(0f, 1f))
+        1f + (NATIVE_INTERLUDE_HEARTBEAT_PEAK_SCALE - 1f) * t
+    } else {
+        val t = NATIVE_CSS_EASE_IN.transform(((phase - 0.5f) / 0.5f).coerceIn(0f, 1f))
+        NATIVE_INTERLUDE_HEARTBEAT_PEAK_SCALE -
+            (NATIVE_INTERLUDE_HEARTBEAT_PEAK_SCALE - 1f) * t
+    }
+}
+
+private fun nativeCyclicPhase(elapsedMs: Float, periodMs: Float): Float {
+    if (periodMs <= 0f) return 1f
+    return ((elapsedMs % periodMs) / periodMs).coerceIn(0f, 1f)
+}
+
+private fun nativeAppleInterludeEndCollapse01(current: Float, duration: Float): Float {
+    val endingElapsed = (current - (duration - NATIVE_INTERLUDE_ENDING_MS)).coerceAtLeast(0f)
+    val collapseRaw = ((endingElapsed - NATIVE_INTERLUDE_END_GROW_MS) / NATIVE_INTERLUDE_END_COLLAPSE_MS)
+        .coerceIn(0f, 1f)
+    return 1f - (1f - collapseRaw) * (1f - collapseRaw)
 }
 
 private fun nativeAppleInterludeDotAlpha(
@@ -4253,6 +4323,7 @@ private fun nativeRenderPositionMs(clockMs: Float): Long {
 
 // CSS default timing-function for `transition: color 0.1s`.
 private val NATIVE_CSS_DEFAULT_EASE = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f)
+private val NATIVE_CSS_EASE_IN = CubicBezierEasing(0.42f, 0f, 1f, 1f)
 private val NATIVE_LINE_SWITCH_EASE = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
 private val NATIVE_SCROLL_EASE_IN_OUT_QUAD = Easing { t ->
     val x = t.coerceIn(0f, 1f)
@@ -4409,9 +4480,17 @@ private const val NATIVE_INTERLUDE_DOT_COUNT = 3f
 private const val NATIVE_INTERLUDE_DOT_SIZE_EM = 8.5f / 22f
 private const val NATIVE_INTERLUDE_DOT_GAP_RATIO = 0.5f
 private const val NATIVE_INTERLUDE_DOT_INACTIVE_ALPHA = 0.30f
-private const val NATIVE_INTERLUDE_ENDING_FADE_MS = 500f
-private const val NATIVE_INTERLUDE_MAX_SCALE = 1f
-private const val NATIVE_INTERLUDE_MARGIN_EM = 0.40f
+private const val NATIVE_INTERLUDE_HEARTBEAT_MS = 5_000f
+private const val NATIVE_INTERLUDE_HEARTBEAT_PEAK_SCALE = 1.20f
+private const val NATIVE_INTERLUDE_ENDING_MS = 1_500f
+private const val NATIVE_INTERLUDE_NEXT_LINE_LEAD_MS = 250f
+private const val NATIVE_INTERLUDE_END_COLLAPSE_MS = 120f
+private const val NATIVE_INTERLUDE_END_GROW_MS =
+    NATIVE_INTERLUDE_ENDING_MS - NATIVE_INTERLUDE_NEXT_LINE_LEAD_MS - NATIVE_INTERLUDE_END_COLLAPSE_MS
+private const val NATIVE_INTERLUDE_END_SCALE_PEAK = 1.40f
+private const val NATIVE_INTERLUDE_MAX_SCALE = NATIVE_INTERLUDE_END_SCALE_PEAK
+// Apple fullscreen lyrics use about 30px top margin on a 28px line font.
+private const val NATIVE_INTERLUDE_TOP_MARGIN_EM = 30f / 28f
 // Apple Web scrollTop 本身是 350ms，但 current / previous / inactive 行状态不同。
 // Android 这里保持整列同相，避免逐行延迟在快切时互相叠加抖动。
 private const val NATIVE_MANUAL_TOP_BOUNCE_FRACTION = 0.18f

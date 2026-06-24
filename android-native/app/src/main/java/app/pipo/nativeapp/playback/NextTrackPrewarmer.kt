@@ -26,13 +26,23 @@ class NextTrackPrewarmer(
             .setUri(Uri.parse(url))
             .setKey(PlaybackCacheKeys.forTrack(track) ?: url)
             .setPosition(0L)
-            .setLength(PREWARM_BYTES)
             .setFlags(DataSpec.FLAG_ALLOW_CACHE_FRAGMENTATION or DataSpec.FLAG_MIGHT_NOT_USE_FULL_NETWORK_SPEED)
             .build()
         val writer = CacheWriter(dataSource, dataSpec, ByteArray(CacheWriter.DEFAULT_BUFFER_SIZE_BYTES), null)
         activeWriter.getAndSet(writer)?.cancel()
         try {
             writer.cache()
+            DiagnosticsLogStore.record(
+                area = "playback",
+                event = "prewarm_completed",
+                fields = mapOf(
+                    "trackId" to track.id,
+                    "neteaseId" to track.neteaseId,
+                    "title" to track.title,
+                    "artist" to track.artist,
+                    "mode" to "full",
+                ),
+            )
             true
         } catch (e: CancellationException) {
             writer.cancel()
@@ -60,7 +70,4 @@ class NextTrackPrewarmer(
         activeWriter.getAndSet(null)?.cancel()
     }
 
-    companion object {
-        private const val PREWARM_BYTES = 3L * 1024L * 1024L
-    }
 }

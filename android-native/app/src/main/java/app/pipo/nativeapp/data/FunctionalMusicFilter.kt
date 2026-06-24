@@ -16,8 +16,11 @@ object FunctionalMusicFilter {
         "纯音乐", "轻音乐", "催眠", "助眠", "入睡", "安眠", "哄睡", "睡眠音乐",
         "冥想", "白噪音", "白噪声", "胎教", "疗愈", "理疗", "养生", "八音盒",
         "脑波", "脑部", "spa", "安神", "静心", "瑜伽", "禅修", "钢琴曲集",
+        "写代码", "编程", "专注音乐", "工作音乐", "学习音乐",
         "meditation", "white noise", "sleep music", "relaxing music",
         "study music", "healing music", "bgm合集",
+        "coding", "programming music", "deep focus", "focus music", "concentration",
+        "work music", "study beats", "lofi beats", "lo-fi beats", "calm code",
     )
 
     fun isFunctional(title: String, artist: String): Boolean {

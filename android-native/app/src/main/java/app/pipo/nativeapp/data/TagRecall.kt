@@ -23,7 +23,7 @@ object TagRecall {
             if (!passesHardConstraints(profile, intent)) continue
 
             var score = 0.0
-            score += matchArray(intent.hardLanguages, listOf(profile.language.key)) * 0.8
+            score += matchLanguages(intent.hardLanguages, profile.language.key) * 0.8
             score += matchArray(intent.hardRegions, listOf(profile.region.key)) * 0.7
             score += matchArray(intent.hardGenres, profile.genres) * 0.7
             score += matchArray(intent.hardSubGenres, profile.subGenres) * 0.55
@@ -62,7 +62,7 @@ object TagRecall {
     }
 
     fun passesHardConstraints(profile: TrackSemanticProfile, intent: PetIntent): Boolean {
-        if (intent.hardLanguages.isNotEmpty() && !includesAny(intent.hardLanguages, listOf(profile.language.key))) return false
+        if (intent.hardLanguages.isNotEmpty() && !matchesAnyLanguage(intent.hardLanguages, profile.language.key)) return false
         if (intent.hardRegions.isNotEmpty() && !includesAny(intent.hardRegions, listOf(profile.region.key))) return false
         if (intent.hardGenres.isNotEmpty() && !includesAny(intent.hardGenres, profile.genres)) return false
         if (intent.hardSubGenres.isNotEmpty() && !includesAny(intent.hardSubGenres, profile.subGenres)) return false
@@ -91,6 +91,22 @@ object TagRecall {
         var hit = 0
         for (n in needles) if (includesAny(listOf(n), haystack)) hit++
         return hit.toDouble() / needles.size
+    }
+
+    private fun matchLanguages(needles: List<String>, actual: String): Double {
+        if (needles.isEmpty()) return 0.0
+        return if (matchesAnyLanguage(needles, actual)) 1.0 else 0.0
+    }
+
+    fun matchesAnyLanguage(needles: List<String>, actual: String): Boolean {
+        val normalizedNeedles = needles.map(::normalize).filter { it.isNotBlank() }
+        val normalizedActual = normalize(actual)
+        val chineseUmbrella = "chinese" in normalizedNeedles ||
+            ("mandarin" in normalizedNeedles && "cantonese" in normalizedNeedles)
+        if (chineseUmbrella && normalizedActual in setOf("mandarin", "cantonese", "mixed")) return true
+        return normalizedNeedles.any { needle ->
+            needle == normalizedActual || needle.contains(normalizedActual) || normalizedActual.contains(needle)
+        }
     }
 
     private fun includesAny(needles: List<String>, haystack: List<String>): Boolean {

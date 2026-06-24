@@ -121,7 +121,9 @@ object CandidateRecall {
         // 9) explore
         for (h in recallByExplore(library, tasteProfile, behaviorEvents)) hit(h.track, Source.Explore, h.score)
 
-        return buckets.values.toList().take(limit)
+        return buckets.values
+            .sortedByDescending { candidate -> candidate.sourceScores.values.sum() }
+            .take(limit)
     }
 
     // ----- recall paths -----

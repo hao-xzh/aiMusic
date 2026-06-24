@@ -2,6 +2,7 @@ package app.pipo.nativeapp.data.agent.runtime
 
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.CLOUD_DISK_PLAYLIST_ID
+import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetMemory
 import app.pipo.nativeapp.data.PetPersona
@@ -170,9 +171,10 @@ class AgentToolLoop(
         state: LoopState,
     ): Boolean {
         if (state.playbackCommitted || state.hasTerminalResult) return false
-        val entry = state.drafts.entries.lastOrNull { (_, draft) ->
+        val validDrafts = state.drafts.entries.filter { (_, draft) ->
             draft.queuePlan.validation.passed && draft.play.tracks.isNotEmpty()
-        } ?: return false
+        }
+        val entry = selectDraftForSalvage(input.userText, validDrafts) ?: return false
         val (draftId, draft) = entry
         state.trace("auto_commit_validated_draft:$draftId:${draft.play.tracks.size}")
         DiagnosticsLogStore.record(
@@ -187,6 +189,27 @@ class AgentToolLoop(
         )
         commitPlayTracks(draft.plan, draft.queuePlan.validation, draft.play, executor, state)
         return state.hasTerminalResult
+    }
+
+    private fun selectDraftForSalvage(
+        userText: String,
+        validDrafts: List<Map.Entry<String, QueueDraft>>,
+    ): Map.Entry<String, QueueDraft>? {
+        if (validDrafts.isEmpty()) return null
+        if (!looksLikeBatchPlaybackRequest(userText)) return validDrafts.last()
+        return validDrafts
+            .mapIndexed { index, entry -> index to entry }
+            .maxWithOrNull(
+                compareBy<Pair<Int, Map.Entry<String, QueueDraft>>> { it.second.value.play.tracks.size }
+                    .thenBy { it.first },
+            )
+            ?.second
+    }
+
+    private fun looksLikeBatchPlaybackRequest(userText: String): Boolean {
+        val compact = userText.replace(Regex("\\s+"), "")
+        return BATCH_PLAYBACK_HINTS.any { it in compact } ||
+            Regex("""\d+首|[两三四五六七八九十]首""").containsMatchIn(compact)
     }
 
     private suspend fun buildOutcome(
@@ -485,15 +508,17 @@ class AgentToolLoop(
         if (tracks.isEmpty()) {
             return JSONObject().put("ok", false).put("error", "empty_track_keys")
         }
+        val modeForCommit = playMode(args.optString("operation"), PlayMode.ReplaceQueue)
+        val continuous = directCommitContinuousSource(args, input, modeForCommit, tracks.size)
         val action = PlannedAction.PlayTracks(
             actionId = "commit",
-            mode = playMode(args.optString("operation"), PlayMode.ReplaceQueue),
+            mode = modeForCommit,
             tracks = tracks,
-            continuous = null,
+            continuous = continuous,
             primaryGoal = goalFromArgs(args),
             target = trackRequirement(args.optJSONObject("target"), TrackPlacement.Now),
             similar = args.optBoolean("similar", false),
-            jumpToInserted = args.optBoolean("jump_to_inserted", defaultJumpToInserted(playMode(args.optString("operation"), PlayMode.ReplaceQueue))),
+            jumpToInserted = args.optBoolean("jump_to_inserted", defaultJumpToInserted(modeForCommit)),
         )
         val plan = MusicTurnPlan(
             turnId = state.turnId,
@@ -504,6 +529,31 @@ class AgentToolLoop(
         val queuePlan = queuePlanner.plan(plan)
         val play = queuePlan.actions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull() ?: action
         return commitPlayTracks(plan.copy(actions = queuePlan.actions), queuePlan.validation, play, executor, state)
+    }
+
+    private suspend fun directCommitContinuousSource(
+        args: JSONObject,
+        input: AgentTurnInput,
+        mode: PlayMode,
+        trackCount: Int,
+    ): ContinuousQueueSource? {
+        if (mode == PlayMode.InsertNext || trackCount <= 1) return null
+        val request = playRequestFromArgs(args, input).copy(mode = mode)
+        val plan = MusicTurnPlan(
+            turnId = UUID.randomUUID().toString(),
+            userText = input.userText,
+            actions = listOf(request),
+            plannerRaw = "tool_loop_direct_commit_continuous",
+            confidence = 0.9,
+        )
+        return runCatching {
+            resolver.resolve(plan, input)
+                .plan
+                .actions
+                .filterIsInstance<PlannedAction.PlayTracks>()
+                .firstOrNull()
+                ?.continuous
+        }.getOrNull()
     }
 
     /**
@@ -1319,6 +1369,10 @@ class AgentToolLoop(
 
         /** 整轮 wall-clock 预算：超过就不再开新的 LLM 轮，直接 salvage 收口，防止极端慢网把用户晾几分钟。 */
         private const val TURN_BUDGET_MS = 110_000L
+
+        private val BATCH_PLAYBACK_HINTS = listOf(
+            "一批", "一组", "一套", "一些", "几首", "多首", "多来", "来点", "歌单", "专场",
+        )
 
         /** 带 more_actions_pending 语义的执行类工具：成功且显式传 false ⇒ 本轮直接收尾。 */
         private val EXECUTION_TOOLS = setOf(

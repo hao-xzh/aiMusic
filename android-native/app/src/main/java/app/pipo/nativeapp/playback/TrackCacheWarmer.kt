@@ -25,7 +25,8 @@ import kotlinx.coroutines.withContext
  * 20s 再灌 —— 跳歌高发段不为整首无损（20-40MB）买单。延迟醒来后校验仍在播
  * 同一条目才真正开始。
  *
- * 与 NextTrackPrewarmer（下一首前 3MB）互补：那个保切歌起步，这个保整曲连续。
+ * 与 NextTrackPrewarmer（下一首整曲）互补：那个保切歌起步和下一首连续，
+ * 这个保当前曲连续。
  * CacheWriter 自动跳过已缓存区段，重复触发只补洞，幂等。
  */
 @UnstableApi

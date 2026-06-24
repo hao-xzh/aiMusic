@@ -34,6 +34,7 @@ import androidx.media3.session.MediaSession
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.runtime.AppForeground
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -68,6 +69,7 @@ class PipoPlaybackService : MediaLibraryService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var lastKeepAlivePrepareAtMs: Long = 0L
+    private var foregroundStartDeniedUntilMs: Long = 0L
     private var badSourceSkipToken: Long = 0L
     private var badSourceRecoveryMediaId: String? = null
     private var badSourceRecoveryUntilMs: Long = 0L
@@ -471,11 +473,16 @@ class PipoPlaybackService : MediaLibraryService() {
                             ),
                         )
                         badSourceSkipToken += 1L
-                        clearBadSourceRecovery()
+                        val isUrlRefreshReplacement = updateServiceUrlRefreshTriedOnTransition(
+                            mediaItem?.mediaId,
+                            reason,
+                        )
+                        if (!isUrlRefreshReplacement) {
+                            clearBadSourceRecovery()
+                        }
                         // 换曲 = 旧的卡顿观察作废,新曲重置重踢预算
                         cancelBufferStallCheck()
                         resetBufferStallAttempts()
-                        updateServiceUrlRefreshTriedOnTransition(mediaItem?.mediaId, reason)
                         // 换曲(含 URL 重签 replace):丢掉旧 URI 的整曲预热,起新曲的
                         trackCacheWarmer?.cancel()
                         trackCacheWarmer?.maybeWarmCurrent(this@apply)
@@ -559,6 +566,7 @@ class PipoPlaybackService : MediaLibraryService() {
                                     }
                                 }
                                 if (playbackState == Player.STATE_READY) {
+                                    clearBadSourceRecovery(this@apply.currentMediaItem?.mediaId)
                                     // 到 READY = 这一刻加载是通的:撤掉待检查、重置该首的重踢预算。
                                     cancelBufferStallCheck()
                                     resetBufferStallAttempts()
@@ -590,6 +598,12 @@ class PipoPlaybackService : MediaLibraryService() {
                             updatePlaybackCallbackRegistration(this@apply)
                             return
                         }
+                        if (playWhenReady) {
+                            notificationPlayer?.armRecoveryWindow()
+                            mediaSession?.let { session ->
+                                updateNotificationSafely(session, true, "play-when-ready")
+                            }
+                        }
                         when (reason) {
                             Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> {
                                 if (!playWhenReady) {
@@ -612,9 +626,11 @@ class PipoPlaybackService : MediaLibraryService() {
                                         observedExternalAudio = true,
                                         waitForAudioFocusGain = shouldWaitForFocusGain,
                                     )
-                                } else {
+                                } else if (!playWhenReady) {
                                     clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
                                     abandonAudioFocus("play-when-ready-${playWhenReadyReason(reason)}")
+                                } else {
+                                    clearAudioFocusAutoResume("play-when-ready-${playWhenReadyReason(reason)}")
                                 }
                             }
                             Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> {
@@ -1023,9 +1039,19 @@ class PipoPlaybackService : MediaLibraryService() {
         if (isWaitingForBadSourceController(player, now)) {
             DiagnosticsLogStore.record(
                 area = "playback_service",
-                event = "keep_alive_prepare_suppressed",
+                event = "keep_alive_bad_source_refresh",
                 fields = playerFields(player) + mapOf("reason" to reason),
             )
+            sessionPlayer.armRecoveryWindow()
+            if (now - lastKeepAlivePrepareAtMs >= KEEP_ALIVE_PREPARE_COOLDOWN_MS) {
+                lastKeepAlivePrepareAtMs = now
+                mainHandler.post {
+                    val liveSession = mediaSession ?: return@post
+                    if (player.playWhenReady && player.mediaItemCount > 0) {
+                        updateNotificationSafely(liveSession, true, "keep-alive-$reason-bad-source")
+                    }
+                }
+            }
             return
         }
         if (now - lastKeepAlivePrepareAtMs < KEEP_ALIVE_PREPARE_COOLDOWN_MS) return
@@ -1419,7 +1445,7 @@ class PipoPlaybackService : MediaLibraryService() {
         serviceUrlRefreshReplacementMediaId = mediaId
     }
 
-    private fun updateServiceUrlRefreshTriedOnTransition(mediaId: String?, reason: Int) {
+    private fun updateServiceUrlRefreshTriedOnTransition(mediaId: String?, reason: Int): Boolean {
         val isRefreshReplacement = mediaId != null && mediaId == serviceUrlRefreshReplacementMediaId
         if (isRefreshReplacement) {
             serviceUrlRefreshReplacementMediaId = null
@@ -1431,6 +1457,7 @@ class PipoPlaybackService : MediaLibraryService() {
         } else {
             mediaId?.let { serviceUrlRefreshTried.remove(it) }
         }
+        return isRefreshReplacement
     }
 
     private fun startServiceUrlRefresh(player: Player, error: PlaybackException): Boolean {
@@ -1465,6 +1492,10 @@ class PipoPlaybackService : MediaLibraryService() {
         val startPositionMs = player.currentPosition.coerceAtLeast(0L)
         badSourceRecoveryMediaId = mediaId
         badSourceRecoveryUntilMs = SystemClock.elapsedRealtime() + BAD_SOURCE_SERVICE_REFRESH_GRACE_MS
+        notificationPlayer?.armRecoveryWindow()
+        mediaSession?.let { session ->
+            updateNotificationSafely(session, true, "bad-source-refresh-start")
+        }
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "bad_source_refresh_start",
@@ -1510,7 +1541,7 @@ class PipoPlaybackService : MediaLibraryService() {
                 val itemIndex = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
                 if (itemIndex !in 0 until player.mediaItemCount) return@runCatching
                 val resumePositionMs = maxOf(startPositionMs, player.currentPosition.coerceAtLeast(0L))
-                clearBadSourceRecovery(mediaId)
+                notificationPlayer?.armRecoveryWindow()
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "bad_source_refresh_success",
@@ -1531,6 +1562,9 @@ class PipoPlaybackService : MediaLibraryService() {
                 player.seekTo(itemIndex, resumePositionMs)
                 player.prepare()
                 player.play()
+                mediaSession?.let { session ->
+                    updateNotificationSafely(session, true, "bad-source-refresh-success")
+                }
             }.onFailure { err ->
                 if (serviceUrlRefreshReplacementMediaId == mediaId) {
                     serviceUrlRefreshReplacementMediaId = null
@@ -1957,6 +1991,10 @@ class PipoPlaybackService : MediaLibraryService() {
         val token = ++badSourceSkipToken
         badSourceRecoveryMediaId = mediaId
         badSourceRecoveryUntilMs = SystemClock.elapsedRealtime() + BAD_SOURCE_SERVICE_REFRESH_GRACE_MS
+        notificationPlayer?.armRecoveryWindow()
+        mediaSession?.let { session ->
+            updateNotificationSafely(session, true, "silent-stall-url-refresh-start")
+        }
         DiagnosticsLogStore.record(
             area = "playback_service",
             event = "silent_stall_url_refresh",
@@ -1983,7 +2021,7 @@ class PipoPlaybackService : MediaLibraryService() {
                 val idx = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
                 if (idx !in 0 until player.mediaItemCount) return@runCatching
                 val resumePositionMs = maxOf(startPositionMs, player.currentPosition.coerceAtLeast(0L))
-                clearBadSourceRecovery(mediaId)
+                notificationPlayer?.armRecoveryWindow()
                 markServiceUrlRefreshReplacement(mediaId)
                 player.replaceMediaItem(
                     idx,
@@ -1995,6 +2033,9 @@ class PipoPlaybackService : MediaLibraryService() {
                 player.seekTo(idx, resumePositionMs)
                 player.prepare()
                 player.play()
+                mediaSession?.let { session ->
+                    updateNotificationSafely(session, true, "silent-stall-url-refresh-success")
+                }
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "silent_stall_url_refresh_success",
@@ -2134,8 +2175,24 @@ class PipoPlaybackService : MediaLibraryService() {
         startInForegroundRequired: Boolean,
         reason: String,
     ) {
+        val now = SystemClock.elapsedRealtime()
+        val appInForeground = AppForeground.isForeground.value
+        val startInForeground = startInForegroundRequired && appInForeground
+        if (startInForegroundRequired && !startInForeground) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "notification_foreground_deferred",
+                fields = playerFields(session.player) + mapOf(
+                    "reason" to reason,
+                    "appForeground" to appInForeground,
+                    "deniedBackoff" to (now < foregroundStartDeniedUntilMs),
+                ),
+            )
+        }
         runCatching {
-            onUpdateNotification(session, startInForegroundRequired)
+            onUpdateNotification(session, startInForeground)
+        }.onSuccess {
+            if (startInForeground) foregroundStartDeniedUntilMs = 0L
         }.onFailure { err ->
             val foregroundDenied = isForegroundStartDenied(err)
             DiagnosticsLogStore.record(
@@ -2147,12 +2204,14 @@ class PipoPlaybackService : MediaLibraryService() {
                 },
                 fields = playerFields(session.player) + mapOf(
                     "reason" to reason,
-                    "startForeground" to startInForegroundRequired,
+                    "startForeground" to startInForeground,
                     "errorType" to err::class.java.simpleName,
                     "message" to err.message,
                 ),
             )
-            if (foregroundDenied && startInForegroundRequired) {
+            if (foregroundDenied && startInForeground) {
+                foregroundStartDeniedUntilMs =
+                    SystemClock.elapsedRealtime() + FOREGROUND_START_DENIED_BACKOFF_MS
                 runCatching { onUpdateNotification(session, false) }
                     .onFailure { fallback ->
                         DiagnosticsLogStore.record(
@@ -2239,6 +2298,7 @@ class PipoPlaybackService : MediaLibraryService() {
     private companion object {
         private const val KEEP_ALIVE_PREPARE_COOLDOWN_MS = 1_500L
         private const val KEEP_ALIVE_NOTIFICATION_DELAY_MS = 80L
+        private const val FOREGROUND_START_DENIED_BACKOFF_MS = 2 * 60 * 1000L
         private const val STREAM_URL_TIMEOUT_MS = 15_000L
         private const val BAD_SOURCE_SERVICE_REFRESH_GRACE_MS = STREAM_URL_TIMEOUT_MS + 2_000L
         private const val BAD_SOURCE_CONTROLLER_GRACE_MS = 5_000L

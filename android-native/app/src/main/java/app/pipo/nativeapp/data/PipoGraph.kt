@@ -35,6 +35,9 @@ object PipoGraph {
     private var recLog: RecommendationLog? = null
 
     @Volatile
+    private var recFeedbackLog: RecommendationFeedbackLog? = null
+
+    @Volatile
     private var libraryAnalysis: LibraryAnalysis? = null
 
     @Volatile
@@ -85,6 +88,9 @@ object PipoGraph {
 
     val recommendationLog: RecommendationLog
         get() = recLog ?: error("PipoGraph.installContext() must be called before recommendationLog")
+
+    val recommendationFeedbackLog: RecommendationFeedbackLog
+        get() = recFeedbackLog ?: error("PipoGraph.installContext() must be called before recommendationFeedbackLog")
 
     val libraryAnalyzer: LibraryAnalysis
         get() = libraryAnalysis ?: LibraryAnalysis(repository, audioFeaturesStore)
@@ -152,6 +158,7 @@ object PipoGraph {
         if (semanticStore == null) semanticStore = TrackSemanticStore(app)
         if (memory == null) memory = PetMemory(app)
         if (recLog == null) recLog = RecommendationLog(app)
+        if (recFeedbackLog == null) recFeedbackLog = RecommendationFeedbackLog(app)
         if (embedStore == null) embedStore = EmbeddingStore(app)
     }
 }

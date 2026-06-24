@@ -10,6 +10,7 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetIntent
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoRepository
+import app.pipo.nativeapp.data.RecommendationFeedbackLog
 import app.pipo.nativeapp.data.TrackDedupe
 import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
@@ -29,6 +30,7 @@ class MusicResolver(
 ) {
     private companion object {
         const val CONTINUATION_WANT_COUNT = 12
+        const val CONTINUATION_LOCAL_POOL_COUNT = 96
         const val CONTINUATION_SEARCH_LIMIT = 50
         const val CONTINUATION_MAX_SEARCH_QUERIES = 16
     }
@@ -181,7 +183,11 @@ class MusicResolver(
             actionId = action.actionId,
             mode = action.mode,
             tracks = tracks,
-            continuous = if (action.mode == PlayMode.ReplaceQueue) continuousSourceFor(action, plan, scopedTracks) else null,
+            continuous = if (action.mode != PlayMode.InsertNext && tracks.size > 1) {
+                continuousSourceFor(action, plan, input, scopedTracks)
+            } else {
+                null
+            },
             primaryGoal = action.primaryGoal,
             target = action.target,
             similar = action.similar,
@@ -322,11 +328,12 @@ class MusicResolver(
             behaviorEvents = behaviorEvents,
             behaviorPreference = behaviorPreference,
             currentTrack = input.currentTrack,
-            limit = 220,
+            limit = maxOf(220, desired * 8).coerceAtMost(900),
             queryVector = queryVector,
             embeddingStore = embeddingStore,
         )
-        val ranked = CandidateRanker.rank(
+        val feedback = contextFeedbackFor(intent)
+        val rankedRaw = CandidateRanker.rank(
             candidates = candidates,
             intent = intent,
             options = CandidateRanker.Options(
@@ -335,7 +342,23 @@ class MusicResolver(
                 recentRecommendation = runCatching { PipoGraph.recommendationLog.recentContext() }.getOrNull(),
                 behaviorPreference = behaviorPreference,
             ),
-        ).map { it.candidate.track }
+        )
+        val ranked = rankedRaw
+            .filterNot { feedback.contains(it.candidate.track) }
+            .map { it.candidate.track }
+        val feedbackFiltered = rankedRaw.size - ranked.size
+        if (feedbackFiltered > 0) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "context_feedback_filtered",
+                fields = mapOf(
+                    "query" to intent.queryText.take(80),
+                    "filteredCount" to feedbackFiltered,
+                    "rankedBefore" to rankedRaw.size,
+                    "rankedAfter" to ranked.size,
+                ),
+            )
+        }
         val artistKeys = intent.hardArtists
             .map(CommandTextSignals::normalizeForMatch)
             .filter { it.isNotBlank() }
@@ -436,7 +459,17 @@ class MusicResolver(
                 }
             }
         }
-        return demoteRecentlyRecommended(out).take(desired)
+        return filterContextFeedback(demoteRecentlyRecommended(out), intent).take(desired)
+    }
+
+    private fun contextFeedbackFor(intent: PetIntent): RecommendationFeedbackLog.RejectedContext =
+        runCatching { PipoGraph.recommendationFeedbackLog.rejectedForIntent(intent) }
+            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
+
+    private fun filterContextFeedback(tracks: List<NativeTrack>, intent: PetIntent): List<NativeTrack> {
+        if (tracks.isEmpty()) return tracks
+        val feedback = contextFeedbackFor(intent)
+        return tracks.filterNot { feedback.contains(it) }
     }
 
     /** 近期（24h/7d）推荐过的沉底：池子够大时等于换一批新歌；池子太小时仍允许重复兜底。 */
@@ -463,6 +496,7 @@ class MusicResolver(
     private fun continuousSourceFor(
         action: PlannedAction.PlayRequest,
         plan: MusicTurnPlan,
+        input: AgentTurnInput,
         localTracks: List<NativeTrack>,
     ): ContinuousQueueSource {
         val intent = intentFor(action, plan, localTracks)
@@ -491,7 +525,16 @@ class MusicResolver(
             "英" in lang || lang.lowercase().startsWith("eng")
         }
         return ContinuousQueueSource { excludeIds ->
-            searchContinuation(seedQueries, artistScope, artistKeys, excludeIds, allowFunctional, preferLatin)
+            val local = localContinuation(intent, input, localTracks, artistScope, excludeIds)
+            if (local.size >= CONTINUATION_WANT_COUNT) {
+                local
+            } else {
+                val haveKeys = local.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+                val online = searchContinuation(seedQueries, artistScope, artistKeys, excludeIds, allowFunctional, preferLatin)
+                    .let { filterContextFeedback(it, intent) }
+                    .filter { TrackDedupe.songKey(it) !in haveKeys }
+                (local + online).take(CONTINUATION_WANT_COUNT)
+            }
         }
     }
 
@@ -508,6 +551,87 @@ class MusicResolver(
         }
         return latin > cjk
     }
+
+    private suspend fun localContinuation(
+        intent: PetIntent,
+        input: AgentTurnInput,
+        localTracks: List<NativeTrack>,
+        artistScope: ArtistScope,
+        excludeIds: Set<Long>,
+    ): List<NativeTrack> {
+        if (localTracks.isEmpty()) return emptyList()
+        val rankedPool = rankForIntent(
+            intent = intent,
+            input = input,
+            localTracks = localTracks,
+            desired = CONTINUATION_LOCAL_POOL_COUNT,
+            artistScope = artistScope,
+            allowOnline = false,
+        )
+        val eligible = rankedPool.filter { track ->
+            track.neteaseId?.let { it !in excludeIds } ?: true
+        }
+        val sampled = sampleContinuation(eligible, CONTINUATION_WANT_COUNT)
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "continuous_source_local_sample",
+            fields = mapOf(
+                "query" to intent.queryText.take(80),
+                "languages" to intent.hardLanguages.joinToString(","),
+                "rankedPoolCount" to rankedPool.size,
+                "eligibleCount" to eligible.size,
+                "selectedCount" to sampled.size,
+            ),
+        )
+        return sampled
+    }
+
+    private fun sampleContinuation(pool: List<NativeTrack>, wantCount: Int): List<NativeTrack> {
+        if (pool.size <= wantCount) return pool
+        val available = TrackDedupe.capSameTitle(pool).toMutableList()
+        if (available.size <= wantCount) return available
+        val rnd = java.util.Random()
+        val out = ArrayList<NativeTrack>(wantCount)
+        val artistCounts = HashMap<String, Int>()
+        var guard = 0
+        while (out.size < wantCount && available.isNotEmpty() && guard < pool.size * 3) {
+            guard += 1
+            val idx = weightedRankIndex(available.size, rnd)
+            val track = available.removeAt(idx)
+            val artistKey = firstArtistKey(track)
+            val count = artistCounts[artistKey] ?: 0
+            if (count >= 2 && available.size >= wantCount - out.size) continue
+            out.add(track)
+            artistCounts[artistKey] = count + 1
+        }
+        if (out.size < wantCount) {
+            for (track in available.shuffled()) {
+                out.add(track)
+                if (out.size >= wantCount) break
+            }
+        }
+        return out
+    }
+
+    private fun weightedRankIndex(size: Int, rnd: java.util.Random): Int {
+        if (size <= 1) return 0
+        var total = 0.0
+        for (idx in 0 until size) {
+            total += 1.0 / (1.0 + idx * 0.08)
+        }
+        var ticket = rnd.nextDouble() * total
+        for (idx in 0 until size) {
+            ticket -= 1.0 / (1.0 + idx * 0.08)
+            if (ticket <= 0.0) return idx
+        }
+        return size - 1
+    }
+
+    private fun firstArtistKey(track: NativeTrack): String =
+        track.artist.split("/", "&", ",", "、")
+            .firstOrNull()
+            ?.let(CommandTextSignals::normalizeForMatch)
+            .orEmpty()
 
     private suspend fun searchContinuation(
         seedQueries: List<String>,

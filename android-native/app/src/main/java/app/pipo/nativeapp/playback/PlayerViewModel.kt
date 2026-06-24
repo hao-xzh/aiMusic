@@ -125,6 +125,7 @@ class PlayerViewModel(
 
     private val queueRecommendationAvoidIds = LinkedHashSet<Long>()
     private val queueRecommendationAvoidSongKeys = LinkedHashSet<String>()
+    private var activeRecommendationContextText: String? = null
 
     // 真正的播放权威仍是 MediaSessionService 里的主 ExoPlayer。Service 侧的 SmartAutoMixer
     // 只在 TransitionScore 高置信度时做单播放器智能切换；这里负责把队列排到更容易接。
@@ -142,7 +143,7 @@ class PlayerViewModel(
         val raw = PipoGraph.recommendEngine.fetchMore(
             anchor = current,
             excludeIds = excludeIds,
-            wantCount = 8,
+            wantCount = QUEUE_EXTEND_FETCH_CANDIDATE_COUNT,
         )
         val existingSongKeys = state.queue.mapTo(HashSet()) { TrackDedupe.songKey(it) }
         val unique = raw.filter { TrackDedupe.songKey(it) !in existingSongKeys }
@@ -276,6 +277,45 @@ class PlayerViewModel(
             manualOrigin && preferredPlaybackMode == PlaybackQueueMode.AiRadio
         }
     }
+
+    private fun rememberActiveRecommendationContext(request: AgentQueueRequest) {
+        if (request.operation == QueueOperation.InsertNext) return
+        val text = request.sourceUserText.trim()
+        if (text.isBlank() || isSystemRecommendationContext(text)) return
+        activeRecommendationContextText = text.take(240)
+    }
+
+    private fun recommendationFeedbackContext(): String? {
+        activeRecommendationContextText?.let { return it }
+        val planText = CommittedQueuePlanStore.current()?.sourceUserText?.trim().orEmpty()
+        return planText.takeIf { it.isNotBlank() && !isSystemRecommendationContext(it) }
+    }
+
+    private fun recordRecommendationRejection(track: NativeTrack, contextText: String?) {
+        val text = contextText?.trim().orEmpty()
+        if (text.isBlank()) return
+        runCatching { PipoGraph.recommendationFeedbackLog.rejectForContext(track, text) }
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "recommendation_context_rejected",
+            fields = mapOf(
+                "trackId" to track.id,
+                "neteaseId" to track.neteaseId,
+                "title" to track.title,
+                "artist" to track.artist,
+                "context" to text.take(96),
+            ),
+        )
+    }
+
+    private fun isSystemRecommendationContext(text: String): Boolean {
+        return text.startsWith("manual_") ||
+            text == "taste_screen_play" ||
+            text == "queue_extend_append" ||
+            text == "force_extend_and_play_next" ||
+            text == "recover_from_state_queue"
+    }
+
     private val playbackOrchestrator by lazy {
         PlaybackOrchestrator(
             featuresStore = featuresStore,
@@ -292,6 +332,10 @@ class PlayerViewModel(
     private val autoMixFeatureBackoffUntilMs = HashMap<String, Long>()
     private var queueExtendBackoffUntilMs = 0L
     private var queueExtendFailureCount = 0
+    private var queueExtendSkipDiagKey: String? = null
+    private var queueExtendSkipDiagAtMs = 0L
+    private var lastMediaTransitionWasAuto = false
+    private var lastAutoWrapForceExtendAtMs = 0L
     private var stablePlaybackResetJob: Job? = null
     private var userPausedPlayback = false
     private var resolvingPlayback = false
@@ -306,6 +350,7 @@ class PlayerViewModel(
             mediaItem: androidx.media3.common.MediaItem?,
             reason: Int,
         ) {
+            lastMediaTransitionWasAuto = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
             DiagnosticsLogStore.record(
                 area = "playback",
                 event = "media_transition",
@@ -319,6 +364,8 @@ class PlayerViewModel(
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 logEventForPrev(BehaviorType.Completed, completionPctOverride = 1f)
                 logEventForCurrent(BehaviorType.PlayStarted)
+                maybeExtendQueue(trigger = "media_transition_auto", logSkips = true)
+                maybeForceExtendAfterAutoWrap(mediaItem)
             } else {
                 // 用户主动切：next/previous 里已经 log 过 Skipped/ManualCut
                 logEventForCurrent(BehaviorType.PlayStarted)
@@ -878,7 +925,10 @@ class PlayerViewModel(
     fun applyAgentQueueRequest(request: AgentQueueRequest): QueueCommitResult {
         val result = playbackOrchestrator.applyAgentRequest(request)
         when (result) {
-            is QueueCommitResult.Success -> scheduleTransitionPrepare(result.plan)
+            is QueueCommitResult.Success -> {
+                rememberActiveRecommendationContext(request)
+                scheduleTransitionPrepare(result.plan)
+            }
             is QueueCommitResult.Rejected -> {
                 DiagnosticsLogStore.record(
                     area = "playback_orchestrator",
@@ -1251,9 +1301,11 @@ class PlayerViewModel(
         val stateIdx = state.queue.indexOfFirst { it.id == trackId }
         if (stateIdx < 0) return
         val removedTrack = state.queue[stateIdx]
+        val feedbackContext = recommendationFeedbackContext()
         val queueVersion = PlaybackSessionClock.bump("remove_track")
         CommittedQueuePlanStore.clear()
         rememberQueueRecommendationAvoidance(listOf(removedTrack))
+        recordRecommendationRejection(removedTrack, feedbackContext)
         
         val playerIdx = player.indexOfMediaId(trackId)
         if (playerIdx != null) {
@@ -1280,6 +1332,7 @@ class PlayerViewModel(
                 "title" to removedTrack.title,
                 "artist" to removedTrack.artist,
                 "blockedFromRecommendation" to true,
+                "feedbackContext" to feedbackContext?.take(96),
                 "queueVersion" to queueVersion,
                 "queueSize" to newQueue.size,
             ),
@@ -1758,6 +1811,7 @@ class PlayerViewModel(
                         currentIndex = currentQueueIndexFor(player, queueSnapshot),
                     )
                 }
+                val remaining = queueSnapshot.size - state.currentIndex - 1
                 val exclusions = queueRecommendationExclusions(queueSnapshot)
                 val more = try {
                     sourceSnapshot.fetchMore(exclusions.trackIds)
@@ -1766,6 +1820,13 @@ class PlayerViewModel(
                 }
                 if (gen != playGen) return@launch
                 if (more.isEmpty()) {
+                    recordQueueExtendFailure(
+                        trigger = "force_extend",
+                        stage = "fetch_more_empty",
+                        queueSnapshot = queueSnapshot,
+                        remaining = remaining,
+                        extra = mapOf("source" to continuousSourceKind(sourceSnapshot)),
+                    )
                     fallbackWrapAround(player)
                     return@launch
                 }
@@ -1776,20 +1837,48 @@ class PlayerViewModel(
                 }
                 if (gen != playGen) return@launch
                 if (resolved.isEmpty()) {
+                    recordQueueExtendFailure(
+                        trigger = "force_extend",
+                        stage = "resolved_empty",
+                        queueSnapshot = queueSnapshot,
+                        remaining = remaining,
+                        extra = mapOf(
+                            "candidateCount" to more.size,
+                            "source" to continuousSourceKind(sourceSnapshot),
+                        ),
+                    )
                     fallbackWrapAround(player)
                     return@launch
                 }
-                val append = filterQueueRecommendationCandidates(resolved, exclusions)
+                val append = selectQueueRecommendationAppend(
+                    candidates = resolved,
+                    currentQueue = queueSnapshot,
+                    trigger = "force_extend",
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                )
                 if (append.isEmpty() || gen != playGen) {
+                    recordQueueExtendFailure(
+                        trigger = "force_extend",
+                        stage = "append_empty_after_filter",
+                        queueSnapshot = queueSnapshot,
+                        remaining = remaining,
+                        extra = mapOf(
+                            "candidateCount" to more.size,
+                            "resolvedCount" to resolved.size,
+                            "source" to continuousSourceKind(sourceSnapshot),
+                        ),
+                    )
                     fallbackWrapAround(player)
                     return@launch
                 }
                 val live = controller ?: return@launch
                 val insertIdx = live.mediaItemCount
-                val plannedQueue = queueSnapshot + append
+                val smartAppend = planAgentAppendForSmartMix(queueSnapshot, append)
+                val plannedQueue = queueSnapshot + smartAppend
                 state = state.copy(queue = plannedQueue)
-                live.addMediaItems(append.map(::toMediaItem))
-                rememberQueueRecommendations(append)
+                live.addMediaItems(toMediaItems(smartAppend, plannedQueue))
+                rememberQueueRecommendations(smartAppend)
 
                 live.seekTo(insertIdx, 0L)
                 ensurePlayerLive(live)
@@ -1810,9 +1899,9 @@ class PlayerViewModel(
                         "smoothnessAvg" to "1.000",
                         "hardPassed" to true,
                         "accepted" to true,
-                        "reordered" to false,
-                        "appendCount" to append.size,
-                    ) + appendedTrackFields(append),
+                        "reordered" to (smartAppend.map { it.id } != append.map { it.id }),
+                        "appendCount" to smartAppend.size,
+                    ) + appendedTrackFields(smartAppend),
                 )
                 scheduleTransitionPrepare(
                     CommittedQueuePlan.snapshot(
@@ -2097,11 +2186,14 @@ class PlayerViewModel(
 
     private fun syncFrom(player: Player) {
         val queue = state.queue
+        val previousIndex = state.currentIndex
         // 关键：trackId 以 player.currentMediaItem.mediaId 为权威源，不再相信 state.queue[index]。
         // 之前 phase-1/phase-2 期间（state.queue 还没追上 player 实际队列）会出现
         // "用 queue 里的旧 track.id 拉歌词、配上 player 实际在播的另一首" → 歌词不对。
         val playerMediaId = player.currentMediaItem?.mediaId
         val index = currentQueueIndexFor(player, queue)
+        val wasAutoTransition = lastMediaTransitionWasAuto
+        lastMediaTransitionWasAuto = false
         val track = playerMediaId?.let { id -> queue.firstOrNull { it.id == id } } ?: queue.getOrNull(index)
         val authoritativeTrackId = playerMediaId ?: track?.id
         if (authoritativeTrackId != null && loadedLyricsFor != authoritativeTrackId) {
@@ -2212,6 +2304,9 @@ class PlayerViewModel(
         }
         // 续杯：current 后剩 < 阈值时调一次 fetchMore
         maybeExtendQueue()
+        if (shouldForceExtendAfterAutoWrap(player, queue, previousIndex, index, wasAutoTransition)) {
+            triggerAutoWrapForceExtend(player, "sync_auto_wrap")
+        }
         maybePrepareAutoMix(player)
         // 节流持久化：杀掉冷启动黑屏 + 跳到 playlist[0] 的尴尬
         if (queue.isNotEmpty()) {
@@ -2434,18 +2529,197 @@ class PlayerViewModel(
         return raw.takeIf { it in 0 until count }
     }
 
-    private fun maybeExtendQueue() {
-        if (fetchingMore) return
-        val sourceSnapshot = continuousSource ?: return
+    private fun maybeForceExtendAfterAutoWrap(mediaItem: androidx.media3.common.MediaItem?) {
+        val player = controller ?: return
+        val queue = state.queue
+        if (
+            shouldForceExtendAfterAutoWrap(
+                player = player,
+                queue = queue,
+                previousIndex = state.currentIndex,
+                newIndex = queue.indexOfFirst { it.id == mediaItem?.mediaId },
+                wasAutoTransition = true,
+            )
+        ) {
+            triggerAutoWrapForceExtend(player, "media_transition_auto_wrap")
+        }
+    }
+
+    private fun shouldForceExtendAfterAutoWrap(
+        player: Player,
+        queue: List<NativeTrack>,
+        previousIndex: Int,
+        newIndex: Int,
+        wasAutoTransition: Boolean,
+    ): Boolean {
+        if (!wasAutoTransition) return false
+        if (state.playbackMode != PlaybackQueueMode.AiRadio) return false
+        if (!player.playWhenReady || queue.size <= 1) return false
+        if (newIndex != 0) return false
+        val tailWindowStart = (queue.lastIndex - extendThreshold).coerceAtLeast(0)
+        return previousIndex >= tailWindowStart
+    }
+
+    private fun triggerAutoWrapForceExtend(player: Player, trigger: String) {
         val now = SystemClock.elapsedRealtime()
-        if (now < queueExtendBackoffUntilMs) return
+        if (now - lastAutoWrapForceExtendAtMs < AUTO_WRAP_FORCE_EXTEND_DEBOUNCE_MS) return
+        lastAutoWrapForceExtendAtMs = now
+        DiagnosticsLogStore.record(
+            area = "queue",
+            event = "ai_radio_auto_wrap_force_extend",
+            fields = mapOf(
+                "trigger" to trigger,
+                "queueSize" to state.queue.size,
+                "currentIndex" to state.currentIndex,
+                "mediaItemCount" to player.mediaItemCount,
+                "playbackMode" to state.playbackMode.name,
+            ) + currentTrackFields(),
+        )
+        triggerForceExtendAndPlayNext(player)
+    }
+
+    private fun queueExtendDiagFields(
+        trigger: String,
+        queueSnapshot: List<NativeTrack>,
+        remaining: Int,
+    ): Map<String, Any?> =
+        mapOf(
+            "trigger" to trigger,
+            "queueSize" to queueSnapshot.size,
+            "currentIndex" to state.currentIndex,
+            "remaining" to remaining,
+            "threshold" to extendThreshold,
+            "playbackMode" to state.playbackMode.name,
+        )
+
+    private fun continuousSourceKind(source: ContinuousQueueSource): String =
+        if (source === defaultContinuousSource) "default" else "agent"
+
+    private fun recordQueueExtendSkip(
+        trigger: String,
+        reason: String,
+        queueSnapshot: List<NativeTrack>,
+        remaining: Int,
+        extra: Map<String, Any?> = emptyMap(),
+    ) {
+        val now = SystemClock.elapsedRealtime()
+        val key = "$trigger:$reason:${state.currentIndex}:${queueSnapshot.size}"
+        if (queueExtendSkipDiagKey == key && now - queueExtendSkipDiagAtMs < QUEUE_EXTEND_SKIP_LOG_THROTTLE_MS) {
+            return
+        }
+        queueExtendSkipDiagKey = key
+        queueExtendSkipDiagAtMs = now
+        DiagnosticsLogStore.record(
+            area = "queue",
+            event = "queue_extend_skip",
+            fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf("reason" to reason) + extra,
+        )
+    }
+
+    private fun recordQueueExtendFailure(
+        trigger: String,
+        stage: String,
+        queueSnapshot: List<NativeTrack>,
+        remaining: Int,
+        error: Exception? = null,
+        extra: Map<String, Any?> = emptyMap(),
+    ) {
+        DiagnosticsLogStore.record(
+            area = "queue",
+            event = "queue_extend_failed",
+            fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf(
+                "stage" to stage,
+                "error" to error?.javaClass?.simpleName,
+                "message" to error?.message?.take(160),
+            ) + extra,
+        )
+    }
+
+    private fun recordQueueExtendAbort(
+        trigger: String,
+        reason: String,
+        queueSnapshot: List<NativeTrack>,
+        remaining: Int,
+    ) {
+        DiagnosticsLogStore.record(
+            area = "queue",
+            event = "queue_extend_aborted",
+            fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf("reason" to reason),
+        )
+    }
+
+    private fun maybeExtendQueue(trigger: String = "sync", logSkips: Boolean = false) {
         val queueSnapshot = state.queue
-        val mediaCountSnapshot = controller?.mediaItemCount ?: return
-        if (mediaCountSnapshot < queueSnapshot.size) return
         val remaining = queueSnapshot.size - state.currentIndex - 1
         if (remaining > extendThreshold) return
+        if (fetchingMore) {
+            if (logSkips) {
+                recordQueueExtendSkip(
+                    trigger = trigger,
+                    reason = "fetching_more",
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                )
+            }
+            return
+        }
+        val sourceSnapshot = continuousSource ?: run {
+            if (logSkips) {
+                recordQueueExtendSkip(
+                    trigger = trigger,
+                    reason = "no_continuous_source",
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                )
+            }
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now < queueExtendBackoffUntilMs) {
+            if (logSkips) {
+                recordQueueExtendSkip(
+                    trigger = trigger,
+                    reason = "backoff",
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                    extra = mapOf("backoffRemainingMs" to (queueExtendBackoffUntilMs - now)),
+                )
+            }
+            return
+        }
+        val mediaCountSnapshot = controller?.mediaItemCount ?: run {
+            if (logSkips) {
+                recordQueueExtendSkip(
+                    trigger = trigger,
+                    reason = "controller_missing",
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                )
+            }
+            return
+        }
+        if (mediaCountSnapshot < queueSnapshot.size) {
+            if (logSkips) {
+                recordQueueExtendSkip(
+                    trigger = trigger,
+                    reason = "timeline_not_ready",
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                    extra = mapOf("mediaItemCount" to mediaCountSnapshot),
+                )
+            }
+            return
+        }
         val gen = playGen
         fetchingMore = true
+        DiagnosticsLogStore.record(
+            area = "queue",
+            event = "queue_extend_start",
+            fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf(
+                "source" to continuousSourceKind(sourceSnapshot),
+                "mediaItemCount" to mediaCountSnapshot,
+            ),
+        )
         viewModelScope.launch {
             try {
                 val initialExclusions = queueRecommendationExclusions(queueSnapshot)
@@ -2453,11 +2727,15 @@ class PlayerViewModel(
                     sourceSnapshot.fetchMore(initialExclusions.trackIds)
                 } catch (e: CancellationException) {
                     throw e
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    recordQueueExtendFailure(trigger, "fetch_more_exception", queueSnapshot, remaining, e)
                     armQueueExtendBackoff()
                     return@launch
                 }
-                if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) return@launch
+                if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) {
+                    recordQueueExtendAbort(trigger, "stale_after_fetch", queueSnapshot, remaining)
+                    return@launch
+                }
                 if (more.isEmpty()) {
                     // source 跑空了 —— 不关闭循环，也不立刻放弃续杯：
                     // agent 的“按本次需求搜索”源召回面窄（静态 query 的 top-N 被排除完即枯竭），
@@ -2476,7 +2754,10 @@ class PlayerViewModel(
                     DiagnosticsLogStore.record(
                         area = "queue",
                         event = if (fallback != null) "continuous_source_fallback_default" else "continuous_source_exhausted",
-                        fields = mapOf("mode" to state.playbackMode.name),
+                        fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf(
+                            "mode" to state.playbackMode.name,
+                            "source" to continuousSourceKind(sourceSnapshot),
+                        ),
                     )
                     resetQueueExtendBackoff()
                     return@launch
@@ -2485,24 +2766,53 @@ class PlayerViewModel(
                     resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }
                 } catch (e: CancellationException) {
                     throw e
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    recordQueueExtendFailure(trigger, "resolve_exception", queueSnapshot, remaining, e)
                     armQueueExtendBackoff()
                     return@launch
                 }
-                if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) return@launch
+                if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) {
+                    recordQueueExtendAbort(trigger, "stale_after_resolve", queueSnapshot, remaining)
+                    return@launch
+                }
                 if (resolved.isEmpty()) {
+                    recordQueueExtendFailure(trigger, "resolved_empty", queueSnapshot, remaining)
                     armQueueExtendBackoff()
                     return@launch
                 }
                 val currentQueue = state.queue
-                val liveExclusions = queueRecommendationExclusions(currentQueue)
-                val append = filterQueueRecommendationCandidates(resolved, liveExclusions)
+                val append = selectQueueRecommendationAppend(
+                    candidates = resolved,
+                    currentQueue = currentQueue,
+                    trigger = trigger,
+                    queueSnapshot = queueSnapshot,
+                    remaining = remaining,
+                )
                 if (append.isEmpty()) {
+                    recordQueueExtendFailure(
+                        trigger = trigger,
+                        stage = "append_empty_after_filter",
+                        queueSnapshot = queueSnapshot,
+                        remaining = remaining,
+                        extra = mapOf(
+                            "candidateCount" to more.size,
+                            "resolvedCount" to resolved.size,
+                            "source" to continuousSourceKind(sourceSnapshot),
+                        ),
+                    )
                     armQueueExtendBackoff()
                     return@launch
                 }
                 val live = controller ?: return@launch
-                if (live.mediaItemCount < currentQueue.size) return@launch
+                if (live.mediaItemCount < currentQueue.size) {
+                    recordQueueExtendAbort(
+                        trigger = trigger,
+                        reason = "timeline_shrank_before_append",
+                        queueSnapshot = queueSnapshot,
+                        remaining = remaining,
+                    )
+                    return@launch
+                }
                 val smartAppend = planAgentAppendForSmartMix(currentQueue, append)
                 val plannedQueue = currentQueue + smartAppend
                 val queueVersion = PlaybackSessionClock.bump("queue_extend_append")
@@ -2577,6 +2887,30 @@ class PlayerViewModel(
             ),
         )
         return planned
+    }
+
+    private fun selectQueueRecommendationAppend(
+        candidates: List<NativeTrack>,
+        currentQueue: List<NativeTrack>,
+        trigger: String,
+        queueSnapshot: List<NativeTrack>,
+        remaining: Int,
+    ): List<NativeTrack> {
+        val append = filterQueueRecommendationCandidates(
+            candidates = candidates,
+            exclusions = queueRecommendationExclusions(currentQueue),
+        ).take(QUEUE_EXTEND_APPEND_TARGET)
+        if (append.isNotEmpty()) {
+            DiagnosticsLogStore.record(
+                area = "queue",
+                event = "queue_extend_candidate_selected",
+                fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf(
+                    "candidateCount" to candidates.size,
+                    "appendCount" to append.size,
+                ) + appendedTrackFields(append),
+            )
+        }
+        return append
     }
 
     private fun isQueueExtendStillCurrent(
@@ -2875,13 +3209,17 @@ class PlayerViewModel(
         private const val MAX_RECOVERY_SKIPS = 2
         private const val PREWARM_AFTER_PROGRESS = 0.55f
         private const val PREWARM_WHEN_REMAINING_MS = 90_000L
-        private const val NEXT_PREWARM_TIMEOUT_MS = 20_000L
+        private const val NEXT_PREWARM_TIMEOUT_MS = 60_000L
         private const val PREWARM_FAILURE_BACKOFF_MS = 3 * 60_000L
         private const val AUTO_MIX_FEATURE_LOOKAHEAD = 4
         private const val AUTO_MIX_FEATURE_TIMEOUT_MS = 25_000L
         private const val AUTO_MIX_FEATURE_FAILURE_BACKOFF_MS = 5 * 60_000L
         private const val QUEUE_EXTEND_BACKOFF_BASE_MS = 30_000L
         private const val QUEUE_EXTEND_BACKOFF_MAX_MS = 5 * 60_000L
+        private const val QUEUE_EXTEND_SKIP_LOG_THROTTLE_MS = 15_000L
+        private const val QUEUE_EXTEND_FETCH_CANDIDATE_COUNT = 24
+        private const val QUEUE_EXTEND_APPEND_TARGET = 8
+        private const val AUTO_WRAP_FORCE_EXTEND_DEBOUNCE_MS = 5_000L
         private const val QUEUE_RECOMMENDATION_AVOID_MAX = 512
         private const val PLAYLIST_APPEND_RESOLVE_CHUNK_SIZE = 40
         private const val INITIAL_APPEND_RESOLVE_CHUNK_SIZE = 8
