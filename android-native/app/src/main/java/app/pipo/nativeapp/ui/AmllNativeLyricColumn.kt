@@ -28,6 +28,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -69,6 +70,7 @@ import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.Hyphens
@@ -125,10 +127,20 @@ internal fun AppleMusicLyricColumn(
     lyricFontWeight: FontWeight = FontWeight.Bold,
     bottomFadeStart: Float = 0.80f,
     bottomFadeSoftEnd: Float = 0.94f,
+    topFadeTransparentEnd: Float = 0.08f,
+    topFadePartialEnd: Float = 0.14f,
+    topFadeSolidEnd: Float? = null,
     lineWidthAspect: Float = NATIVE_LINE_WIDTH_ASPECT,
     enterProgress: Float = 1f,
-    // 固定歌词锚点的纵向偏移：正值=整体下移。横屏传 80dp 下移，竖屏默认 0 不变。
+    // 固定歌词锚点的纵向偏移：正值=整体下移。横屏传 60dp 下移，竖屏默认 0 不变。
     anchorBiasDp: Dp = 0.dp,
+    // 可选的当前行顶部上限：竖屏歌词页用它把上一行刚好推出顶部裁剪区，
+    // 比固定负偏移更能适配不同屏幕高度。
+    anchorTopCapDp: Dp? = null,
+    // 顶部硬裁剪安全区：防止上一句是两行/有发光边缘时，在顶部残留一两像素。
+    topHardClipDp: Dp = 0.dp,
+    // 竖屏歌词页专用：active 上方的旧行直接不渲染，避免多行旧歌词残留。
+    hideRowsAboveAnchor: Boolean = false,
 ) {
     val sessionKey = remember(sessionId, lines) { nativeLyricSessionKey(sessionId, lines) }
     val initialPositionMs = remember(sessionKey) { positionMs.coerceAtLeast(0L) }
@@ -303,7 +315,14 @@ internal fun AppleMusicLyricColumn(
     val activeLineTopLiftPx = estimatedRowHeightPx.toFloat() * NATIVE_ACTIVE_LINE_TOP_UPSHIFT_ROWS
     val activeLineExtraLiftPx = with(density) { NATIVE_ACTIVE_LINE_EXTRA_UPSHIFT_DP.dp.toPx() }
     val anchorBiasPx = with(density) { anchorBiasDp.toPx() }
-    val anchorYPx = containerHeightPx * NATIVE_ALIGN_POSITION - activeLineTopLiftPx - activeLineExtraLiftPx + anchorBiasPx
+    val baseAnchorYPx =
+        containerHeightPx * NATIVE_ALIGN_POSITION - activeLineTopLiftPx - activeLineExtraLiftPx + anchorBiasPx
+    val anchorTopCapPx = anchorTopCapDp?.let { with(density) { it.toPx() } }
+    val anchorYPx = if (anchorTopCapPx != null) {
+        minOf(baseAnchorYPx, anchorTopCapPx)
+    } else {
+        baseAnchorYPx
+    }
 
     val initialActiveLyricIndex = if (positionProvider != null) {
         initialTimelineSnapshot.targetIndex
@@ -322,6 +341,7 @@ internal fun AppleMusicLyricColumn(
     val layoutAnchorCenter = rowAnchor(layoutAnchorSlotIdx)
     val measuredRowCount = mainRowHeights.size
     var manualScrollCenterPx by remember(sessionKey) { mutableFloatStateOf(Float.NaN) }
+    var manualVisualSlotIdx by remember(sessionKey) { mutableIntStateOf(-1) }
     var manualHoldUntilMs by remember(sessionKey) { mutableLongStateOf(0L) }
     var isUserDragging by remember(sessionKey) { mutableStateOf(false) }
     // 两段式跳转：第一击“固定”该行（pendingSeekIdx 高亮 + 暂停跟随），第二击同一行才 seek。
@@ -427,6 +447,7 @@ internal fun AppleMusicLyricColumn(
             // manualScrollCenterPx 是渲染坐标，换算回基准坐标后交给 spring 复位。
             val startCenter = baseForRenderCenter(manualScrollCenterPx)
             manualScrollCenterPx = Float.NaN
+            manualVisualSlotIdx = -1
             scrollSpring.snapTo(startCenter)
             scrollSpring.animateTo(
                 targetValue = scrollTargetCenter,
@@ -435,6 +456,7 @@ internal fun AppleMusicLyricColumn(
         }
     }
 
+    val lastSlotIndex = nativeSlots.lastIndex.coerceAtLeast(0)
     // derivedStateOf：拖动中每帧重算就近行，但只在「行号真正变化」时才通知下游（渲染窗口/焦点），
     // 把手动滚动的重组从「每帧」降到「每越过一行」；自动播放时它等于 targetIndex（切句才变）。
     val visualActiveIdx by remember(sessionKey) {
@@ -444,7 +466,9 @@ internal fun AppleMusicLyricColumn(
             if (!m.isFinite()) {
                 pa
             } else {
-                rowMetrics.nearestRenderIndex(m)
+                manualVisualSlotIdx
+                    .takeIf { it in 0..lastSlotIndex }
+                    ?: rowMetrics.nearestRenderIndex(m)
             }
         }
     }
@@ -458,12 +482,35 @@ internal fun AppleMusicLyricColumn(
     } else {
         NATIVE_INITIAL_RENDER_RADIUS_LINES
     }
-    val lastSlotIndex = nativeSlots.lastIndex.coerceAtLeast(0)
     val visibleStartIndex = (visualActiveIdx - renderRadiusRows).coerceIn(0, lastSlotIndex)
     val visibleEndIndex = (visualActiveIdx + renderRadiusRows).coerceIn(visibleStartIndex, lastSlotIndex)
+    val leavingLineSlotIdx = if (
+        hideRowsAboveAnchor &&
+        effectiveLineSwitchFromIdx >= 0 &&
+        effectiveLineSwitchFromIdx != effectiveLineSwitchToIdx &&
+        lineSwitchProgressState.floatValue < 0.999f
+    ) {
+        slotForLine(effectiveLineSwitchFromIdx)
+    } else {
+        -1
+    }
+    val previousLyricSlotIdx = if (hideRowsAboveAnchor && currentLineIdx > 0) {
+        slotForLine(currentLineIdx - 1)
+    } else {
+        -1
+    }
+    fun isHiddenAboveAnchorSlot(slotIndex: Int): Boolean {
+        if (slotIndex == leavingLineSlotIdx) return false
+        if (slotIndex == previousLyricSlotIdx) return false
+        return hideRowsAboveAnchor &&
+            !manualScrollActive &&
+            !isUserDragging &&
+            slotIndex < layoutAnchorSlotIdx
+    }
     val initialWindowMeasured = if (containerHeightPx > 0 && nativeSlots.isNotEmpty()) {
         var ready = true
         for (slotIndex in visibleStartIndex..visibleEndIndex) {
+            if (isHiddenAboveAnchorSlot(slotIndex)) continue
             if (!mainRowHeights.containsKey(slotIndex)) ready = false
             val slot = nativeSlots[slotIndex]
             if (slot is NativeLyricSlot.Line) {
@@ -640,17 +687,39 @@ internal fun AppleMusicLyricColumn(
             warmGlyphs = true,
         )
     }
-    val topFadeEnd = 0.16f
+    val topFadeSolidStop = (topFadeSolidEnd ?: if (showTranslation) 0.22f else 0.20f)
+        .coerceIn(0f, 0.36f)
+    val topFadePartialStop = topFadePartialEnd.coerceIn(0f, topFadeSolidStop)
+    val topFadeTransparentStop = topFadeTransparentEnd.coerceIn(0f, topFadePartialStop)
+    val topHardClipPx = with(density) { topHardClipDp.toPx() }
     val bottomSolidStop = bottomFadeStart.coerceIn(0.60f, 0.96f)
     val bottomSoftStop = bottomFadeSoftEnd.coerceIn(bottomSolidStop, 0.99f)
     // 渐隐遮罩 Brush 只建一次（之前每帧 draw 都重新分配 colorStops 数组 + Brush）。
-    val fadeMaskBrush = remember(topFadeEnd, bottomSolidStop, bottomSoftStop) {
-        Brush.verticalGradient(
-            colorStops = arrayOf(
+    val fadeMaskBrush = remember(
+        topFadeTransparentStop,
+        topFadePartialStop,
+        topFadeSolidStop,
+        bottomSolidStop,
+        bottomSoftStop,
+    ) {
+        val topStops = if (topFadeSolidStop <= 0.001f) {
+            arrayOf(0f to Color.Black)
+        } else if (topFadeTransparentStop <= 0.001f) {
+            arrayOf(
                 0f to Color.Transparent,
-                0.05f to Color.Black.copy(alpha = 0.12f),
-                0.11f to Color.Black.copy(alpha = 0.72f),
-                topFadeEnd to Color.Black,
+                topFadePartialStop to Color.Black.copy(alpha = 0.38f),
+                topFadeSolidStop to Color.Black,
+            )
+        } else {
+            arrayOf(
+                0f to Color.Transparent,
+                topFadeTransparentStop to Color.Transparent,
+                topFadePartialStop to Color.Black.copy(alpha = 0.38f),
+                topFadeSolidStop to Color.Black,
+            )
+        }
+        Brush.verticalGradient(
+            colorStops = topStops + arrayOf(
                 bottomSolidStop to Color.Black,
                 bottomSoftStop to Color.Black.copy(alpha = 0.45f),
                 1f to Color.Transparent,
@@ -671,6 +740,13 @@ internal fun AppleMusicLyricColumn(
             .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
             .drawWithContent {
                 drawContent()
+                if (topHardClipPx > 0.5f) {
+                    drawRect(
+                        color = Color.Transparent,
+                        size = androidx.compose.ui.geometry.Size(size.width, topHardClipPx),
+                        blendMode = androidx.compose.ui.graphics.BlendMode.DstIn,
+                    )
+                }
                 drawRect(
                     brush = fadeMaskBrush,
                     blendMode = androidx.compose.ui.graphics.BlendMode.DstIn,
@@ -685,7 +761,9 @@ internal fun AppleMusicLyricColumn(
                                 pendingSeekIdx = -1
                                 manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
                                 // 拖动工作在渲染坐标（1:1 手感），以当前渲染中心为起点。
-                                manualScrollCenterPx = renderCenterNow()
+                                val startCenter = renderCenterNow()
+                                manualScrollCenterPx = startCenter
+                                manualVisualSlotIdx = rowMetrics.nearestRenderIndex(startCenter)
                                 gestureScope.launch {
                                     scrollSpring.stop()
                                 }
@@ -700,7 +778,8 @@ internal fun AppleMusicLyricColumn(
                             },
                             onDrag = { change, dragAmount ->
                                 change.consume()
-                                manualHoldUntilMs = SystemClock.elapsedRealtime() + NATIVE_MANUAL_HOLD_MS
+                                // Keep the hold timer edge-triggered; refreshing it on every move
+                                // forces the lyric column back through composition during a drag.
                                 val currentCenter = if (manualScrollCenterPx.isFinite()) {
                                     manualScrollCenterPx
                                 } else {
@@ -713,7 +792,13 @@ internal fun AppleMusicLyricColumn(
                                     totalHeight = rowMetrics.totalRenderHeight,
                                     viewportHeight = containerHeightPx.toFloat(),
                                 )
-                                manualScrollCenterPx = next
+                                if (!manualScrollCenterPx.isFinite() || kotlin.math.abs(next - manualScrollCenterPx) > 0.5f) {
+                                    manualScrollCenterPx = next
+                                }
+                                val nextVisualSlot = rowMetrics.nearestRenderIndex(next)
+                                if (manualVisualSlotIdx != nextVisualSlot) {
+                                    manualVisualSlotIdx = nextVisualSlot
+                                }
                             },
                         )
                     }
@@ -725,6 +810,7 @@ internal fun AppleMusicLyricColumn(
         // 渲染窗口按「虚拟行」裁剪（基于 visualActiveIdx），不再依赖每帧 rowY：
         // 用最小行高估算半径（高估行数→多渲染几行，保证滚动时不漏、不空白）。
         for (slotIndex in visibleStartIndex..visibleEndIndex) {
+            if (isHiddenAboveAnchorSlot(slotIndex)) continue
             val slot = nativeSlots[slotIndex]
             when (slot) {
                 is NativeLyricSlot.Line -> {
@@ -755,6 +841,7 @@ internal fun AppleMusicLyricColumn(
                             lineSwitchProgressState.floatValue
                         }
                         val isManualFocus = manualScrollActive && slotIndex == visualActiveIdx
+                        val isManualInteraction = isUserDragging || manualScrollActive
                         val isFocused = idx == pendingSeekIdx || if (manualScrollActive) {
                             slotIndex == visualActiveIdx
                         } else {
@@ -765,7 +852,7 @@ internal fun AppleMusicLyricColumn(
                         val blurTarget = nativeLineBlur(
                             hasLineFocus = hasAppleLineFocus,
                             isFirstLine = idx == 0,
-                            isUserInteracting = isUserDragging || manualScrollActive,
+                            isUserInteracting = isManualInteraction,
                         )
                         val itemAlignment = if (line.alignment == PipoLyricAlignment.End) {
                             Alignment.TopEnd
@@ -805,6 +892,7 @@ internal fun AppleMusicLyricColumn(
                                                             val seekCenter = rowAnchor(slotIndex)
                                                             val resumeCenter = baseForRenderCenter(renderCenterNow())
                                                             manualScrollCenterPx = Float.NaN
+                                                            manualVisualSlotIdx = -1
                                                             gestureScope.launch {
                                                                 scrollSpring.stop()
                                                                 scrollSpring.snapTo(resumeCenter)
@@ -854,10 +942,10 @@ internal fun AppleMusicLyricColumn(
                                     onTransFullHeight = { h -> if (transFullHeights[slotIndex] != h) transFullHeights[slotIndex] = h },
                                     onTransMaxHeight = { h -> if (transMaxHeights[slotIndex] != h) transMaxHeights[slotIndex] = h },
                                     rowMinHeight = rowMinHeight,
-                                    isUserDragging = isUserDragging,
                                     isPlaying = isPlaying,
                                     targetBlur = blurTarget,
                                     isManualFocus = isManualFocus,
+                                    isUserInteracting = isManualInteraction,
                                     fontSize = lyricFontSize,
                                     lineHeight = lyricLineHeight,
                                     fontWeight = lyricFontWeight,
@@ -1006,10 +1094,10 @@ private fun NativeAmllLyricRow(
     onTransFullHeight: (Int) -> Unit,
     onTransMaxHeight: (Int) -> Unit,
     rowMinHeight: Dp,
-    isUserDragging: Boolean,
     isPlaying: Boolean,
     targetBlur: Float,
     isManualFocus: Boolean,
+    isUserInteracting: Boolean,
     fontSize: TextUnit,
     lineHeight: TextUnit,
     fontWeight: FontWeight,
@@ -1156,6 +1244,7 @@ private fun NativeAmllLyricRow(
                 fg = fg,
                 fgUnsung = fgUnsung,
                 keepFocusGradient = isManualFocus,
+                suspendTimedDraw = isUserInteracting,
                 fontSize = fontSize,
                 lineHeight = lineHeight,
                 fontWeight = effectiveMainFontWeight,
@@ -1186,6 +1275,7 @@ private fun NativeAmllLyricRow(
                     lineWidthPx = lineWidthPx,
                     topMargin = if (bgIndex == 0) backgroundVocalTopMargin else 0.dp,
                     effectsEnabled = rowEffectsEnabled,
+                    suspendTimedDraw = isUserInteracting,
                     planCache = planCache,
                 )
             }
@@ -1264,6 +1354,7 @@ private fun NativeAmllCompanionLine(
     lineWidthPx: Float,
     topMargin: Dp,
     effectsEnabled: Boolean,
+    suspendTimedDraw: Boolean,
     planCache: NativeLyricPlanCache,
 ) {
     val textMeasurer = rememberTextMeasurer()
@@ -1354,6 +1445,7 @@ private fun NativeAmllCompanionLine(
             textAlign = companionTextAlign,
             isBackgroundVocal = true,
             effectsEnabled = effectsEnabled,
+            suspendTimedDraw = suspendTimedDraw,
             wordTimelineOffsetMs = wordTimelineOffsetMs,
             preparedPlan = preparedTimedPlan,
             preparedKey = companionPreparedKey,
@@ -1457,6 +1549,7 @@ private fun NativeAmllLyricText(
     textAlign: TextAlign,
     isBackgroundVocal: Boolean = false,
     effectsEnabled: Boolean = true,
+    suspendTimedDraw: Boolean = false,
     wordTimelineOffsetMs: Long = 0L,
     lineTransitionProgress: Float = 1f,
     lineTransitionRole: NativeLineTransitionRole = NativeLineTransitionRole.None,
@@ -1491,6 +1584,7 @@ private fun NativeAmllLyricText(
     val manualStaticFocus = keepFocusGradient && !isActive
     val shouldDrawTimed = line.chars.isNotEmpty() &&
         !manualStaticFocus &&
+        !suspendTimedDraw &&
         isActive
     val timedDrawOffsetMs = if (shouldDrawTimed) wordTimelineOffsetMs else 0L
     val appleLineClockState = rememberNativeAppleLineClockMs(
@@ -1669,6 +1763,7 @@ private fun nativeLyricTextStyle(
 ): TextStyle {
     return TextStyle(
         fontSize = fontSize,
+        fontFamily = FontFamily.SansSerif,
         fontWeight = fontWeight,
         lineHeight = nativeDescenderSafeLineHeight(fontSize, lineHeight),
         textAlign = textAlign,
@@ -1705,9 +1800,10 @@ private fun nativeDescenderSafeLineHeight(
 
 private fun nativeAppleLyricFontWeight(text: String, fallback: FontWeight): FontWeight {
     return when {
+        // Apple Lyrics 的 system stack 在 CJK 行上会降到约 600，拉丁行保持 700；
+        // 不让横屏/沙盒传入的 ExtraBold 把歌词压得比 Apple Music 更重。
         nativeIsCjkText(text) -> FontWeight.SemiBold
-        fallback.weight > FontWeight.Bold.weight -> FontWeight.Bold
-        else -> fallback
+        else -> FontWeight.Bold
     }
 }
 
@@ -3060,9 +3156,18 @@ private fun DrawScope.drawNativeSlowSegmentText(
         }
         val glyphCenter = (boxLeft + boxRight) * 0.5f
         val glyphWidth = (boxRight - boxLeft).coerceAtLeast(1f)
-        val solidX = boxLeft + glyphWidth * (gradientPercent / 100f)
-        val rampEndX = boxLeft + glyphWidth *
-            ((gradientPercent + NATIVE_APPLE_SWEEP_LEAD_RATIO * 100f) / 100f)
+        // 普通 syllable 的 sweep 过渡带按整段宽度计算；慢词如果按单个 glyph
+        // 宽度计算，20% fade 会窄到近似硬切，颜色变化就会出现明显分界线。
+        // 这里保留逐字母时间轴，但过渡带复用所在词段的宽度，并用同一套
+        // progress -> solid/ramp 公式保证 -20% 时全未唱、100% 时全已唱。
+        val segmentWidth = (segment.right - segment.left).coerceAtLeast(glyphWidth)
+        val sweepFadeWidth = (segmentWidth * NATIVE_APPLE_SWEEP_LEAD_RATIO)
+            .coerceAtLeast(glyphWidth * NATIVE_APPLE_SWEEP_LEAD_RATIO)
+            .coerceAtLeast(1f)
+        val sweepProgress = ((gradientPercent + NATIVE_APPLE_SWEEP_LEAD_RATIO * 100f) /
+            (NATIVE_APPLE_SWEEP_TRAVEL_RATIO * 100f)).coerceIn(0f, 1f)
+        val solidX = boxLeft + sweepProgress * (glyphWidth + sweepFadeWidth) - sweepFadeWidth
+        val rampEndX = solidX + sweepFadeWidth
         val fadeEndX = rampEndX.coerceAtMost(boxRight)
         val glyphLayout = nativeSlowGlyphLayout(
             plan = plan,

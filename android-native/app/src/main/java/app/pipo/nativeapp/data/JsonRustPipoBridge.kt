@@ -214,7 +214,14 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             if (parsed.isNotEmpty()) return attachTranslationLines(parsed, translations)
         }
         val lrc = raw.optStringOrNull("lyric") ?: return emptyList()
-        return attachTranslationLines(LrcParser.parse(lrc), translations)
+        val splitLines = splitEmbeddedTranslationLines(
+            lines = LrcParser.parse(lrc),
+            translationLines = translations,
+        )
+        val effectiveTranslations = splitLines.embeddedTranslationLines
+            .takeIf { it.isNotEmpty() }
+            ?: translations
+        return attachTranslationLines(splitLines.primaryLines, effectiveTranslations)
     }
 
     override suspend fun neteaseLikeSong(id: Long, like: Boolean) {
@@ -497,6 +504,95 @@ private object LrcParser {
     }
 }
 
+private data class EmbeddedTranslationSplit(
+    val primaryLines: List<PipoLyricLine>,
+    val embeddedTranslationLines: List<PipoLyricLine> = emptyList(),
+)
+
+private fun splitEmbeddedTranslationLines(
+    lines: List<PipoLyricLine>,
+    translationLines: List<PipoLyricLine>,
+): EmbeddedTranslationSplit {
+    if (
+        lines.size < MIN_EMBEDDED_TRANSLATION_LINES * 2 ||
+        translationLines.size < MIN_EMBEDDED_TRANSLATION_LINES
+    ) {
+        return EmbeddedTranslationSplit(lines)
+    }
+
+    val translationBucket = dominantLanguageBucket(translationLines) ?: return EmbeddedTranslationSplit(lines)
+    val translationBucketCount = translationLines.count { languageBucketForText(it.text) == translationBucket }
+    if (translationBucketCount < MIN_EMBEDDED_TRANSLATION_LINES) return EmbeddedTranslationSplit(lines)
+
+    val primaryBuckets = lines.map { languageBucketForText(it.text) }
+    val embeddedIndices = primaryBuckets
+        .mapIndexedNotNull { index, bucket -> if (bucket == translationBucket) index else null }
+    val embeddedCount = embeddedIndices.size
+    val otherRenderableCount = primaryBuckets.count { it != null && it != translationBucket }
+    if (embeddedCount < MIN_EMBEDDED_TRANSLATION_LINES || otherRenderableCount < MIN_EMBEDDED_TRANSLATION_LINES) {
+        return EmbeddedTranslationSplit(lines)
+    }
+
+    val embeddedRatio = embeddedCount.toFloat() / lines.size.toFloat()
+    if (embeddedRatio !in EMBEDDED_TRANSLATION_MIN_RATIO..EMBEDDED_TRANSLATION_MAX_RATIO) {
+        return EmbeddedTranslationSplit(lines)
+    }
+
+    val allowedDelta = maxOf(
+        MIN_EMBEDDED_TRANSLATION_COUNT_DELTA,
+        (translationBucketCount * EMBEDDED_TRANSLATION_COUNT_DELTA_RATIO).toInt(),
+    )
+    if (kotlin.math.abs(embeddedCount - translationBucketCount) > allowedDelta) {
+        return EmbeddedTranslationSplit(lines)
+    }
+
+    val drop = embeddedIndices.toHashSet()
+    return EmbeddedTranslationSplit(
+        primaryLines = lines.filterIndexed { index, _ -> index !in drop },
+        embeddedTranslationLines = lines.filterIndexed { index, _ -> index in drop },
+    )
+}
+
+private fun dominantLanguageBucket(lines: List<PipoLyricLine>): LyricLanguageBucket? {
+    return lines
+        .asSequence()
+        .mapNotNull { languageBucketForText(it.text) }
+        .groupingBy { it }
+        .eachCount()
+        .maxByOrNull { it.value }
+        ?.key
+}
+
+private fun languageBucketForText(text: String): LyricLanguageBucket? {
+    var latin = 0
+    var cjk = 0
+    var kana = 0
+    var hangul = 0
+    for (ch in text) {
+        when {
+            ch in 'a'..'z' || ch in 'A'..'Z' || ch.isDigit() -> latin += 1
+            ch in '\u3040'..'\u30ff' -> kana += 1
+            ch in '\uac00'..'\ud7af' -> hangul += 1
+            ch in '\u4e00'..'\u9fff' -> cjk += 1
+        }
+    }
+    val buckets = listOf(
+        LyricLanguageBucket.Latin to latin,
+        LyricLanguageBucket.Cjk to cjk,
+        LyricLanguageBucket.Kana to kana,
+        LyricLanguageBucket.Hangul to hangul,
+    )
+    val (bucket, count) = buckets.maxBy { it.second }
+    return if (count >= MIN_LANGUAGE_BUCKET_CHARS) bucket else null
+}
+
+private enum class LyricLanguageBucket {
+    Latin,
+    Cjk,
+    Kana,
+    Hangul,
+}
+
 private fun attachTranslationLines(
     primaryLines: List<PipoLyricLine>,
     translationLines: List<PipoLyricLine>,
@@ -566,6 +662,12 @@ private const val TRANSLATION_HOST_LEAD_MS = 700L
 private const val TRANSLATION_HOST_TAIL_MS = 350L
 private const val TRANSLATION_MAX_START_DISTANCE_MS = 1_650L
 private const val TRANSLATION_HOST_WINDOW_SCORE = 10_000L
+private const val MIN_EMBEDDED_TRANSLATION_LINES = 4
+private const val MIN_LANGUAGE_BUCKET_CHARS = 2
+private const val MIN_EMBEDDED_TRANSLATION_COUNT_DELTA = 4
+private const val EMBEDDED_TRANSLATION_COUNT_DELTA_RATIO = 0.35f
+private const val EMBEDDED_TRANSLATION_MIN_RATIO = 0.25f
+private const val EMBEDDED_TRANSLATION_MAX_RATIO = 0.75f
 
 private fun jsonObject(vararg pairs: Pair<String, Any?>): JSONObject {
     val o = JSONObject()

@@ -24,6 +24,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
@@ -69,22 +70,22 @@ internal fun LandscapePlayerLyricsScreen(
     onSeekToMs: (Long) -> Unit,
 ) {
     val edges = useCoverEdgeColors(coverUrl)
-    val ambientRgb = edges.ambient ?: edges.right ?: edges.bottom ?: edges.top ?: edges.left
-    val edgeRgb = blendRgb(edges.right ?: edges.bottom ?: edges.top, ambientRgb, 0.46f)
-    val accentRgb = blendRgb(edges.accent ?: edges.right, ambientRgb, 0.30f)
-    val tone = computeTone(edgeRgb ?: ambientRgb)
+    val ambientRgb = edges.ambient ?: edges.right ?: edges.top ?: edges.bottom ?: edges.left
+    val ambientColor = rgbToColor(ambientRgb, fallback = PipoColors.Bg1)
+    val seamColor = appleMusicLandscapeSurfaceColor(edges, fallback = ambientColor)
+    val coverEdgeColor = appleMusicLandscapeCoverColor(edges, fallback = seamColor)
+    val accentRgb = blendRgb(edges.accent ?: edges.right, ambientRgb, 0.22f)
+    val tone = toneForColor(seamColor)
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
-    val ambientColor = rgbToColor(ambientRgb, fallback = PipoColors.Bg1)
     val landscapeAccent = rgbToColor(accentRgb, fallback = ambientColor)
-    val seamColor = rgbToColor(edgeRgb, fallback = ambientColor)
 
     Box(modifier = Modifier.fillMaxSize()) {
         LandscapeBackdrop(
-            ambientColor = ambientColor,
-            accentColor = landscapeAccent,
-            edgeColor = seamColor,
+            coverUrl = coverUrl,
+            baseColor = seamColor,
+            coverEdgeColor = coverEdgeColor,
         )
 
         BoxWithConstraints(
@@ -94,7 +95,7 @@ internal fun LandscapePlayerLyricsScreen(
             Row(modifier = Modifier.fillMaxSize()) {
                 LandscapeCoverPane(
                     coverUrl = coverUrl,
-                    seamColor = seamColor,
+                    seamColor = coverEdgeColor,
                     modifier = Modifier
                         .width(coverSide + 42.dp)
                         .fillMaxHeight(),
@@ -135,7 +136,7 @@ internal fun LandscapePlayerLyricsScreen(
                             rowVerticalPadding = 6.dp,
                             lyricFontSize = 25.sp,
                             lyricLineHeight = 30.sp,
-                            lyricFontWeight = FontWeight.ExtraBold,
+                            lyricFontWeight = FontWeight.Bold,
                             bottomFadeStart = 0.90f,
                             bottomFadeSoftEnd = 0.98f,
                             // 横屏把固定歌词位置整体下移 60dp（竖屏 ImmersiveLyrics 不传，保持不变）。
@@ -167,14 +168,12 @@ internal fun LandscapePlayerLyricsScreen(
 
 @Composable
 private fun LandscapeBackdrop(
-    ambientColor: Color,
-    accentColor: Color,
-    edgeColor: Color,
+    coverUrl: String?,
+    baseColor: Color,
+    coverEdgeColor: Color,
 ) {
-    val seamAccent = lerp(ambientColor, edgeColor, 0.34f)
-    val panelAccent = lerp(ambientColor, edgeColor, 0.18f)
-    val farAccent = lerp(ambientColor, Color.Black, 0.08f)
-    val quietEdge = lerp(edgeColor, ambientColor, 0.40f)
+    val seamAccent = lerp(coverEdgeColor, baseColor, 0.26f)
+    val panelAccent = lerp(coverEdgeColor, baseColor, 0.72f)
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -182,42 +181,44 @@ private fun LandscapeBackdrop(
                 Brush.horizontalGradient(
                     colorStops = arrayOf(
                         0.0f to seamAccent,
-                        0.50f to seamAccent,
-                        0.82f to panelAccent,
-                        1.0f to farAccent,
+                        0.34f to seamAccent,
+                        0.68f to panelAccent,
+                        1.0f to baseColor,
                     ),
                 ),
+            ),
+    ) {
+        if (coverUrl != null) {
+            CrossfadeCoverImage(
+                url = coverUrl,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        alpha = 0.30f
+                        scaleX = 1.74f
+                        scaleY = 1.74f
+                    }
+                    .blur(64.dp),
+                contentScale = ContentScale.Crop,
+                durationMs = PipoMotion.CoverFadeMs,
+                maxDecodeSizePx = 448,
             )
-            .drawWithContent {
-                drawContent()
-                val w = size.width
-                val h = size.height
-                val maxDim = kotlin.math.max(w, h)
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(accentColor.copy(alpha = 0.12f), Color.Transparent),
-                        center = androidx.compose.ui.geometry.Offset(w * 0.22f, h * 0.22f),
-                        radius = maxDim * 0.90f,
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        colorStops = arrayOf(
+                            0.00f to Color.Transparent,
+                            0.36f to Color.Transparent,
+                            0.62f to baseColor.copy(alpha = 0.18f),
+                            1.00f to baseColor.copy(alpha = 0.46f),
+                        ),
                     ),
-                    radius = maxDim,
-                    center = androidx.compose.ui.geometry.Offset(w * 0.22f, h * 0.22f),
-                )
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(quietEdge.copy(alpha = 0.12f), Color.Transparent),
-                        center = androidx.compose.ui.geometry.Offset(w * 0.88f, h * 0.26f),
-                        radius = maxDim * 0.78f,
-                    ),
-                    radius = maxDim,
-                    center = androidx.compose.ui.geometry.Offset(w * 0.88f, h * 0.26f),
-                )
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.04f)),
-                    ),
-                )
-            },
-    )
+                ),
+        )
+    }
 }
 
 @Composable
@@ -236,9 +237,9 @@ private fun LandscapeCoverPane(
                     brush = Brush.horizontalGradient(
                         colorStops = arrayOf(
                             0.0f to Color.Black,
-                            0.58f to Color.Black,
-                            0.78f to Color.Black.copy(alpha = 0.78f),
-                            0.91f to Color.Black.copy(alpha = 0.24f),
+                            0.54f to Color.Black,
+                            0.72f to Color.Black.copy(alpha = 0.84f),
+                            0.90f to Color.Black.copy(alpha = 0.28f),
                             1.0f to Color.Transparent,
                         ),
                     ),
@@ -269,10 +270,9 @@ private fun LandscapeCoverPane(
                     Brush.horizontalGradient(
                         colorStops = arrayOf(
                             0.0f to Color.Transparent,
-                            0.48f to Color.Transparent,
-                            0.72f to seamColor.copy(alpha = 0.14f),
-                            0.88f to seamColor.copy(alpha = 0.30f),
-                            1.0f to seamColor.copy(alpha = 0.46f),
+                            0.58f to Color.Transparent,
+                            0.82f to seamColor.copy(alpha = 0.08f),
+                            1.0f to seamColor.copy(alpha = 0.18f),
                         ),
                     ),
                 ),

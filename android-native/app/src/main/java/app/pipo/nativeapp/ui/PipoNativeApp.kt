@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.MaterialTheme
@@ -172,11 +173,11 @@ fun PipoNativeApp(
         val contentProgressAnim = remember { Animatable(0f) }
         LaunchedEffect(immersive) {
             if (immersive) {
-                delay(120)
+                delay(90)
                 contentProgressAnim.animateTo(
                     targetValue = 1f,
                     animationSpec = tween(
-                        durationMillis = 340,
+                        durationMillis = 620,
                         easing = CubicBezierEasing(0.2f, 0.9f, 0.15f, 1f),
                     ),
                 )
@@ -184,18 +185,13 @@ fun PipoNativeApp(
                 contentProgressAnim.animateTo(
                     targetValue = 0f,
                     animationSpec = tween(
-                        durationMillis = 180,
+                        durationMillis = 220,
                         easing = CubicBezierEasing(0.4f, 0f, 1f, 1f),
                     ),
                 )
             }
         }
         val contentProgress = contentProgressAnim.value
-
-        // compact 封面 / nav 图标在过渡期间都隐藏（0.02 阈值给浮点误差留余量）
-        val coverInTransition by remember {
-            derivedStateOf { coverProgress > 0.02f }
-        }
 
         LaunchedEffect(immersive, route, isLandscape) {
             DiagnosticsLogStore.record(
@@ -297,7 +293,7 @@ fun PipoNativeApp(
                         },
                         onOpenDistill = { route = Route.Distill },
                         onOpenSettings = { route = Route.Settings },
-                        immersiveActive = coverInTransition,
+                        immersiveProgress = contentProgress,
                         showTranslation = showLyricTranslation && hasLyricTranslation,
                         hasTranslation = hasLyricTranslation,
                         onToggleTranslation = toggleLyricTranslation,
@@ -309,41 +305,29 @@ fun PipoNativeApp(
                         exit = fadeOut(tween(180, easing = PipoMotion.CloseEase)),
                     ) {
                         Box(modifier = Modifier.fillMaxSize()) {
-                        // 沉浸式 backdrop（仅黑兜底 + 模糊封面 + 顶/底渐变压底，不含标题歌词）
-                        ImmersiveBackdrop(
-                            progress = coverProgress,
-                            coverUrl = viewModel.state.artworkUrl,
-                        )
-
-                        // 真 FLIP 封面 —— 在 backdrop 之上、标题歌词之下
-                        TransitioningCover(
-                            compactRect = coverAnchor.state.value.rect,
-                            coverUrl = viewModel.state.artworkUrl,
-                            progress = coverProgress,
-                        )
-
-                        // 标题 + 控件 + 歌词列 —— 在封面之上（标题压在封面下 1/4 处，歌词溶进封面底）
-                        val lyricPositionProvider = remember(viewModel) { { viewModel.positionMs } }
-                        ImmersiveLyricsOverlay(
-                            progress = coverProgress,
-                            contentProgress = contentProgress,
-                            coverUrl = viewModel.state.artworkUrl,
-                            title = viewModel.state.title,
-                            artist = viewModel.state.artist,
-                            trackId = viewModel.state.currentTrackId,
-                            lyrics = viewModel.state.lyrics,
-                            positionProvider = lyricPositionProvider,
-                            isPlaying = viewModel.state.isPlaying,
-                            showTranslation = showLyricTranslation && hasLyricTranslation,
-                            hasTranslation = hasLyricTranslation,
-                            onClose = { immersive = false },
-                            onToggle = viewModel::toggle,
-                            onNext = viewModel::next,
-                            onToggleTranslation = toggleLyricTranslation,
-                            onSeekToMs = { targetMs ->
-                                viewModel.seekToMs(targetMs)
-                            },
-                        )
+                            // 播放页本身已经绘制 Apple Music 式清晰封面 + 同源毛玻璃背景。
+                            // 歌词页共享这层底图，只让播放控件淡出、歌词列表淡入，避免两套封面层叠出分界。
+                            val lyricPositionProvider = remember(viewModel) { { viewModel.positionMs } }
+                            ImmersiveLyricsOverlay(
+                                progress = coverProgress,
+                                contentProgress = contentProgress,
+                                coverUrl = viewModel.state.artworkUrl,
+                                title = viewModel.state.title,
+                                artist = viewModel.state.artist,
+                                trackId = viewModel.state.currentTrackId,
+                                lyrics = viewModel.state.lyrics,
+                                positionProvider = lyricPositionProvider,
+                                isPlaying = viewModel.state.isPlaying,
+                                showTranslation = showLyricTranslation && hasLyricTranslation,
+                                hasTranslation = hasLyricTranslation,
+                                onClose = { immersive = false },
+                                onToggle = viewModel::toggle,
+                                onNext = viewModel::next,
+                                onToggleTranslation = toggleLyricTranslation,
+                                onSeekToMs = { targetMs ->
+                                    viewModel.seekToMs(targetMs)
+                                },
+                            )
                         }
                     }
                 }
@@ -413,17 +397,17 @@ fun PipoNativeApp(
                 if (route == Route.Player && !immersive && !isLandscape && settings.hideAiPetOrb) {
                     Box(
                         modifier = Modifier
-                            .align(Alignment.TopCenter)
+                            .align(Alignment.BottomCenter)
                             .fillMaxWidth()
-                            .height(112.dp)
-                            .statusBarsPadding()
+                            .height(104.dp)
+                            .navigationBarsPadding()
                             .pointerInput(Unit) {
                                 detectTapGestures(
                                     onDoubleTap = {
                                         AiPetCommandBus.openChat()
                                         DiagnosticsLogStore.record(
                                             area = "ai_pet",
-                                            event = "open_from_top_double_tap",
+                                            event = "open_from_bottom_double_tap",
                                         )
                                     },
                                 )

@@ -44,7 +44,7 @@ object AiCaptionBus {
             .replace(Regex("\\s+"), " ")
             .trim()
             .trim('「', '」', '『', '』', '"', '\'', '“', '”', '-', '—', ' ')
-        if (normalized.length <= 30) return normalized
-        return normalized.take(29).trimEnd() + "…"
+        if (normalized.length <= 120) return normalized
+        return normalized.take(119).trimEnd() + "…"
     }
 }

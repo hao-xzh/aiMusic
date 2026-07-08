@@ -406,7 +406,7 @@ fun NativeAiPet(
             )
         }
 
-        // 隐藏圆球时：AI 的话只贴在封面上方，logo + 一句话，自动消散。
+        // 隐藏圆球时：AI 的话落在播放页底部按钮下方的空白区，logo + 一句话，自动消散。
         val coverCaptionText = if (settings.hideAiPetOrb && !open) {
             (coverCaption?.text ?: AiCaptionBus.compact(hint ?: latestReply))
                 .takeIf { it.isNotBlank() }
@@ -415,32 +415,17 @@ fun NativeAiPet(
             visible = coverCaptionText != null,
             enter = fadeIn(tween(220)) + slideInVertically(
                 animationSpec = tween(260, easing = PipoMotion.FlipEase),
-                initialOffsetY = { -it / 3 },
+                initialOffsetY = { it / 3 },
             ),
             exit = fadeOut(tween(180)) + slideOutVertically(
                 animationSpec = tween(180),
-                targetOffsetY = { -it / 3 },
+                targetOffsetY = { it / 3 },
             ),
-            modifier = Modifier.layout { measurable, _ ->
-                val placeable = measurable.measure(androidx.compose.ui.unit.Constraints())
-                layout(placeable.width, placeable.height) {
-                    val rect = coverRect
-                    if (rect != null) {
-                        val topInset = with(density) { 12.dp.toPx() }.toInt()
-                        val left = (rect.left + topInset).toInt()
-                        val top = (rect.top + topInset).toInt()
-                        placeable.placeRelative(
-                            x = left.coerceAtLeast(0),
-                            y = top.coerceAtLeast(0),
-                        )
-                    } else {
-                        placeable.placeRelative(
-                            x = ((screenW - placeable.width) / 2).toInt().coerceAtLeast(0),
-                            y = with(density) { 72.dp.toPx() }.toInt(),
-                        )
-                    }
-                }
-            },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 32.dp),
         ) {
             CoverAiCaption(coverCaptionText.orEmpty(), palette = petPalette)
         }

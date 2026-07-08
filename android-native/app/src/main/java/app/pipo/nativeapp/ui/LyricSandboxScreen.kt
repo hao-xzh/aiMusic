@@ -141,7 +141,7 @@ internal fun LyricSandboxScreen(
                 rowVerticalPadding = 8.dp,
                 lyricFontSize = 30.sp,
                 lyricLineHeight = 35.sp,
-                lyricFontWeight = FontWeight.ExtraBold,
+                lyricFontWeight = FontWeight.Bold,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(top = 150.dp, bottom = 24.dp)

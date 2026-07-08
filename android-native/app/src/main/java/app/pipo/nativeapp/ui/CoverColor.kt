@@ -17,6 +17,8 @@ import coil.request.ImageRequest
 import coil.request.SuccessResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
 
 /**
  * 封面边缘色采样 + 明暗判断 —— 镜像 src/lib/cover-color.ts。
@@ -29,6 +31,10 @@ data class EdgeColors(
     val bottom: IntArray?,
     val right: IntArray?,
     val left: IntArray? = null,
+    // 下半部中心稳定色：用于封面溶解到纯色背景的接缝。它比最底边更少受贴纸/角标/文字影响。
+    val lower: IntArray? = null,
+    // 真实溶解接缝色：优先采样封面底部偏上的中心区域，播放页/歌词页下方整块背景跟它对齐。
+    val seam: IntArray? = null,
     // 封面主色调（最鲜艳的一簇颜色）—— 用来给歌词扫描交界处染"随歌曲变化的微光"。
     // 灰度封面提不出主色时为 null（此时歌词不染色，保持纯白/黑）。
     val accent: IntArray? = null,
@@ -42,13 +48,24 @@ data class EdgeColors(
 
 enum class Tone { Light, Dark }
 
+private val coverEdgeColorsCache = ConcurrentHashMap<String, EdgeColors>()
+
 @Composable
 fun useCoverEdgeColors(url: String?): EdgeColors {
     val context = LocalContext.current
-    var colors by remember(url) { mutableStateOf(EdgeColors(null, null, null)) }
+    var colors by remember(url) {
+        mutableStateOf(
+            url?.takeIf { it.isNotBlank() }?.let { coverEdgeColorsCache[it] }
+                ?: EdgeColors(null, null, null),
+        )
+    }
     LaunchedEffect(url) {
         if (url.isNullOrBlank()) {
             colors = EdgeColors(null, null, null)
+            return@LaunchedEffect
+        }
+        coverEdgeColorsCache[url]?.let { cached ->
+            colors = cached
             return@LaunchedEffect
         }
         val bitmap = withContext(Dispatchers.IO) {
@@ -77,6 +94,7 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
         val sampled = withContext(Dispatchers.Default) {
             sampleEdges(bitmap)
         }
+        coverEdgeColorsCache[url] = sampled
         colors = sampled
     }
     return colors
@@ -116,17 +134,40 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
                     EdgeSide.Bottom -> 1.0 - ((h - 1 - y).toDouble() / h.toDouble()) * 0.42
                     EdgeSide.Left -> 1.0 - (x.toDouble() / w.toDouble()) * 0.42
                     EdgeSide.Right -> 1.0 - ((w - 1 - x).toDouble() / w.toDouble()) * 0.42
+                    EdgeSide.Lower -> 1.0 - ((h - 1 - y).toDouble() / h.toDouble()) * 0.26
+                    EdgeSide.Seam -> 1.0
                     null -> 1.0
                 }.coerceIn(0.58, 1.0)
+                val centerWeight = if (edge == EdgeSide.Seam) {
+                    val center = (w - 1) / 2.0
+                    1.0 - (kotlin.math.abs(x - center) / center.coerceAtLeast(1.0)) * 0.24
+                } else {
+                    1.0
+                }.coerceIn(0.76, 1.0)
                 // 黑字/纯白高光/高饱和小贴纸通常面积不大但很抢眼，降低它们对"背景底色"
                 // 的投票权；真正大面积的强色仍会靠面积胜出。
                 val noiseWeight = when {
+                    edge == EdgeSide.Seam -> when {
+                        luma > 246.0 -> 0.30
+                        chroma > 178 && luma > 160.0 -> 0.72
+                        else -> 1.0
+                    }
+                    edge == EdgeSide.Lower -> when {
+                        luma > 246.0 -> 0.34
+                        chroma > 168 -> 0.50
+                        else -> 1.0
+                    }
                     luma < 28.0 -> 0.28
                     luma > 246.0 -> 0.46
                     chroma > 156 -> 0.68
                     else -> 1.0
                 }
-                val weight = distanceWeight * noiseWeight
+                val darkSeamWeight = when (edge) {
+                    EdgeSide.Seam -> (1.46 - (luma / 255.0) * 0.54).coerceIn(0.90, 1.46)
+                    EdgeSide.Lower -> (1.34 - (luma / 255.0) * 0.42).coerceIn(0.92, 1.34)
+                    else -> 1.0
+                }
+                val weight = distanceWeight * centerWeight * noiseWeight * darkSeamWeight
                 val idx = ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
                 bucketWeight[idx] += weight
                 bucketR[idx] += r * weight
@@ -155,13 +196,27 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
     val bottom = dominant(h - band, h, edge = EdgeSide.Bottom)
     val right = dominant(0, h, w - band, w, EdgeSide.Right)
     val left = dominant(0, h, 0, band, EdgeSide.Left)
+    val lower = dominant(
+        yStart = (h * 0.48f).roundToInt(),
+        yEnd = h,
+        xStart = (w * 0.08f).roundToInt(),
+        xEnd = (w * 0.92f).roundToInt(),
+        edge = EdgeSide.Lower,
+    )
+    val seam = dominant(
+        yStart = (h * 0.58f).roundToInt(),
+        yEnd = (h * 0.94f).roundToInt(),
+        xStart = (w * 0.10f).roundToInt(),
+        xEnd = (w * 0.90f).roundToInt(),
+        edge = EdgeSide.Seam,
+    )
     val accent = extractVibrant(pixels)
     val ambient = dominant(0, h)
     if (small !== bitmap) small.recycle()
-    return EdgeColors(top, bottom, right, left, accent, ambient)
+    return EdgeColors(top, bottom, right, left, lower, seam, accent, ambient)
 }
 
-private enum class EdgeSide { Top, Bottom, Left, Right }
+private enum class EdgeSide { Top, Bottom, Left, Right, Lower, Seam }
 
 /**
  * 从缩略图里提取"最鲜艳的一簇颜色"作为封面主色调。
@@ -223,6 +278,50 @@ fun pickFgDim(tone: Tone): Color =
 fun pickFgUnsung(tone: Tone): Color =
     if (tone == Tone.Dark) Color(0x66000000) else Color(0x70FFFFFF)
 
+fun appleMusicPureSurfaceColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val base = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
+    val luma = rgbLumaValue(base)
+    val mixed = when {
+        base == null -> null
+        luma > 180f -> blendRgb(base, edges.accent ?: edges.ambient, 0.14f)
+        luma > 120f -> blendRgb(base, edges.accent ?: edges.ambient, 0.08f)
+        else -> blendRgb(base, edges.lower ?: edges.bottom ?: edges.ambient, 0.08f)
+    }
+    return normalizeAppleMusicSurface(mixed, fallback)
+}
+
+fun appleMusicPureTopColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val seamBase = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient
+    val base = blendRgb(edges.top ?: edges.ambient ?: seamBase, seamBase, 0.18f)
+    return normalizeAppleMusicSurface(base, fallback)
+}
+
+fun appleMusicDissolveBridgeColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val base = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
+    val mixed = blendRgb(base, edges.accent ?: edges.ambient, 0.06f)
+    return normalizeAppleMusicBridgeSurface(mixed, fallback)
+}
+
+fun appleMusicLandscapeSurfaceColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val base = edges.right ?: edges.ambient ?: edges.seam ?: edges.lower ?: edges.bottom ?: edges.top ?: edges.left
+    val mixed = when {
+        base == null -> null
+        rgbLumaValue(base) > 170f -> blendRgb(base, edges.ambient ?: edges.accent, 0.10f)
+        else -> blendRgb(base, edges.ambient ?: edges.accent, 0.06f)
+    }
+    return normalizeAppleMusicLandscapeSurface(mixed, fallback)
+}
+
+fun appleMusicLandscapeCoverColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val base = blendRgb(edges.right ?: edges.ambient ?: edges.top, edges.ambient, 0.10f)
+    return normalizeAppleMusicLandscapeSurface(base, fallback)
+}
+
+fun toneForColor(color: Color): Tone {
+    val luma = (0.299f * color.red + 0.587f * color.green + 0.114f * color.blue) * 255f
+    return if (luma > 145f) Tone.Dark else Tone.Light
+}
+
 fun rgbToColor(rgb: IntArray?, fallback: Color = PipoColors.Bg1): Color {
     if (rgb == null || rgb.size < 3) return fallback
     return Color(red = rgb[0] / 255f, green = rgb[1] / 255f, blue = rgb[2] / 255f)
@@ -237,4 +336,78 @@ fun blendRgb(a: IntArray?, b: IntArray?, amount: Float): IntArray? {
         (left[1] + (right[1] - left[1]) * t).toInt().coerceIn(0, 255),
         (left[2] + (right[2] - left[2]) * t).toInt().coerceIn(0, 255),
     )
+}
+
+private fun normalizeAppleMusicSurface(rgb: IntArray?, fallback: Color): Color {
+    if (rgb == null || rgb.size < 3) return fallback
+    val hsv = FloatArray(3)
+    android.graphics.Color.RGBToHSV(rgb[0], rgb[1], rgb[2], hsv)
+    val luma = rgbLumaValue(rgb)
+    when {
+        luma > 180f -> {
+            hsv[1] = (hsv[1] * 0.92f).coerceIn(0.035f, 0.34f)
+            hsv[2] = hsv[2].coerceIn(0.84f, 0.97f)
+        }
+        luma > 120f -> {
+            hsv[1] = (hsv[1] * 0.98f).coerceIn(0.08f, 0.44f)
+            hsv[2] = hsv[2].coerceIn(0.56f, 0.82f)
+        }
+        else -> {
+            hsv[1] = (hsv[1] * 1.08f).coerceIn(0.16f, 0.74f)
+            hsv[2] = hsv[2].coerceIn(0.07f, 0.23f)
+        }
+    }
+    return Color(android.graphics.Color.HSVToColor(hsv))
+}
+
+private fun normalizeAppleMusicBridgeSurface(rgb: IntArray?, fallback: Color): Color {
+    if (rgb == null || rgb.size < 3) return fallback
+    val hsv = FloatArray(3)
+    android.graphics.Color.RGBToHSV(rgb[0], rgb[1], rgb[2], hsv)
+    val luma = rgbLumaValue(rgb)
+    when {
+        luma > 180f -> {
+            hsv[1] = (hsv[1] * 0.94f).coerceIn(0.035f, 0.38f)
+            hsv[2] = hsv[2].coerceIn(0.84f, 0.97f)
+        }
+        luma > 120f -> {
+            hsv[1] = (hsv[1] * 0.98f).coerceIn(0.08f, 0.50f)
+            hsv[2] = hsv[2].coerceIn(0.58f, 0.86f)
+        }
+        else -> {
+            // 溶解带要接住封面，不要像底部纯色一样压得太深。
+            hsv[1] = (hsv[1] * 1.02f).coerceIn(0.14f, 0.76f)
+            hsv[2] = hsv[2].coerceIn(0.20f, 0.46f)
+        }
+    }
+    return Color(android.graphics.Color.HSVToColor(hsv))
+}
+
+private fun normalizeAppleMusicLandscapeSurface(rgb: IntArray?, fallback: Color): Color {
+    if (rgb == null || rgb.size < 3) return fallback
+    val hsv = FloatArray(3)
+    android.graphics.Color.RGBToHSV(rgb[0], rgb[1], rgb[2], hsv)
+    val luma = rgbLumaValue(rgb)
+    when {
+        luma > 180f -> {
+            hsv[1] = (hsv[1] * 0.92f).coerceIn(0.04f, 0.36f)
+            hsv[2] = hsv[2].coerceIn(0.82f, 0.97f)
+        }
+        luma > 120f -> {
+            hsv[1] = (hsv[1] * 0.98f).coerceIn(0.08f, 0.50f)
+            hsv[2] = hsv[2].coerceIn(0.56f, 0.84f)
+        }
+        else -> {
+            // 横屏右侧本来就是大面积背景，不应为了文字对比再压黑。
+            // 保留封面右侧颜色的明度，只把过暗值抬到可见的深色区。
+            hsv[1] = (hsv[1] * 0.96f).coerceIn(0.14f, 0.74f)
+            hsv[2] = hsv[2].coerceIn(0.20f, 0.48f)
+        }
+    }
+    return Color(android.graphics.Color.HSVToColor(hsv))
+}
+
+private fun rgbLumaValue(rgb: IntArray?): Float {
+    if (rgb == null || rgb.size < 3) return 128f
+    return 0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2]
 }

@@ -33,7 +33,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -169,7 +168,7 @@ fun ImmersiveLyricsOverlay(
     if (progress <= 0.001f) return
 
     val edges = useCoverEdgeColors(coverUrl)
-    val tone = computeTone(edges.bottom)
+    val tone = toneForColor(appleMusicPureSurfaceColor(edges))
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
@@ -195,10 +194,16 @@ fun ImmersiveLyricsOverlay(
     val screenWDp = configuration.screenWidthDp.dp
     // tap 关闭区域仍跟着封面 progress 增长，避免点空封面尚未飞到的位置
     val coverTapHeight = screenWDp * progress.coerceIn(0f, 1f)
-    val density = LocalDensity.current
     val cp = contentProgress.coerceIn(0f, 1f)
-    val titleTopPadding = (screenWDp - 84.dp).coerceAtLeast(14.dp)
-    val lyricsTopPadding = (screenWDp - 28.dp).coerceAtLeast(80.dp)
+    fun smoothRange(start: Float, end: Float): Float {
+        val t = ((cp - start) / (end - start)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+    val titleEnter = smoothRange(0.70f, 0.86f)
+    val lyricControlsEnter = smoothRange(0.88f, 1.00f)
+    val lyricListEnter = smoothRange(0.90f, 1.00f)
+    val titleTopPadding = immersiveLyricsTitleTop(screenWDp)
+    val lyricsTopPadding = (titleTopPadding + 50.dp).coerceAtLeast(104.dp)
     val coverCloseHeight = minOf(
         coverTapHeight,
         lyricsTopPadding,
@@ -221,26 +226,19 @@ fun ImmersiveLyricsOverlay(
                     onClick = onClose,
                 ),
         )
-        // 标题 / 歌词列绝对定位到 immersive 终态。封面 FLIP 期间它们还是 alpha 0，
-        // 由 contentProgress（延后 120ms 起跳）控制软入。
 
-        // 标题 + 副标题 + 控件条 —— 固定在封面下 1/4
-        val titleRiseDp = 16.dp
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = titleTopPadding, start = 24.dp, end = 24.dp)
-                .zIndex(2f)
-                .graphicsLayer {
-                    alpha = cp
-                    translationY = (1f - cp) * titleRiseDp.toPx()
-                },
+                .zIndex(2f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .padding(end = 12.dp),
+                    .padding(end = 12.dp)
+                    .graphicsLayer { alpha = titleEnter },
             ) {
                 Text(
                     text = title.ifBlank { "—" },
@@ -248,24 +246,33 @@ fun ImmersiveLyricsOverlay(
                     style = TextStyle(
                         fontSize = 22.sp,
                         fontWeight = FontWeight.Bold,
-                        letterSpacing = (-0.2).sp,
+                        lineHeight = 26.sp,
                     ),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = artist,
+                    text = artist.ifBlank { " " },
                     color = fgDim,
                     style = TextStyle(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
+                        lineHeight = 18.sp,
                     ),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.graphicsLayer {
+                    alpha = lyricControlsEnter
+                    translationY = (1f - lyricControlsEnter) * 8.dp.toPx()
+                },
+            ) {
                 if (hasTranslation) {
                     ImmersiveIconButton(
                         onClick = onToggleTranslation,
@@ -274,22 +281,25 @@ fun ImmersiveLyricsOverlay(
                     ) {
                         TranslateGlyph(
                             color = if (showTranslation) fg else fgDim,
-                            modifier = Modifier.size(22.dp),
+                            modifier = Modifier.size(20.dp),
                         )
                     }
                 }
                 ImmersiveIconButton(onClick = onToggle) {
-                    if (isPlaying) PauseGlyph(color = fg, modifier = Modifier.size(24.dp))
-                    else PlayGlyph(color = fg, modifier = Modifier.size(24.dp))
+                    if (isPlaying) {
+                        PauseGlyph(color = fg, modifier = Modifier.size(23.dp))
+                    } else {
+                        PlayGlyph(color = fg, modifier = Modifier.size(23.dp))
+                    }
                 }
                 ImmersiveIconButton(onClick = onNext) {
-                    SkipForwardGlyph(color = fg, modifier = Modifier.size(25.dp))
+                    SkipForwardGlyph(color = fg, modifier = Modifier.size(22.dp))
                 }
             }
         }
 
-        // 歌词列 —— 固定在封面终态底部下方 28dp。封面 FLIP 期间整列 translateY 抬起 24dp，
-        // 内部各行按距 active 行的索引差 stagger 入场（cascade 焦点感）。
+        // 歌词列共享播放页的封面/毛玻璃背景：进入歌词页时只让下方播放控件淡出、
+        // 歌词列表淡入，背景不重绘第二套封面，避免出现上下分界。
         val lyricsRiseDp = 24.dp
         // 内容淡入前就挂载歌词列：它会先用 alpha=0 完成行高/锚点校准，
         // 等校准完成后才随 contentProgress 淡入，避免首屏可见跳动。
@@ -304,7 +314,7 @@ fun ImmersiveLyricsOverlay(
             lyricAccentColor = lyricAccentColor,
             showTranslation = showTranslation,
             onSeekToMs = onSeekToMs,
-            enterProgress = cp,
+            enterProgress = lyricListEnter,
             lyricsTopPadding = lyricsTopPadding,
             lyricsRiseDp = lyricsRiseDp,
         )
@@ -339,6 +349,12 @@ private fun ImmersiveLyricsColumnLayer(
             showTranslation = showTranslation,
             onSeekToMs = onSeekToMs,
             enterProgress = enterProgress,
+            topFadeTransparentEnd = 0.00f,
+            topFadePartialEnd = 0.00f,
+            topFadeSolidEnd = 0.00f,
+            anchorTopCapDp = 2.dp,
+            topHardClipDp = 8.dp,
+            hideRowsAboveAnchor = true,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
@@ -381,3 +397,6 @@ private fun ImmersiveIconButton(
         content()
     }
 }
+
+private fun immersiveLyricsTitleTop(screenWidth: Dp): Dp =
+    (screenWidth - 18.dp).coerceAtLeast(52.dp)

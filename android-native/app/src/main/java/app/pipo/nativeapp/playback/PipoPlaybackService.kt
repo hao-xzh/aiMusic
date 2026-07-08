@@ -12,6 +12,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -162,6 +163,11 @@ class PipoPlaybackService : MediaLibraryService() {
 
     private data class ExternalAudioProfile(
         val activeUsages: String,
+        val rawActiveUsages: String,
+        val inactiveConfigCount: Int,
+        val ownUidConfigCount: Int,
+        val ownExpectedMediaCount: Int,
+        val externalMediaOrGameCount: Int,
         val hasExternalMediaOrGame: Boolean,
         val hasVoiceOrAssistant: Boolean,
         val hasNavigation: Boolean,
@@ -432,7 +438,7 @@ class PipoPlaybackService : MediaLibraryService() {
         audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(platformMusicAttrs)
             .setAcceptsDelayedFocusGain(false)
-            .setWillPauseWhenDucked(true)
+            .setWillPauseWhenDucked(false)
             .setOnAudioFocusChangeListener(audioFocusChangeListener, mainHandler)
             .build()
 
@@ -1314,9 +1320,8 @@ class PipoPlaybackService : MediaLibraryService() {
             clearAudioFocusAutoResume("not-needed-$reason")
             return
         }
-        val allowMediaWithoutRecentFocus = waitingForAudioFocusGain && !hasAudioFocus
         val profile = externalAudioProfile(configs)
-        if (hasExternalPauseBlockingAudio(profile, allowMediaWithoutRecentFocus = allowMediaWithoutRecentFocus)) {
+        if (hasExternalPauseBlockingAudio(profile)) {
             externalAudioObservedSincePause = true
             externalAudioQuietSinceMs = 0L
             scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "external-still-active")
@@ -1461,17 +1466,63 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     private fun externalAudioProfile(configs: List<AudioPlaybackConfiguration>): ExternalAudioProfile {
-        val usages = configs.map { it.audioAttributes.usage }
-        val externalMediaCount = (usages.count(::isMediaPlaybackUsage) - expectedOwnMediaPlaybackCount())
+        val activeConfigs = configs.filter(::isPlaybackConfigActiveForPolicy)
+        val ownUidConfigs = activeConfigs.filter(::isOwnPlaybackConfig)
+        val policyConfigs = if (ownUidConfigs.isNotEmpty()) {
+            activeConfigs.filterNot(::isOwnPlaybackConfig)
+        } else {
+            activeConfigs
+        }
+        val usages = policyConfigs.map { it.audioAttributes.usage }
+        val ownExpectedCount = if (ownUidConfigs.isNotEmpty()) 0 else expectedOwnMediaPlaybackCount()
+        val externalMediaCount = (usages.count(::isMediaPlaybackUsage) - ownExpectedCount)
             .coerceAtLeast(0)
         return ExternalAudioProfile(
-            activeUsages = activeUsageSummary(configs),
+            activeUsages = activeUsageSummary(policyConfigs),
+            rawActiveUsages = activeUsageSummary(activeConfigs),
+            inactiveConfigCount = configs.size - activeConfigs.size,
+            ownUidConfigCount = ownUidConfigs.size,
+            ownExpectedMediaCount = ownExpectedCount,
+            externalMediaOrGameCount = externalMediaCount,
             hasExternalMediaOrGame = externalMediaCount > 0,
             hasVoiceOrAssistant = usages.any(::isVoiceOrAssistantUsage),
             hasNavigation = usages.any(::isNavigationUsage),
             hasNotification = usages.any(::isNotificationOrSonificationUsage),
             hasAlarmOrRingtone = usages.any(::isAlarmOrRingtoneUsage),
         )
+    }
+
+    private fun isPlaybackConfigActiveForPolicy(config: AudioPlaybackConfiguration): Boolean {
+        return invokeBooleanPlaybackConfigMethod(config, "isActive") ?: true
+    }
+
+    private fun isOwnPlaybackConfig(config: AudioPlaybackConfiguration): Boolean {
+        val uid = invokeIntPlaybackConfigMethod(config, "getClientUid") ?: return false
+        return uid == Process.myUid()
+    }
+
+    private fun invokeBooleanPlaybackConfigMethod(
+        config: AudioPlaybackConfiguration,
+        methodName: String,
+    ): Boolean? {
+        return runCatching {
+            val method = config.javaClass.methods.firstOrNull { method ->
+                method.name == methodName && method.parameterTypes.isEmpty()
+            } ?: return null
+            method.invoke(config) as? Boolean
+        }.getOrNull()
+    }
+
+    private fun invokeIntPlaybackConfigMethod(
+        config: AudioPlaybackConfiguration,
+        methodName: String,
+    ): Int? {
+        return runCatching {
+            val method = config.javaClass.methods.firstOrNull { method ->
+                method.name == methodName && method.parameterTypes.isEmpty()
+            } ?: return null
+            method.invoke(config) as? Int
+        }.getOrNull()
     }
 
     private fun externalAudioPolicyKey(profile: ExternalAudioProfile, focusChange: Int?): String {
@@ -1545,6 +1596,24 @@ class PipoPlaybackService : MediaLibraryService() {
             )
         }
         if (profile.hasExternalMediaOrGame) {
+            if (!hasRecentFocusSignal) {
+                return ExternalAudioPolicy(
+                    action = ExternalAudioAction.Ignore,
+                    decision = "ignore_media_without_focus",
+                )
+            }
+            if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+                focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+            ) {
+                return ExternalAudioPolicy(
+                    action = ExternalAudioAction.Duck,
+                    decision = "duck_external_media_transient",
+                    targetGain = MEDIA_TRANSIENT_DUCK_GAIN,
+                    attackMs = EXTERNAL_AUDIO_DUCK_FAST_ATTACK_MS,
+                    restoreQuietMs = EXTERNAL_AUDIO_DUCK_RESTORE_QUIET_MS,
+                    restoreMs = EXTERNAL_AUDIO_DUCK_RESTORE_MS,
+                )
+            }
             if (durationMs < EXTERNAL_MEDIA_MISFIRE_IGNORE_MS) {
                 return ExternalAudioPolicy(
                     action = ExternalAudioAction.Ignore,
@@ -1621,6 +1690,11 @@ class PipoPlaybackService : MediaLibraryService() {
                 "decision" to policy.decision,
                 "focusChange" to audioFocusChangeNameOrNone(focusChange),
                 "activeUsages" to profile.activeUsages,
+                "rawActiveUsages" to profile.rawActiveUsages,
+                "inactiveConfigCount" to profile.inactiveConfigCount,
+                "ownUidConfigCount" to profile.ownUidConfigCount,
+                "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                 "targetGain" to target,
                 "durationMs" to durationMs,
                 "quietForMs" to 0L,
@@ -1649,6 +1723,11 @@ class PipoPlaybackService : MediaLibraryService() {
                     "decision" to policy.decision,
                     "focusChange" to audioFocusChangeNameOrNone(focusChange),
                     "activeUsages" to profile.activeUsages,
+                    "rawActiveUsages" to profile.rawActiveUsages,
+                    "inactiveConfigCount" to profile.inactiveConfigCount,
+                    "ownUidConfigCount" to profile.ownUidConfigCount,
+                    "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                    "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                     "targetGain" to policy.targetGain,
                     "durationMs" to durationMs,
                     "quietForMs" to 0L,
@@ -1682,13 +1761,9 @@ class PipoPlaybackService : MediaLibraryService() {
         }, EXTERNAL_AUDIO_PAUSE_FLAG_CLEAR_MS)
     }
 
-    private fun hasExternalPauseBlockingAudio(
-        profile: ExternalAudioProfile,
-        allowMediaWithoutRecentFocus: Boolean,
-    ): Boolean {
+    private fun hasExternalPauseBlockingAudio(profile: ExternalAudioProfile): Boolean {
         if (profile.hasAlarmOrRingtone || profile.hasVoiceOrAssistant || profile.hasNavigation) return true
-        if (!profile.hasExternalMediaOrGame) return false
-        return allowMediaWithoutRecentFocus || hasRecentExternalFocusInterruption()
+        return false
     }
 
     private fun expectedOwnMediaPlaybackCount(): Int {
@@ -1771,6 +1846,11 @@ class PipoPlaybackService : MediaLibraryService() {
                 "action" to policy.action.name.lowercase(Locale.US),
                 "focusChange" to audioFocusChangeNameOrNone(focusChange),
                 "activeUsages" to profile.activeUsages,
+                "rawActiveUsages" to profile.rawActiveUsages,
+                "inactiveConfigCount" to profile.inactiveConfigCount,
+                "ownUidConfigCount" to profile.ownUidConfigCount,
+                "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                 "targetGain" to policy.targetGain,
                 "durationMs" to durationMs,
                 "quietForMs" to currentExternalDuckingQuietForMs(),
@@ -1797,6 +1877,11 @@ class PipoPlaybackService : MediaLibraryService() {
                 "decision" to policy.decision,
                 "focusChange" to audioFocusChangeNameOrNone(focusChange),
                 "activeUsages" to profile.activeUsages,
+                "rawActiveUsages" to profile.rawActiveUsages,
+                "inactiveConfigCount" to profile.inactiveConfigCount,
+                "ownUidConfigCount" to profile.ownUidConfigCount,
+                "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                 "targetGain" to policy.targetGain,
                 "durationMs" to durationMs,
                 "quietForMs" to currentExternalDuckingQuietForMs(),
@@ -2669,15 +2754,25 @@ class PipoPlaybackService : MediaLibraryService() {
     ) {
         val now = SystemClock.elapsedRealtime()
         val appInForeground = AppForeground.isForeground.value
-        val startInForeground = startInForegroundRequired && appInForeground
-        if (startInForegroundRequired && !startInForeground) {
+        val deniedBackoff = now < foregroundStartDeniedUntilMs
+        val startInForeground = startInForegroundRequired && !deniedBackoff
+        if (startInForegroundRequired && !appInForeground && !deniedBackoff) {
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "notification_foreground_background_start",
+                fields = playerFields(session.player) + mapOf(
+                    "reason" to reason,
+                    "appForeground" to appInForeground,
+                ),
+            )
+        } else if (startInForegroundRequired && deniedBackoff) {
             DiagnosticsLogStore.record(
                 area = "playback_service",
                 event = "notification_foreground_deferred",
                 fields = playerFields(session.player) + mapOf(
                     "reason" to reason,
                     "appForeground" to appInForeground,
-                    "deniedBackoff" to (now < foregroundStartDeniedUntilMs),
+                    "deniedBackoff" to true,
                 ),
             )
         }
@@ -2831,6 +2926,7 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val EXTERNAL_AUDIO_DUCK_RESTORE_MS = 500L
         private const val AUDIO_DUCKING_STATE_PROBE_MS = 500L
         private const val EXTERNAL_AUDIO_DUCK_FRAME_MS = 16L
+        private const val MEDIA_TRANSIENT_DUCK_GAIN = 0.55f
         private const val VOICE_DUCK_GAIN = 0.28f
         private const val NAVIGATION_DUCK_GAIN = 0.38f
         private const val NOTIFICATION_DUCK_GAIN = 0.75f

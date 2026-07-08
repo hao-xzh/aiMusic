@@ -227,12 +227,13 @@ internal fun CoverAiCaption(text: String, palette: PetPalette) {
     if (text.isBlank()) return
     Row(
         modifier = Modifier
-            .widthIn(max = 280.dp)
-            .clip(RoundedCornerShape(999.dp))
+            .widthIn(max = 360.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
             .background(palette.panel.copy(alpha = 0.78f))
-            .padding(start = 7.dp, end = 11.dp, top = 7.dp, bottom = 7.dp),
+            .padding(start = 8.dp, end = 14.dp, top = 9.dp, bottom = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
     ) {
         Image(
             painter = painterResource(id = R.mipmap.ic_launcher_round),
@@ -244,11 +245,12 @@ internal fun CoverAiCaption(text: String, palette: PetPalette) {
         Text(
             text = text,
             color = palette.panelText,
-            maxLines = 1,
+            modifier = Modifier.weight(1f),
+            maxLines = 3,
             overflow = TextOverflow.Ellipsis,
             style = TextStyle(
-                fontSize = 12.sp,
-                lineHeight = 15.sp,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
                 fontWeight = FontWeight.Medium,
             ),
         )

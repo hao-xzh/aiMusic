@@ -71,18 +71,6 @@ private val PauseIconVector: ImageVector by lazy {
 
 private val SkipBackIconVector: ImageVector by lazy {
     iconVector {
-        // <rect x="3.6" y="6.5" width="1.8" height="11" rx="0.9" stroke="none" />
-        path(fill = SolidColor(Color.White)) {
-            moveTo(4.5f, 6.5f); horizontalLineTo(4.5f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, 0.9f, 0.9f)
-            verticalLineTo(16.6f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, -0.9f, 0.9f)
-            horizontalLineTo(4.5f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, -0.9f, -0.9f)
-            verticalLineTo(7.4f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, 0.9f, -0.9f)
-            close()
-        }
         // <path d="M13 7.2L7 11.5v1L13 16.8z" /> stroke 2.2 round join
         path(
             fill = SolidColor(Color.White),
@@ -138,18 +126,6 @@ private val SkipForwardIconVector: ImageVector by lazy {
             lineToRelative(6f, 4.3f)
             verticalLineToRelative(1f)
             lineToRelative(-6f, 4.3f)
-            close()
-        }
-        // <rect x="18.6" y="6.5" width="1.8" height="11" rx="0.9" stroke="none" />
-        path(fill = SolidColor(Color.White)) {
-            moveTo(19.5f, 6.5f); horizontalLineTo(19.5f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, 0.9f, 0.9f)
-            verticalLineTo(16.6f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, -0.9f, 0.9f)
-            horizontalLineTo(19.5f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, -0.9f, -0.9f)
-            verticalLineTo(7.4f)
-            arcToRelative(0.9f, 0.9f, 0f, false, true, 0.9f, -0.9f)
             close()
         }
     }

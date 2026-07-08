@@ -44,12 +44,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.Image
 import androidx.compose.ui.layout.ContentScale
@@ -77,7 +82,7 @@ fun PlayerScreen(
     onOpenLyrics: () -> Unit,
     onOpenDistill: () -> Unit,
     onOpenSettings: () -> Unit,
-    immersiveActive: Boolean,
+    immersiveProgress: Float,
     showTranslation: Boolean,
     hasTranslation: Boolean,
     onToggleTranslation: () -> Unit,
@@ -112,12 +117,6 @@ fun PlayerScreen(
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
         configuration.screenWidthDp > configuration.screenHeightDp
-
-    val hideAlpha by animateFloatAsState(
-        targetValue = if (immersiveActive) 0f else 1f,
-        animationSpec = tween(140),
-        label = "hideAlpha",
-    )
 
     AnimatedContent(
         targetState = isLandscape,
@@ -174,8 +173,7 @@ fun PlayerScreen(
                 positionProvider = positionProvider,
                 durationMs = state.durationMs,
                 progressProvider = progressProvider,
-                hideAlpha = hideAlpha,
-                hideCover = immersiveActive,
+                transitionProgress = immersiveProgress,
                 onOpenLyrics = onOpenLyrics,
                 onOpenDistill = onOpenDistill,
                 onOpenSettings = onOpenSettings,
@@ -201,8 +199,7 @@ private fun PortraitPlayerContent(
     positionProvider: () -> Long,
     durationMs: Long,
     progressProvider: () -> Float,
-    hideAlpha: Float,
-    hideCover: Boolean,
+    transitionProgress: Float,
     onOpenLyrics: () -> Unit,
     onOpenDistill: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -212,64 +209,98 @@ private fun PortraitPlayerContent(
     onSeek: (Float) -> Unit,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
-        // 全局背景（封面驱动 blur + 切歌 cross-fade，点阵已移除）
-        AdaptiveDotField(
-            coverUrl = artworkUrl,
-        )
+        AppleMusicPlayerBackdrop(coverUrl = artworkUrl)
 
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .padding(top = 28.dp, bottom = 12.dp),
-            contentAlignment = Alignment.Center,
+                .padding(bottom = 12.dp),
+            contentAlignment = Alignment.TopCenter,
         ) {
             val viewportW = maxWidth
             val viewportH = maxHeight
-            val coverSize = clampDp(220.dp, viewportW * 0.86f, 400.dp).coerceAtMost(viewportH * 0.5f)
+            val controlsWidth = clampDp(260.dp, viewportW * 0.86f, 420.dp)
             val shellPad = clampDp(16.dp, viewportW * 0.04f, 40.dp)
             val titleFs = clampSp(17, viewportW.value * 0.04f, 22)
             val subtitleFs = clampSp(12, viewportW.value * 0.032f, 14)
+            val controlEdges = useCoverEdgeColors(artworkUrl)
+            val controlTone = toneForColor(appleMusicPureSurfaceColor(controlEdges))
+            val fg = pickFg(controlTone)
+            val fgDim = pickFgDim(controlTone)
+            val fgFaint = if (controlTone == Tone.Dark) {
+                Color(0x61000000)
+            } else {
+                Color(0x66FFFFFF)
+            }
+            val trackColor = if (controlTone == Tone.Dark) {
+                Color(0x24000000)
+            } else {
+                Color(0x26FFFFFF)
+            }
+            val controlsTop = (viewportH * 0.515f)
+                .coerceAtLeast(viewportW * 1.02f)
+                .coerceAtMost(viewportH * 0.565f)
             // 标题块到封面 / 到进度条的距离相等 —— 都用 titleGap
             // 用户要求加高 1/2（×1.5）让封面 / 标题 / 进度条不再挤
             // 标题 → 副标题之间（titleSubGap）保持 6dp 不动
             val titleGap = clampDp(21.dp, viewportH * 0.033f, 30.dp)
             val controlsMarginTop = clampDp(22.dp, viewportH * 0.034f, 32.dp)
-            val navMarginTop = controlsMarginTop
+            val volumeMarginTop = clampDp(9.dp, viewportH * 0.014f, 14.dp)
+            val navMarginTop = clampDp(12.dp, viewportH * 0.018f, 18.dp)
+            val sideButtonSize = clampDp(52.dp, viewportW * 0.12f, 66.dp)
+            val centerButtonSize = clampDp(66.dp, viewportW * 0.16f, 84.dp)
+            val removedVolumeGap = volumeMarginTop + 30.dp + navMarginTop
+            val transition = transitionProgress.coerceIn(0f, 1f)
+            fun smoothRange(start: Float, end: Float): Float {
+                val t = ((transition - start) / (end - start)).coerceIn(0f, 1f)
+                return t * t * (3f - 2f * t)
+            }
+            val controlsExit = smoothRange(0.08f, 0.86f)
+            val titleMove = smoothRange(0.00f, 0.62f)
+            val titleExit = smoothRange(0.70f, 0.86f)
+            val lyricTitleTop = immersiveTitleTop(viewportW)
+            val currentTitleLeft = (viewportW - controlsWidth) * 0.5f
+            val targetTitleLeft = 24.dp
+            val titleScaleTarget = (22f / titleFs.value).coerceIn(1f, 1.34f)
+            val titleShiftY = (lyricTitleTop - controlsTop) * titleMove
+            val titleShiftX = (targetTitleLeft - currentTitleLeft) * titleMove
+            val titleScale = 1f + (titleScaleTarget - 1f) * titleMove
 
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = shellPad)
-                    .widthIn(max = 600.dp), // shell maxWidth
+                    .padding(top = controlsTop)
+                    .widthIn(max = 600.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Column(
                     modifier = Modifier
-                        .width(coverSize) // trackColumn width = COVER_SIZE
+                        .width(controlsWidth)
                         .align(Alignment.CenterHorizontally),
                 ) {
-                    CompactCover(
-                        coverUrl = artworkUrl,
-                        isPlaying = isPlaying,
-                        hidden = hideCover,
-                    )
-
-                    Spacer(modifier = Modifier.height(titleGap))
                     if (title.isNotBlank()) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .alpha(hideAlpha),
+                                .graphicsLayer {
+                                    alpha = 1f - titleExit
+                                    translationX = titleShiftX.toPx()
+                                    translationY = titleShiftY.toPx()
+                                    scaleX = titleScale
+                                    scaleY = titleScale
+                                    transformOrigin = TransformOrigin(0f, 0f)
+                                },
                         ) {
                             Text(
                                 text = title,
-                                color = Color(0xFFF5F7FF),
+                                color = fg,
                                 style = TextStyle(
                                     fontSize = titleFs,
-                                    fontWeight = FontWeight.SemiBold,
-                                    letterSpacing = (-0.4).sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.sp,
                                     lineHeight = (titleFs.value * 1.25f).sp,
                                 ),
                                 maxLines = 1,
@@ -281,7 +312,7 @@ private fun PortraitPlayerContent(
                                     append(artist)
                                     if (album.isNotBlank()) append(" · $album")
                                 },
-                                color = Color(0x8CE9EFFF),
+                                color = fgDim,
                                 style = TextStyle(
                                     fontSize = subtitleFs,
                                     fontWeight = FontWeight.Medium,
@@ -294,78 +325,243 @@ private fun PortraitPlayerContent(
                         Spacer(modifier = Modifier.height(8.dp))
                     }
 
-                    Spacer(modifier = Modifier.height(titleGap))
-                    PipoProgressBar(
-                        progress = progressProvider,
-                        onSeek = onSeek,
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                    Column(
+                        modifier = Modifier.graphicsLayer {
+                            alpha = 1f - controlsExit
+                            translationY = controlsExit * 18.dp.toPx()
+                        },
                     ) {
-                        MonoTime(positionProvider, color = Color(0xB8E9EFFF))
-                        MonoTime(
-                            { (durationMs - positionProvider()).coerceAtLeast(0L) },
-                            color = Color(0x6BE9EFFF),
-                            prefix = "-",
+                        Spacer(modifier = Modifier.height(titleGap))
+                        PipoProgressBar(
+                            progress = progressProvider,
+                            onSeek = onSeek,
+                            barHeight = 6.dp,
+                            trackColor = trackColor,
+                            fillColor = fg,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            MonoTime(positionProvider, color = fgDim)
+                            MonoTime(
+                                { (durationMs - positionProvider()).coerceAtLeast(0L) },
+                                color = fgFaint,
+                                prefix = "-",
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(controlsMarginTop))
+                        TriCol(
+                            a = {
+                                FlatBtn(
+                                    onClick = onPrevious,
+                                    enabled = queueReady,
+                                    size = sideButtonSize,
+                                ) {
+                                    SkipBackGlyph(
+                                        color = fg,
+                                        modifier = Modifier.size(clampDp(42.dp, viewportW * 0.11f, 58.dp)),
+                                    )
+                                }
+                            },
+                            b = {
+                                FlatBtn(
+                                    onClick = onToggle,
+                                    enabled = queueReady,
+                                    size = centerButtonSize,
+                                ) {
+                                    val centerGlyphSize = clampDp(58.dp, viewportW * 0.15f, 78.dp)
+                                    if (isLoading) {
+                                        LoadingRing(color = fg, modifier = Modifier.size(centerGlyphSize * 0.68f))
+                                    } else if (isPlaying) {
+                                        PauseGlyph(color = fg, modifier = Modifier.size(centerGlyphSize))
+                                    } else {
+                                        PlayGlyph(color = fg, modifier = Modifier.size(centerGlyphSize))
+                                    }
+                                }
+                            },
+                            c = {
+                                FlatBtn(
+                                    onClick = onNext,
+                                    enabled = queueReady,
+                                    size = sideButtonSize,
+                                ) {
+                                    SkipForwardGlyph(
+                                        color = fg,
+                                        modifier = Modifier.size(clampDp(42.dp, viewportW * 0.11f, 58.dp)),
+                                    )
+                                }
+                            },
+                        )
+
+                        Spacer(modifier = Modifier.height(removedVolumeGap))
+                        TriCol(
+                            a = {
+                                NavIconBtn(onClick = onOpenLyrics, enabled = lyricsReady) {
+                                    LyricsIcon(color = fg, modifier = Modifier.size(24.dp))
+                                }
+                            },
+                            b = {
+                                NavIconBtn(onClick = onOpenDistill) {
+                                    ListIcon(color = fg, modifier = Modifier.size(24.dp))
+                                }
+                            },
+                            c = {
+                                NavIconBtn(onClick = onOpenSettings) {
+                                    GearIcon(color = fg, modifier = Modifier.size(24.dp))
+                                }
+                            },
                         )
                     }
-
-                    Spacer(modifier = Modifier.height(controlsMarginTop))
-                    TriCol(
-                        a = {
-                            FlatBtn(
-                                onClick = onPrevious,
-                                enabled = queueReady,
-                                size = clampDp(50.dp, viewportW * 0.115f, 64.dp),
-                            ) {
-                                SkipBackGlyph(modifier = Modifier.size(clampDp(32.dp, viewportW * 0.085f, 44.dp)))
-                            }
-                        },
-                        b = {
-                            FlatBtn(
-                                onClick = onToggle,
-                                enabled = queueReady,
-                                size = clampDp(64.dp, viewportW * 0.155f, 80.dp),
-                            ) {
-                                val centerGlyphSize = clampDp(44.dp, viewportW * 0.12f, 60.dp)
-                                if (isLoading) {
-                                    LoadingRing(modifier = Modifier.size(centerGlyphSize * 0.68f))
-                                } else if (isPlaying) {
-                                    PauseGlyph(modifier = Modifier.size(centerGlyphSize))
-                                } else {
-                                    PlayGlyph(modifier = Modifier.size(centerGlyphSize))
-                                }
-                            }
-                        },
-                        c = {
-                            FlatBtn(
-                                onClick = onNext,
-                                enabled = queueReady,
-                                size = clampDp(50.dp, viewportW * 0.115f, 64.dp),
-                            ) {
-                                SkipForwardGlyph(modifier = Modifier.size(clampDp(32.dp, viewportW * 0.085f, 44.dp)))
-                            }
-                        },
-                    )
-
-                    Spacer(modifier = Modifier.height(navMarginTop))
-                    TriCol(
-                        modifier = Modifier.alpha(hideAlpha),
-                        a = {
-                            NavIconBtn(onClick = onOpenLyrics, enabled = lyricsReady) {
-                                LyricsIcon(modifier = Modifier.size(24.dp))
-                            }
-                        },
-                        b = {
-                            NavIconBtn(onClick = onOpenDistill) { ListIcon(modifier = Modifier.size(24.dp)) }
-                        },
-                        c = {
-                            NavIconBtn(onClick = onOpenSettings) { GearIcon(modifier = Modifier.size(24.dp)) }
-                        },
-                    )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppleMusicPlayerBackdrop(coverUrl: String?) {
+    val configuration = LocalConfiguration.current
+    val screenW = configuration.screenWidthDp.dp
+    val screenH = configuration.screenHeightDp.dp
+    val clearCoverHeight = (screenW * 1.20f)
+        .coerceAtLeast(screenW)
+        .coerceAtMost(screenH * 0.64f)
+    val edges = useCoverEdgeColors(coverUrl)
+    val surfaceColor = appleMusicPureSurfaceColor(edges)
+    val bridgeColor = appleMusicDissolveBridgeColor(edges, fallback = surfaceColor)
+    val topColor = appleMusicPureTopColor(edges, fallback = bridgeColor)
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colorStops = arrayOf(
+                        0.00f to topColor,
+                        0.30f to bridgeColor,
+                        0.54f to lerp(bridgeColor, surfaceColor, 0.28f),
+                        0.76f to lerp(bridgeColor, surfaceColor, 0.72f),
+                        1.00f to surfaceColor,
+                    ),
+                ),
+            ),
+    ) {
+        AppleMusicLowerGlassWash(
+            coverUrl = coverUrl,
+        )
+
+        AppleMusicTopCover(
+            coverUrl = coverUrl,
+            height = clearCoverHeight,
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colorStops = arrayOf(
+                            0.00f to Color.Transparent,
+                            0.50f to Color.Transparent,
+                            0.74f to surfaceColor.copy(alpha = 0.20f),
+                            1.00f to surfaceColor.copy(alpha = 0.52f),
+                        ),
+                    ),
+                ),
+        )
+    }
+}
+
+@Composable
+private fun AppleMusicLowerGlassWash(
+    coverUrl: String?,
+) {
+    if (coverUrl == null) return
+    Box(
+        modifier = Modifier
+            .fillMaxSize(),
+    ) {
+        CrossfadeCoverImage(
+            url = coverUrl,
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    alpha = 0.30f
+                    scaleX = 1.78f
+                    scaleY = 1.78f
+                }
+                .blur(64.dp),
+            contentScale = ContentScale.Crop,
+            durationMs = PipoMotion.CoverFadeMs,
+            maxDecodeSizePx = 448,
+        )
+    }
+}
+
+@Composable
+private fun AppleMusicTopCover(
+    coverUrl: String?,
+    height: Dp,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(height)
+            .reportCoverRect()
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithContent {
+                drawContent()
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colorStops = arrayOf(
+                            0.00f to Color.Black,
+                            0.48f to Color.Black,
+                            0.64f to Color.Black.copy(alpha = 0.92f),
+                            0.80f to Color.Black.copy(alpha = 0.54f),
+                            0.94f to Color.Black.copy(alpha = 0.13f),
+                            1.00f to Color.Transparent,
+                        ),
+                    ),
+                    blendMode = BlendMode.DstIn,
+                )
+            },
+    ) {
+        if (coverUrl != null) {
+            CrossfadeCoverImage(
+                url = coverUrl,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = 1.025f
+                        scaleY = 1.025f
+                    }
+                    .background(Color(0xFF11151D)),
+                contentScale = ContentScale.Crop,
+                durationMs = PipoMotion.CoverFadeMs,
+                maxDecodeSizePx = 960,
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(
+                                PipoColors.Accent.copy(alpha = 0.18f),
+                                PipoColors.Bg1,
+                            ),
+                        ),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    painter = painterResource(R.mipmap.ic_launcher_round),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(0.22f),
+                )
             }
         }
     }
@@ -464,6 +660,7 @@ internal fun PipoProgressBar(
     modifier: Modifier = Modifier,
     trackColor: Color = Color(0x1FE9EFFF),
     fillColor: Color = Color(0xEBF5F7FF),
+    barHeight: Dp = 4.dp,
 ) {
     var draggingProgress by remember { mutableStateOf<Float?>(null) }
     // progress() 在此惰性读取 viewModel.positionMs —— 仅本进度条随进度 30Hz 重组,父级不受影响。
@@ -505,14 +702,14 @@ internal fun PipoProgressBar(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(4.dp)
+                .height(barHeight)
                 .clip(RoundedCornerShape(50))
                 .background(trackColor),
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth(fraction = animated)
-                    .height(4.dp)
+                    .height(barHeight)
                     .clip(RoundedCornerShape(50))
                     .background(fillColor),
             )
@@ -526,10 +723,13 @@ private fun progressFromOffset(x: Float, width: Int): Float {
 }
 
 @Composable
-internal fun LoadingRing(modifier: Modifier = Modifier) {
+internal fun LoadingRing(
+    modifier: Modifier = Modifier,
+    color: Color = Color(0xFFF5F7FF),
+) {
     CircularProgressIndicator(
         modifier = modifier,
-        color = Color(0xFFF5F7FF),
+        color = color,
         strokeWidth = 2.4.dp,
         trackColor = Color.Transparent,
     )
@@ -629,3 +829,6 @@ private fun clampSp(min: Int, preferDp: Float, max: Int): androidx.compose.ui.un
     val v = preferDp.coerceIn(min.toFloat(), max.toFloat())
     return v.sp
 }
+
+private fun immersiveTitleTop(screenWidth: Dp): Dp =
+    (screenWidth - 18.dp).coerceAtLeast(52.dp)
