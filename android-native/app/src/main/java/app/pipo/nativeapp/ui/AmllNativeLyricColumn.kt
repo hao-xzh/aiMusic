@@ -89,8 +89,10 @@ import app.pipo.nativeapp.data.PipoLyricAlignment
 import app.pipo.nativeapp.data.PipoLyricChar
 import app.pipo.nativeapp.data.PipoLyricLine
 import app.pipo.nativeapp.data.PipoLyricRole
+import app.pipo.nativeapp.data.PipoLyricTimingPart
 import app.pipo.nativeapp.data.effectiveDurationMs
 import app.pipo.nativeapp.data.effectiveEndMs
+import app.pipo.nativeapp.data.timingPartsForProgress
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.isActive
@@ -1250,7 +1252,9 @@ private fun NativeAmllLyricRow(
                 fontWeight = effectiveMainFontWeight,
                 textAlign = textAlign,
                 effectsEnabled = rowEffectsEnabled,
-                wordTimelineOffsetMs = if (isCurrentLine) NATIVE_SCROLL_FOCUS_LEAD_MS else 0L,
+                // Apple Web uses the 250ms lead for current-line selection/scroll only.
+                // Syllable TimeGroup keyframes run on the line's own continuous clock.
+                wordTimelineOffsetMs = 0L,
                 lineTransitionProgress = lineTransitionProgress,
                 lineTransitionRole = lineTransitionRole,
                 preparedPlan = preparedTimedPlan,
@@ -3105,6 +3109,7 @@ private fun DrawScope.drawNativeSlowSegmentText(
     val totalPhaseMs = NATIVE_SLOW_LETTER_TOTAL_MS.toFloat()
     val cssPxToLocal = fontPx / NATIVE_APPLE_WEB_LINE_FONT_PX
     val letterStepMs = segDurationMs / segment.letterUnits.coerceAtLeast(1).toFloat()
+    val letterTimingParts = nativeSlowLetterTimingParts(segment.sourceTiming)
 
     var glyphOrdinal = segment.letterOrdinalStart
     for (i in segment.startChar until segment.endChar) {
@@ -3113,7 +3118,12 @@ private fun DrawScope.drawNativeSlowSegmentText(
         val boxLeft = plan.glyphBoxLeft[i]
         if (boxLeft.isNaN()) continue
         val boxRight = plan.glyphBoxRight[i]
-        val letterStartMs = segStartMs + letterStepMs * glyphOrdinal
+        val letterStartMs = nativeSlowLetterStartMs(
+            segment = segment,
+            timingParts = letterTimingParts,
+            glyphOrdinal = glyphOrdinal,
+            fallbackStepMs = letterStepMs,
+        )
         glyphOrdinal++
         val elapsedMs = motionPositionMs.toFloat() - letterStartMs
         val scaleValue: Float
@@ -3547,6 +3557,75 @@ private fun nativeSlowSyllableDurationMs(token: PipoLyricChar): Long {
     // merges split YRC fragments into one visual word; the effective duration
     // is the closest local equivalent to Apple's full word begin/end.
     return token.effectiveDurationMs()
+}
+
+private fun nativeSlowLetterTimingParts(token: PipoLyricChar): List<PipoLyricTimingPart>? {
+    val parts = token.timingPartsForProgress()
+    if (parts.size <= 1) return null
+    val tokenUnits = nativeAppleLetterTimelineUnits(token.text)
+    val partUnits = parts.sumOf { part -> nativeAppleLetterTimelineUnits(part.text) }
+    if (partUnits < (tokenUnits * 0.75f).toInt().coerceAtLeast(1)) return null
+
+    var ordered = true
+    var previousStart = Long.MIN_VALUE
+    var previousEnd: Long? = null
+    var maxGap = 0L
+    parts.forEachIndexed { index, part ->
+        if (part.startMs < previousStart) ordered = false
+        val end = part.startMs + nativeTimingPartEffectiveDurationMs(parts, index)
+        previousEnd?.let { maxGap = maxOf(maxGap, part.startMs - it) }
+        previousStart = part.startMs
+        previousEnd = end
+    }
+    if (!ordered) return null
+
+    val tokenEnd = token.startMs + token.durationMs.coerceAtLeast(1L)
+    val firstStart = parts.first().startMs
+    val lastEnd = previousEnd ?: tokenEnd
+    val coverage = (lastEnd - firstStart).coerceAtLeast(1L).toFloat() /
+        token.durationMs.coerceAtLeast(1L).toFloat()
+    val reliable =
+        firstStart >= token.startMs - NATIVE_SLOW_TIMING_PART_START_SLOP_MS &&
+            lastEnd <= tokenEnd + NATIVE_SLOW_TIMING_PART_END_SLOP_MS &&
+            coverage in NATIVE_SLOW_TIMING_PART_MIN_COVERAGE..NATIVE_SLOW_TIMING_PART_MAX_COVERAGE &&
+            maxGap <= maxOf(NATIVE_SLOW_TIMING_PART_MAX_GAP_MS, token.durationMs / 2L)
+    return parts.takeIf { reliable }
+}
+
+private fun nativeSlowLetterStartMs(
+    segment: NativeLyricSegment,
+    timingParts: List<PipoLyricTimingPart>?,
+    glyphOrdinal: Int,
+    fallbackStepMs: Float,
+): Float {
+    if (timingParts.isNullOrEmpty()) {
+        return segment.slowStartMs + fallbackStepMs * glyphOrdinal
+    }
+
+    var consumedUnits = 0
+    timingParts.forEachIndexed { index, part ->
+        val partUnits = nativeAppleLetterTimelineUnits(part.text)
+        if (glyphOrdinal < consumedUnits + partUnits) {
+            val localOrdinal = glyphOrdinal - consumedUnits
+            val partStepMs = nativeTimingPartEffectiveDurationMs(timingParts, index).toFloat() /
+                partUnits.coerceAtLeast(1).toFloat()
+            return part.startMs + partStepMs * localOrdinal
+        }
+        consumedUnits += partUnits
+    }
+    return segment.slowStartMs + fallbackStepMs * glyphOrdinal
+}
+
+private fun nativeTimingPartEffectiveDurationMs(
+    parts: List<PipoLyricTimingPart>,
+    index: Int,
+): Long {
+    val part = parts[index]
+    val rawDuration = part.durationMs.coerceAtLeast(1L)
+    val nextStartMs = parts.getOrNull(index + 1)?.startMs
+    return nextStartMs
+        ?.let { (it - part.startMs).coerceAtLeast(1L).coerceAtMost(rawDuration) }
+        ?: rawDuration
 }
 
 private fun nativeAppleEmphasisContentUnits(text: String): Int {
@@ -4529,6 +4608,11 @@ private const val NATIVE_APPLE_TRAILING_WORD_SPACE = "\u2009"
 // Apple Web shouldBeEmphasized：词长 >= 1s 且文本单位 <= 7。
 private const val NATIVE_SLOW_WORD_MIN_DURATION_MS = 1_000L
 private const val NATIVE_SLOW_WORD_MAX_UNITS = 7
+private const val NATIVE_SLOW_TIMING_PART_START_SLOP_MS = 90L
+private const val NATIVE_SLOW_TIMING_PART_END_SLOP_MS = 180L
+private const val NATIVE_SLOW_TIMING_PART_MAX_GAP_MS = 280L
+private const val NATIVE_SLOW_TIMING_PART_MIN_COVERAGE = 0.35f
+private const val NATIVE_SLOW_TIMING_PART_MAX_COVERAGE = 1.40f
 private const val NATIVE_APPLE_WEB_LINE_FONT_PX = 22f
 private const val NATIVE_SLOW_LETTER_FIRST_PHASE_MS = 500L
 private const val NATIVE_SLOW_LETTER_TOTAL_MS = 1_000L
