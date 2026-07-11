@@ -53,7 +53,8 @@ class BehaviorPreferenceEngine(
         val tracks = runCatching { library.library() }.getOrDefault(emptyList())
         val byId = tracks.associateBy { it.id }
         val now = System.currentTimeMillis()
-        val cutoff = now - WINDOW_DAYS * 24L * 3600L * 1000L
+        val longCutoff = now - LONG_WINDOW_DAYS * 24L * 3600L * 1000L
+        val shortCutoff = now - SHORT_WINDOW_DAYS * 24L * 3600L * 1000L
 
         val artist = ScoreBucket()
         val genre = ScoreBucket()
@@ -68,7 +69,7 @@ class BehaviorPreferenceEngine(
         var weightedEvents = 0.0
 
         for (event in events) {
-            if (event.tsMs < cutoff) continue
+            if (event.tsMs < longCutoff) continue
             val track = byId[event.trackId] ?: NativeTrack(
                 id = event.trackId,
                 neteaseId = event.neteaseId,
@@ -80,25 +81,31 @@ class BehaviorPreferenceEngine(
             val base = eventPreferenceWeight(event)
             if (base == 0.0) continue
             val ageHours = max(0.0, (now - event.tsMs) / 3_600_000.0)
-            val recency = exp(-ageHours / RECENCY_HALF_LIFE_HOURS)
-            val weight = base * recency
-            if (weight == 0.0) continue
+            // Stable identity/style signals decay slowly; mood/scene/tempo are deliberately
+            // short-lived so a temporary listening session does not become a permanent taste.
+            val longWeight = base * exp(-ageHours / LONG_RECENCY_HALF_LIFE_HOURS)
+            val shortWeight = if (event.tsMs >= shortCutoff) {
+                base * exp(-ageHours / SHORT_RECENCY_HALF_LIFE_HOURS)
+            } else 0.0
+            if (longWeight == 0.0 && shortWeight == 0.0) continue
 
-            weightedEvents += kotlin.math.abs(weight)
+            weightedEvents += kotlin.math.abs(longWeight)
             if (base > 0) evidence += 1.0
             val features = featuresStore.get(track.id)
             val semantic = semanticStore.get(track.id)
                 ?: indexer.buildRuleBasedProfile(track, features)
 
-            addArtistKeys(artist, track, weight)
-            addKeys(genre, semantic.genres + semantic.subGenres + semantic.styleAnchors, weight, 1.0)
-            addKeys(mood, semantic.moods + semantic.textures, weight, 0.85)
-            addKeys(scene, semantic.scenes, weight, 0.75)
-            addKey(language, semantic.language.key, weight, semantic.languageConfidence)
-            addKey(region, semantic.region.key, weight, semantic.regionConfidence)
-            addKey(vocal, semantic.vocalType.key, weight, 0.65)
-            addKey(energy, energyBucket(semantic, features), weight, 0.75)
-            addKey(tempo, tempoBucket(semantic, features), weight, 0.60)
+            addArtistKeys(artist, track, longWeight)
+            addKeys(genre, semantic.genres + semantic.subGenres + semantic.styleAnchors, longWeight, 1.0)
+            addKey(language, semantic.language.key, longWeight, semantic.languageConfidence)
+            addKey(region, semantic.region.key, longWeight, semantic.regionConfidence)
+            addKey(vocal, semantic.vocalType.key, longWeight, 0.65)
+            if (shortWeight != 0.0) {
+                addKeys(mood, semantic.moods + semantic.textures, shortWeight, 0.85)
+                addKeys(scene, semantic.scenes, shortWeight, 0.75)
+                addKey(energy, energyBucket(semantic, features), shortWeight, 0.75)
+                addKey(tempo, tempoBucket(semantic, features), shortWeight, 0.60)
+            }
         }
 
         if (weightedEvents < MIN_WEIGHTED_EVENTS) return BehaviorPreferenceSnapshot.Empty
@@ -192,8 +199,10 @@ class BehaviorPreferenceEngine(
     }
 
     companion object {
-        private const val WINDOW_DAYS = 45
-        private const val RECENCY_HALF_LIFE_HOURS = 120.0
+        private const val LONG_WINDOW_DAYS = 180
+        private const val SHORT_WINDOW_DAYS = 21
+        private const val LONG_RECENCY_HALF_LIFE_HOURS = 24.0 * 21.0
+        private const val SHORT_RECENCY_HALF_LIFE_HOURS = 120.0
         private const val MIN_WEIGHTED_EVENTS = 2.5
         private const val CONFIDENCE_FULL_WEIGHT = 42.0
         private const val MIN_BUCKET_ABS_SCORE = 0.12

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -46,6 +47,8 @@ import app.pipo.nativeapp.data.agent.domain.AgentUiCard
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.execute.PlayerAgentExecutor
 import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
+import app.pipo.nativeapp.data.agent.task.AgentTask
+import app.pipo.nativeapp.data.agent.task.AgentTaskGateway
 import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.runtime.Amp
@@ -57,6 +60,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.PI
 import kotlin.math.sin
+import org.json.JSONArray
+import org.json.JSONObject
 
 private fun AgentUiCard.toPetResultCard(): PetResultCard =
     when (kind) {
@@ -143,6 +148,25 @@ fun NativeAiPet(
             }
         }
     }
+    // Observe durable task state so leaving/re-entering the player does not cancel the visual state.
+    LaunchedEffect(Unit) {
+        PipoGraph.agentTasks.store.tasks.collect { tasks ->
+            pending = tasks.any { it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.QUEUED || it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.RUNNING }
+            tasks.filter {
+                (it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.SUCCEEDED ||
+                    it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.FAILED) &&
+                    it.resultReply.isNotBlank()
+            }
+                .takeLast(3)
+                .forEach { task ->
+                    val alreadyDelivered = messages.any { it.taskId == task.id } ||
+                        messages.any { !it.fromUser && it.taskId == null && it.text == task.resultReply }
+                    if (!alreadyDelivered) {
+                        messages += PetMessage(fromUser = false, text = task.resultReply, taskId = task.id)
+                    }
+                }
+        }
+    }
 
     // open 变化镜像到共享状态 —— PipoNativeApp 读它给播放界面做唤起虚化(背景模糊)。
     LaunchedEffect(open) { AiPetCommandBus.isOpen.value = open }
@@ -157,6 +181,43 @@ fun NativeAiPet(
             repository = repository,
             ledger = AgentLedgerStore(context),
         )
+    }
+
+    // The durable coordinator owns execution; this gateway is only the current UI/player bridge.
+    // It is registered process-wide and removed when this composable leaves the tree.
+    val taskGateway = remember(repository, context, currentTrackKey, currentQueueSignature, settings.personaId, settings.userFacts) {
+        object : AgentTaskGateway {
+            override suspend fun execute(task: AgentTask): app.pipo.nativeapp.data.agent.domain.TurnOutcome {
+                val promptContext = runCatching { PipoGraph.petMemory.conversationContext() }
+                    .getOrDefault(app.pipo.nativeapp.data.PetMemory.ConversationContext())
+                val snapshotTrack = currentTrack
+                val executor = PlayerAgentExecutor(
+                    repository = repository,
+                    currentTrackProvider = { snapshotTrack },
+                    sourceUserText = task.userText,
+                    onApplyAgentQueueRequest = onApplyAgentQueueRequest,
+                    onSkip = onSkipFromAgent,
+                    taskId = task.id,
+                )
+                return agentRuntime.handle(
+                    input = AgentTurnInput(
+                        userText = task.userText,
+                        history = promptContext.turns,
+                        historySummary = promptContext.summary,
+                        musicReferences = promptContext.musicReferences,
+                        currentTrack = snapshotTrack,
+                        currentQueue = currentQueue,
+                        userFacts = settings.userFacts,
+                        persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
+                    ),
+                    executor = executor,
+                )
+            }
+        }
+    }
+    DisposableEffect(taskGateway) {
+        PipoGraph.agentTasks.registerGateway(taskGateway)
+        onDispose { PipoGraph.agentTasks.unregisterGateway(taskGateway) }
     }
 
     // 风场弹簧物理 + 节拍包络 —— 镜像 src/components/AiPet.tsx 159-289 行
@@ -513,82 +574,42 @@ fun NativeAiPet(
                 onSend = {
                     val text = input.trim()
                     if (text.isEmpty()) return@PetCommandBar
-                    val promptContext = runCatching { PipoGraph.petMemory.conversationContext() }
-                        .getOrDefault(app.pipo.nativeapp.data.PetMemory.ConversationContext())
-                    val currentTrackSnapshot = currentTrack
                     input = ""
                     messages += PetMessage(fromUser = true, text = text)
                     PetBubbleState.lastUserContext = text
                     runCatching { PipoGraph.petMemory.recordUtterance(text) }
                     pending = true
-                    scope.launch {
-                        try {
-                            try {
-                                PipoGraph.petMemory.recordConversationTurn(
-                                    app.pipo.nativeapp.data.PetMemory.ROLE_USER,
-                                    text,
-                                )
-                            } catch (_: Exception) {
-                                // 记忆失败不能阻塞点歌。
-                            }
-                            val executor = PlayerAgentExecutor(
-                                repository = repository,
-                                currentTrackProvider = { currentTrackSnapshot },
-                                sourceUserText = text,
-                                onApplyAgentQueueRequest = onApplyAgentQueueRequest,
-                                onSkip = onSkipFromAgent,
+                    val taskContext = JSONObject()
+                        .put("currentTrack", currentTrack?.let { JSONObject().put("id", it.id).put("neteaseId", it.neteaseId).put("title", it.title).put("artist", it.artist).put("album", it.album).put("streamUrl", if (it.neteaseId == null) it.streamUrl else "") })
+                        .put("queue", JSONArray(currentQueue.take(24).map { JSONObject().put("id", it.id).put("neteaseId", it.neteaseId).put("title", it.title).put("artist", it.artist).put("album", it.album).put("streamUrl", if (it.neteaseId == null) it.streamUrl else "").put("artworkUrl", it.artworkUrl) }))
+                        .put("userFacts", settings.userFacts)
+                        .put("persona", settings.personaId)
+                        .toString()
+                    var submittedTaskId = ""
+                    val submittedTask = PipoGraph.agentTasks.submit(text, contextJson = taskContext, onFinished = { result ->
+                        scope.launch {
+                            result.fold(
+                                onSuccess = { outcome ->
+                                    if (messages.none { it.taskId == submittedTaskId && it.card == null }) {
+                                        messages += PetMessage(fromUser = false, text = outcome.reply, taskId = submittedTaskId)
+                                    }
+                                    outcome.cards.forEach { card -> messages += PetMessage(false, "", card.toPetResultCard(), taskId = submittedTaskId) }
+                                    latestReply = outcome.reply
+                                    AiCaptionBus.show(outcome.reply)
+                                },
+                                onFailure = {
+                                    val reply = "这次请求没能完成，请检查网络或 AI 配置后重试。"
+                                    if (messages.none { it.taskId == submittedTaskId && it.card == null }) {
+                                        messages += PetMessage(fromUser = false, text = reply, taskId = submittedTaskId)
+                                    }
+                                    latestReply = reply
+                                    AiCaptionBus.show(reply)
+                                },
                             )
-                            val outcome = agentRuntime.handle(
-                                input = AgentTurnInput(
-                                    userText = text,
-                                    history = promptContext.turns,
-                                    historySummary = promptContext.summary,
-                                    musicReferences = promptContext.musicReferences,
-                                    currentTrack = currentTrackSnapshot,
-                                    currentQueue = currentQueue,
-                                    userFacts = settings.userFacts,
-                                    persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
-                                ),
-                                executor = executor,
-                            )
-                            messages += PetMessage(fromUser = false, text = outcome.reply)
-                            outcome.cards.forEach { card ->
-                                messages += PetMessage(false, "", card.toPetResultCard())
-                            }
-                            try {
-                                PipoGraph.petMemory.recordConversationTurn(
-                                    app.pipo.nativeapp.data.PetMemory.ROLE_ASSISTANT,
-                                    outcome.reply,
-                                )
-                            } catch (_: Exception) {
-                                // 只保存干净的 assistant 文本；失败不影响 UI/播放动作。
-                            }
-                            try {
-                                PipoGraph.petMemory.recordMusicReferences(outcome.musicReferences)
-                            } catch (_: Exception) {
-                                // 可执行指代记忆失败不能影响 UI/播放动作。
-                            }
-                            latestReply = outcome.reply
-                            AiCaptionBus.show(outcome.reply)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            val reply = "我这边刚刚断了一下，再说一次。"
-                            messages += PetMessage(fromUser = false, text = reply)
-                            try {
-                                PipoGraph.petMemory.recordConversationTurn(
-                                    app.pipo.nativeapp.data.PetMemory.ROLE_ASSISTANT,
-                                    reply,
-                                )
-                            } catch (_: Exception) {
-                                // ignore
-                            }
-                            latestReply = reply
-                            AiCaptionBus.show(reply)
-                        } finally {
                             pending = false
                         }
-                    }
+                    })
+                    submittedTaskId = submittedTask.id
                 },
             )
         }

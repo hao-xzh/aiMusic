@@ -53,7 +53,9 @@ private val coverEdgeColorsCache = ConcurrentHashMap<String, EdgeColors>()
 @Composable
 fun useCoverEdgeColors(url: String?): EdgeColors {
     val context = LocalContext.current
-    var colors by remember(url) {
+    // URL 切换时保留上一首的 palette，直到新封面采样完成。旧的 remember(url)
+    // 会先把背景打回空色，再突然跳到新色；封面虽在 cross-fade，过渡色层却会闪一下。
+    var colors by remember {
         mutableStateOf(
             url?.takeIf { it.isNotBlank() }?.let { coverEdgeColorsCache[it] }
                 ?: EdgeColors(null, null, null),
@@ -89,7 +91,13 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
                         )
                 }
             }.getOrNull()
-        } ?: return@LaunchedEffect
+        }
+        if (bitmap == null) {
+            // 新封面获取失败时不能整首沿用上一首的颜色；回到中性 palette 也通过
+            // backdrop 的 1100ms 色彩动画过渡，不会出现一帧硬闪。
+            colors = EdgeColors(null, null, null)
+            return@LaunchedEffect
+        }
 
         val sampled = withContext(Dispatchers.Default) {
             sampleEdges(bitmap)
@@ -299,6 +307,20 @@ fun appleMusicPureTopColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1):
 fun appleMusicDissolveBridgeColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
     val base = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
     val mixed = blendRgb(base, edges.accent ?: edges.ambient, 0.06f)
+    return normalizeAppleMusicBridgeSurface(mixed, fallback)
+}
+
+/**
+ * 歌曲专属的中段色场：它不是直接把高饱和 accent 铺在屏幕上，而是以封面
+ * seam/lower 为稳定底色，混入少量主色。用在清晰封面与下方背景之间，
+ * 让每首歌的过渡带有不同色相，同时保持足够低频、不形成一块明显色条。
+ */
+fun appleMusicTransitionWashColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val base = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
+    val songColor = edges.accent ?: edges.top ?: edges.right ?: edges.ambient ?: base
+    // 主色只提供柔和色相偏移；二维色云的空间分布由 backdrop 负责，避免在某个
+    // 固定 Y stop 堆出一条高饱和色脊。
+    val mixed = blendRgb(base, songColor, 0.18f)
     return normalizeAppleMusicBridgeSurface(mixed, fallback)
 }
 

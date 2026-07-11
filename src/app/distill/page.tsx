@@ -27,8 +27,9 @@ import { loadLibrary, clearLibraryMemo } from "@/lib/library";
 import { startBackgroundAnalysis } from "@/lib/analysis-progress";
 import { PlaylistPager } from "@/components/PlaylistPager";
 import { PlaylistFusionBg } from "@/components/PlaylistFusionBg";
+import { AppIcon } from "@/components/AppIcon";
 import { useIsDesktop } from "@/lib/use-is-desktop";
-import { usePlatform } from "@/lib/use-platform";
+import { usePlatformInfo } from "@/lib/use-platform";
 import { useCoverEdgeColors, computeTone, pickFg, pickFgDim } from "@/lib/cover-color";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -479,7 +480,7 @@ function DistillLibraryPage({
         fg={fg}
         right={
           <div style={{ display: "flex", gap: 8 }}>
-            <Link href="/taste" style={chipStyle(fg)} aria-label="我的画像" title="画像">
+            <Link href="/taste" style={chipStyle(fg)} aria-label="我的画像" title="画像" className="platform-icon-button">
               <ProfileIcon />
             </Link>
             <button
@@ -487,13 +488,14 @@ function DistillLibraryPage({
               style={chipStyle(fg)}
               aria-label="蒸馏画像"
               title="蒸馏画像"
+              className="platform-icon-button"
             >
               <SparkIcon />
             </button>
-            <Link href="/export" style={chipStyle(fg)} aria-label="曲库导出" title="曲库导出">
+            <Link href="/export" style={chipStyle(fg)} aria-label="曲库导出" title="曲库导出" className="platform-icon-button">
               <DownloadIcon />
             </Link>
-            <Link href="/settings" style={chipStyle(fg)} aria-label="设置" title="设置">
+            <Link href="/settings" style={chipStyle(fg)} aria-label="设置" title="设置" className="platform-icon-button">
               <GearIcon />
             </Link>
           </div>
@@ -577,9 +579,9 @@ function FloatingTopBar({
   right?: React.ReactNode;
   fg?: string;
 }) {
-  const platform = usePlatform();
-  const isMac = platform === "mac";
-  const isWin = platform === "windows";
+  const { platform, runtime } = usePlatformInfo();
+  const isMac = runtime === "tauri" && platform === "mac";
+  const isWin = runtime === "tauri" && platform === "windows";
   const isAndroid = platform === "android";
   const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
   const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "40px";
@@ -613,7 +615,7 @@ function FloatingTopBar({
           display: "flex",
           alignItems: "center",
           gap: 9,
-          height: 30,
+          height: 34,
         }}
       >
         <button
@@ -621,6 +623,7 @@ function FloatingTopBar({
           style={chipStyle(fg)}
           aria-label={backLabel}
           title={backLabel}
+          className="platform-icon-button"
         >
           <BackIcon />
         </button>
@@ -677,6 +680,8 @@ function ImmersiveLayout({
   canPlay: boolean;
   onPlayAll: () => void;
 }) {
+  const { platform } = usePlatformInfo();
+  const isAndroidPlatform = platform === "android";
   if (isDesktop) {
     const coverSize = "clamp(320px, min(46vw, 66vh), 760px)";
     return (
@@ -749,7 +754,7 @@ function ImmersiveLayout({
             error={error}
             fg={fg}
             fgDim={fgDim}
-            androidDensity
+            androidDensity={isAndroidPlatform}
           />
         </div>
       </div>
@@ -827,7 +832,7 @@ function ImmersiveLayout({
           error={error}
           fg={fg}
           fgDim={fgDim}
-          androidDensity
+          androidDensity={isAndroidPlatform}
         />
       </div>
     </div>
@@ -972,6 +977,7 @@ function PlayAllBtn({
     <button
       onClick={onPlayAll}
       disabled={!canPlay}
+      className="platform-icon-button"
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -996,15 +1002,7 @@ function PlayAllBtn({
         e.currentTarget.style.transform = "scale(1)";
       }}
     >
-      <svg
-        width={compact ? 20 : 24}
-        height={compact ? 20 : 24}
-        viewBox="0 0 24 24"
-        fill="currentColor"
-        aria-hidden
-      >
-        <path d="M8 5v14l11-7z" />
-      </svg>
+      <AppIcon name="play" size={compact ? 20 : 24} />
     </button>
   );
 }
@@ -1284,7 +1282,7 @@ function TrackRow({
         borderRadius: androidDensity ? 0 : 8,
         background: rowBaseBg,
         boxShadow: visuallyActive && !androidDensity
-          ? `inset 3px 0 0 ${fg}, 0 8px 22px ${rowGlowBg(fg)}`
+          ? `0 8px 22px ${rowGlowBg(fg)}`
           : "none",
         transition: "opacity 160ms ease, background 160ms ease, box-shadow 160ms ease",
         opacity: visuallyActive ? 1 : 0.78,
@@ -1340,65 +1338,20 @@ function TrackRow({
         aria-label={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
         title={pending ? "正在准备" : active ? (player.isPlaying ? "暂停" : "继续") : "播放"}
         disabled={pending}
+        className="platform-icon-button"
         style={{
           ...playBtn(androidDensity && visuallyActive ? pipoMint : fg),
           flexShrink: 0,
           opacity: pending ? 0.62 : 1,
         }}
       >
-        {showIndicator ? (
-          <PlayingMark fg={androidDensity ? pipoMint : fg} playing={isPlayingThis || pending} />
-        ) : (
-          <PlayIcon />
-        )}
+        <AppIcon
+          name={pending ? "playing" : showIndicator && isPlayingThis ? "pause" : "play"}
+          size={14}
+          style={{ color: androidDensity && visuallyActive ? pipoMint : fg }}
+        />
       </button>
     </div>
-  );
-}
-
-function PlayingMark({ fg, playing }: { fg: string; playing: boolean }) {
-  // 三条 bar 跳动，做成 active 行的"正在播"指示
-  return (
-    <span
-      aria-hidden
-      style={{
-        display: "inline-flex",
-        alignItems: "flex-end",
-        gap: 2,
-        height: 12,
-      }}
-    >
-      <span style={{ ...bar(fg, playing), animationDelay: "0ms" }} />
-      <span style={{ ...bar(fg, playing), animationDelay: "120ms", height: 8 }} />
-      <span style={{ ...bar(fg, playing), animationDelay: "240ms", height: 5 }} />
-    </span>
-  );
-}
-
-const bar = (fg: string, playing: boolean): React.CSSProperties => ({
-  display: "inline-block",
-  width: 2,
-  height: 10,
-  background: fg,
-  borderRadius: 1,
-  animation: "playingBar 900ms ease-in-out infinite alternate",
-  animationPlayState: playing ? "running" : "paused",
-  opacity: playing ? 1 : 0.78,
-});
-
-function PlayIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-      <path d="M8 5v14l11-7z" />
-    </svg>
-  );
-}
-
-function PauseIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-      <path d="M6 5h4v14H6zM14 5h4v14h-4z" />
-    </svg>
   );
 }
 
@@ -1435,67 +1388,28 @@ function isDarkTextColor(fg: string): boolean {
 }
 
 // ---------- 顶部按钮图标 ----------
-//
-// 视觉统一三件事：
-//   1. 所有 svg 都是 22x22（之前 20x20）—— 手指点更舒服，比 Mac 三键稍大一档
-//   2. strokeWidth 全部 1.9：原先 2.0 / 2.2 混用，gear / profile 显粗，spark / back
-//      显细，肉眼一眼看出"几个图标重量不一致"
-//   3. 路径都填 24x24 viewBox 里的 ~18x18 主区，保证"墨水量"接近：
-//      - Back：原 chevron 6x12 偏小 → 8x14
-//      - Spark：原 4 角星中心偏上（y=10）+ 路径 14x14 → 居中 y=12 + 20x20
-//      - Profile：心形+点已经填得够，保持
-//      - Gear：齿轮太密，缩小到 ~17x17 + 居中，跟其它三个齐平
-const TOP_ICON_SW = 1.85;
+// 统一使用 18px 光学盒；AppIcon 会按 macOS / Windows 切换对应的几何与笔触。
 const TOP_ICON_SIZE = 18;
 
 function BackIcon() {
-  return (
-    <svg width={TOP_ICON_SIZE} height={TOP_ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={TOP_ICON_SW} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M16 5l-8 7 8 7" />
-    </svg>
-  );
+  return <AppIcon name="back" size={TOP_ICON_SIZE} />;
 }
 
 function GearIcon() {
-  // 把整套齿轮路径整体围绕 (12,12) 缩放到 0.9，图形更紧凑，跟 spark / profile
-  // 的视觉直径对齐；strokeWidth 自动按 transform 视觉变化无碍（路径还是 path 单位）
-  return (
-    <svg width={TOP_ICON_SIZE} height={TOP_ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={TOP_ICON_SW} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <g transform="translate(12 12) scale(0.88) translate(-12 -12)">
-        <circle cx="12" cy="12" r="3" />
-        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-      </g>
-    </svg>
-  );
+  return <AppIcon name="settings" size={TOP_ICON_SIZE} />;
 }
 
 function ProfileIcon() {
-  return (
-    <svg width={TOP_ICON_SIZE} height={TOP_ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={TOP_ICON_SW} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 19c-4-2.5-7-5.4-7-9.2A3.8 3.8 0 0 1 12 7a3.8 3.8 0 0 1 7 2.8c0 3.8-3 6.7-7 9.2z" />
-      <circle cx="18" cy="6" r="1.3" fill="currentColor" stroke="none" />
-    </svg>
-  );
+  return <AppIcon name="profile" size={TOP_ICON_SIZE} />;
 }
 
 function SparkIcon() {
-  // 4 角星：中心移到 (12,12)，长轴 ±10、短轴 ±2 凹陷，整体填 ~20x20
-  return (
-    <svg width={TOP_ICON_SIZE} height={TOP_ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={TOP_ICON_SW} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 2l1.8 8.2L22 12l-8.2 1.8L12 22l-1.8-8.2L2 12l8.2-1.8L12 2z" />
-    </svg>
-  );
+  return <AppIcon name="sparkle" size={TOP_ICON_SIZE} />;
 }
 
 /** 顶部 titlebar 按钮：参考 Codex 桌面栏的轻量 icon button。 */
 function DownloadIcon() {
-  return (
-    <svg width={TOP_ICON_SIZE} height={TOP_ICON_SIZE} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={TOP_ICON_SW} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 4v10" />
-      <path d="M7.5 10.5 12 15l4.5-4.5" />
-      <path d="M5 20h14" />
-    </svg>
-  );
+  return <AppIcon name="download" size={TOP_ICON_SIZE} />;
 }
 
 function chipStyle(fg: string): React.CSSProperties {
@@ -1503,8 +1417,8 @@ function chipStyle(fg: string): React.CSSProperties {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: 30,
-    height: 30,
+    width: 34,
+    height: 34,
     borderRadius: 8,
     border: "none",
     background: "transparent",
@@ -1585,6 +1499,7 @@ function DistillBottomBar({
         onClick={onCancel}
         disabled={running}
         style={{ ...ghostPillBtn, opacity: running ? 0.5 : 1 }}
+        className="platform-action-button"
       >
         取消
       </button>
@@ -1596,14 +1511,19 @@ function DistillBottomBar({
           opacity: count === 0 || running ? 0.5 : 1,
           cursor: count === 0 || running ? "not-allowed" : "pointer",
         }}
+        className="platform-action-button"
       >
-        {running ? "蒸馏中 · · ·" : "开始蒸馏 →"}
+        {running ? "蒸馏中 · · ·" : <><span>开始蒸馏</span><AppIcon name="forward" size={13} /></>}
       </button>
     </div>
   );
 }
 
 const primaryPillBtn: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
   padding: "8px 18px",
   borderRadius: 999,
   border: "1px solid rgba(155,227,198,0.5)",
@@ -1616,6 +1536,9 @@ const primaryPillBtn: React.CSSProperties = {
 };
 
 const ghostPillBtn: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
   padding: "8px 16px",
   borderRadius: 999,
   border: "1px solid rgba(233,239,255,0.18)",
@@ -1655,8 +1578,11 @@ function UnauthState() {
       </div>
       <Link
         href="/login"
+        className="platform-action-button"
         style={{
-          display: "inline-block",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
           padding: "8px 18px",
           borderRadius: 999,
           border: "1px solid #9be3c6",
@@ -1665,7 +1591,7 @@ function UnauthState() {
           fontSize: 13,
         }}
       >
-        去扫码登录 →
+        <span>去扫码登录</span><AppIcon name="forward" size={13} />
       </Link>
     </div>
   );
@@ -1761,20 +1687,7 @@ function PlaylistGrid({
                   transition: "all 160ms ease",
                 }}
               >
-                {selected && (
-                  <svg
-                    width="11"
-                    height="11"
-                    viewBox="0 0 12 12"
-                    fill="none"
-                    stroke="#0b0d12"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M2.5 6.2l2.5 2.5L9.5 3.6" />
-                  </svg>
-                )}
+                {selected && <AppIcon name="check" size={11} style={{ color: "#0b0d12" }} />}
               </div>
             )}
           </div>

@@ -25,6 +25,7 @@ import { cdn } from "@/lib/cdn";
 import { netease } from "@/lib/tauri";
 import { announceAi } from "@/lib/ai-announcer";
 import { getAppSettingsSnapshot, useAppSettings } from "@/lib/app-settings";
+import { AppIcon } from "./AppIcon";
 import "./AiPet.css";
 import {
   chat as petChat,
@@ -644,11 +645,14 @@ export function AiPet() {
               </div>
             </div>
             <button
+              type="button"
               onClick={requestClose}
               aria-label="关闭"
+              title="关闭"
               style={panelCloseBtn}
+              className="platform-icon-button"
             >
-              ×
+              <AppIcon name="close" size={15} />
             </button>
           </div>
 
@@ -686,8 +690,9 @@ export function AiPet() {
               disabled={pending || !input.trim()}
               aria-label="发送"
               style={panelSendBtn}
+              className="platform-icon-button"
             >
-              <SendArrow />
+              <AppIcon name="send" size={16} />
             </button>
           </form>
         </div>
@@ -740,27 +745,6 @@ export function AiPet() {
       </div>
       )}
     </>
-  );
-}
-
-function SendArrow() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-      style={{ display: "block" }}
-    >
-      {/* 一支上指箭头 —— 类似 iMessage 的发送 icon */}
-      <line x1="12" y1="19" x2="12" y2="5" />
-      <polyline points="6 11 12 5 18 11" />
-    </svg>
   );
 }
 
@@ -896,15 +880,15 @@ const panelHeaderSubtitle: CSSProperties = {
 };
 
 const panelCloseBtn: CSSProperties = {
-  width: 24,
-  height: 24,
-  borderRadius: 999,
+  width: 30,
+  height: 30,
+  padding: 0,
   border: "none",
   background: "transparent",
-  color: "rgba(233,239,255,0.5)",
-  fontSize: 18,
+  color: "rgba(233,239,255,0.62)",
   lineHeight: 1,
   cursor: "pointer",
+  flexShrink: 0,
 };
 
 const panelScroll: CSSProperties = {

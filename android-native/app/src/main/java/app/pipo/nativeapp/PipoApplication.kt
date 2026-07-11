@@ -21,6 +21,8 @@ class PipoApplication : Application(), ImageLoaderFactory {
         PipoGraph.installContext(this)
         registerForegroundTracker()
         installRustBridgeWhenPackaged()
+        // Repository installation must finish before a recovered task can reach the model/tools.
+        PipoGraph.agentTasks.scheduleRecovery()
     }
 
     @Suppress("DEPRECATION")

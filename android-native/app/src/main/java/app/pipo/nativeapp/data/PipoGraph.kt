@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.data
 
 import android.content.Context
+import app.pipo.nativeapp.data.agent.task.AgentTaskCoordinator
 
 /**
  * 全局 DI 容器。RustBridgeRepository 在 PipoApplication.onCreate 装配；
@@ -60,6 +61,12 @@ object PipoGraph {
 
     @Volatile
     private var behaviorPref: BehaviorPreferenceEngine? = null
+
+    @Volatile
+    private var agentTaskCoordinator: AgentTaskCoordinator? = null
+
+    val agentTasks: AgentTaskCoordinator
+        get() = agentTaskCoordinator ?: error("PipoGraph.installContext() must be called before agentTasks")
 
     val repository: PipoRepository
         get() = overrideRepository ?: emptyRepository
@@ -151,6 +158,7 @@ object PipoGraph {
 
     fun installContext(context: Context) {
         val app = context.applicationContext
+        if (agentTaskCoordinator == null) agentTaskCoordinator = AgentTaskCoordinator(app)
         if (profileStore == null) profileStore = TasteProfileStore(app)
         if (featuresStore == null) featuresStore = AudioFeaturesStore(app)
         if (behaviorLogger == null) behaviorLogger = BehaviorLog(app)

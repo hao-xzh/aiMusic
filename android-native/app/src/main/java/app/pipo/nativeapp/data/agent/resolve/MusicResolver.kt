@@ -9,6 +9,7 @@ import app.pipo.nativeapp.data.FunctionalMusicFilter
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetIntent
 import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.data.PipoPlaylist
 import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.data.RecommendationFeedbackLog
 import app.pipo.nativeapp.data.TrackDedupe
@@ -71,7 +72,7 @@ class MusicResolver(
                 tracks = runCatching { repository.cloudDiskTracks() }.getOrDefault(emptyList()),
             )
         }
-        val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        val playlists = availablePlaylists()
         val resolved = playlistResolver.resolve(action.name, playlists)
         val tracks = resolved?.let {
             runCatching { repository.tracksForPlaylist(it.playlist.id) }.getOrDefault(emptyList())
@@ -200,9 +201,18 @@ class MusicResolver(
         if (CommandTextSignals.isCloudPlaylistName(playlistName)) {
             return runCatching { repository.cloudDiskTracks() }.getOrDefault(emptyList())
         }
-        val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        val playlists = availablePlaylists()
         val resolved = playlistResolver.resolve(playlistName, playlists) ?: return emptyList()
         return runCatching { repository.tracksForPlaylist(resolved.playlist.id) }.getOrDefault(emptyList())
+    }
+
+    private suspend fun availablePlaylists(): List<PipoPlaylist> {
+        var playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        if (playlists.isEmpty()) {
+            runCatching { repository.refreshPlaylists() }
+            playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        }
+        return playlists
     }
 
     private fun intentFor(
@@ -333,6 +343,8 @@ class MusicResolver(
             embeddingStore = embeddingStore,
         )
         val feedback = contextFeedbackFor(intent)
+        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
+            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
         val rankedRaw = CandidateRanker.rank(
             candidates = candidates,
             intent = intent,
@@ -344,7 +356,7 @@ class MusicResolver(
             ),
         )
         val ranked = rankedRaw
-            .filterNot { feedback.contains(it.candidate.track) }
+            .filterNot { feedback.contains(it.candidate.track) || hardRejected.contains(it.candidate.track) }
             .map { it.candidate.track }
         val feedbackFiltered = rankedRaw.size - ranked.size
         if (feedbackFiltered > 0) {
@@ -377,12 +389,16 @@ class MusicResolver(
                 "scopedAfter" to scoped.size,
             ),
         )
+        val explicitTrackRequest = intent.hardTracks.isNotEmpty() || intent.textTracks.isNotEmpty()
+        fun capTitles(items: List<NativeTrack>): List<NativeTrack> =
+            if (explicitTrackRequest) TrackDedupe.capSameTitle(items)
+            else TrackDedupe.capRecommendationTitleFamily(items)
         val localResult = when (artistScope) {
-            ArtistScope.Strict -> TrackDedupe.capSameTitle(scoped).take(desired)
-            ArtistScope.Focus -> TrackDedupe.capSameTitle(
+            ArtistScope.Strict -> capTitles(scoped).take(desired)
+            ArtistScope.Focus -> capTitles(
                 diversifyByArtistButPreserveFocus(scoped, artistKeys),
             ).take(desired)
-            ArtistScope.Similar -> TrackDedupe.capSameTitle(diversifyByArtist(scoped)).take(desired)
+            ArtistScope.Similar -> capTitles(diversifyByArtist(scoped)).take(desired)
         }
         return if (localResult.isNotEmpty()) {
             localResult
@@ -420,12 +436,14 @@ class MusicResolver(
             .filter { it.isNotBlank() }
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
+        val genericRecommendation = intent.hardTracks.isEmpty() && intent.textTracks.isEmpty()
+        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
+            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
         // 分批并行搜（批内 3 个并行，凑够目标不开下一批）。query 按「具体歌→歌手→风格」
         // 优先级排序，合并仍按该顺序取，结果语义与串行一致；wall-time 约为串行的 1/3。
-        // 多收一倍做新鲜度池：搜索接口固定返回相同 top-N，若只收 desired 张，
-        // 用户短时间重复同一风格要求时会拿到一模一样的歌单；收 2x 后把近期推过的
-        // 沉底，优先给没推过的。
-        val poolTarget = desired * 2
+        // 多收四倍再重排/去标题族。不能在搜索阶段先留第一个 Pop 标题，否则会把
+        // 搜索顺序误当智能排序，并可能被模板标题提前塞满池子。
+        val poolTarget = desired * 4
         val allowFunctional = FunctionalMusicFilter.mentionsFunctional(
             listOf(intent.queryText) + intent.hardGenres + intent.musicHintsGenres +
                 intent.refStyles + intent.aiMainStyles,
@@ -447,6 +465,7 @@ class MusicResolver(
                     else -> hits
                 }
                 for (track in scopedHits) {
+                    if (hardRejected.contains(track)) continue
                     // 情绪词搜索的助眠/养生流水线内容不进候选（明确要纯音乐/点名歌手除外）。
                     if (!allowFunctional &&
                         FunctionalMusicFilter.isFunctional(track.title, track.artist) &&
@@ -459,7 +478,58 @@ class MusicResolver(
                 }
             }
         }
-        return filterContextFeedback(demoteRecentlyRecommended(out), intent).take(desired)
+        val feedbackFiltered = filterContextFeedback(out, intent)
+        val tasteReranked = rerankOnlineCandidates(feedbackFiltered, intent, poolTarget)
+        val freshFirst = demoteRecentlyRecommended(tasteReranked)
+        val titleCapped = if (genericRecommendation) {
+            TrackDedupe.capRecommendationTitleFamily(freshFirst)
+        } else {
+            freshFirst
+        }
+        return titleCapped.take(desired)
+    }
+
+    /**
+     * 在线搜索只负责召回，不能把搜索服务的标题热度直接当推荐分。
+     * 复用本地同一套 intent / 画像 / 长短期行为排序，再把没被召回器识别的结果
+     * 按原搜索顺序补回，保证窄查询不因画像稀疏而饿死。
+     */
+    private suspend fun rerankOnlineCandidates(
+        tracks: List<NativeTrack>,
+        intent: PetIntent,
+        limit: Int,
+    ): List<NativeTrack> {
+        if (tracks.size <= 1) return tracks
+        val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
+        val behaviorPreference = runCatching { PipoGraph.behaviorPreference.current() }
+            .getOrDefault(BehaviorPreferenceSnapshot.Empty)
+        val candidates = CandidateRecall.recall(
+            intent = intent,
+            library = tracks,
+            featuresStore = PipoGraph.audioFeaturesStore,
+            semanticStore = PipoGraph.trackSemanticStore,
+            indexer = PipoGraph.semanticIndexer,
+            tasteProfile = PipoGraph.tasteProfileStore.current(),
+            behaviorEvents = behaviorEvents,
+            behaviorPreference = behaviorPreference,
+            currentTrack = null,
+            limit = maxOf(limit, tracks.size),
+        )
+        val ranked = CandidateRanker.rank(
+            candidates = candidates,
+            intent = intent,
+            options = CandidateRanker.Options(
+                topN = maxOf(limit, tracks.size),
+                recentPlay = runCatching { PipoGraph.behaviorLog.recentPlay() }.getOrNull(),
+                recentRecommendation = runCatching { PipoGraph.recommendationLog.recentContext() }.getOrNull(),
+                behaviorPreference = behaviorPreference,
+            ),
+        ).map { it.candidate.track }
+        val seen = ranked.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+        return buildList {
+            addAll(ranked)
+            tracks.forEach { if (seen.add(TrackDedupe.songKey(it))) add(it) }
+        }.take(limit)
     }
 
     private fun contextFeedbackFor(intent: PetIntent): RecommendationFeedbackLog.RejectedContext =
@@ -506,13 +576,17 @@ class MusicResolver(
         val artistScope = action.primaryGoal.artistScope
         if (action.primaryGoal.playlistName.isNotBlank()) {
             return ContinuousQueueSource { excludeIds ->
+                val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
+                    .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
                 val scoped = applyArtistScope(
                     tracks = localTracks,
                     artistKeys = artistKeys,
                     artistScope = artistScope,
                 )
                 TrackDedupe.capSameTitle(scoped)
-                    .filter { track -> track.neteaseId?.let { it !in excludeIds } ?: true }
+                    .filter { track ->
+                        (track.neteaseId?.let { it !in excludeIds } ?: true) && !hardRejected.contains(track)
+                    }
                     .take(12)
             }
         }
@@ -643,6 +717,8 @@ class MusicResolver(
     ): List<NativeTrack> {
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
+        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
+            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
         for (batch in seedQueries.chunked(3)) {
             if (out.size >= CONTINUATION_WANT_COUNT * 2) break
             val hitsPerQuery = coroutineScope {
@@ -664,6 +740,7 @@ class MusicResolver(
                 for (track in scopedHits) {
                     val id = track.neteaseId
                     if (id != null && id in excludeIds) continue
+                    if (hardRejected.contains(track)) continue
                     // 续杯是无人值守的：情绪词搜索返回的助眠/养生流水线内容必须挡掉
                     //（点名歌手的结果放行），否则一次续杯就把电台灌满纯音乐。
                     if (!allowFunctional &&
@@ -684,13 +761,14 @@ class MusicResolver(
             out.addAll(latin)
             out.addAll(other)
         }
-        val deduped = TrackDedupe.capSameTitle(out)
+        val deduped = TrackDedupe.dedupe(out)
         val ordered = when (artistScope) {
             ArtistScope.Strict -> deduped
             ArtistScope.Focus -> diversifyByArtistButPreserveFocus(deduped, artistKeys)
             ArtistScope.Similar -> diversifyByArtist(deduped)
         }
-        return demoteRecentlyRecommended(ordered).take(CONTINUATION_WANT_COUNT)
+        return TrackDedupe.capRecommendationTitleFamily(demoteRecentlyRecommended(ordered))
+            .take(CONTINUATION_WANT_COUNT)
     }
 
     private fun buildContinuationSearchQueries(intent: PetIntent): List<String> {

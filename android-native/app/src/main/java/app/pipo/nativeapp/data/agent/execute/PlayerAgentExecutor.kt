@@ -25,6 +25,8 @@ class PlayerAgentExecutor(
     private val sourceUserText: String,
     private val onApplyAgentQueueRequest: suspend (AgentQueueRequest) -> QueueCommitResult,
     private val onSkip: () -> Unit,
+    /** Durable task id; makes playback request ids stable across Worker retries. */
+    private val taskId: String = "",
 ) : AgentActionExecutor {
     private val playbackUrlResolver = PlaybackUrlResolver(
         repository = repository,
@@ -58,7 +60,7 @@ class PlayerAgentExecutor(
             else -> tracks
         }
         val request = AgentQueueRequest(
-            requestId = actionId,
+            requestId = stableId("play", tracks.joinToString(",") { it.id }, mode.name, similar.toString()),
             sourceUserText = sourceUserText,
             operation = operation,
             tracks = requestTracks,
@@ -66,7 +68,7 @@ class PlayerAgentExecutor(
             desiredCount = requestTracks.size,
             hardConstraints = hardConstraintsFor(primaryGoal, target, operation),
         )
-        return resultForCommit(actionId, "play_queue", request, onApplyAgentQueueRequest(request), similar)
+        return resultForCommit(request.requestId, "play_queue", request, onApplyAgentQueueRequest(request), similar)
     }
 
     override suspend fun insertNext(
@@ -80,7 +82,7 @@ class PlayerAgentExecutor(
             ?: return noPlayableSource(actionId, "insert_next", first)
         val requestTracks = listOf(resolvedFirst) + tracks.drop(1)
         val request = AgentQueueRequest(
-            requestId = actionId,
+            requestId = stableId("insert", tracks.joinToString(",") { it.id }, jumpToInserted.toString()),
             sourceUserText = sourceUserText,
             operation = QueueOperation.InsertNext,
             tracks = requestTracks,
@@ -91,19 +93,21 @@ class PlayerAgentExecutor(
                 nextTrack = TrackRequirement(title = resolvedFirst.title, artist = resolvedFirst.artist, placement = TrackPlacement.Next),
             ),
         )
-        return resultForCommit(actionId, "insert_next", request, onApplyAgentQueueRequest(request), similar = false)
+        return resultForCommit(request.requestId, "insert_next", request, onApplyAgentQueueRequest(request), similar = false)
     }
 
     override suspend fun skip(actionId: String): ActionExecutionResult {
+        val stableActionId = stableId("skip")
         onSkip()
-        return ActionExecutionResult(actionId, "skip", success = true, message = "换一首")
+        return ActionExecutionResult(stableActionId, "skip", success = true, message = "换一首")
     }
 
     override suspend fun likeCurrent(actionId: String, like: Boolean): ActionExecutionResult {
+        val stableActionId = stableId("like_current", like.toString())
         val currentTrack = currentTrackProvider()
         val tid = currentTrack?.neteaseId
         if (currentTrack == null || tid == null) {
-            return ActionExecutionResult(actionId, "like", success = false, message = "现在没在放歌，没法${if (like) "收藏" else "取消收藏"}。")
+            return ActionExecutionResult(stableActionId, "like", success = false, message = "现在没在放歌，没法${if (like) "收藏" else "取消收藏"}。")
         }
         DiagnosticsLogStore.record(
             area = "ai_agent",
@@ -114,7 +118,7 @@ class PlayerAgentExecutor(
             .fold(
                 onSuccess = {
                     ActionExecutionResult(
-                        actionId = actionId,
+                        actionId = stableActionId,
                         type = "like",
                         success = true,
                         message = if (like) "收藏好了：${currentTrack.title}" else "取消收藏了：${currentTrack.title}",
@@ -125,7 +129,7 @@ class PlayerAgentExecutor(
                 },
                 onFailure = { err ->
                     ActionExecutionResult(
-                        actionId = actionId,
+                        actionId = stableActionId,
                         type = "like",
                         success = false,
                         message = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
@@ -139,12 +143,13 @@ class PlayerAgentExecutor(
         like: Boolean,
         target: TrackRequirement,
     ): ActionExecutionResult {
+        val stableActionId = stableId("like_track", like.toString(), target.artist.orEmpty(), target.title)
         val track = resolveTrackForLike(target)
         val tid = track?.neteaseId
         if (track == null || tid == null) {
             val label = listOfNotNull(target.artist, target.title).joinToString(" - ")
             return ActionExecutionResult(
-                actionId = actionId,
+                actionId = stableActionId,
                 type = "like",
                 success = false,
                 message = "没找到可${if (like) "收藏" else "取消收藏"}的「$label」。",
@@ -166,7 +171,7 @@ class PlayerAgentExecutor(
             .fold(
                 onSuccess = {
                     ActionExecutionResult(
-                        actionId = actionId,
+                        actionId = stableActionId,
                         type = "like",
                         success = true,
                         message = if (like) "收藏好了：${trackLabel(track)}" else "取消收藏了：${trackLabel(track)}",
@@ -177,7 +182,7 @@ class PlayerAgentExecutor(
                 },
                 onFailure = { err ->
                     ActionExecutionResult(
-                        actionId = actionId,
+                        actionId = stableActionId,
                         type = "like",
                         success = false,
                         message = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
@@ -191,20 +196,21 @@ class PlayerAgentExecutor(
         add: Boolean,
         playlistName: String,
     ): ActionExecutionResult {
+        val stableActionId = stableId("playlist", add.toString(), playlistName)
         val currentTrack = currentTrackProvider()
         val tid = currentTrack?.neteaseId
         if (currentTrack == null || tid == null) {
-            return ActionExecutionResult(actionId, "playlist", success = false, message = "现在没在放歌，没法操作歌单。")
+            return ActionExecutionResult(stableActionId, "playlist", success = false, message = "现在没在放歌，没法操作歌单。")
         }
         val playlists = repository.playlists.first()
         val target = matchPlaylist(playlists, playlistName)
-            ?: return ActionExecutionResult(actionId, "playlist", success = false, message = "没找到歌单「$playlistName」。")
+            ?: return ActionExecutionResult(stableActionId, "playlist", success = false, message = "没找到歌单「$playlistName」。")
         val opStr = if (add) "add" else "del"
         return runCatching { repository.playlistModifyTracks(target.id, opStr, listOf(tid)) }
             .fold(
                 onSuccess = {
                     ActionExecutionResult(
-                        actionId = actionId,
+                        actionId = stableActionId,
                         type = "playlist",
                         success = true,
                         message = "${if (add) "已加入" else "已移出"}「${target.name}」",
@@ -214,7 +220,7 @@ class PlayerAgentExecutor(
                 },
                 onFailure = { err ->
                     ActionExecutionResult(
-                        actionId = actionId,
+                        actionId = stableActionId,
                         type = "playlist",
                         success = false,
                         message = "操作歌单失败：${err.message ?: err::class.java.simpleName}",
@@ -428,6 +434,11 @@ class PlayerAgentExecutor(
                 )
             }
         }
+    }
+
+    private fun stableId(operation: String, vararg parts: String): String {
+        val seed = listOf(taskId, sourceUserText, operation, *parts).joinToString("|")
+        return "agent-${seed.hashCode().toUInt().toString(16)}-$operation"
     }
 
     private companion object {

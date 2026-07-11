@@ -292,9 +292,13 @@ class PlayerViewModel(
     }
 
     private fun recordRecommendationRejection(track: NativeTrack, contextText: String?) {
+        // Queue removal is an explicit, cross-context dislike. Keep the context signal too,
+        // but do not make persistence depend on an active AI request.
+        runCatching { PipoGraph.recommendationFeedbackLog.reject(track) }
         val text = contextText?.trim().orEmpty()
-        if (text.isBlank()) return
-        runCatching { PipoGraph.recommendationFeedbackLog.rejectForContext(track, text) }
+        if (text.isNotBlank()) {
+            runCatching { PipoGraph.recommendationFeedbackLog.rejectForContext(track, text) }
+        }
         DiagnosticsLogStore.record(
             area = "ai_agent",
             event = "recommendation_context_rejected",

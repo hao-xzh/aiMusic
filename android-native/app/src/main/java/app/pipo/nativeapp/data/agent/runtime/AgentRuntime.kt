@@ -10,6 +10,12 @@ import app.pipo.nativeapp.data.agent.queue.AgentQueuePlanner
 import app.pipo.nativeapp.data.agent.reply.ReplyGrounder
 import app.pipo.nativeapp.data.agent.resolve.MusicResolver
 
+/** Signals the durable task layer whether a tool-loop failure should be attempted again. */
+class AgentTurnExecutionException(
+    val retryable: Boolean,
+    reason: String,
+) : IllegalStateException(reason)
+
 /**
  * 安卓音乐 Agent 的唯一入口。
  *
@@ -27,10 +33,9 @@ class AgentRuntime(
     private val ledger: AgentLedgerStore,
     private val resolver: MusicResolver = MusicResolver(repository),
     private val queuePlanner: AgentQueuePlanner = AgentQueuePlanner(),
-    private val replyGrounder: ReplyGrounder = ReplyGrounder.withLlmCopywriter { system, user ->
-        // 回复由 LLM 按人格现写，温度高一点求自然多样；仍过 ReplyVerifier + 模板兜底。
-        repository.aiChat(system = system, user = user, temperature = 0.85f, maxTokens = 160)
-    },
+    // 动作回复必须基于已执行事实；本地模板已经过 ReplyVerifier，不再为“说做完了”额外
+    // 发起第三次 LLM 请求。这样播放成功的常规请求只需一次工具规划调用。
+    private val replyGrounder: ReplyGrounder = ReplyGrounder(),
 ) {
     private val toolLoop by lazy {
         AgentToolLoop(

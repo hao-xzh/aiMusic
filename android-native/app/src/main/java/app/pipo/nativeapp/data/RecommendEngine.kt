@@ -1,6 +1,9 @@
 package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.exp
@@ -54,6 +57,8 @@ class RecommendEngine(
             .getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
         val behaviorDelta = runCatching { behaviorPreference.current() }
             .getOrDefault(BehaviorPreferenceSnapshot.Empty)
+        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
+            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
 
         val anchorKey = anchor?.let { TrackDedupe.songKey(it) }
         val anchorArtistKey = anchor?.firstArtistKey()
@@ -65,7 +70,8 @@ class RecommendEngine(
             val ne = t.neteaseId
             val sk = TrackDedupe.songKey(t)
             (ne != null && ne in excludeIds) || sk == anchorKey ||
-                (ne != null && ne in recentRec.last24hTrackIds)
+                (ne != null && ne in recentRec.last24hTrackIds) ||
+                hardRejected.contains(t)
         }
 
         // ---- 召回 ----
@@ -101,6 +107,7 @@ class RecommendEngine(
                     if (diverse.size >= wantCount) break
                 }
             }
+            logRecommendationTracks(diverse)
             return@withContext diverse
         }
 
@@ -138,11 +145,17 @@ class RecommendEngine(
 
         // ---- 在线兜底 ----
         val haveKeys = picks.mapTo(HashSet()) { TrackDedupe.songKey(it.track) }
+        val haveTitleFamilies = picks.mapTo(HashSet()) { TrackDedupe.recommendationTitleKey(it.track.title) }
         val online = fetchFromOnline(anchor, taste, behaviorDelta, excludeIds, wantCount - picks.size)
-            .filter { TrackDedupe.songKey(it) !in haveKeys && !hardExclude(it) }
+            .filter {
+                val family = TrackDedupe.recommendationTitleKey(it.title)
+                TrackDedupe.songKey(it) !in haveKeys && !hardExclude(it) &&
+                    (family.isBlank() || family !in haveTitleFamilies)
+            }
         val final = picks.map { it.track } + online
-        logRecommendations(picks)
-        return@withContext final.take(wantCount)
+        val result = final.take(wantCount)
+        logRecommendationTracks(result)
+        return@withContext result
     }
 
     // ============== 召回 ==============
@@ -320,12 +333,15 @@ class RecommendEngine(
         val picked = ArrayList<Candidate>()
         val artistCount = HashMap<String, Int>()
         val seenSongKeys = HashSet<String>()
+        val seenTitleFamilies = HashSet<String>()
         var anchorArtistTaken = 0
 
         for (c in ranked) {
             if (picked.size >= wantCount) break
             val sk = TrackDedupe.songKey(c.track)
             if (sk in seenSongKeys) continue
+            val titleFamily = TrackDedupe.recommendationTitleKey(c.track.title)
+            if (titleFamily.isNotBlank() && titleFamily in seenTitleFamilies) continue
             val ak = c.track.firstArtistKey()
             val artistN = artistCount[ak] ?: 0
             if (artistN >= 2) continue
@@ -334,6 +350,7 @@ class RecommendEngine(
 
             picked.add(c)
             seenSongKeys.add(sk)
+            if (titleFamily.isNotBlank()) seenTitleFamilies.add(titleFamily)
             artistCount[ak] = artistN + 1
             if (anchorArtistKey != null && ak == anchorArtistKey) anchorArtistTaken++
         }
@@ -357,30 +374,64 @@ class RecommendEngine(
         val seeds = buildOnlineSeeds(anchor, taste, behaviorDelta)
         if (seeds.isEmpty()) return emptyList()
         val out = LinkedHashMap<String, NativeTrack>()  // songKey -> track
+        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
+            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
         val anchorArtistKey = anchor?.firstArtistKey()
-        val artistCount = HashMap<String, Int>()
         // mood/genre seed 在网易搜索里会捞回助眠/养生流水线内容；除非用户正在听的
         // 锚点本身就是功能性音乐（那继续推同类才对），一律挡掉。
         val anchorFunctional = anchor != null && FunctionalMusicFilter.isFunctional(anchor.title, anchor.artist)
-        for (seed in seeds) {
-            if (out.size >= wantCount * 3) break
-            val hits = runCatching { repository.searchTracks(seed, limit = 12) }.getOrDefault(emptyList())
-            for (t in hits) {
-                val ne = t.neteaseId ?: continue
-                if (ne in excludeIds) continue
-                if (!anchorFunctional && FunctionalMusicFilter.isFunctional(t.title, t.artist)) continue
-                val sk = TrackDedupe.songKey(t)
-                if (sk in out) continue
-                val ak = t.firstArtistKey()
-                val artistN = artistCount[ak] ?: 0
-                if (artistN >= 2) continue  // 同 artist 上限 2，跟本地 rerank 对齐
-                // anchor 的 artist 在线最多 1 首（搜索结果通常是该 artist 的另一首热曲）
-                if (anchorArtistKey != null && ak == anchorArtistKey && artistN >= 1) continue
-                out[sk] = t
-                artistCount[ak] = artistN + 1
+        for (batch in seeds.chunked(3)) {
+            if (out.size >= wantCount * 4) break
+            val hitsPerSeed = coroutineScope {
+                batch.map { seed ->
+                    async { runCatching { repository.searchTracks(seed, limit = 12) }.getOrDefault(emptyList()) }
+                }.awaitAll()
+            }
+            for (hits in hitsPerSeed) {
+                for (t in hits) {
+                    val ne = t.neteaseId ?: continue
+                    if (ne in excludeIds) continue
+                    if (hardRejected.contains(t)) continue
+                    if (!anchorFunctional && FunctionalMusicFilter.isFunctional(t.title, t.artist)) continue
+                    val sk = TrackDedupe.songKey(t)
+                    if (sk in out) continue
+                    out[sk] = t
+                    if (out.size >= wantCount * 4) break
+                }
+                if (out.size >= wantCount * 4) break
             }
         }
-        return out.values.toList().take(wantCount)
+        val recalled = out.values.toList()
+        val tasteArtists = taste?.topArtists.orEmpty().associate { normalizeKey(it.name) to it.affinity.toDouble() }
+        // 搜索次序只代表召回热度。最终顺序再叠加长期口味、近期正负行为；
+        // 用户反复跳过/删掉某类歌后，即使它仍是搜索热榜，也会自然沉底。
+        val ranked = recalled.mapIndexed { index, track ->
+            val searchPrior = 1.0 - index.toDouble() / maxOf(1, recalled.size)
+            val behaviorScore = behaviorPreference.scoreTrack(behaviorDelta, track)
+            val artistTaste = track.artist
+                .split('/', '&', ',', '、')
+                .maxOfOrNull { tasteArtists[normalizeKey(it)] ?: 0.0 }
+                ?: 0.0
+            track to (searchPrior * 0.45 + behaviorScore * 0.40 + artistTaste * 0.15)
+        }
+            .sortedByDescending { it.second }
+            .map { it.first }
+        val artistCount = HashMap<String, Int>()
+        val titleFamilies = HashSet<String>()
+        val result = ArrayList<NativeTrack>(wantCount)
+        for (track in ranked) {
+            val family = TrackDedupe.recommendationTitleKey(track.title)
+            if (family.isNotBlank() && family in titleFamilies) continue
+            val artist = track.firstArtistKey()
+            val count = artistCount[artist] ?: 0
+            if (count >= 2) continue
+            if (anchorArtistKey != null && artist == anchorArtistKey && count >= 1) continue
+            result.add(track)
+            artistCount[artist] = count + 1
+            if (family.isNotBlank()) titleFamilies.add(family)
+            if (result.size >= wantCount) break
+        }
+        return result
     }
 
     private fun buildOnlineSeeds(
@@ -411,20 +462,10 @@ class RecommendEngine(
         for (e in eras) seeds.add(e)
         for (c in cultural) seeds.add(c)
 
-        // 冷启动兜底：taste 是空的（新用户没建画像 / 装库前）+ 没有 mood/genre/era/cultural →
-        // 上面所有循环都没 add。如果直接退化成"anchor.artist"，又回到"同 artist 热曲堆叠"
-        // 的老问题。给一组通用 mood/genre 种子保底，至少跨题材跨调子搜
+        // 冷启动不再注入裸 pop/city-pop 固定种子。没有可靠语义时宁可不搜，
+        // 避免把搜索服务的默认热榜误当成用户口味。
         if (seeds.isEmpty() && anchorArtist.isNotBlank()) {
             seeds.add("$anchorArtist 同类")
-            seeds.add("华语流行 经典")
-            seeds.add("indie folk")
-            seeds.add("city pop")
-            seeds.add("ambient")
-        } else if (seeds.isEmpty()) {
-            // 连 anchor 也没有的极端 cold start —— 只能给最大公约数
-            seeds.add("华语流行 经典")
-            seeds.add("indie folk")
-            seeds.add("city pop")
         }
 
         // 单独 anchor.artist 放最后兜底（且只放 1 个），不让它霸占 seeds
@@ -435,8 +476,12 @@ class RecommendEngine(
     // ============== utility ==============
 
     private fun logRecommendations(picks: List<Candidate>) {
-        if (picks.isEmpty()) return
-        runCatching { recommendationLog.logTracks(picks.map { it.track }, RecommendationLog.Source.Pet) }
+        logRecommendationTracks(picks.map { it.track })
+    }
+
+    private fun logRecommendationTracks(tracks: List<NativeTrack>) {
+        if (tracks.isEmpty()) return
+        runCatching { recommendationLog.logTracks(tracks, RecommendationLog.Source.Pet) }
     }
 
     private data class Candidate(

@@ -8,6 +8,7 @@
  */
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { AppIcon } from "./AppIcon";
 
 type Props = {
   href?: string;
@@ -17,36 +18,30 @@ type Props = {
 export function BackButton({ href, label = "返回" }: Props) {
   const router = useRouter();
 
-  // 跟 distill 顶部 BackIcon 严格同源（18 svg + 1.85 stroke + 8x14 chevron）—— 否则
-  // /settings、/taste、/login 几页的返回图标会比 distill 一眼小一圈，体验不齐
-  const inner = (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.85" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M16 5l-8 7 8 7" />
-    </svg>
-  );
+  const inner = <AppIcon name="back" size={18} />;
 
   if (href) {
     return (
-      <Link href={href} aria-label={label} title={label} style={chip}>
+      <Link href={href} aria-label={label} title={label} style={chip} className="platform-icon-button">
         {inner}
       </Link>
     );
   }
   return (
-    <button onClick={() => router.back()} aria-label={label} title={label} style={chip}>
+    <button onClick={() => router.back()} aria-label={label} title={label} style={chip} className="platform-icon-button">
       {inner}
     </button>
   );
 }
 
-// 30x30 直角线框 icon button，跟 Android 内页设置风格统一。
+// 桌面顶栏统一光学盒；圆角与按压反馈由 platform-icon-button 按 OS 接管。
 const chip: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
-  width: 30,
-  height: 30,
-  borderRadius: 0,
+  width: 34,
+  height: 34,
+  borderRadius: 8,
   border: "1px solid rgba(233,239,255,0.10)",
   background: "transparent",
   color: "rgba(245,247,255,0.86)",

@@ -8,6 +8,7 @@
 //! 所以这里只需要一份调用逻辑，按 caller 传进来的 base_url / api_key / model 路由即可。
 //! 后续如果接 Anthropic / Gemini 这种不兼容协议的，再单独写一支。
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -15,7 +16,27 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const CHAT_TIMEOUT_SECS: u64 = 180;
+// Android Agent 一轮有明确 wall-clock deadline；请求必须比 Kotlin bridge timeout 更早
+// 收口，否则 Kotlin 取消后 native 线程会继续挂着等待网络。
+const CHAT_TIMEOUT_SECS: u64 = 24;
+const EMBEDDING_TIMEOUT_SECS: u64 = 60;
+
+type CachedClient = std::result::Result<Client, String>;
+
+static CHAT_HTTP_CLIENT: OnceLock<CachedClient> = OnceLock::new();
+static EMBEDDING_HTTP_CLIENT: OnceLock<CachedClient> = OnceLock::new();
+
+fn cached_http_client(cache: &'static OnceLock<CachedClient>, timeout_secs: u64) -> Result<Client> {
+    match cache.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| format!("构造 http client 失败：{e}"))
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(message) => Err(anyhow!(message.clone())),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
@@ -88,10 +109,7 @@ pub async fn chat(
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(CHAT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
+    let client = cached_http_client(&CHAT_HTTP_CLIENT, CHAT_TIMEOUT_SECS)?;
 
     let restricted = is_openai_restricted(model);
     let body = ChatReq {
@@ -169,10 +187,7 @@ pub async fn chat_tools(
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(CHAT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
+    let client = cached_http_client(&CHAT_HTTP_CLIENT, CHAT_TIMEOUT_SECS)?;
 
     let restricted = is_openai_restricted(model);
     let mut body = json!({
@@ -273,10 +288,7 @@ pub async fn embeddings(
     }
 
     let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
-    let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| anyhow!("构造 http client 失败：{e}"))?;
+    let client = cached_http_client(&EMBEDDING_HTTP_CLIENT, EMBEDDING_TIMEOUT_SECS)?;
 
     let body = EmbedReq {
         model,

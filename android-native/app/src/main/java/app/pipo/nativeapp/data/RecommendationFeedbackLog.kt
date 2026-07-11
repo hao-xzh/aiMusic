@@ -15,16 +15,20 @@ class RecommendationFeedbackLog(context: Context) {
     data class RejectedContext(
         val trackIds: Set<Long>,
         val songKeys: Set<String>,
+        val trackRefs: Set<String> = emptySet(),
     ) {
         fun contains(track: NativeTrack): Boolean {
             val id = track.neteaseId
-            return (id != null && id in trackIds) || TrackDedupe.songKey(track) in songKeys
+            return (id != null && id in trackIds) ||
+                (track.id in trackRefs || TrackDedupe.idKey(track)?.let { it in trackRefs } == true) ||
+                TrackDedupe.compatibleKeys(track).any { it in songKeys }
         }
     }
 
     private data class Event(
         val contextKey: String,
         val trackId: Long?,
+        val trackRef: String,
         val songKey: String,
         val tsSec: Long,
         val sourceText: String,
@@ -44,6 +48,7 @@ class RecommendationFeedbackLog(context: Context) {
         val event = Event(
             contextKey = contextKey,
             trackId = track.neteaseId,
+            trackRef = TrackDedupe.idKey(track) ?: track.id,
             songKey = TrackDedupe.songKey(track),
             tsSec = now,
             sourceText = sourceText.take(180),
@@ -60,6 +65,40 @@ class RecommendationFeedbackLog(context: Context) {
         flush()
     }
 
+    /** Manual removal is a durable, context-independent dislike. */
+    @Synchronized
+    fun reject(track: NativeTrack) {
+        val now = System.currentTimeMillis() / 1000
+        val event = Event(
+            contextKey = GLOBAL_CONTEXT,
+            trackId = track.neteaseId,
+            trackRef = TrackDedupe.idKey(track) ?: track.id,
+            songKey = TrackDedupe.songKey(track),
+            tsSec = now,
+            sourceText = "manual_queue_remove",
+        )
+        val buf = ensureBuffer()
+            .filterNot { it.contextKey == GLOBAL_CONTEXT &&
+                (it.trackRef == event.trackRef || it.songKey == event.songKey ||
+                    (it.trackId != null && it.trackId == event.trackId)) }
+            .toMutableList()
+        buf.add(event)
+        buffer = trimFresh(buf, now)
+        flush()
+    }
+
+    /** Global hard negatives, used by every recommendation entry point. */
+    @Synchronized
+    fun globallyRejected(): RejectedContext {
+        val now = System.currentTimeMillis() / 1000
+        val matched = trimFresh(ensureBuffer(), now).filter { it.contextKey == GLOBAL_CONTEXT }
+        return RejectedContext(
+            trackIds = matched.mapNotNullTo(HashSet()) { it.trackId },
+            songKeys = matched.mapTo(HashSet()) { it.songKey },
+            trackRefs = matched.mapTo(HashSet()) { it.trackRef },
+        )
+    }
+
     @Synchronized
     fun rejectedForIntent(intent: PetIntent): RejectedContext {
         val contextKey = contextKeyForIntent(intent)
@@ -71,6 +110,7 @@ class RecommendationFeedbackLog(context: Context) {
         return RejectedContext(
             trackIds = matched.mapNotNullTo(HashSet()) { it.trackId },
             songKeys = matched.mapTo(HashSet()) { it.songKey },
+            trackRefs = matched.mapTo(HashSet()) { it.trackRef },
         )
     }
 
@@ -91,6 +131,7 @@ class RecommendationFeedbackLog(context: Context) {
                         Event(
                             contextKey = key,
                             trackId = if (o.has("trackId")) o.optLong("trackId") else null,
+                            trackRef = o.optString("trackRef", ""),
                             songKey = songKey,
                             tsSec = o.optLong("ts"),
                             sourceText = o.optString("sourceText"),
@@ -110,6 +151,7 @@ class RecommendationFeedbackLog(context: Context) {
             arr.put(JSONObject().apply {
                 put("contextKey", event.contextKey)
                 event.trackId?.let { put("trackId", it) }
+                if (event.trackRef.isNotBlank()) put("trackRef", event.trackRef)
                 put("songKey", event.songKey)
                 put("ts", event.tsSec)
                 put("sourceText", event.sourceText)
@@ -119,17 +161,25 @@ class RecommendationFeedbackLog(context: Context) {
     }
 
     private fun trimFresh(events: List<Event>, nowSec: Long): MutableList<Event> {
-        val fresh = events.filter { nowSec - it.tsSec <= TTL_SEC }
-            .sortedBy { it.tsSec }
-            .takeLast(MAX_EVENTS)
-        return fresh.toMutableList()
+        val fresh = events.filter {
+            // Manual deletion is an explicit durable preference and does not expire.
+            // Contextual rejections remain soft and may age out as the user's mood changes.
+            it.contextKey == GLOBAL_CONTEXT || nowSec - it.tsSec <= SOFT_TTL_SEC
+        }.sortedBy { it.tsSec }
+        val hard = fresh.filter { it.contextKey == GLOBAL_CONTEXT }.takeLast(MAX_HARD_EVENTS)
+        val soft = fresh.filter { it.contextKey != GLOBAL_CONTEXT }
+            .takeLast((MAX_EVENTS - hard.size).coerceAtLeast(0))
+        val kept = (soft + hard).sortedBy { it.tsSec }.takeLast(MAX_EVENTS)
+        return kept.toMutableList()
     }
 
     companion object {
         private const val PREFS_NAME = "claudio_recommendation_feedback"
         private const val KEY = "context_rejections_v1"
         private const val MAX_EVENTS = 500
-        private const val TTL_SEC = 30L * 24 * 3600
+        private const val MAX_HARD_EVENTS = 300
+        private const val SOFT_TTL_SEC = 30L * 24 * 3600
+        private const val GLOBAL_CONTEXT = "__global_manual_rejection__"
 
         fun contextKeyForIntent(intent: PetIntent): String {
             val tokens = buildList {

@@ -352,7 +352,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             .put("system", system)
             .put("temperature", temperature)
             .put("maxTokens", maxTokens)
-        return parseJsonString(callRaw("ai_chat", args, timeoutMs = AI_CALL_TIMEOUT_MS))
+        return parseJsonString(callRaw("ai_chat", args, timeoutMs = AI_CHAT_CALL_TIMEOUT_MS))
     }
 
     override suspend fun aiChatTools(
@@ -368,13 +368,13 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             .put("maxTokens", maxTokens)
         // 成功时 bridge 原样回传 assistant message JSON 对象（含 tool_calls）。
         // callRaw 只在出现顶层 "error" 字段时抛错；普通 message 不含该字段，原样返回。
-        return callRaw("ai_chat_tools", args, timeoutMs = AI_CALL_TIMEOUT_MS)
+        return callRaw("ai_chat_tools", args, timeoutMs = AI_CHAT_CALL_TIMEOUT_MS)
     }
 
     override suspend fun aiEmbed(inputs: List<String>): List<FloatArray> {
         if (inputs.isEmpty()) return emptyList()
         val args = JSONObject().put("inputs", JSONArray(inputs))
-        val arr = callArray("ai_embed", args, timeoutMs = AI_CALL_TIMEOUT_MS)
+        val arr = callArray("ai_embed", args, timeoutMs = AI_EMBED_CALL_TIMEOUT_MS)
         val out = ArrayList<FloatArray>(arr.length())
         for (i in 0 until arr.length()) {
             val vec = arr.optJSONArray(i) ?: continue
@@ -408,14 +408,17 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         // 关键是上层 viewModelScope 不会永久 pending(协程堆积、歌词不显示、续杯不来
         // 都会消解)。
         //
-        // 默认 30s 是按网易 API 估的(正常 RTT < 2s)。AI chat/tools/embed 一轮带大上下文
-        // 经常超 30s,Rust 端 reqwest 自己的硬超时是 60s —— 所以 AI 类命令用
-        // AI_CALL_TIMEOUT_MS(75s) 让 Rust 先返回,避免 Kotlin 提前掐断一个其实会成功的调用。
+        // 默认 30s 是按网易 API 估的(正常 RTT < 2s)。AI chat/tools 的 Rust 硬超时
+        // 是 24s；embedding 仍保留 60s。Kotlin 分别多留 3/5s，让 Rust 先收口，
+        // 避免 Kotlin 提前取消 JNI 协程后留下仍在网络中的 zombie bridge 线程。
         return try {
             withTimeout(timeoutMs) {
                 withContext(bridgeDispatcher) {
                     invokeNative(command, args.toString()).also { raw ->
                         val trimmed = raw.trimStart()
+                        if (trimmed.isBlank()) {
+                            throw RustBridgeException(command, "empty response")
+                        }
                         if (trimmed.startsWith("{")) {
                             val obj = runCatching { JSONObject(raw) }.getOrNull()
                             // 显式 error 字段 → bridge 层传上来的错误(不是网易业务码)
@@ -451,8 +454,10 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     companion object {
         private const val DEFAULT_CALL_TIMEOUT_MS = 30_000L
 
-        /** AI 类命令(chat/tools/embed):Rust reqwest 硬超时 60s,Kotlin 留 75s 让 Rust 先返回。 */
-        private const val AI_CALL_TIMEOUT_MS = 75_000L
+        /** Chat/tools: Rust 硬超时 24s，Kotlin 留 27s 等 Rust 收口。 */
+        private const val AI_CHAT_CALL_TIMEOUT_MS = 27_000L
+        /** Embedding 可批处理较大输入；Rust 60s，Kotlin 留 65s。 */
+        private const val AI_EMBED_CALL_TIMEOUT_MS = 65_000L
 
         private const val BRIDGE_PARALLELISM = 6
         private val bridgeDispatcher = Executors.newFixedThreadPool(BRIDGE_PARALLELISM) { task ->

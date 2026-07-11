@@ -9,6 +9,7 @@ object TrackDedupe {
     private val PAREN_RE = Regex("（.*?）|\\(.*?\\)|\\[.*?\\]")
     private val SPACE_RE = Regex("\\s+")
     private val VERSION_RE = Regex("live|remix|伴奏|纯音乐|cover|翻唱", RegexOption.IGNORE_CASE)
+    private val POP_TITLE_FAMILY_RE = Regex("(?<![a-z])(?:city\\s*[-_]?\\s*)?pop(?![a-z])", RegexOption.IGNORE_CASE)
 
     fun normalizeTitle(name: String): String {
         return name.lowercase()
@@ -24,6 +25,29 @@ object TrackDedupe {
         val artist = normalizeTitle(firstArtist)
         return "$title::$artist"
     }
+
+    /**
+     * 推荐列表的标题族键。除了精确同名，还把 Pop Night / City Pop Mix / K-Pop
+     * 这类搜索服务常成批返回的模板化标题归为同一族；不会误伤 popcorn 等单词。
+     */
+    fun recommendationTitleKey(name: String): String {
+        val withoutVersions = name.lowercase().replace(PAREN_RE, " ").replace(VERSION_RE, " ")
+        if (POP_TITLE_FAMILY_RE.containsMatchIn(withoutVersions)) return "family:pop"
+        return normalizeTitle(name)
+    }
+
+    /** IDs used by different catalog/account paths. Keep title key as the final fallback. */
+    fun compatibleKeys(t: NativeTrack): Set<String> = linkedSetOf<String>().apply {
+        add(songKey(t))
+        idKey(t)?.let { add(it) }
+        t.neteaseId?.let { add("netease:$it") }
+    }
+
+    fun idKey(t: NativeTrack): String? =
+        t.id.trim().takeIf { it.isNotEmpty() }?.let { "id:${normalizeId(it)}" }
+
+    private fun normalizeId(value: String): String =
+        value.lowercase().trim().replace(Regex("\\s+"), "")
 
     fun dedupe(items: List<NativeTrack>): List<NativeTrack> {
         val seen = HashSet<String>()
@@ -54,6 +78,25 @@ object TrackDedupe {
             if (c >= perTitle) continue
             titleCounts[titleKey] = c + 1
             out.add(t)
+        }
+        return out
+    }
+
+    /** Generic recommendation-only cap for template title families such as Pop *. */
+    fun capRecommendationTitleFamily(items: List<NativeTrack>, perFamily: Int = 1): List<NativeTrack> {
+        if (items.size <= 1) return items
+        val counts = HashMap<String, Int>()
+        val out = ArrayList<NativeTrack>(items.size)
+        for (track in items) {
+            val key = recommendationTitleKey(track.title)
+            if (key.isBlank()) {
+                out.add(track)
+                continue
+            }
+            val count = counts[key] ?: 0
+            if (count >= perFamily) continue
+            counts[key] = count + 1
+            out.add(track)
         }
         return out
     }

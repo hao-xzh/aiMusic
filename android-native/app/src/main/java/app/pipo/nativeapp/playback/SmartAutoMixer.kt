@@ -205,24 +205,46 @@ internal class SmartAutoMixer(
     }
 
     private fun updateArmedMix(waiting: ArmedMix) {
-        val plan = waiting.plan
+        var plan = waiting.plan
         if (!PlaybackSessionClock.isCurrent(plan.queueVersion)) {
-            DiagnosticsLogStore.record(
-                area = "transition",
-                event = "stale_transition_cancel",
-                fields = mapOf(
-                    "pairKey" to plan.key,
-                    "planQueueVersion" to plan.queueVersion,
-                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
-                    "stage" to "armed",
-                ),
-            )
-            cancel("stale-transition-plan", keepMainVolume = true)
-            return
+            if (isPlanQueuePairLive(plan)) {
+                val liveQueueVersion = PlaybackSessionClock.currentQueueVersion()
+                DiagnosticsLogStore.record(
+                    area = "transition",
+                    event = "queue_version_changed_pair_preserved",
+                    fields = mapOf(
+                        "pairKey" to plan.key,
+                        "planQueueVersion" to plan.queueVersion,
+                        "currentQueueVersion" to liveQueueVersion,
+                        "stage" to "armed",
+                    ),
+                )
+                plan = plan.copy(queueVersion = liveQueueVersion)
+                waiting.plan = plan
+            } else {
+                DiagnosticsLogStore.record(
+                    area = "transition",
+                    event = "stale_transition_cancel",
+                    fields = mapOf(
+                        "pairKey" to plan.key,
+                        "planQueueVersion" to plan.queueVersion,
+                        "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
+                        "stage" to "armed",
+                    ),
+                )
+                cancel("stale-transition-plan", keepMainVolume = true)
+                return
+            }
         }
         val currentId = mainPlayer.currentMediaItem?.mediaId
         if (currentId != plan.currentId) {
             cancel("armed-current-changed", keepMainVolume = true)
+            return
+        }
+        if (!isPlanQueuePairLive(plan)) {
+            // Assistant set/add、AI 队列重排或下一首 URL 重签都可能不经过同一套
+            // queueVersion；直接核验 live timeline，避免拿旧 nextMediaItem 启动 B。
+            cancel("armed-next-changed", keepMainVolume = true)
             return
         }
         if (mainPlayer.playbackState != Player.STATE_READY) return
@@ -256,31 +278,26 @@ internal class SmartAutoMixer(
      * @return true 表示已交给实时 crossfade;false 则调用方继续走 main-only。
      */
     private fun startRealtimeCrossfade(waiting: ArmedMix, remainingMs: Long): Boolean {
-        val plan = waiting.plan
+        var plan = waiting.plan
         if (plan.targetTransitionMode != TransitionMode.RealtimeCrossfade) return false
         if (!REALTIME_CROSSFADE_ENABLED || !SeamlessRuntimeFlags.current.realtimeCrossfadeV2Enabled) return false
         val controller = crossfadeController ?: return false
         if (controller.isRunning) return false
         if (!PlaybackSessionClock.isCurrent(plan.queueVersion)) {
-            cancel("stale-transition-plan", keepMainVolume = true)
-            DiagnosticsLogStore.record(
-                area = "transition",
-                event = "stale_transition_cancel",
-                fields = mapOf(
-                    "pairKey" to plan.key,
-                    "planQueueVersion" to plan.queueVersion,
-                    "currentQueueVersion" to PlaybackSessionClock.currentQueueVersion(),
-                    "stage" to "realtime_start",
-                ),
-            )
-            return false
+            if (!isPlanQueuePairLive(plan)) {
+                cancel("stale-transition-plan", keepMainVolume = true)
+                return false
+            }
+            plan = plan.copy(queueVersion = PlaybackSessionClock.currentQueueVersion())
+            waiting.plan = plan
         }
         if (remainingMs < MIN_REALTIME_CROSSFADE_MS) return false
         // 主控必须正播在当前曲,否则接续点/位置对不上。
         if (mainPlayer.currentMediaItem?.mediaId != plan.currentId) return false
+        if (!isPlanQueuePairLive(plan)) return false
         if (!mainPlayer.playWhenReady || mainPlayer.playbackState != Player.STATE_READY) return false
         val nextGain = PlaybackGain.linearForRms(featuresStore.get(plan.nextId)?.rmsDb)
-        controller.start(
+        val started = controller.start(
             nextMediaItem = plan.nextMediaItem,
             nextIndex = plan.nextIndex,
             nextStartMs = plan.nextStartPositionMs,
@@ -290,6 +307,7 @@ internal class SmartAutoMixer(
             queueVersion = plan.queueVersion,
             pairKey = plan.key,
         )
+        if (!started) return false
         armed = null
         logMixEvent(
             "realtime_crossfade_started",
@@ -545,6 +563,7 @@ internal class SmartAutoMixer(
         val nextItem = mainPlayer.getMediaItemAt(nextIndex)
         val currentTrack = currentItem.toNativeTrack() ?: return null
         val nextTrack = nextItem.toNativeTrack() ?: return null
+        if (currentTrack.streamUrl.isBlank() || nextTrack.streamUrl.isBlank()) return null
         // 特征时长与元数据不符 = 特征是从截断/不同版本音频上分析的，它描述的
         // outro/intro 根本不是这条音频的真实首尾——在这种特征上做切歌决策，
         // 就是“人声没唱完就切”的来源之一。当缺失处理（走活体幅度兜底）。
@@ -598,6 +617,8 @@ internal class SmartAutoMixer(
             key = "${currentTrack.id}->${nextTrack.id}",
             queueVersion = queueVersion,
             currentId = currentTrack.id,
+            currentIndex = currentIndex,
+            currentMediaItem = currentItem,
             nextId = nextTrack.id,
             nextIndex = nextIndex,
             nextStartPositionMs = mix.nextStartPositionMs,
@@ -1468,9 +1489,33 @@ internal class SmartAutoMixer(
     }
 
     private fun nextIndex(currentIndex: Int): Int? {
-        if (currentIndex + 1 < mainPlayer.mediaItemCount) return currentIndex + 1
-        if (mainPlayer.repeatMode == Player.REPEAT_MODE_ALL && mainPlayer.mediaItemCount > 1) return 0
-        return null
+        // Media3 的 next index 会同时遵循 shuffle order 与 repeat-all；repeat-one 的自动
+        // 播放会留在当前曲，因此不能按它的“手动 next 等同 repeat-off”语义规划混音。
+        if (mainPlayer.repeatMode == Player.REPEAT_MODE_ONE) return null
+        val nextIndex = mainPlayer.nextMediaItemIndex
+        return nextIndex.takeIf { it != C.INDEX_UNSET && it != currentIndex }
+    }
+
+    private fun isPlanQueuePairLive(plan: AutoMixPlan): Boolean {
+        val currentIndex = mainPlayer.currentMediaItemIndex
+        if (currentIndex != plan.currentIndex) return false
+        if (nextIndex(currentIndex) != plan.nextIndex) return false
+        val liveCurrent = mainPlayer.currentMediaItem ?: return false
+        if (!samePlaybackItem(liveCurrent, plan.currentMediaItem)) return false
+        if (plan.nextIndex !in 0 until mainPlayer.mediaItemCount) return false
+        val liveNext = mainPlayer.getMediaItemAt(plan.nextIndex)
+        return samePlaybackItem(liveNext, plan.nextMediaItem)
+    }
+
+    private fun samePlaybackItem(left: MediaItem, right: MediaItem): Boolean {
+        val leftLocal = left.localConfiguration ?: return false
+        val rightLocal = right.localConfiguration ?: return false
+        if (leftLocal.uri.toString().isBlank() || rightLocal.uri.toString().isBlank()) return false
+        return left.mediaId == right.mediaId &&
+            leftLocal.uri == rightLocal.uri &&
+            leftLocal.customCacheKey == rightLocal.customCacheKey &&
+            left.clippingConfiguration.startPositionMs == right.clippingConfiguration.startPositionMs &&
+            left.clippingConfiguration.endPositionMs == right.clippingConfiguration.endPositionMs
     }
 
     private fun remainingMs(): Long? {
@@ -1585,6 +1630,8 @@ internal class SmartAutoMixer(
         val key: String,
         val queueVersion: Long,
         val currentId: String,
+        val currentIndex: Int,
+        val currentMediaItem: MediaItem,
         val nextId: String,
         val nextIndex: Int,
         val nextStartPositionMs: Long,
@@ -1617,7 +1664,7 @@ internal class SmartAutoMixer(
     )
 
     private data class ArmedMix(
-        val plan: AutoMixPlan,
+        var plan: AutoMixPlan,
         var tailDipTicks: Int = 0,
         var tempoLockApplied: Boolean = false,
     )

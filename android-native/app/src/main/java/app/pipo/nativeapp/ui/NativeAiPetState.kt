@@ -12,6 +12,8 @@ internal data class PetMessage(
     /** 非空时这条消息渲染成结果卡片(放歌/收藏/加歌单等),而不是纯文字气泡。 */
     val card: PetResultCard? = null,
     val createdAtMillis: Long = System.currentTimeMillis(),
+    /** Durable agent task id, used to make foreground callback + task observer delivery idempotent. */
+    val taskId: String? = null,
 )
 
 /**

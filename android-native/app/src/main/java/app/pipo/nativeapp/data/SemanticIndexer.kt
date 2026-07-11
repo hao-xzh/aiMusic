@@ -309,7 +309,9 @@ class SemanticIndexer(
         if (Regex("(folk|民谣|acoustic|unplugged)").containsMatchIn(t)) genres += "folk"
         if (Regex("(edm|dance|club|remix|电子|techno|house|trance)").containsMatchIn(t)) genres += "electronic"
         if (Regex("(rock|摇滚|indie rock|britpop)").containsMatchIn(t)) genres += "rock"
-        if (genres.isEmpty()) genres += "pop"
+        // Unknown metadata must remain unknown.  Defaulting every unclassified title to
+        // pop polluted long-term taste and made online fallback converge on pop/city-pop.
+        // Empty is intentional here; callers already treat missing genre as low confidence.
         return genres.distinct().take(3)
     }
 

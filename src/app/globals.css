@@ -37,6 +37,93 @@ body {
 
 button { font: inherit; }
 
+.appleLyricsFullscreen {
+  --apple-lyrics-page-padding: 10vw;
+  --apple-lyrics-cover-column-width: 32vw;
+  --apple-lyrics-column-width: 40vw;
+}
+
+@keyframes appleLyricFadeOut {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: var(--lyrics-display-synced-line-opacity, 1);
+  }
+}
+
+@keyframes appleLyricHeightExpand {
+  0% {
+    height: 0;
+  }
+  99% {
+    height: 80px;
+  }
+  100% {
+    height: auto;
+  }
+}
+
+@keyframes appleLyricHeightCollapse {
+  0% {
+    height: 80px;
+  }
+  100% {
+    height: 0;
+  }
+}
+
+[data-apple-lyrics-viewport="true"]::-webkit-scrollbar {
+  display: none;
+}
+
+[data-apple-lyrics-viewport="true"][data-apple-lyrics-scrolling="true"] {
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 80px, #000 calc(100% - 80px), transparent) !important;
+  mask-image: linear-gradient(180deg, transparent, #000 80px, #000 calc(100% - 80px), transparent) !important;
+}
+
+[data-apple-lyrics-viewport="true"] .display-synced-line {
+  display: block !important;
+}
+
+[data-apple-lyrics-viewport="true"] .line:has(.show-supplementary .supplementary):not(:has(.secondary.is-visible)) .primary-vocals,
+[data-apple-lyrics-viewport="true"] .line:has(.show-supplementary .supplementary):not(:has(.secondary.is-visible)) .background-vocals {
+  margin-bottom: -0.5em;
+}
+
+[data-yrc-group="true"].trailing-whitespace > [data-yrc-main="true"]::after {
+  content: "";
+  margin-right: 0.3ch;
+}
+
+[data-yrc-group="true"][data-yrc-group-align="end"].trailing-whitespace > [data-yrc-main="true"]::after {
+  margin-right: 0;
+  margin-left: 0.3ch;
+}
+
+@media (min-width: 1680px) {
+  .appleLyricsFullscreen {
+    --apple-lyrics-page-padding: 12vw;
+    --apple-lyrics-cover-column-width: 31vw;
+    --apple-lyrics-column-width: 38vw;
+  }
+}
+
+@media (min-width: 2000px) {
+  .appleLyricsFullscreen {
+    --apple-lyrics-page-padding: 13vw;
+    --apple-lyrics-cover-column-width: 30vw;
+    --apple-lyrics-column-width: 38vw;
+  }
+}
+
+@media (min-width: 2561px) {
+  .appleLyricsFullscreen {
+    --apple-lyrics-cover-column-width: calc(22.2vw + 199.68px);
+    --apple-lyrics-column-width: calc(28.12vw + 252.928px);
+  }
+}
+
 /* 干掉 Android / iOS WebView 的所有"原生"按下反馈：
  *   1. -webkit-tap-highlight-color：tap 一瞬间出现的蓝色覆盖（iOS / Android Chromium WebView）
  *   2. focus / focus-visible / focus-within outline：键盘 / tap 后留下的蓝色描边
@@ -63,6 +150,194 @@ button, a, [role="button"], [tabindex] {
   outline: none !important;
   -webkit-tap-highlight-color: transparent !important;
 }
+
+/* ===== Desktop icon system =====
+ * AppIcon keeps one semantic name and ships two optical drawings. macOS uses
+ * compact SF-like shapes; Windows uses lighter Fluent-like geometry. */
+.app-icon {
+  display: inline-grid;
+  place-items: center;
+  width: var(--app-icon-size, 20px);
+  height: var(--app-icon-size, 20px);
+  min-width: var(--app-icon-size, 20px);
+  min-height: var(--app-icon-size, 20px);
+  flex: 0 0 auto;
+  line-height: 0;
+  vertical-align: -0.125em;
+}
+
+.app-icon__glyph {
+  grid-area: 1 / 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.app-icon__glyph--windows { display: none; }
+html[data-platform="windows"] .app-icon__glyph--mac { display: none; }
+html[data-platform="windows"] .app-icon__glyph--windows { display: block; }
+
+.platform-icon-button {
+  position: relative;
+  display: inline-grid !important;
+  place-items: center;
+  flex: 0 0 auto;
+  line-height: 0 !important;
+  transform: translateZ(0);
+  transition:
+    color 150ms ease,
+    background-color 150ms ease,
+    border-color 150ms ease,
+    opacity 150ms ease,
+    transform 150ms cubic-bezier(.2,.7,.2,1) !important;
+}
+
+.platform-icon-button:hover:not(:disabled) {
+  background-color: rgba(255,255,255,.075) !important;
+}
+
+.platform-icon-button:active:not(:disabled) {
+  transform: scale(.94) translateZ(0);
+}
+
+.platform-icon-button:focus-visible {
+  outline: 2px solid rgba(155,227,198,.86) !important;
+  outline-offset: 2px !important;
+}
+
+html[data-platform="mac"] .platform-icon-button,
+html:not([data-platform]) .platform-icon-button,
+html[data-platform="unknown"] .platform-icon-button {
+  border-radius: 9px !important;
+}
+
+html[data-platform="windows"] .platform-icon-button {
+  border-radius: 4px !important;
+}
+
+.platform-action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: opacity 150ms ease, transform 150ms cubic-bezier(.2,.7,.2,1) !important;
+}
+.platform-action-button:active:not(:disabled) { transform: scale(.975); }
+.platform-action-button:focus-visible {
+  outline: 2px solid rgba(155,227,198,.86) !important;
+  outline-offset: 2px !important;
+}
+html[data-platform="mac"] .platform-action-button,
+html:not([data-platform]) .platform-action-button,
+html[data-platform="unknown"] .platform-action-button { border-radius: 8px !important; }
+html[data-platform="windows"] .platform-action-button { border-radius: 4px !important; }
+
+.platform-nav-rail {
+  box-sizing: border-box;
+  border: 1px solid rgba(255,255,255,.075);
+  background: rgba(9,11,18,.18);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.035);
+}
+
+html[data-platform="mac"] .platform-nav-rail,
+html:not([data-platform]) .platform-nav-rail,
+html[data-platform="unknown"] .platform-nav-rail {
+  border-radius: 14px;
+  -webkit-backdrop-filter: blur(18px) saturate(1.18);
+  backdrop-filter: blur(18px) saturate(1.18);
+}
+
+html[data-platform="windows"] .platform-nav-rail {
+  border-radius: 6px;
+  background: rgba(18,20,28,.42);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+@keyframes appIconMeter {
+  0%, 100% { transform: scaleY(.52); }
+  45% { transform: scaleY(1); }
+}
+
+.app-icon--playing .app-icon__meter {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: appIconMeter 820ms ease-in-out infinite;
+}
+.app-icon--playing .app-icon__meter--2 { animation-delay: -240ms; }
+.app-icon--playing .app-icon__meter--3 { animation-delay: -480ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .app-icon--playing .app-icon__meter { animation: none; }
+}
+
+/* Desktop immersive playback scrubber. The real range input owns pointer and
+ * keyboard behavior; only its native track/thumb paint is replaced. */
+.immersive-progress {
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  display: block;
+  cursor: pointer;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.immersive-progress::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    currentColor 0 var(--immersive-progress),
+    rgba(255,255,255,.18) var(--immersive-progress) 100%
+  );
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+}
+
+.immersive-progress::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border: 0;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 1px 5px rgba(0,0,0,.32);
+  appearance: none;
+  -webkit-appearance: none;
+  transition: transform 120ms ease;
+}
+
+.immersive-progress:hover::-webkit-slider-thumb,
+.immersive-progress:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.16);
+}
+
+.immersive-progress::-moz-range-track {
+  height: 4px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255,255,255,.18);
+}
+
+.immersive-progress::-moz-range-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.immersive-progress::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 1px 5px rgba(0,0,0,.32);
+}
+
+.immersive-progress:disabled { cursor: default; }
 
 @keyframes claudioPulse {
   0%, 100% { transform: scale(1); opacity: 1; }
@@ -202,7 +477,7 @@ button, a, [role="button"], [tabindex] {
  * 这条 overlay z-index: 100、position: fixed、top: 0，会盖住我们的 Nav。
  * 所以 Windows 下把 body 内容下推 32px，给 overlay 让位。
  */
-html[data-platform="windows"] body {
+html[data-runtime="tauri"][data-platform="windows"] body {
   padding-top: 32px;
 }
 
@@ -225,10 +500,10 @@ html[data-platform="android"] .safe-top {
    Mac 红黄绿 / Win decorum 三键 —— 这些行不像 distill 的封面那样要全屏贴边。
    distill 封面 + play page floating bar 自己 inline 设置 paddingLeft/Right，
    会覆盖下面这两条规则（inline 优先级高）。 */
-html[data-platform="mac"] .safe-top {
+html[data-runtime="tauri"][data-platform="mac"] .safe-top {
   padding-left: 112px;
 }
-html[data-platform="windows"] .safe-top {
+html[data-runtime="tauri"][data-platform="windows"] .safe-top {
   padding-right: 152px;
 }
 .safe-bottom {
@@ -253,18 +528,39 @@ html[data-platform="android"] .safe-bottom {
   --titlebar-fg-hover: rgba(245, 247, 255, 1);
 }
 
-button.decorum-tb-btn {
+html[data-runtime="tauri"][data-platform="windows"] button.decorum-tb-btn {
+  width: 46px !important;
+  min-width: 46px !important;
+  height: 32px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  display: inline-grid !important;
+  place-items: center !important;
+  line-height: 32px !important;
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets" !important;
+  font-size: 10px !important;
+  font-weight: 300 !important;
   color: var(--titlebar-fg) !important;
-  transition: color 320ms ease, background 160ms ease;
+  background-color: transparent !important;
+  transition: color 160ms ease, background-color 100ms ease !important;
 }
-button.decorum-tb-btn:hover {
+html[data-runtime="tauri"][data-platform="windows"] button.decorum-tb-btn:hover {
   color: var(--titlebar-fg-hover) !important;
+  background-color: rgba(127,127,127,.18) !important;
 }
-/* SVG 图标内部用 currentColor 跟随 button color；同时强行覆盖 stroke/fill
- * 防 decorum 自带的 inline 颜色覆盖我们 */
-button.decorum-tb-btn svg,
-button.decorum-tb-btn svg * {
-  color: currentColor !important;
-  stroke: currentColor !important;
-  fill: currentColor !important;
+html[data-runtime="tauri"][data-platform="windows"] button.decorum-tb-btn:active {
+  background-color: rgba(127,127,127,.28) !important;
+}
+html[data-runtime="tauri"][data-platform="windows"] button.decorum-tb-btn:focus-visible {
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.46) !important;
+}
+html[data-runtime="tauri"][data-platform="windows"] #decorum-tb-close:hover {
+  color: #fff !important;
+  background-color: #c42b1c !important;
+}
+html[data-runtime="tauri"][data-platform="windows"] #decorum-tb-close:active {
+  color: #fff !important;
+  background-color: #b21f18 !important;
 }

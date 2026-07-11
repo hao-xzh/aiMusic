@@ -66,6 +66,8 @@ function parseP(el: Element): ParsedP | null {
 
   const chars: YrcChar[] = [];
   const companions: YrcLine[] = [];
+  let romanParts: YrcTimingPart[] = [];
+  let romanFallbackText = "";
   let text = "";
 
   for (const node of Array.from(el.childNodes)) {
@@ -82,7 +84,15 @@ function parseP(el: Element): ParsedP | null {
 
     const role = attr(child, "role", TTM_NS) ?? attr(child, "role");
     if (role === "x-translation" || role === "x-roman") {
-      const companionText = directText(child).trim();
+      const companionText = textContentDeep(child).trim();
+      if (role === "x-roman") {
+        const timedRomanParts = parseTimedTextParts(child);
+        if (timedRomanParts.length > 0) {
+          romanParts = timedRomanParts;
+          romanFallbackText = companionText;
+          continue;
+        }
+      }
       if (companionText) {
         companions.push({
           time: beginSec,
@@ -98,8 +108,7 @@ function parseP(el: Element): ParsedP | null {
     if (role === "x-bg") {
       const bgBegin = parseTimeAttr(child, "begin") ?? beginSec;
       const bgEnd = parseTimeAttr(child, "end") ?? endSec;
-      const bgLine = parseBackgroundVocalSpan(child, bgBegin, bgEnd);
-      if (bgLine) companions.push(bgLine);
+      companions.push(...parseBackgroundVocalSpan(child, bgBegin, bgEnd));
       continue;
     }
 
@@ -120,7 +129,20 @@ function parseP(el: Element): ParsedP | null {
     }
   }
 
-  const mergedChars = mergeAdjacentAsciiLyricChars(chars);
+  const romanAttached = attachWordSupplementary(
+    mergeAdjacentAsciiLyricChars(chars),
+    romanParts,
+  );
+  if (!romanAttached.attached && romanFallbackText) {
+    companions.push({
+      time: beginSec,
+      durSec: endSec - beginSec,
+      text: romanFallbackText,
+      chars: [],
+      role: "romaji",
+    });
+  }
+  const mergedChars = romanAttached.chars;
   const finalText = text || mergedChars.map((char) => char.text).join("");
   if (!finalText.trim()) return null;
   return {
@@ -133,8 +155,9 @@ function parseP(el: Element): ParsedP | null {
   };
 }
 
-function parseBackgroundVocalSpan(el: Element, beginSec: number, endSec: number): YrcLine | null {
+function parseBackgroundVocalSpan(el: Element, beginSec: number, endSec: number): YrcLine[] {
   const chars: YrcChar[] = [];
+  const translations: YrcLine[] = [];
   let text = "";
   for (const node of Array.from(el.childNodes)) {
     if (node.nodeType === Node.TEXT_NODE) {
@@ -148,6 +171,19 @@ function parseBackgroundVocalSpan(el: Element, beginSec: number, endSec: number)
     const child = node as Element;
     if (child.localName !== "span") continue;
     const role = attr(child, "role", TTM_NS) ?? attr(child, "role");
+    if (role === "x-translation") {
+      const translationText = directText(child).trim();
+      if (translationText) {
+        translations.push({
+          time: beginSec,
+          durSec: Math.max(0.001, endSec - beginSec),
+          text: translationText,
+          chars: [],
+          role: "background-translation",
+        });
+      }
+      continue;
+    }
     if (role != null) continue;
 
     const spanText = directText(child);
@@ -167,14 +203,14 @@ function parseBackgroundVocalSpan(el: Element, beginSec: number, endSec: number)
 
   const mergedChars = mergeAdjacentAsciiLyricChars(chars);
   const finalText = text || mergedChars.map((char) => char.text).join("");
-  if (!finalText.trim()) return null;
-  return {
+  if (!finalText.trim()) return translations;
+  return [{
     time: beginSec,
     durSec: Math.max(0.001, endSec - beginSec),
     text: finalText,
     chars: mergedChars,
     role: "companion",
-  };
+  }, ...translations];
 }
 
 function toYrcLine(parsed: ParsedP, role: YrcLineRole, alignment: YrcLineAlignment): YrcLine {
@@ -228,6 +264,87 @@ function directText(el: Element): string {
   return text;
 }
 
+function textContentDeep(el: Element): string {
+  return el.textContent ?? "";
+}
+
+function parseTimedTextParts(el: Element): YrcTimingPart[] {
+  const parts: YrcTimingPart[] = [];
+  for (const child of elementsByLocalName(el.ownerDocument, "span")) {
+    if (child.parentElement !== el) continue;
+    const role = attr(child, "role", TTM_NS) ?? attr(child, "role");
+    if (role != null) continue;
+    const beginSec = parseTimeAttr(child, "begin");
+    const endSec = parseTimeAttr(child, "end");
+    const text = directText(child);
+    if (beginSec == null || endSec == null || endSec <= beginSec || !text) continue;
+    parts.push({
+      startSec: beginSec,
+      durSec: Math.max(0.001, endSec - beginSec),
+      text,
+    });
+  }
+  return parts.sort((a, b) => a.startSec - b.startSec);
+}
+
+function attachWordSupplementary(
+  chars: YrcChar[],
+  parts: YrcTimingPart[],
+): { chars: YrcChar[]; attached: boolean } {
+  if (chars.length === 0 || parts.length === 0) {
+    return { chars, attached: false };
+  }
+  if (chars.length === parts.length) {
+    return {
+      chars: chars.map((char, index) => ({
+        ...char,
+        supplementaryText: parts[index]?.text || char.supplementaryText,
+      })),
+      attached: true,
+    };
+  }
+
+  const used = new Set<number>();
+  let attachedCount = 0;
+  const nextChars = chars.map((char) => {
+    const matchIndex = bestSupplementaryPartIndex(char, parts, used);
+    if (matchIndex < 0) return char;
+    used.add(matchIndex);
+    attachedCount += 1;
+    return {
+      ...char,
+      supplementaryText: parts[matchIndex]?.text || char.supplementaryText,
+    };
+  });
+  return { chars: nextChars, attached: attachedCount > 0 };
+}
+
+function bestSupplementaryPartIndex(
+  char: YrcChar,
+  parts: YrcTimingPart[],
+  used: Set<number>,
+): number {
+  const charStart = char.startSec;
+  const charEnd = char.startSec + Math.max(0.001, char.durSec);
+  const charMid = (charStart + charEnd) / 2;
+  let bestIndex = -1;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  parts.forEach((part, index) => {
+    if (used.has(index)) return;
+    const partStart = part.startSec;
+    const partEnd = part.startSec + Math.max(0.001, part.durSec);
+    const overlap = Math.min(charEnd, partEnd) - Math.max(charStart, partStart);
+    const partMid = (partStart + partEnd) / 2;
+    const midpointPenalty = Math.abs(charMid - partMid);
+    const score = overlap > 0 ? overlap * 10 - midpointPenalty : -midpointPenalty;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  });
+  return bestScore > -0.25 ? bestIndex : -1;
+}
+
 function appendTextToLastChar(chars: YrcChar[], text: string) {
   if (chars.length === 0) return;
   const last = chars[chars.length - 1]!;
@@ -243,6 +360,7 @@ function mergeAdjacentAsciiLyricChars(chars: YrcChar[]): YrcChar[] {
       merged[merged.length - 1] = {
         ...prev,
         text: prev.text + char.text,
+        supplementaryText: mergeSupplementaryText(prev.supplementaryText, char.supplementaryText),
         timingParts: [...timingPartsOrSelf(prev), ...timingPartsOrSelf(char)],
       };
     } else if (prev && shouldMergeAsciiFragments(prev.text, char.text)) {
@@ -253,6 +371,7 @@ function mergeAdjacentAsciiLyricChars(chars: YrcChar[]): YrcChar[] {
         startSec: start,
         durSec: Math.max(0.001, end - start),
         text: prev.text + char.text,
+        supplementaryText: mergeSupplementaryText(prev.supplementaryText, char.supplementaryText),
         timingParts: parts,
       };
     } else {
@@ -266,6 +385,12 @@ function timingPartsOrSelf(char: YrcChar): YrcTimingPart[] {
   return char.timingParts && char.timingParts.length > 0
     ? char.timingParts
     : [{ startSec: char.startSec, durSec: char.durSec, text: char.text }];
+}
+
+function mergeSupplementaryText(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return `${left}${right}`;
 }
 
 function shouldAttachTrailingPunctuation(left: string, right: string): boolean {

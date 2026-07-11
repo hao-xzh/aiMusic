@@ -139,8 +139,17 @@ internal fun LandscapePlayerLyricsScreen(
                             lyricFontWeight = FontWeight.Bold,
                             bottomFadeStart = 0.90f,
                             bottomFadeSoftEnd = 0.98f,
-                            // 横屏把固定歌词位置整体下移 60dp（竖屏 ImmersiveLyrics 不传，保持不变）。
-                            anchorBiasDp = 60.dp,
+                            // 锚点改到顶部后同步收窄渐隐区；否则高横屏按百分比计算的
+                            // 20% mask 会把已经贴近标题的当前句也压暗。
+                            topFadeTransparentEnd = 0f,
+                            topFadePartialEnd = 0.02f,
+                            topFadeSolidEnd = 0.05f,
+                            // 90dp 只保护极短横屏/分屏不把当前句裁到 viewport 外；常规与
+                            // 平板横屏均由 8dp 上限决定，锚点不会随可用高度越长越远离标题。
+                            anchorBiasDp = 90.dp,
+                            anchorTopCapDp = 8.dp,
+                            // 横屏也按真实可用宽度排满再换行，不为“两行等长”提前折行。
+                            naturalSyllableWrap = true,
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth(),

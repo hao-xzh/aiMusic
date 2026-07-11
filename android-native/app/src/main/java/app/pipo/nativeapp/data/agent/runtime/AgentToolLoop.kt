@@ -31,6 +31,7 @@ import app.pipo.nativeapp.data.agent.queue.AgentQueuePlanner
 import app.pipo.nativeapp.data.agent.reply.ReplyGrounder
 import app.pipo.nativeapp.data.agent.resolve.MusicResolver
 import app.pipo.nativeapp.data.agent.resolve.PlaylistResolver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import org.json.JSONArray
@@ -49,7 +50,7 @@ class AgentToolLoop(
         executor: AgentActionExecutor,
     ): TurnOutcome? {
         val turnId = UUID.randomUUID().toString()
-        val state = LoopState(turnId = turnId, userText = input.userText)
+        val state = LoopState(turnId = turnId, userText = input.userText, startedAtMs = System.currentTimeMillis())
         val messages = mutableListOf(
             JSONObject()
                 .put("role", "system")
@@ -59,18 +60,22 @@ class AgentToolLoop(
                 .put("content", buildUserPrompt(input, state)),
         )
         val tools = toolSchemas().toString()
-        val startedAtMs = System.currentTimeMillis()
+        val startedAtMs = state.startedAtMs
+        val deadlineAtMs = startedAtMs + TURN_BUDGET_MS
 
         repeat(MAX_STEPS) { step ->
-            if (System.currentTimeMillis() - startedAtMs > TURN_BUDGET_MS) {
+            if (System.currentTimeMillis() >= deadlineAtMs) {
                 state.trace("turn_budget_exhausted:$step")
                 return salvageOutcome(input, executor, state, reason = "turn_budget_exhausted")
+                    ?: throw unavailableFailure(state, "turn_budget_exhausted")
             }
-            val raw = aiChatToolsWithRetry(messages, tools, state)
+            val raw = aiChatToolsWithRetry(messages, tools, state, deadlineAtMs)
                 ?: return salvageOutcome(input, executor, state, reason = "aiChatTools_failed")
+                    ?: throw unavailableFailure(state, "aiChatTools_failed")
             val assistant = parseAssistantMessage(raw) ?: run {
                 state.trace("assistant_parse_failed")
                 return salvageOutcome(input, executor, state, reason = "assistant_parse_failed")
+                    ?: throw unavailableFailure(state, "assistant_parse_failed")
             }
             messages.add(assistant)
             val content = cleanString(assistant.opt("content"))
@@ -100,6 +105,7 @@ class AgentToolLoop(
             }
         }
         return salvageOutcome(input, executor, state, reason = "max_steps_exhausted")
+            ?: throw unavailableFailure(state, "max_steps_exhausted")
     }
 
     /**
@@ -110,8 +116,15 @@ class AgentToolLoop(
         messages: List<JSONObject>,
         tools: String,
         state: LoopState,
+        deadlineAtMs: Long,
     ): String? {
         repeat(2) { attempt ->
+            val remainingMs = deadlineAtMs - System.currentTimeMillis()
+            if (remainingMs < MIN_RETRY_WINDOW_MS) {
+                state.trace("aiChatTools_deadline_before_attempt${attempt + 1}:remainingMs=${remainingMs.coerceAtLeast(0)}")
+                return null
+            }
+            val callStartedAtMs = System.currentTimeMillis()
             runCatching {
                 repository.aiChatTools(
                     messagesJson = JSONArray(messages).toString(),
@@ -120,21 +133,82 @@ class AgentToolLoop(
                     maxTokens = 1400,
                 )
             }.fold(
-                onSuccess = { return it },
+                onSuccess = {
+                    DiagnosticsLogStore.record(
+                        area = "ai_agent",
+                        event = "tool_llm_stage",
+                        fields = mapOf(
+                            "turnId" to state.turnId,
+                            "stage" to "tools",
+                            "attempt" to attempt + 1,
+                            "elapsedMs" to (System.currentTimeMillis() - callStartedAtMs),
+                            "remainingMs" to (deadlineAtMs - System.currentTimeMillis()).coerceAtLeast(0),
+                            "success" to true,
+                        ),
+                    )
+                    return it
+                },
                 onFailure = { error ->
-                    val message = error.message ?: error::class.java.simpleName
-                    state.trace("aiChatTools_attempt${attempt + 1}_failed:$message")
-                    if (attempt == 0 && isRetryableLlmError(message)) delay(1200) else return null
+                    if (error is CancellationException) throw error
+                    val message = error.message.orEmpty()
+                    val safeError = safeProviderError(message, error)
+                    val retryable = isRetryableLlmError(message)
+                    state.lastProviderError = safeError
+                    state.lastProviderFailureRetryable = retryable
+                    val elapsedMs = System.currentTimeMillis() - callStartedAtMs
+                    DiagnosticsLogStore.record(
+                        area = "ai_agent",
+                        event = "tool_llm_stage",
+                        fields = mapOf(
+                            "turnId" to state.turnId,
+                            "stage" to "tools",
+                            "attempt" to attempt + 1,
+                            "elapsedMs" to elapsedMs,
+                            "remainingMs" to (deadlineAtMs - System.currentTimeMillis()).coerceAtLeast(0),
+                            "success" to false,
+                            "providerError" to safeError,
+                        ),
+                    )
+                    state.trace("aiChatTools_attempt${attempt + 1}_failed:$safeError")
+                    val afterFailureMs = deadlineAtMs - System.currentTimeMillis()
+                    if (attempt == 0 && retryable && afterFailureMs >= MIN_RETRY_WINDOW_MS) {
+                        delay(minOf(RETRY_DELAY_MS, (afterFailureMs - MIN_RETRY_WINDOW_MS).coerceAtLeast(0)))
+                    } else return null
                 },
             )
         }
         return null
     }
 
+    /** 只保留错误类型/HTTP 状态，避免把 provider 返回体中的 prompt 或敏感字段写入日志。 */
+    private fun safeProviderError(message: String, error: Throwable): String {
+        val lower = message.lowercase()
+        val status = Regex("\\b[45]\\d\\d\\b").find(message)?.value
+        val category = when {
+            status in setOf("400", "403", "404", "405", "409", "422") -> "client_http"
+            status == "408" || status == "429" || status?.startsWith("5") == true -> "transient_http"
+            "timeout" in lower || "timed out" in lower -> "timeout"
+            "api key" in lower || "unauthorized" in lower || "401" in lower -> "auth"
+            "请求失败" in message || "network" in lower || "connect" in lower -> "network"
+            else -> null
+        }
+        return listOfNotNull(error::class.java.simpleName, status, category)
+            .joinToString(":")
+            .ifBlank { "provider_error" }
+    }
+
     private fun isRetryableLlmError(message: String): Boolean {
         val lower = message.lowercase()
-        return "api key" !in lower && "401" !in lower && "还没填" !in message
+        val definiteClientFailure = listOf("400", "401", "403", "404", "405", "409", "422")
+            .any { Regex("\\b$it\\b").containsMatchIn(message) }
+        return !definiteClientFailure && "api key" !in lower && "unauthorized" !in lower && "还没填" !in message
     }
+
+    private fun unavailableFailure(state: LoopState, reason: String): AgentTurnExecutionException =
+        AgentTurnExecutionException(
+            retryable = state.lastProviderFailureRetryable,
+            reason = listOf(reason, state.lastProviderError).filter { it.isNotBlank() }.joinToString(":"),
+        )
 
     /**
      * LLM 轮失败 / 步数·时间预算耗尽时的统一收口。顺序：
@@ -345,12 +419,14 @@ class AgentToolLoop(
                 .put("error", "arguments_json_malformed")
                 .put("message", "这次的 arguments 不是完整 JSON（可能被截断）。请精简参数后重新调用 ${call.name}：列表类参数只留必要项，长文案缩短。")
         }
+        val toolStartedAtMs = System.currentTimeMillis()
+        var toolFailure: Throwable? = null
         val observation = runCatching {
             when (call.name) {
                 "list_playlists" -> listPlaylists(state)
                 "get_playlist_tracks" -> getPlaylistTracks(call.arguments, state)
                 "search_tracks" -> searchTracks(call.arguments, state)
-                "draft_queue" -> draftQueue(call.arguments, input, state)
+                "draft_queue" -> draftQueue(call.arguments, input, executor, state)
                 "commit_queue" -> commitQueue(call.arguments, input, executor, state)
                 "final_response" -> finalResponse(call.arguments, input, state)
                 "skip_current" -> skipCurrent(input, executor, state)
@@ -372,11 +448,23 @@ class AgentToolLoop(
                     .put("error", "unknown_tool:${call.name}")
             }
         }.getOrElse { error ->
+            toolFailure = error
             JSONObject()
                 .put("ok", false)
                 .put("tool", call.name)
                 .put("error", error.message ?: error::class.java.simpleName)
         }
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "tool_stage",
+            fields = mapOf(
+                "turnId" to state.turnId,
+                "tool" to call.name,
+                "elapsedMs" to (System.currentTimeMillis() - toolStartedAtMs),
+                "success" to observation.optBoolean("ok", false),
+                "errorType" to (toolFailure?.let { it::class.java.simpleName } ?: ""),
+            ),
+        )
         // 模型在执行工具上声明 more_actions_pending=false = 「这是本轮最后一个动作」。
         // 工具成功后直接收尾，省掉那轮只为说“结束”的 final_response（回复反正由
         // ReplyGrounder 按真实结果生成，final 文本不会被用到）。失败不收尾，让模型修复。
@@ -391,7 +479,7 @@ class AgentToolLoop(
     }
 
     private suspend fun listPlaylists(state: LoopState): JSONObject {
-        val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        val playlists = availablePlaylists()
         val cloudCount = runCatching { repository.cachedTracksFor(CLOUD_DISK_PLAYLIST_ID)?.size ?: 0 }.getOrDefault(0)
         val arr = JSONArray()
         if (cloudCount > 0) {
@@ -421,7 +509,7 @@ class AgentToolLoop(
                 runCatching { repository.cloudDiskTracks() }.getOrDefault(emptyList())
             id != Long.MIN_VALUE -> runCatching { repository.tracksForPlaylist(id) }.getOrDefault(emptyList())
             else -> {
-                val playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+                val playlists = availablePlaylists()
                 val playlist = PlaylistResolver().resolve(name, playlists)?.playlist
                 playlist?.let { runCatching { repository.tracksForPlaylist(it.id) }.getOrDefault(emptyList()) }.orEmpty()
             }
@@ -433,6 +521,15 @@ class AgentToolLoop(
             .put("trackCount", tracks.size)
             .put("tracks", arr)
             .put("error", if (tracks.isEmpty()) "playlist_empty_or_not_found" else JSONObject.NULL)
+    }
+
+    private suspend fun availablePlaylists(): List<PipoPlaylist> {
+        var playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        if (playlists.isEmpty()) {
+            runCatching { repository.refreshPlaylists() }
+            playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+        }
+        return playlists
     }
 
     private suspend fun searchTracks(args: JSONObject, state: LoopState): JSONObject {
@@ -453,6 +550,7 @@ class AgentToolLoop(
     private suspend fun draftQueue(
         args: JSONObject,
         input: AgentTurnInput,
+        executor: AgentActionExecutor,
         state: LoopState,
     ): JSONObject {
         val action = playRequestFromArgs(args, input)
@@ -480,6 +578,24 @@ class AgentToolLoop(
         state.resolution = resolution.summary
         state.queuePlan = queuePlan.actions.joinToString(",") { describeAction(it) }
         state.trace("draft_queue:$draftId:${play?.tracks?.size ?: 0}:${queuePlan.validation.passed}")
+        val valid = play != null && play.tracks.isNotEmpty() && queuePlan.validation.passed
+        // 单一播放请求在 draft 校验通过后直接提交，省掉“只为调用 commit_queue”的第二次
+        // LLM。多动作由模型把 more_actions_pending=true 传进来，仍会继续工具循环。
+        val moreActionsPending = args.optBoolean("more_actions_pending", false) ||
+            hasLikelyMultipleActions(input.userText)
+        if (valid && !moreActionsPending) {
+            val playToCommit = requireNotNull(play)
+            val blocked = blockedCommitReason(playToCommit.mode, state)
+            if (blocked == null) {
+                val committed = commitPlayTracks(resolution.plan.copy(actions = queuePlan.actions), queuePlan.validation, playToCommit, executor, state)
+                if (committed.optBoolean("ok", false)) {
+                    state.done = true
+                    return committed
+                        .put("draftId", draftId)
+                        .put("autoCommitted", true)
+                }
+            }
+        }
         return JSONObject()
             .put("ok", play != null && play.tracks.isNotEmpty())
             .put("draftId", draftId)
@@ -489,6 +605,19 @@ class AgentToolLoop(
             .put("trackTotal", play?.tracks?.size ?: 0)
             .put("tracks", play?.tracks.orEmpty().take(15).toTrackArray(state))
             .put("error", if (play == null || play.tracks.isEmpty()) "empty_draft_queue" else JSONObject.NULL)
+    }
+
+    private fun hasLikelyMultipleActions(userText: String): Boolean {
+        val compact = userText.replace(Regex("\\s+"), "")
+        val connector = listOf("然后", "同时", "并且", "并").any { it in compact }
+        val insert = listOf("插播", "下一首", "接下来").any { it in compact }
+        val playback = compact.contains("播放") || compact.contains("放")
+        val likeOrPlaylist = listOf("收藏", "喜欢", "改歌单", "加入歌单", "移出歌单").any { it in compact }
+        // “下一首插播 X”是一个动作，不能因为同时出现“下一首”和“放”就误判成多动作。
+        // 只有明确连接词、收藏/歌单动作，或带标点的“整组播放 + 插播”才继续循环。
+        return connector ||
+            likeOrPlaylist && (playback || insert) ||
+            playback && insert && (compact.contains("，") || compact.contains(",") || compact.contains("再"))
     }
 
     private suspend fun commitQueue(
@@ -1206,6 +1335,7 @@ class AgentToolLoop(
             .put("target_title", stringSchema("Specific first/next track title"))
             .put("target_artist", stringSchema("Specific first/next artist hint"))
             .put("jump_to_inserted", booleanSchema("LLM semantic decision for insert_next: true means jump immediately, false means keep current song playing and only queue next"))
+            .put("more_actions_pending", moreActionsPendingSchema())
             .put("must_include_titles", arraySchema("Track titles that must appear"))
             .put("closer_title", stringSchema("Track title requested at the end"))
             .put("exclude_terms", arraySchema("Artists/languages/styles to avoid"))
@@ -1274,6 +1404,7 @@ class AgentToolLoop(
     private class LoopState(
         val turnId: String,
         val userText: String,
+        val startedAtMs: Long,
     ) {
         val tracks = LinkedHashMap<String, NativeTrack>()
         private val trackKeyById = HashMap<String, String>()
@@ -1283,6 +1414,8 @@ class AgentToolLoop(
         var normalizedPlan: String = ""
         var resolution: String = ""
         var queuePlan: String = ""
+        var lastProviderError: String = ""
+        var lastProviderFailureRetryable: Boolean = true
         var lastAssistantContent: String = ""
 
         /** 模型调用 final_response 收尾、或执行工具声明 more_actions_pending=false 后置 true，让循环立即结束。 */
@@ -1344,7 +1477,8 @@ class AgentToolLoop(
         fun nextDraftId(): String = "d${++draftSeq}"
 
         fun trace(value: String) {
-            traceLines.add(value.take(120))
+            val elapsed = (System.currentTimeMillis() - startedAtMs).coerceAtLeast(0)
+            traceLines.add("${elapsed}ms:$value".take(160))
         }
     }
 
@@ -1368,7 +1502,10 @@ class AgentToolLoop(
         private const val DEFAULT_INSERT_BATCH_COUNT = 6
 
         /** 整轮 wall-clock 预算：超过就不再开新的 LLM 轮，直接 salvage 收口，防止极端慢网把用户晾几分钟。 */
-        private const val TURN_BUDGET_MS = 110_000L
+        private const val TURN_BUDGET_MS = 60_000L
+        /** 单次 Kotlin bridge AI call 最长 27s，留出少量收口余量再允许尝试。 */
+        private const val MIN_RETRY_WINDOW_MS = 28_000L
+        private const val RETRY_DELAY_MS = 600L
 
         private val BATCH_PLAYBACK_HINTS = listOf(
             "一批", "一组", "一套", "一些", "几首", "多首", "多来", "来点", "歌单", "专场",
@@ -1392,8 +1529,8 @@ class AgentToolLoop(
 【循环纪律】
 1. 每一轮都必须至少调用一个工具。纯聊天 / 澄清 / 诚实说明做不到时，调用 final_response。
 2. 要播放、排歌、插歌、打开歌单、收藏、改歌单，必须真正调用对应执行工具；绝不能只在 final_response 里口头答应。
-3. 先观察再提交：用 list_playlists / get_playlist_tracks / search_tracks / draft_queue 看到真实候选，再 commit_queue。draft_queue 会跑本地解析+排序+校验，commit_queue 才真正交给播放器。
-4. 工具失败时按 observation 修复：换 query、换 playlist、搜具体歌、放宽 artist_scope、重新 draft，再 commit，直到能播。
+3. 先观察再提交：用 list_playlists / get_playlist_tracks / search_tracks / draft_queue 看到真实候选。draft_queue 会跑本地解析+排序+校验；单一播放请求校验成功时会自动 commit，只有要继续其它动作时才传 more_actions_pending=true 并随后 commit_queue。
+4. 工具失败时按 observation 修复：换 query、换 playlist、搜具体歌、放宽 artist_scope、重新 draft，再 commit，直到能播。draft_queue 校验成功且没有后续动作时会自动提交，不要再重复 commit；若这句话还有后续动作，请给 draft_queue 传 more_actions_pending=true。
 5. 不要编造歌名、歌手、歌单名或“已经放好”。final_response 只能描述工具已成功提交的动作；没成功就如实说没找到 / 没放成，不要假装完成。
 6. 执行工具（commit_queue / skip_current / like_current / like_track / modify_playlist_current）都有 more_actions_pending 参数：这是本轮最后一个动作就传 false——成功后回合立即结束，回复由系统按真实结果生成，不用再调 final_response；这句话里还有别的动作没做就传 true。
 

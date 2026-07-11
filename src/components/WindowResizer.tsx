@@ -12,7 +12,7 @@
  * 仅在 Windows 启用；其它平台返回 null，不影响 macOS 已经原生支持的 frame resize。
  */
 
-import { useEffect, useState } from "react";
+import { usePlatformInfo } from "@/lib/use-platform";
 
 const EDGES = ["s", "e", "w", "se", "sw"] as const;
 type Edge = (typeof EDGES)[number];
@@ -34,15 +34,8 @@ const CURSORS: Record<Edge, string> = {
 };
 
 export function WindowResizer() {
-  const [enabled, setEnabled] = useState(false);
-
-  useEffect(() => {
-    if (typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent)) {
-      setEnabled(true);
-    }
-  }, []);
-
-  if (!enabled) return null;
+  const { platform, runtime } = usePlatformInfo();
+  if (runtime !== "tauri" || platform !== "windows") return null;
 
   const onDown = async (e: React.MouseEvent, edge: Edge) => {
     // 只响应主键，避免右键/中键误触发

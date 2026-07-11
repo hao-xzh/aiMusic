@@ -8,6 +8,7 @@
     "build:tauri": "node scripts/build-tauri.mjs",
     "start": "next start -p 4321",
     "typecheck": "tsc --noEmit",
+    "verify:apple-lyrics": "node scripts/verify-apple-lyrics.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

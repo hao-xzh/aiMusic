@@ -13,6 +13,7 @@
  */
 
 import { BackButton } from "@/components/BackButton";
+import { AppIcon } from "@/components/AppIcon";
 import { netease, type QrCheck } from "@/lib/tauri";
 import Link from "next/link";
 import QRCode from "qrcode";
@@ -490,8 +491,8 @@ function LoginDone({
       <div style={{ fontSize: compact ? 19 : 22, fontWeight: 700 }}>
         已登录{nickname ? ` · ${nickname}` : ""}
       </div>
-      <Link href="/distill" style={playlistCta}>
-        进入我的歌单 →
+      <Link href="/distill" style={playlistCta} className="platform-action-button">
+        <span>进入我的歌单</span><AppIcon name="forward" size={13} />
       </Link>
     </div>
   );
@@ -622,6 +623,7 @@ const playlistCta: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
+  gap: 6,
   marginTop: 16,
   padding: "8px 14px",
   borderRadius: 0,

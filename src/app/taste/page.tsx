@@ -16,6 +16,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { BackButton } from "@/components/BackButton";
+import { AppIcon } from "@/components/AppIcon";
 import { cache, type TrackInfo } from "@/lib/tauri";
 import { loadTasteProfile, type TasteProfile } from "@/lib/taste-profile";
 import {
@@ -84,12 +85,16 @@ function EmptyState() {
         还没画过你的音乐画像
       </div>
       <div style={{ color: "#8a93a8", fontSize: 13, marginTop: 8, lineHeight: 1.6 }}>
-        去歌单页挑几张能代表你的歌单，按"✦ 蒸馏画像"。
+        去歌单页挑几张能代表你的歌单，按“
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 3, whiteSpace: "nowrap" }}>
+          <AppIcon name="sparkle" size={12} /> 蒸馏画像
+        </span>
+        ”。
         AI 会把这些歌单读完，把你的音乐性格画成一份结构化画像 ——
         后面的库外推荐和电台模式都基于它。
       </div>
-      <Link href="/distill" style={ctaBtn}>
-        去挑歌单 →
+      <Link href="/distill" style={ctaBtn} className="platform-action-button">
+        <span>去挑歌单</span><AppIcon name="forward" size={14} />
       </Link>
     </div>
   );
@@ -176,7 +181,7 @@ function ProfileView({ profile }: { profile: TasteProfile }) {
       <DiscoverySection profile={profile} />
 
       <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
-        <Link href="/distill" style={secondaryBtn}>
+        <Link href="/distill" style={secondaryBtn} className="platform-action-button">
           重新挑歌单蒸馏
         </Link>
       </div>
@@ -213,13 +218,15 @@ function BehaviorSummary() {
       {(stats.loveArtists.length > 0 || stats.skipHotArtists.length > 0) && (
         <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
           {stats.loveArtists.length > 0 && (
-            <div style={{ color: "#9be3c6" }}>
-              ❤ 反复完整听：{stats.loveArtists.slice(0, 6).join("、")}
+            <div style={{ color: "#9be3c6", display: "flex", alignItems: "center", gap: 6 }}>
+              <AppIcon name="heart" size={13} />
+              <span>反复完整听：{stats.loveArtists.slice(0, 6).join("、")}</span>
             </div>
           )}
           {stats.skipHotArtists.length > 0 && (
-            <div style={{ color: "rgba(255,180,180,0.85)" }}>
-              ✕ 反复跳过：{stats.skipHotArtists.slice(0, 6).join("、")}
+            <div style={{ color: "rgba(255,180,180,0.85)", display: "flex", alignItems: "center", gap: 6 }}>
+              <AppIcon name="close" size={12} />
+              <span>反复跳过：{stats.skipHotArtists.slice(0, 6).join("、")}</span>
             </div>
           )}
         </div>
@@ -554,16 +561,16 @@ function DiscoverySection({ profile }: { profile: TasteProfile }) {
           </div>
         </div>
         {state.kind === "idle" && (
-          <button onClick={() => void run()} style={primaryBtn}>
-            为我推荐 →
+          <button onClick={() => void run()} style={primaryBtn} className="platform-action-button">
+            <span>为我推荐</span><AppIcon name="forward" size={13} />
           </button>
         )}
         {state.kind === "ready" && (
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button onClick={playAll} style={primaryBtn}>
-              ▶ 全部进电台
+            <button onClick={playAll} style={primaryBtn} className="platform-action-button">
+              <AppIcon name="play" size={13} /><span>全部进电台</span>
             </button>
-            <button onClick={() => void run(true)} style={secondaryBtn}>
+            <button onClick={() => void run(true)} style={secondaryBtn} className="platform-action-button">
               换一批
             </button>
           </div>
@@ -773,10 +780,9 @@ function PickRow({
         onClick={() => onPlay(pick)}
         aria-label="播放"
         style={playBtn}
+        className="platform-icon-button"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2.4" strokeLinejoin="round" aria-hidden>
-          <path d="M8 5.5v13l11-6.5z" />
-        </svg>
+        <AppIcon name="play" size={14} />
       </button>
       <div style={voteGroup}>
         <button
@@ -806,6 +812,10 @@ const discoveryHeader: React.CSSProperties = {
 };
 
 const primaryBtn: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
   padding: "8px 14px",
   borderRadius: 0,
   border: "1px solid rgba(233,239,255,0.92)",
@@ -1030,7 +1040,10 @@ const emptyCard: React.CSSProperties = {
 };
 
 const ctaBtn: React.CSSProperties = {
-  display: "inline-block",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
   marginTop: 18,
   padding: "8px 14px",
   borderRadius: 0,
@@ -1115,6 +1128,10 @@ const weightLabel: React.CSSProperties = {
 };
 
 const secondaryBtn: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
   padding: "8px 14px",
   borderRadius: 0,
   border: "1px solid rgba(233,239,255,0.18)",

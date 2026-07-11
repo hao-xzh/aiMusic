@@ -13,7 +13,8 @@ import {
 } from "@/lib/tauri";
 import { useAppSettings } from "@/lib/app-settings";
 import { BackButton } from "@/components/BackButton";
-import { usePlatform } from "@/lib/use-platform";
+import { AppIcon } from "@/components/AppIcon";
+import { usePlatformInfo } from "@/lib/use-platform";
 import {
   useAnalysisProgress,
   startBackgroundAnalysis,
@@ -139,9 +140,9 @@ export default function SettingsPage() {
 }
 
 function SettingsTopBar() {
-  const platform = usePlatform();
-  const isMac = platform === "mac";
-  const isWin = platform === "windows";
+  const { platform, runtime } = usePlatformInfo();
+  const isMac = runtime === "tauri" && platform === "mac";
+  const isWin = runtime === "tauri" && platform === "windows";
   const isAndroid = platform === "android";
   const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
   const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "40px";
@@ -968,6 +969,7 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
         </div>
         <Link
           href="/login"
+          className="platform-action-button"
           style={{
             ...ghostLinkBtn,
             border: connected
@@ -984,6 +986,7 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
       {connected && (
         <Link
           href="/distill"
+          className="platform-action-button"
           style={{
             display: "flex",
             alignItems: "center",
@@ -997,14 +1000,14 @@ function NeteaseRow({ me, err }: { me: UserProfile | null | "loading"; err: stri
           }}
         >
           <div>
-            <div style={{ color: "#9be3c6", fontWeight: 700, fontSize: 15 }}>
-              进入我的歌单 →
+            <div style={{ color: "#9be3c6", fontWeight: 700, fontSize: 15, display: "flex", alignItems: "center", gap: 6 }}>
+              <span>进入我的歌单</span><AppIcon name="forward" size={14} />
             </div>
             <div style={{ color: "#8a93a8", fontSize: 12, marginTop: 2 }}>
               挑一张歌单，点一首歌，Pipo 会在主窗口原生播放。
             </div>
           </div>
-          <div style={{ color: "#9be3c6", fontSize: 22 }}>♪</div>
+          <AppIcon name="music" size={22} style={{ color: "#9be3c6" }} />
         </Link>
       )}
     </div>
@@ -1124,8 +1127,9 @@ function AnalysisRow() {
         </div>
       ) : progress.lastFinishedAt ? (
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <div style={{ color: "#9be3c6", fontSize: 13 }}>
-            ✓ 已分析 {progress.done} / {progress.total}
+          <div style={{ color: "#9be3c6", fontSize: 13, display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <AppIcon name="check" size={13} />
+            <span>已分析 {progress.done} / {progress.total}</span>
           </div>
           <button onClick={startResume} disabled={starting || clearing} style={ghostBtn}>
             {starting ? "启动中…" : "重新跑"}

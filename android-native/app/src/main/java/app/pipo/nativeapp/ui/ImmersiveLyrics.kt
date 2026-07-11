@@ -349,14 +349,20 @@ private fun ImmersiveLyricsColumnLayer(
             showTranslation = showTranslation,
             onSeekToMs = onSeekToMs,
             enterProgress = enterProgress,
-            topFadeTransparentEnd = 0.00f,
-            topFadePartialEnd = 0.00f,
-            topFadeSolidEnd = 0.00f,
-            anchorTopCapDp = 2.dp,
-            topHardClipDp = 8.dp,
-            hideRowsAboveAnchor = true,
+            lyricFontSize = 34.sp,
+            lyricLineHeight = 41.sp,
+            lyricFontWeight = FontWeight.Bold,
+            rowVerticalPadding = 7.75.dp,
+            useMobileAppleProfile = true,
+            // 当前页面的歌词 viewport 只有封面/标题下方半屏，不能继续按整屏 25%
+            // 下压锚点。14dp + 行内约 31dp 顶部间距后，字形从约 45dp 开始，刚好
+            // 越过 40dp 顶部渐隐区；相比上一版再上移一整行，同时保持当前句完整。
+            anchorTopCapDp = 14.dp,
             modifier = Modifier
                 .fillMaxSize()
+                // 这个页面上方仍保留正方形封面与曲名 controls；Apple 的歌词排版 token
+                // 只应用在剩余歌词 viewport 内。绘制、裁剪和 pointerInput 都位于 padding
+                // 之后，保证旧句不会穿进封面/标题，歌词命中区也不会盖住标题 controls。
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
                 .navigationBarsPadding()
                 .graphicsLayer {

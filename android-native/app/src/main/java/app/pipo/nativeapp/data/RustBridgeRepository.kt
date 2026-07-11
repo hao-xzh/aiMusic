@@ -838,7 +838,7 @@ class RustBridgeRepository(
         temperature: Float?,
         maxTokens: Int?,
     ): String {
-        return safe({ bridge.aiChat(system, user, temperature, maxTokens) }, { fallback.aiChat(system, user, temperature, maxTokens) })
+        return bridgeAiCall("ai_chat") { bridge.aiChat(system, user, temperature, maxTokens) }
     }
 
     override suspend fun aiChatTools(
@@ -847,10 +847,9 @@ class RustBridgeRepository(
         temperature: Float?,
         maxTokens: Int?,
     ): String {
-        return safe(
-            { bridge.aiChatTools(messagesJson, toolsJson, temperature, maxTokens) },
-            { fallback.aiChatTools(messagesJson, toolsJson, temperature, maxTokens) },
-        )
+        return bridgeAiCall("ai_chat_tools") {
+            bridge.aiChatTools(messagesJson, toolsJson, temperature, maxTokens)
+        }
     }
 
     override suspend fun aiEmbed(inputs: List<String>): List<FloatArray> {
@@ -875,6 +874,35 @@ class RustBridgeRepository(
             throw e
         } catch (_: Exception) {
             fallbackCall()
+        }
+    }
+
+    /** AI bridge 失败不能退成空字符串/演示结果，否则 Agent 会误判为模型正常返回。 */
+    private suspend fun <T> bridgeAiCall(stage: String, call: suspend () -> T): T {
+        val startedAt = System.currentTimeMillis()
+        return try {
+            call().also {
+                DiagnosticsLogStore.record(
+                    area = "ai_agent",
+                    event = "bridge_ai_stage",
+                    fields = mapOf("stage" to stage, "elapsedMs" to (System.currentTimeMillis() - startedAt), "success" to true),
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "bridge_ai_stage",
+                fields = mapOf(
+                    "stage" to stage,
+                    "elapsedMs" to (System.currentTimeMillis() - startedAt),
+                    "success" to false,
+                    "errorType" to e::class.java.simpleName,
+                    "providerError" to Regex("\\b[45]\\d\\d\\b").find(e.message.orEmpty())?.value.orEmpty(),
+                ),
+            )
+            throw e
         }
     }
 

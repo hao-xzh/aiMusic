@@ -19,11 +19,18 @@ export type YrcChar = {
   durSec: number;
   /** 文本（可能含尾空格 / 标点） */
   text: string;
+  /** Apple lyrics word-group supplementary text, e.g. per-word romanization. */
+  supplementaryText?: string;
   /** 细分时间片。没有时退回到自身时间。 */
   timingParts?: YrcTimingPart[];
 };
 
-export type YrcLineRole = "primary" | "companion" | "translation" | "romaji";
+export type YrcLineRole =
+  | "primary"
+  | "companion"
+  | "translation"
+  | "romaji"
+  | "background-translation";
 export type YrcLineAlignment = "start" | "end";
 
 export type YrcLine = {

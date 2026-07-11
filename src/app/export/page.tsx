@@ -4,8 +4,9 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { BackButton } from "@/components/BackButton";
+import { AppIcon } from "@/components/AppIcon";
 import { netease, wrapAudioUrl, type ExportedTrack, type TrackInfo } from "@/lib/tauri";
-import { usePlatform } from "@/lib/use-platform";
+import { usePlatformInfo } from "@/lib/use-platform";
 
 type Tone = "idle" | "ok" | "warn" | "err";
 
@@ -192,6 +193,7 @@ export default function ExportPage() {
               onClick={() => void search()}
               disabled={!canSearch || loggedIn === false}
               style={{ ...buttonStyle, ...primaryButton }}
+              className="platform-action-button"
             >
               <SearchIcon />
               搜索
@@ -205,6 +207,7 @@ export default function ExportPage() {
                 setStatus({ tone: "idle", text: "准备好了。" });
               }}
               style={buttonStyle}
+              className="platform-action-button"
             >
               清空
             </button>
@@ -272,9 +275,9 @@ export default function ExportPage() {
 }
 
 function ExportTopBar() {
-  const platform = usePlatform();
-  const isMac = platform === "mac";
-  const isWin = platform === "windows";
+  const { platform, runtime } = usePlatformInfo();
+  const isMac = runtime === "tauri" && platform === "mac";
+  const isWin = runtime === "tauri" && platform === "windows";
   const isAndroid = platform === "android";
   const safeTop = isAndroid ? "max(env(safe-area-inset-top), 28px)" : "0px";
   const barHeight = isAndroid ? `calc(${safeTop} + 48px)` : "40px";
@@ -336,6 +339,7 @@ function TrackRow({
           onClick={() => void onPreview(track)}
           disabled={!!busy}
           style={buttonStyle}
+          className="platform-action-button"
         >
           <PlaySmallIcon />
           {previewBusy ? "获取中" : "试听"}
@@ -345,6 +349,7 @@ function TrackRow({
           onClick={() => void onExport(track)}
           disabled={!!busy}
           style={{ ...buttonStyle, ...primaryButton }}
+          className="platform-action-button"
         >
           <DownloadIcon />
           {exportBusy ? "导出中" : "导出"}
@@ -387,30 +392,15 @@ function messageOf(error: unknown): string {
 }
 
 function SearchIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <circle cx="11" cy="11" r="7" />
-      <path d="M20 20l-3.5-3.5" />
-    </svg>
-  );
+  return <AppIcon name="search" size={15} />;
 }
 
 function PlaySmallIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-      <path d="M8 5v14l11-7z" />
-    </svg>
-  );
+  return <AppIcon name="play" size={15} />;
 }
 
 function DownloadIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 3v11" />
-      <path d="M7 10l5 5 5-5" />
-      <path d="M5 21h14" />
-    </svg>
-  );
+  return <AppIcon name="download" size={15} />;
 }
 
 const pageWrap: React.CSSProperties = {
