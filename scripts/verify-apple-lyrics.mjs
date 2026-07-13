@@ -578,7 +578,7 @@ async function verifyTransitionScenario(cdp) {
   assertTruthy("transition opening cover", opening.cover);
   assertNotEqual("transition opening backdrop color follows artwork", opening.backdrop?.backgroundColor, "rgb(0, 0, 0)");
   assertEqual("transition opening backdrop opacity", opening.backdrop?.opacity, "1");
-  assertEqual("transition opening backdrop uses opaque Apple color field", opening.backdrop?.backgroundImage, "none");
+  assertIncludes("transition opening backdrop uses artwork-derived color field", opening.backdrop?.backgroundImage ?? "", "gradient");
   assertIncludes("transition opening backdrop artwork image", opening.backdropArtwork?.backgroundImage ?? "", "url(");
   assertEqual("transition opening column transparent backing", opening.column?.backgroundColor, "rgba(0, 0, 0, 0)");
   assertEqual("transition opening column uses plus-lighter", opening.column?.mixBlendMode, "plus-lighter");
@@ -593,7 +593,7 @@ async function verifyTransitionScenario(cdp) {
   const openedPng = await captureNamedScreenshot(cdp, "apple-lyrics-transition-open-800ms.png");
   assertEqual("transition opened root", opened.transitionRoot?.dataOpen, "1");
   assertNotEqual("transition opened backdrop color follows artwork", opened.backdrop?.backgroundColor, "rgb(0, 0, 0)");
-  assertEqual("transition opened backdrop uses opaque Apple color field", opened.backdrop?.backgroundImage, "none");
+  assertIncludes("transition opened backdrop uses artwork-derived color field", opened.backdrop?.backgroundImage ?? "", "gradient");
   assertEqual("transition opened column uses plus-lighter", opened.column?.mixBlendMode, "plus-lighter");
   assertEqual("transition opened text blend layer stays normal", opened.lyricsBlendLayer?.mixBlendMode, "normal");
   assertIncludes("transition opened active lyric", opened.active.text ?? "", "That I just wanna get with you");
@@ -2441,15 +2441,15 @@ function assertViewportSample(spec, sample) {
   assertIncludes(`backdrop position ${spec.width}`, sample.backdrop.backgroundPosition, "50% 50%");
   assertIncludes(`backdrop size ${spec.width}`, sample.backdrop.backgroundSize, "cover");
   assertEqual(`backdrop opacity ${spec.width}`, sample.backdrop.opacity, "1");
-  assertEqual(`backdrop uses opaque Apple color field ${spec.width}`, sample.backdrop.backgroundImage, "none");
+  assertIncludes(`backdrop uses artwork-derived color field ${spec.width}`, sample.backdrop.backgroundImage, "gradient");
   assertTruthy(`backdrop blur artwork present ${spec.width}`, sample.backdropArtwork);
   assertIncludes(`desktop backdrop blur artwork image ${spec.width}`, sample.backdropArtwork?.backgroundImage ?? "", "url(");
   assertIncludes(`backdrop blur filter ${spec.width}`, sample.backdropArtwork?.filter, "blur(");
   assertIncludes(`backdrop saturate filter ${spec.width}`, sample.backdropArtwork?.filter, "saturate(");
   assertIncludes(`backdrop brightness filter ${spec.width}`, sample.backdropArtwork?.filter, "brightness(");
-  assertEqual(`backdrop artwork opacity ${spec.width}`, sample.backdropArtwork?.opacity, "0");
+  assertEqual(`backdrop artwork opacity ${spec.width}`, sample.backdropArtwork?.opacity, "0.82");
   assertTruthy(`backdrop veil present ${spec.width}`, sample.backdropVeil);
-  assertEqual(`backdrop veil is transparent ${spec.width}`, sample.backdropVeil?.backgroundColor, "rgba(0, 0, 0, 0)");
+  assertIncludes(`backdrop veil remains softly shaded ${spec.width}`, sample.backdropVeil?.backgroundImage ?? "", "gradient");
   assertTruthy(`lyric column veil present ${spec.width}`, sample.columnVeil);
   assertEqual(`lyric column veil is transparent ${spec.width}`, sample.columnVeil?.backgroundColor, "rgba(0, 0, 0, 0)");
   assertEqual(`lyric column veil opacity ${spec.width}`, sample.columnVeil?.opacity, "0");
@@ -2873,8 +2873,8 @@ function assertScrollSamples(scroll, options = {}) {
       springDamping,
     } = scroll.scrollAnimation;
     assertEqual(`${labelPrefix}scroll motion uses retained-velocity spring`, motion, "spring");
-    assertApprox(`${labelPrefix}scroll spring stiffness`, springStiffness, 140, 0.01);
-    assertApprox(`${labelPrefix}scroll spring damping`, springDamping, 24, 0.01);
+    assertApprox(`${labelPrefix}scroll spring stiffness`, springStiffness, 320, 0.01);
+    assertApprox(`${labelPrefix}scroll spring damping`, springDamping, 34, 0.01);
     assertEqual(`${labelPrefix}scroll target source follows Apple pre-current layout`, source, "previous-layout");
     assertEqual(`${labelPrefix}scroll target row index`, targetIndex, 1);
     assertApprox(`${labelPrefix}scroll fullscreen offset-ratio follows Apple`, offsetRatio, APPLE_LYRIC_FULLSCREEN_OFFSET_RATIO, 0.001);
@@ -2892,7 +2892,7 @@ function assertScrollSamples(scroll, options = {}) {
       const elapsed = Number.isFinite(frame.scrollElapsedMs)
         ? frame.scrollElapsedMs
         : frame.timingMs;
-      const expected = from + delta * springStepProgress(elapsed / 1000, 140, 24);
+      const expected = from + delta * springStepProgress(elapsed / 1000, 320, 34);
       assertApprox(`${labelPrefix}scrollTop ${frame.timingMs}ms shared spring`, frame.scrollTop, expected, tolerance);
     }
     assertBetween(
@@ -3370,7 +3370,7 @@ function assertContinuousPlaybackWindow(sample) {
   for (const frame of frames) {
     assertEqual(`continuous backdrop opaque ${frame.timingMs}ms`, frame.backdropOpacity, "1");
     assertNotEqual(`continuous backdrop color follows artwork ${frame.timingMs}ms`, frame.backdropBackgroundColor, "rgb(0, 0, 0)");
-    assertEqual(`continuous backdrop uses opaque Apple color field ${frame.timingMs}ms`, frame.backdropBackgroundImage, "none");
+    assertIncludes(`continuous backdrop uses cover-derived color field ${frame.timingMs}ms`, frame.backdropBackgroundImage, "gradient");
     assertEqual(`continuous column transparent ${frame.timingMs}ms`, frame.columnBackgroundColor, "rgba(0, 0, 0, 0)");
     assertContinuousActiveScrollPhase(`continuous active scroll target ${frame.timingMs}ms`, frame);
     assertAppleRowsUseBlock(`continuous row block display ${frame.timingMs}ms`, frame.rowStack);
@@ -3872,7 +3872,7 @@ function assertNonAdjacentSeekSample(sample) {
       const elapsed = Number.isFinite(frame.scrollElapsedMs)
         ? frame.scrollElapsedMs
         : frame.timingMs;
-      const expected = from + delta * springStepProgress(elapsed / 1000, 140, 24);
+      const expected = from + delta * springStepProgress(elapsed / 1000, 320, 34);
       assertApprox(`non-adjacent seek scrollTop ${frame.timingMs}ms spring`, frame.scrollTop, expected, tolerance);
     }
   }
@@ -4657,19 +4657,28 @@ function cssBlurPx(filter) {
 }
 
 function springStepProgress(timeSec, stiffness, damping) {
-  const discriminant = Math.max(0, damping * damping - 4 * stiffness);
-  const root = Math.sqrt(discriminant);
+  const t = Math.max(0, timeSec);
+  const omegaN = Math.sqrt(Math.max(0.001, stiffness));
+  const dampingRatio = damping / (2 * omegaN);
+  if (dampingRatio < 1 - 1e-6) {
+    const ratioRoot = Math.sqrt(1 - dampingRatio * dampingRatio);
+    const omegaD = omegaN * ratioRoot;
+    const remaining = Math.exp(-dampingRatio * omegaN * t) * (
+      Math.cos(omegaD * t) +
+      (dampingRatio / ratioRoot) * Math.sin(omegaD * t)
+    );
+    return 1 - remaining;
+  }
+  if (Math.abs(dampingRatio - 1) < 1e-6) {
+    return 1 - (1 + omegaN * t) * Math.exp(-omegaN * t);
+  }
+  const root = Math.sqrt(damping * damping - 4 * stiffness);
   const r1 = (-damping + root) / 2;
   const r2 = (-damping - root) / 2;
-  if (Math.abs(r1 - r2) < 1e-6) {
-    const omega = damping / 2;
-    return 1 - (1 + omega * timeSec) * Math.exp(-omega * timeSec);
-  }
   const a = -r2 / (r1 - r2);
   const b = r1 / (r1 - r2);
-  const remaining = a * Math.exp(r1 * Math.max(0, timeSec)) +
-    b * Math.exp(r2 * Math.max(0, timeSec));
-  return Math.max(0, Math.min(1, 1 - remaining));
+  const remaining = a * Math.exp(r1 * t) + b * Math.exp(r2 * t);
+  return 1 - remaining;
 }
 
 function cssEaseInOut(t) {

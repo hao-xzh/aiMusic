@@ -149,15 +149,20 @@ const FLIP_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
 const APPLE_LYRIC_FILTER_MS = 250;
 const APPLE_LYRIC_LAYOUT_MS = 400;
 // 350ms remains the nominal Apple cut duration and the desktop-path marker.
-// The actual movement is a retained-velocity spring shared with Android.
+// Desktop follows the same near-critical retained-velocity motion language as
+// the native renderer. The visible Apple-style spring comes from row cascade,
+// not from making the whole list bounce past its anchor.
 const APPLE_LYRIC_SCROLL_MS = 350;
-const APPLE_LYRIC_SCROLL_SPRING_STIFFNESS = 140;
-const APPLE_LYRIC_SCROLL_SPRING_DAMPING = 24;
+const APPLE_LYRIC_SCROLL_SPRING_STIFFNESS = 320;
+const APPLE_LYRIC_SCROLL_SPRING_DAMPING = 34;
 const APPLE_LYRIC_SCROLL_SPRING_POSITION_EPS_PX = 0.5;
 const APPLE_LYRIC_SCROLL_SPRING_VELOCITY_EPS_PX_S = 5;
 const APPLE_LYRIC_SCROLL_SPRING_MAX_FRAME_SEC = 0.032;
 const APPLE_LYRIC_SCROLL_SPRING_SUBSTEP_SEC = 0.008;
 const APPLE_LYRIC_SPATIAL_FOCUS_SPAN_ROWS = 1.15;
+const APPLE_LYRIC_SCROLL_CASCADE_PER_ROW = 0.045;
+const APPLE_LYRIC_SCROLL_CASCADE_MAX = 0.18;
+const APPLE_LYRIC_SCROLL_CASCADE_RADIUS_ROWS = 4;
 const APPLE_LYRIC_TOP_OFFSET_PX = 75;
 const APPLE_LYRIC_SCROLL_TOP_MARGIN_PX = 55;
 const APPLE_LYRIC_FULLSCREEN_OFFSET_RATIO = 0.4;
@@ -194,13 +199,13 @@ export const APPLE_LYRIC_FONT_FAMILY =
   '-apple-system, BlinkMacSystemFont, "Apple Color Emoji", "SF Pro", "PingFang SC", "PingFang HK", "PingFang TC", "SF Pro Icons", "Helvetica Neue", Helvetica, Arial, sans-serif';
 export const APPLE_LYRIC_BG_COLOR = "#090a0f";
 export const APPLE_DESKTOP_BACKDROP_ARTWORK_FILTER =
-  "blur(150px) saturate(1.35) brightness(0.32)";
-// Apple Music fullscreen lyrics uses the artwork-derived nowPlayingBackdropBG
-// as an opaque field. The full-cover blur stays mounted as a transition-safe
-// fallback, but desktop parity keeps it visually disabled; depth comes from
-// the local artwork radiosity layer instead of a noisy full-screen poster.
-export const APPLE_DESKTOP_BACKDROP_ARTWORK_OPACITY = 0;
-export const APPLE_DESKTOP_BACKDROP_VEIL = "transparent";
+  "blur(128px) saturate(1.28) brightness(0.72)";
+// Apple Music expands the artwork into a very soft full-screen color field.
+// Heavy blur keeps image detail out of the lyric column while retaining the
+// cover's actual red/blue/green balance instead of collapsing it to one color.
+export const APPLE_DESKTOP_BACKDROP_ARTWORK_OPACITY = 0.82;
+export const APPLE_DESKTOP_BACKDROP_VEIL =
+  "linear-gradient(180deg, rgba(4, 6, 12, 0.08), rgba(4, 6, 12, 0.22))";
 export const APPLE_DESKTOP_LYRIC_COLUMN_VEIL = "transparent";
 export const APPLE_DESKTOP_COVER_HALO_OPACITY = 0.4;
 const APPLE_LYRIC_SUPPLEMENTARY_REVEAL_BOX_PX = 50;
@@ -781,9 +786,13 @@ export function ImmersiveLyrics({
   const immersiveDurationSec = Math.max(0, current?.durationSec ?? 0);
   const coverUrl = current?.cover ? cdn(current.cover) : null;
   const desktopBackdropColor = `rgb(${appleBackdropBaseRgb(topRgb, seamRgb, leftRgb, rightRgb)})`;
-  // Apple fullscreen lyrics paints a song-specific opaque color field. Keep
-  // the richer sampled gradient for the mobile immersive path only.
-  const desktopBackdropImage = "none";
+  const desktopBackdropImage = layout.isDesktop
+    ? [
+        `radial-gradient(ellipse 86% 78% at 24% 12%, rgba(${topRgb}, 0.94), transparent 72%)`,
+        `radial-gradient(ellipse 78% 88% at 94% 48%, rgba(${rightRgb}, 0.82), transparent 70%)`,
+        `linear-gradient(132deg, rgb(${leftRgb}) 0%, rgb(${seamRgb}) 52%, rgb(${rightRgb}) 100%)`,
+      ].join(", ")
+    : "none";
   const desktopBackdropArtworkImage = coverUrl ? cssUrl(coverUrl) : "none";
 
   return createPortal(
@@ -795,17 +804,16 @@ export function ImmersiveLyrics({
         inset: 0,
         zIndex: 9000,
         overflow: "hidden",
-        // 桌面 Apple lyrics 是不透底的全屏环境；底色跟随封面采样，
-        // artwork / veil 节点仍保留给过场结构，但桌面稳态不再显示它们。
+        // 桌面 Apple lyrics 是不透底的全屏环境：采样色场负责稳定底色，
+        // 同一封面的高斯扩散层保留多色光影，避免退化成与封面脱节的单色背景。
         background: layout.isDesktop ? desktopBackdropColor : APPLE_LYRIC_BG_COLOR,
         backgroundImage: desktopBackdropImage,
         opacity: 1,
         isolation: "isolate",
       }}
     >
-      {/* 背景：Apple Web fullscreen lyrics 的稳态底层是 nowPlayingBackdropBG
-          对应的不透明色场。封面 artwork 仅保留在 DOM 中承接过场，桌面透明度为 0；
-          移动端仍使用同源 blur artwork，不再给歌词列单独铺黑块。 */}
+      {/* 背景：不透明采样色场兜底，上层用当前封面的重模糊大色块补回 Apple
+          fullscreen 的 cover-derived radiosity；切歌时只淡入新光场，不暴露清晰封面纹理。 */}
       <div
         ref={backdropRef}
         data-apple-lyrics-backdrop={layout.isDesktop ? "true" : undefined}
@@ -824,24 +832,37 @@ export function ImmersiveLyrics({
       >
         {coverUrl && (
           <div
-            data-apple-lyrics-backdrop-artwork={layout.isDesktop ? "true" : undefined}
+            key={`immersive-backdrop-${coverUrl}`}
             aria-hidden
             style={{
               position: "absolute",
-              inset: layout.isDesktop ? "-16%" : "-8%",
-              backgroundImage: layout.isDesktop ? desktopBackdropArtworkImage : cssUrl(coverUrl),
-              backgroundSize: "cover",
-              backgroundPosition: "center",
-              filter: layout.isDesktop
-                ? APPLE_DESKTOP_BACKDROP_ARTWORK_FILTER
-                : IMMERSIVE_BACKDROP_ARTWORK_FILTER,
-              opacity: layout.isDesktop
-                ? APPLE_DESKTOP_BACKDROP_ARTWORK_OPACITY
-                : IMMERSIVE_BACKDROP_ARTWORK_OPACITY,
-              transform: layout.isDesktop ? "scale(1.22)" : "scale(1.16)",
+              inset: 0,
+              animation: layout.isDesktop
+                ? "appleBackdropArtworkIn 900ms cubic-bezier(0.22, 1, 0.36, 1)"
+                : undefined,
               pointerEvents: "none",
             }}
-          />
+          >
+            <div
+              data-apple-lyrics-backdrop-artwork={layout.isDesktop ? "true" : undefined}
+              aria-hidden
+              style={{
+                position: "absolute",
+                inset: layout.isDesktop ? "-16%" : "-8%",
+                backgroundImage: layout.isDesktop ? desktopBackdropArtworkImage : cssUrl(coverUrl),
+                backgroundSize: "cover",
+                backgroundPosition: "center",
+                filter: layout.isDesktop
+                  ? APPLE_DESKTOP_BACKDROP_ARTWORK_FILTER
+                  : IMMERSIVE_BACKDROP_ARTWORK_FILTER,
+                opacity: layout.isDesktop
+                  ? APPLE_DESKTOP_BACKDROP_ARTWORK_OPACITY
+                  : IMMERSIVE_BACKDROP_ARTWORK_OPACITY,
+                transform: layout.isDesktop ? "scale(1.12)" : "scale(1.16)",
+                pointerEvents: "none",
+              }}
+            />
+          </div>
         )}
         <div
           data-apple-lyrics-backdrop-veil={layout.isDesktop ? "true" : undefined}
@@ -1636,6 +1657,7 @@ function LyricStrip({
   return (
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
+      visualActiveIdx={view.visualActiveIdx}
       scrollIdx={view.scrollIdx}
       outerStyle={{
         ...lyricBox,
@@ -1766,6 +1788,7 @@ export function LyricColumn({
   return (
     <MeasuredLyricColumn
       activeIdx={view.activeIdx}
+      visualActiveIdx={view.visualActiveIdx}
       scrollIdx={view.scrollIdx}
       // Apple Music Web fullscreen passes offset-ratio=.4 to amp-lyrics.
       anchorMode="center"
@@ -1850,6 +1873,7 @@ function useCompactSpringNumber(target: number, enabled = true): number {
 
 function MeasuredLyricColumn({
   activeIdx,
+  visualActiveIdx,
   scrollIdx,
   /** 焦点行落在容器纵向多少位置（0..1）。compact = 0.5（居中），immersive = 0.22（偏上） */
   focusFraction = 0.5,
@@ -1865,6 +1889,7 @@ function MeasuredLyricColumn({
   children,
 }: {
   activeIdx: number;
+  visualActiveIdx: number;
   scrollIdx?: number;
   focusFraction?: number;
   focusOffsetPx?: number;
@@ -1892,13 +1917,15 @@ function MeasuredLyricColumn({
     active: false,
     value: 0,
     velocity: 0,
+    from: 0,
     target: 0,
+    targetIndex: -1,
+    maxScrollTop: 0,
     lastFrameAtMs: 0,
     focusViewportOffsetPx: APPLE_LYRIC_TOP_OFFSET_PX + APPLE_LYRIC_SCROLL_TOP_MARGIN_PX,
     focusSpanPx: 1,
     spatialRows: [],
   });
-  const appleGeometrySamplerRafRef = useRef<number | null>(null);
   const appleScrollReadyRef = useRef(false);
   const appleSupplementaryScrollKeyRef = useRef(appleSupplementaryScrollKey);
   const measureAndPlaceRef = useRef<((options?: { force?: boolean }) => void) | null>(null);
@@ -1929,24 +1956,6 @@ function MeasuredLyricColumn({
     writeAppleLyricGeometryDebug(outer, snapshot);
     return snapshot;
   }, []);
-  const scheduleAppleGeometrySampler = useCallback(() => {
-    if (!isAppleScroll) return;
-    if (appleGeometrySamplerRafRef.current != null) {
-      window.cancelAnimationFrame(appleGeometrySamplerRafRef.current);
-      appleGeometrySamplerRafRef.current = null;
-    }
-    const startedAt = performanceNow();
-    const tick = () => {
-      captureAppleGeometryFromDom();
-      const elapsed = performanceNow() - startedAt;
-      if (elapsed <= APPLE_LYRIC_LAYOUT_MS + 80 || appleScrollAnimationRef.current.active) {
-        appleGeometrySamplerRafRef.current = window.requestAnimationFrame(tick);
-        return;
-      }
-      appleGeometrySamplerRafRef.current = null;
-    };
-    appleGeometrySamplerRafRef.current = window.requestAnimationFrame(tick);
-  }, [captureAppleGeometryFromDom, isAppleScroll]);
   const measureAndPlace = useCallback((options: { force?: boolean } = {}) => {
     const outer = outerRef.current;
     const inner = innerRef.current;
@@ -2102,7 +2111,6 @@ function MeasuredLyricColumn({
     if (nextPlaybackJumpSerial === previousPlaybackJumpSerial || playbackJumpReached) {
       appleMeasuredPlaybackJumpSerialRef.current = nextPlaybackJumpSerial;
     }
-    if (isAppleScroll) scheduleAppleGeometrySampler();
   }, [
     activeIdx,
     applePlaybackJumpSerial,
@@ -2110,7 +2118,6 @@ function MeasuredLyricColumn({
     scrollIdx,
     isAppleScroll,
     measureAndPlace,
-    scheduleAppleGeometrySampler,
   ]);
 
   useEffect(() => {
@@ -2126,23 +2133,48 @@ function MeasuredLyricColumn({
     if (previousKey === appleSupplementaryScrollKey) return;
     appleSupplementaryScrollKeyRef.current = appleSupplementaryScrollKey;
     if (previousKey == null) return;
-    const timer = window.setTimeout(() => {
+    // Supplementary text changes row height over 600ms. Retarget once midway
+    // so the shared spring follows the live layout, then settle against the
+    // final geometry. This avoids a per-frame full-list measurement loop.
+    const midpointTimer = window.setTimeout(() => {
+      measureAndPlaceRef.current?.({ force: true });
+    }, APPLE_SUPPLEMENTARY_REVEAL_MS * 0.5);
+    const settleTimer = window.setTimeout(() => {
       measureAndPlaceRef.current?.({ force: true });
     }, APPLE_SUPPLEMENTARY_FORCE_SCROLL_DELAY_MS);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(midpointTimer);
+      window.clearTimeout(settleTimer);
+    };
   }, [appleSupplementaryScrollKey, isAppleScroll]);
 
   useLayoutEffect(() => {
     if (!isAppleScroll) return;
-    captureAppleGeometryFromDom();
     // React refreshes the row's inline fallback variables when visual-current
     // changes. Re-apply the live spring sample in the same layout phase so a
     // render cannot flash the new row at full scale/color for one frame.
     const springState = appleScrollAnimationRef.current;
     if (springState.active && springState.spatialRows.length > 0) {
-      writeAppleSpatialFocus(springState);
+      const outer = outerRef.current;
+      if (outer) {
+        springState.maxScrollTop = Math.max(0, outer.scrollHeight - outer.clientHeight);
+        springState.target = Math.max(
+          0,
+          Math.min(springState.maxScrollTop, springState.target),
+        );
+      }
+      captureAppleGeometryFromDom();
+      writeAppleSpatialFocus(springState, true);
+      return;
     }
-  });
+    captureAppleGeometryFromDom();
+  }, [
+    appleSupplementaryScrollKey,
+    appleViewportHeight,
+    captureAppleGeometryFromDom,
+    isAppleScroll,
+    visualActiveIdx,
+  ]);
 
   useLayoutEffect(() => {
     const outer = outerRef.current;
@@ -2187,10 +2219,6 @@ function MeasuredLyricColumn({
       appleScrollAnimationRef.current.velocity = 0;
       appleScrollAnimationRef.current.lastFrameAtMs = 0;
       appleScrollAnimationRef.current.spatialRows = [];
-      if (appleGeometrySamplerRafRef.current != null) {
-        window.cancelAnimationFrame(appleGeometrySamplerRafRef.current);
-        appleGeometrySamplerRafRef.current = null;
-      }
       appleScrollReadyRef.current = false;
     };
   }, [isAppleScroll]);
@@ -2291,7 +2319,10 @@ type AppleScrollAnimationState = {
   active: boolean;
   value: number;
   velocity: number;
+  from: number;
   target: number;
+  targetIndex: number;
+  maxScrollTop: number;
   lastFrameAtMs: number;
   focusViewportOffsetPx: number;
   focusSpanPx: number;
@@ -2299,6 +2330,9 @@ type AppleScrollAnimationState = {
     element: HTMLElement;
     index: number;
     anchorPx: number;
+    handoffFocusFrom: number;
+    lastFocus: number;
+    lastCascadeY: number;
   }>;
 };
 
@@ -2313,7 +2347,8 @@ function captureAppleLyricGeometry(
     const index = Number.parseInt(row.dataset.appleLyricRowIndex ?? "", 10);
     if (!Number.isFinite(index)) return;
     const rect = row.getBoundingClientRect();
-    rows[index] = { top: rect.y, height: rect.height };
+    const cascadeY = Number.parseFloat(row.dataset.appleLyricCascadeY ?? "0") || 0;
+    rows[index] = { top: rect.y - cascadeY, height: rect.height };
   });
   const activeRow = inner.querySelector<HTMLElement>('[data-active="1"]');
   const visualActiveIdx = Number.parseInt(
@@ -2359,11 +2394,20 @@ function prepareAppleSpatialFocus(
   const containerRect = element.getBoundingClientRect();
   const rows = Array.from(
     element.querySelectorAll<HTMLElement>("[data-apple-lyric-row-index]"),
-  ).map((row) => ({
-    element: row,
-    index: Number.parseInt(row.dataset.appleLyricRowIndex ?? "", 10),
-    anchorPx: row.getBoundingClientRect().top - containerRect.top + element.scrollTop,
-  })).filter((row) => Number.isFinite(row.index) && Number.isFinite(row.anchorPx));
+  ).map((row) => {
+    const lastFocus = Number.parseFloat(row.dataset.appleLyricSpatialFocus ?? "0") || 0;
+    return {
+      element: row,
+      index: Number.parseInt(row.dataset.appleLyricRowIndex ?? "", 10),
+      anchorPx: row.getBoundingClientRect().top -
+        containerRect.top +
+        element.scrollTop -
+        (Number.parseFloat(row.dataset.appleLyricCascadeY ?? "0") || 0),
+      handoffFocusFrom: lastFocus,
+      lastFocus,
+      lastCascadeY: Number.parseFloat(row.dataset.appleLyricCascadeY ?? "0") || 0,
+    };
+  }).filter((row) => Number.isFinite(row.index) && Number.isFinite(row.anchorPx));
   const orderedAnchors = rows
     .map((row) => row.anchorPx)
     .sort((a, b) => a - b);
@@ -2383,14 +2427,70 @@ function prepareAppleSpatialFocus(
     : fallbackFocusViewportOffsetPx;
 }
 
-function writeAppleSpatialFocus(state: AppleScrollAnimationState): void {
-  const focusAnchorPx = state.value + state.focusViewportOffsetPx;
+function writeAppleSpatialFocus(
+  state: AppleScrollAnimationState,
+  forceReactFallbackReset = false,
+  settledTargetIndex?: number,
+): void {
+  const travel = state.target - state.from;
+  const globalProgress = Math.abs(travel) < 0.5
+    ? 1
+    : Math.max(0, Math.min(1, (state.value - state.from) / travel));
+  const handoffProgress = globalProgress * globalProgress * (3 - 2 * globalProgress);
   for (const row of state.spatialRows) {
-    const raw = Math.max(
-      0,
-      Math.min(1, 1 - Math.abs(row.anchorPx - focusAnchorPx) / state.focusSpanPx),
-    );
-    const focus = raw * raw * (3 - 2 * raw);
+    const focus = settledTargetIndex != null && settledTargetIndex >= 0
+      ? row.index === settledTargetIndex ? 1 : 0
+      : row.index === state.targetIndex
+        ? row.handoffFocusFrom + (1 - row.handoffFocusFrom) * handoffProgress
+        : row.handoffFocusFrom * (1 - handoffProgress);
+    const cascadeDistance = row.index - state.targetIndex;
+    const participatesInCascade = settledTargetIndex == null &&
+      state.targetIndex >= 0 &&
+      cascadeDistance > 0 &&
+      cascadeDistance <= APPLE_LYRIC_SCROLL_CASCADE_RADIUS_ROWS &&
+      Math.abs(travel) >= 0.5;
+    const cascadeDelay = participatesInCascade
+      ? Math.min(
+          APPLE_LYRIC_SCROLL_CASCADE_MAX,
+          cascadeDistance * APPLE_LYRIC_SCROLL_CASCADE_PER_ROW,
+        )
+      : 0;
+    const rowProgress = cascadeDelay > 0
+      ? Math.max(0, Math.min(1, (globalProgress - cascadeDelay) / (1 - cascadeDelay)))
+      : globalProgress;
+    const rowCenter = state.from + travel * rowProgress;
+    const cascadeY = participatesInCascade ? state.value - rowCenter : 0;
+    const wasFocused = row.lastFocus > 0.0005;
+    const isFocused = focus > 0.0005;
+    const wasCascading = Math.abs(row.lastCascadeY) > 0.05;
+    const isCascading = Math.abs(cascadeY) > 0.05;
+    const reactMarkedActive = row.element.dataset.active === "1";
+    if (
+      !forceReactFallbackReset &&
+      !wasFocused &&
+      !isFocused &&
+      !wasCascading &&
+      !isCascading
+    ) {
+      continue;
+    }
+    if (
+      !forceReactFallbackReset &&
+      Math.abs(row.lastFocus - focus) < 0.0005 &&
+      Math.abs(row.lastCascadeY - cascadeY) < 0.05
+    ) {
+      continue;
+    }
+    if (
+      forceReactFallbackReset &&
+      !wasFocused &&
+      !isFocused &&
+      !wasCascading &&
+      !isCascading &&
+      !reactMarkedActive
+    ) {
+      continue;
+    }
     const scale = 1 + (APPLE_LYRIC_CURRENT_SCALE - 1) * focus;
     const lineAlpha = APPLE_INACTIVE_LINE_ALPHA +
       (APPLE_TIMED_GRADIENT_ACTIVE_ALPHA - APPLE_INACTIVE_LINE_ALPHA) * focus;
@@ -2401,7 +2501,11 @@ function writeAppleSpatialFocus(state: AppleScrollAnimationState): void {
     row.element.style.setProperty("--apple-lyric-line-alpha", lineAlpha.toFixed(4));
     row.element.style.setProperty("--apple-lyric-sung-alpha", lineAlpha.toFixed(4));
     row.element.style.setProperty("--apple-lyric-unsung-alpha", unsungAlpha.toFixed(4));
+    row.element.style.setProperty("--apple-lyric-row-cascade-y", `${cascadeY.toFixed(3)}px`);
     row.element.dataset.appleLyricSpatialFocus = focus.toFixed(4);
+    row.element.dataset.appleLyricCascadeY = cascadeY.toFixed(3);
+    row.lastFocus = focus;
+    row.lastCascadeY = cascadeY;
   }
 }
 
@@ -2484,18 +2588,24 @@ function performAppleScrollTop(
     state.rafIds.clear();
     state.active = false;
     state.value = target;
+    state.from = target;
     state.target = target;
+    state.targetIndex = debug?.targetIndex ?? -1;
+    state.maxScrollTop = maxScrollTop;
     state.velocity = 0;
     state.lastFrameAtMs = 0;
     element.scrollTop = target;
+    state.value = element.scrollTop;
+    state.from = state.value;
+    state.target = state.value;
     prepareAppleSpatialFocus(
       element,
       state,
       debug?.targetIndex,
-      target,
+      state.target,
       (debug?.topSpacerHeight ?? APPLE_LYRIC_TOP_OFFSET_PX) + APPLE_LYRIC_SCROLL_TOP_MARGIN_PX,
     );
-    writeAppleSpatialFocus(state);
+    writeAppleSpatialFocus(state, true, debug?.targetIndex);
     element.dataset.appleLyricsScrollActiveCount = "0";
     element.dataset.appleLyricsScrolling = "false";
     onComplete?.(serial);
@@ -2507,7 +2617,10 @@ function performAppleScrollTop(
   state.rafIds.clear();
   state.active = true;
   state.value = from;
+  state.from = from;
   state.target = target;
+  state.targetIndex = debug?.targetIndex ?? -1;
+  state.maxScrollTop = maxScrollTop;
   state.velocity = preserveVelocity ? state.velocity : 0;
   state.lastFrameAtMs = startedAt;
   prepareAppleSpatialFocus(
@@ -2520,7 +2633,9 @@ function performAppleScrollTop(
   writeAppleSpatialFocus(state);
   state.rafIds.set(serial, 0);
   element.dataset.appleLyricsScrolling = "true";
+  element.dataset.appleLyricsScrollVelocity = state.velocity.toFixed(3);
   writeScrollDebug(durationMs, startedAt, activeCountAtStart);
+  let debugFrame = 0;
   const tick = (now: number) => {
     if (state.serial !== serial) return;
     let remainingSec = Math.max(
@@ -2540,30 +2655,42 @@ function performAppleScrollTop(
       state.value += state.velocity * stepSec;
       remainingSec -= stepSec;
     }
-    element.scrollTop = state.value;
-    const actualScrollTop = element.scrollTop;
-    if (Math.abs(actualScrollTop - state.value) > 0.5) {
-      state.value = actualScrollTop;
+    const boundedValue = Math.max(0, Math.min(state.maxScrollTop, state.value));
+    if (boundedValue !== state.value) {
+      state.value = boundedValue;
       state.velocity = 0;
     }
+    element.scrollTop = state.value;
+    debugFrame += 1;
+    if (debugFrame % 6 === 0) {
+      const actualScrollTop = element.scrollTop;
+      if (Math.abs(actualScrollTop - state.value) > 0.5) {
+        state.maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+        state.value = actualScrollTop;
+        state.target = Math.max(0, Math.min(state.maxScrollTop, state.target));
+        state.velocity = 0;
+      }
+    }
     writeAppleSpatialFocus(state);
+    if (debugFrame % 4 === 0) {
+      element.dataset.appleLyricsScrollVelocity = state.velocity.toFixed(3);
+    }
     const settled =
       Math.abs(state.target - state.value) <= APPLE_LYRIC_SCROLL_SPRING_POSITION_EPS_PX &&
       Math.abs(state.velocity) <= APPLE_LYRIC_SCROLL_SPRING_VELOCITY_EPS_PX_S;
-    const timedOut = now - startedAt >= 1200;
+    const timedOut = now - startedAt >= 700;
     if (!settled && !timedOut) {
       const nextRafId = window.requestAnimationFrame(tick);
       state.rafIds.set(serial, nextRafId);
       state.active = true;
-      element.dataset.appleLyricsScrollVelocity = state.velocity.toFixed(3);
-      element.dataset.appleLyricsScrollActiveCount = "1";
-      element.dataset.appleLyricsScrolling = "true";
       return;
     }
     state.value = state.target;
     state.velocity = 0;
     element.scrollTop = state.target;
-    writeAppleSpatialFocus(state);
+    state.value = element.scrollTop;
+    state.target = state.value;
+    writeAppleSpatialFocus(state, true, debug?.targetIndex);
     state.rafIds.delete(serial);
     state.active = false;
     element.dataset.appleLyricsScrollVelocity = "0.000";
@@ -2816,6 +2943,7 @@ function useLyricView(p: LyricViewParams): {
   rows: React.ReactNode;
   translateExpr: string;
   activeIdx: number;
+  visualActiveIdx: number;
   /** 应当被滚到焦点位置的行 —— 只保留 100ms 轻预滚动，避免视觉先切句。 */
   scrollIdx: number;
   applePlaybackJumpSerial: number;
@@ -3056,6 +3184,7 @@ function useLyricView(p: LyricViewParams): {
       rows: null,
       translateExpr: "0px",
       activeIdx: -1,
+      visualActiveIdx: -1,
       scrollIdx: -1,
       applePlaybackJumpSerial: applePlaybackJumpRef.current.serial,
       applePlaybackJumpTargetIdx: applePlaybackJumpRef.current.targetIdx,
@@ -3124,7 +3253,7 @@ function useLyricView(p: LyricViewParams): {
           key={`i-${item.key}`}
           startSec={item.startSec}
           endSec={item.endSec}
-          positionSec={renderPositionSec}
+          positionSec={isActive ? renderPositionSec : item.startSec}
           rowIndex={i}
           isActive={isActive}
           isScrollTarget={isScrollTarget}
@@ -3231,6 +3360,7 @@ function useLyricView(p: LyricViewParams): {
     rows: rowEls,
     translateExpr,
     activeIdx: hasActiveLine ? safeIdx : -1,
+    visualActiveIdx: hasRowActiveLine ? safeRowActiveIdx : -1,
     scrollIdx: safeScrollIdx,
     applePlaybackJumpSerial: applePlaybackJumpRef.current.serial,
     applePlaybackJumpTargetIdx: applePlaybackJumpRef.current.targetIdx,
@@ -4988,6 +5118,11 @@ function lineFrame(
         (APPLE_TIMED_GRADIENT_ACTIVE_ALPHA - APPLE_INACTIVE_LINE_ALPHA) * focusProgress,
       "--apple-lyric-unsung-alpha": APPLE_INACTIVE_LINE_ALPHA +
         (APPLE_TIMED_GRADIENT_UNSUNG_ALPHA - APPLE_INACTIVE_LINE_ALPHA) * focusProgress,
+      // Do not declare the cascade variable in React state: the shared spring
+      // owns it imperatively. Re-declaring 0px on every lyric render would
+      // erase the live transform before geometry capture while leaving the
+      // previous dataset sample behind.
+      transform: "translate3d(0, var(--apple-lyric-row-cascade-y, 0px), 0)",
       willChange: willAnimate
         ? "transform, opacity, color, top, background-image"
         : undefined,
