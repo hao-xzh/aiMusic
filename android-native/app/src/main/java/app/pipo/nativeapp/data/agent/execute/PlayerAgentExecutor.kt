@@ -33,6 +33,7 @@ class PlayerAgentExecutor(
         streamLevelFallbacks = STREAM_LEVEL_FALLBACKS,
         streamUrlTimeoutMs = STREAM_URL_TIMEOUT_MS,
     )
+    private val playlistImportService = PlaylistImportService(repository)
 
     override suspend fun playQueue(
         actionId: String,
@@ -229,6 +230,19 @@ class PlayerAgentExecutor(
             )
     }
 
+    override suspend fun createPlaylist(
+        actionId: String,
+        playlistName: String,
+        tracks: List<TrackRequirement>,
+    ): ActionExecutionResult {
+        val stableActionId = stableId(
+            "playlist_create",
+            playlistName,
+            tracks.joinToString("|") { "${it.title}:${it.artist.orEmpty()}" },
+        )
+        return playlistImportService.create(stableActionId, playlistName, tracks)
+    }
+
     private fun matchPlaylist(playlists: List<PipoPlaylist>, query: String): PipoPlaylist? {
         val q = query.lowercase().trim()
         if (q.isEmpty()) return null
@@ -356,6 +370,8 @@ class PlayerAgentExecutor(
             },
             excludedArtists = mergeStrings(excludeArtists),
             excludedLanguages = mergeStrings(excludeLanguages),
+            catalogConstraint = primaryGoal.catalogConstraint,
+            catalogExceptionTracks = mergeRequirements(primaryGoal.mustInclude + listOfNotNull(primaryGoal.closer)),
         )
     }
 

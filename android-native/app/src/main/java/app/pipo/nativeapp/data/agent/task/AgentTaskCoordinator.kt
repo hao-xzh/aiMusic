@@ -37,7 +37,18 @@ class AgentTaskCoordinator(private val context: Context) {
     fun submit(userText: String, contextJson: String = "", onFinished: (Result<TurnOutcome>) -> Unit = {}): AgentTask {
         val task = store.enqueue(userText, contextJson)
         DiagnosticsLogStore.record("ai_agent_task", "enqueued", mapOf("taskId" to task.id, "contextBytes" to contextJson.length))
-        scope.launch { execute(task.id, onFinished) }
+        scope.launch {
+            // Persist the user's side as soon as the durable task exists. taskId makes
+            // this idempotent with process-recovery / retry execution below.
+            runCatching {
+                PipoGraph.petMemory.recordConversationTurn(
+                    PetMemory.ROLE_USER,
+                    task.userText,
+                    task.id,
+                )
+            }
+            execute(task.id, onFinished)
+        }
         scheduleRecovery()
         return task
     }
@@ -50,6 +61,15 @@ class AgentTaskCoordinator(private val context: Context) {
         if (task.status == AgentTaskStatus.FAILED) return@withLock false
         val activeGateway = gateway ?: detachedGateway
         val startedAt = System.currentTimeMillis()
+        // WorkManager may win the race with submit's IO coroutine, or recreate the
+        // process entirely. Ensure the question is durable before doing expensive work.
+        runCatching {
+            PipoGraph.petMemory.recordConversationTurn(
+                PetMemory.ROLE_USER,
+                task.userText,
+                task.id,
+            )
+        }
         DiagnosticsLogStore.record(
             "ai_agent_task",
             "started",
@@ -60,8 +80,13 @@ class AgentTaskCoordinator(private val context: Context) {
             store.succeed(task.id, outcome.reply)
             // Conversation memory belongs to the durable task owner, not the page.
             // This also persists results produced after the UI or process has gone away.
-            runCatching { PipoGraph.petMemory.recordConversationTurn(PetMemory.ROLE_USER, task.userText) }
-            runCatching { PipoGraph.petMemory.recordConversationTurn(PetMemory.ROLE_ASSISTANT, outcome.reply) }
+            runCatching {
+                PipoGraph.petMemory.recordConversationTurn(
+                    PetMemory.ROLE_ASSISTANT,
+                    outcome.reply,
+                    task.id,
+                )
+            }
             runCatching { PipoGraph.petMemory.recordMusicReferences(outcome.musicReferences) }
             DiagnosticsLogStore.record(
                 "ai_agent_task",

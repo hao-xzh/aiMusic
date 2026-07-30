@@ -253,6 +253,17 @@ fn dispatch(command: &str, args: Value) -> String {
                 Ok(json!({ "ok": ok }))
             })
         }
+        "netease_playlist_create" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            run_json(async move {
+                let id = netease_client().playlist_create(&name).await?;
+                Ok(json!({ "id": id }))
+            })
+        }
         "netease_playlist_modify_tracks" => {
             let playlist_id = args.get("playlistId").and_then(Value::as_i64).unwrap_or(0);
             let op = args

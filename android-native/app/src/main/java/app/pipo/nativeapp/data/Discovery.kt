@@ -86,4 +86,22 @@ class Discovery(
  */
 fun interface ContinuousQueueSource {
     suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack>
+
+    /** 精确目录续播不允许在召回耗尽后降级成画像推荐。 */
+    fun permitsDefaultFallback(): Boolean = true
+
+    /** URL 解析可能替换曲目实例；追加前再按当前 source 的硬边界复核一次。 */
+    fun acceptsResolved(track: NativeTrack): Boolean = true
+}
+
+class GuardedContinuousQueueSource(
+    private val allowDefaultFallback: Boolean,
+    private val acceptsTrack: (NativeTrack) -> Boolean,
+    private val fetcher: suspend (Set<Long>) -> List<NativeTrack>,
+) : ContinuousQueueSource {
+    override suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack> = fetcher(excludeIds)
+
+    override fun permitsDefaultFallback(): Boolean = allowDefaultFallback
+
+    override fun acceptsResolved(track: NativeTrack): Boolean = acceptsTrack(track)
 }

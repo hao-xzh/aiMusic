@@ -630,6 +630,13 @@ private fun SkipCorrectionEffect(
                         playlistName: String,
                     ): ActionExecutionResult =
                         ActionExecutionResult(actionId, "playlist", success = false, message = "后台纠偏不操作歌单。")
+
+                    override suspend fun createPlaylist(
+                        actionId: String,
+                        playlistName: String,
+                        tracks: List<TrackRequirement>,
+                    ): ActionExecutionResult =
+                        ActionExecutionResult(actionId, "playlist_create", success = false, message = "后台纠偏不创建歌单。")
                 }
                 runtime.handle(
                     input = AgentTurnInput(

@@ -61,6 +61,9 @@ class LlmPersonaActionCopywriter(
         }
         if (facts.likedTitle.isNotBlank()) appendLine("收藏的歌：${facts.likedTitle}")
         if (facts.playlistName.isNotBlank()) appendLine("歌单：${facts.playlistName}")
+        if (facts.actionType == "playlist_create" && facts.resultMessage.isNotBlank()) {
+            appendLine("真实执行结果：${facts.resultMessage.take(180)}")
+        }
         if (facts.warnings.isNotEmpty()) appendLine("没满足/注意：${facts.warnings.joinToString("；").take(160)}")
         if (!facts.success && facts.errorMessage.isNotBlank()) {
             appendLine("失败原因：${facts.errorMessage.take(120)}")

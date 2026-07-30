@@ -37,7 +37,12 @@ class PetMemory(context: Context) {
     )
 
     data class Utterance(val tsSec: Long, val text: String)
-    data class ConversationTurn(val role: String, val text: String, val tsSec: Long)
+    data class ConversationTurn(
+        val role: String,
+        val text: String,
+        val tsSec: Long,
+        val taskId: String = "",
+    )
     data class MusicReference(
         val title: String,
         val artist: String = "",
@@ -75,7 +80,14 @@ class PetMemory(context: Context) {
                     val role = normalizeRole(o.optString("role"))
                     val text = cleanConversationText(o.optString("text"))
                     if (role != null && text.isNotBlank()) {
-                        conv.add(ConversationTurn(role, text, o.optLong("ts")))
+                        conv.add(
+                            ConversationTurn(
+                                role = role,
+                                text = text,
+                                tsSec = o.optLong("ts"),
+                                taskId = o.optString("taskId"),
+                            ),
+                        )
                     }
                 }
             }
@@ -131,6 +143,7 @@ class PetMemory(context: Context) {
                 put("role", it.role)
                 put("text", it.text)
                 put("ts", it.tsSec)
+                if (it.taskId.isNotBlank()) put("taskId", it.taskId)
             })
         }
         val refArr = JSONArray()
@@ -190,20 +203,34 @@ class PetMemory(context: Context) {
         )
     }
 
-    suspend fun recordConversationTurn(role: String, text: String) {
+    suspend fun recordConversationTurn(role: String, text: String, taskId: String = "") {
         withContext(Dispatchers.IO) {
-            recordConversationTurnBlocking(role, text)
+            recordConversationTurnBlocking(role, text, taskId)
         }
     }
 
     @Synchronized
-    private fun recordConversationTurnBlocking(role: String, text: String) {
+    private fun recordConversationTurnBlocking(role: String, text: String, taskId: String) {
         val normalizedRole = normalizeRole(role) ?: return
         val cleaned = cleanConversationText(text)
         if (cleaned.isBlank()) return
         val m = load()
+        val normalizedTaskId = taskId.trim()
+        if (
+            normalizedTaskId.isNotBlank() &&
+            m.conversation.any { it.taskId == normalizedTaskId && it.role == normalizedRole }
+        ) {
+            return
+        }
         val now = System.currentTimeMillis() / 1000
-        m.conversation.add(ConversationTurn(normalizedRole, cleaned, now))
+        m.conversation.add(
+            ConversationTurn(
+                role = normalizedRole,
+                text = cleaned,
+                tsSec = now,
+                taskId = normalizedTaskId,
+            ),
+        )
         trimConversation(m)
         m.lastSeenAt = now
         save()

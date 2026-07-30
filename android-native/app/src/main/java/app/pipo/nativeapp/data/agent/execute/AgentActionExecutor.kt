@@ -40,4 +40,10 @@ interface AgentActionExecutor {
         add: Boolean,
         playlistName: String,
     ): ActionExecutionResult
+
+    suspend fun createPlaylist(
+        actionId: String,
+        playlistName: String,
+        tracks: List<TrackRequirement>,
+    ): ActionExecutionResult
 }

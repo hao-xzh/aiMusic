@@ -82,6 +82,7 @@ class AgentLedgerStore(context: Context) {
                 is PlannedAction.LikeCurrent -> "like:${action.like}"
                 is PlannedAction.LikeTrack -> "likeTrack:${action.target.artist.orEmpty()}-${action.target.title}:${action.like}"
                 is PlannedAction.ModifyPlaylist -> "playlistModify:${action.playlistName}:${action.add}"
+                is PlannedAction.CreatePlaylist -> "playlistCreate:${action.playlistName}:${action.tracks.size}"
                 is PlannedAction.SkipCurrent -> "skip"
                 is PlannedAction.Say -> "say"
                 is PlannedAction.Clarify -> "clarify"

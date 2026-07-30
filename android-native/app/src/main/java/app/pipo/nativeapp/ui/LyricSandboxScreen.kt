@@ -14,6 +14,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -120,7 +121,8 @@ internal fun LyricSandboxScreen(
             )
         }
 
-        CompositionLocalProvider(LocalLyricAccent provides Color(0xFF68E0D2)) {
+        val sandboxLyricAccentState = remember { mutableStateOf(Color(0xFF68E0D2)) }
+        CompositionLocalProvider(LocalLyricAccent provides sandboxLyricAccentState) {
             AppleMusicLyricColumn(
                 lines = lines,
                 sessionId = "lyric-sandbox",

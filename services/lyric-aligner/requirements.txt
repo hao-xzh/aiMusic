@@ -1,0 +1,15 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.8,<3
+pydantic-settings>=2.4,<3
+httpx>=0.27,<1
+python-multipart>=0.0.9,<1
+soundfile>=0.12,<1
+numpy>=1.26,<3
+av>=12,<16
+pyphen>=0.17,<1
+
+# Qwen3ForcedAligner adapter. Install with GPU-matched torch wheels in production.
+torch>=2.4
+transformers>=4.55
+git+https://github.com/QwenLM/Qwen3-ASR.git

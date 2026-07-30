@@ -29,15 +29,15 @@ import java.io.StringReader
  * ```
  *
  * 输出按既有 [PipoLyricLine] 模型组装：
- *   · `<p>` → 一行 Primary（agent=v1 → alignment=Start 左对齐；agent≠v1 → alignment=End 右对齐）。
- *     和 AMLL 官方播放器一致 —— 不同演唱者的整行各自占一行，第二位歌手靠右展示。
+ *   · `<p>` → 一行 Primary；同一位非 group 演唱者保持当前侧，歌手变化时左右交替，
+ *     group 保持主侧且不改变交替状态，对齐 AMLL 的多歌手 Apple Music 风格转换。
  *   · `<span begin end>` → [PipoLyricChar]（字级 timing）
  *   · `<span ttm:role="x-translation">` → 一条 `role = Translation` 的 companion
  *   · `<span ttm:role="x-bg">` → 一条 `role = Companion` 的副词（"和声 / backing vocal"），
  *     附在所在 `<p>` 的 companionLines 上，由渲染层走小字浮入通道。
  *   · `<span ttm:role="x-roman">` → 一条 `role = Romaji`（音译）的小字行，显示在主词与翻译之间
  *
- * 时间格式支持 `HH:MM:SS.fff`、`MM:SS.fff`、`SS.fff`、纯整数毫秒。
+ * 时间格式支持 `HH:MM:SS.fff`、`MM:SS.fff`、`SS.fff`、纯数字秒数，以及容错的 `s` / `ms` 后缀。
  */
 object AmllTtmlParser {
 
@@ -49,37 +49,57 @@ object AmllTtmlParser {
         }
         val primaries = mutableListOf<PipoLyricLine>()
         val agents = mutableMapOf<String, AgentInfo>()
-        // 第一位出场的非 group 演唱者作为基准（左对齐）；与之不同的演唱者整行右对齐。
-        // 这与 AMLL / Apple 官方对唱排版一致，且不依赖 ttm:type（大量 TTML 并不写 type）。
-        var baseAgentId: String? = null
+        val sidecars = mutableMapOf<String, SidecarExtras>()
+        // AMLL 官方的 Apple Music 风格转换不是把“v1 之外的所有人”都挤在右边：
+        // 连续同一位演唱者保持当前侧，换成另一位非 group 演唱者时左右翻转。
+        // 因此三人及以上也能让相邻的不同歌手分居两侧；group 始终在主侧且不打断交替状态。
+        var lastPersonAgentId: String? = null
+        var lastPersonAlignment = PipoLyricAlignment.Start
         var event = parser.eventType
         while (event != XmlPullParser.END_DOCUMENT) {
             if (event == XmlPullParser.START_TAG) {
                 when (parser.name) {
                     "agent" -> parseAgent(parser)?.let { agents[it.id] = it }
+                    "translation" -> parseSidecarContainer(
+                        parser = parser,
+                        role = PipoLyricRole.Translation,
+                        sidecars = sidecars,
+                    )
+                    "transliteration" -> parseSidecarContainer(
+                        parser = parser,
+                        role = PipoLyricRole.Romaji,
+                        sidecars = sidecars,
+                    )
                     "p" -> {
                         val parsed = parseP(parser)
                         if (parsed != null) {
-                            // 所有 <p> 都作为独立 Primary；对唱右对齐规则：
-                            // group（多人合唱）不右对齐；其余演唱者中第一位出场者左对齐、其余一律右对齐。
-                            // 真正的背景人声 / 副词仍只通过 <span ttm:role="x-bg"> 进入 companionLines。
                             val agentId = parsed.agent ?: DEFAULT_AGENT_ID
                             val agent = agents[agentId]
                             val isGroup = agent?.type == AGENT_TYPE_GROUP
-                            val isDuet = if (isGroup) {
-                                false
-                            } else {
-                                if (baseAgentId == null) baseAgentId = agentId
-                                agentId != baseAgentId
-                            }
-                            val alignment = if (isDuet) {
-                                PipoLyricAlignment.End
-                            } else {
+                            val alignment = if (isGroup) {
                                 PipoLyricAlignment.Start
+                            } else {
+                                val nextAlignment = when {
+                                    lastPersonAgentId == null -> {
+                                        if (agent?.type == AGENT_TYPE_OTHER) {
+                                            PipoLyricAlignment.End
+                                        } else {
+                                            PipoLyricAlignment.Start
+                                        }
+                                    }
+                                    lastPersonAgentId == agentId -> lastPersonAlignment
+                                    lastPersonAlignment == PipoLyricAlignment.Start -> PipoLyricAlignment.End
+                                    else -> PipoLyricAlignment.Start
+                                }
+                                lastPersonAgentId = agentId
+                                lastPersonAlignment = nextAlignment
+                                nextAlignment
                             }
-                            primaries.add(
-                                parsed.toPipoLine(role = PipoLyricRole.Primary, alignment = alignment)
+                            val primary = parsed.toPipoLine(
+                                role = PipoLyricRole.Primary,
+                                alignment = alignment,
                             )
+                            primaries.add(attachSidecar(primary, parsed.key?.let(sidecars::get)))
                         }
                     }
                 }
@@ -106,10 +126,15 @@ object AmllTtmlParser {
         val pEnd = parseTimeAttr(parser, "end") ?: return null
         val pAgent = parser.getAttributeValue(TTM_NS, "agent")
             ?: parser.getAttributeValue(null, "ttm:agent")
+        val pKey = parser.getAttributeValue(ITUNES_NS, "key")
+            ?: parser.getAttributeValue(null, "itunes:key")
+            ?: parser.getAttributeValue(null, "key")
+            ?: parser.attributeValueByLocalName("key")
         val chars = mutableListOf<PipoLyricChar>()
         // companions：翻译 (x-translation) + 背景人声 (x-bg) 都挂到当前 p 的 companionLines。
         // 渲染层按 role 区分 Translation 行（小字翻译）与 Companion 行（合唱 / 副词）。
         val companions = mutableListOf<PipoLyricLine>()
+        val backgroundSupplementaries = mutableListOf<PipoLyricLine>()
         val mainTextBuilder = StringBuilder()
         // 同步读取 p 的纯文本（用于没有字级 span 时的回落）。
         // span 文本会另外存进 chars 并拼到 mainTextBuilder 里。
@@ -122,32 +147,26 @@ object AmllTtmlParser {
                             ?: parser.getAttributeValue(null, "ttm:role")
                         when (role) {
                             "x-translation" -> {
-                                val text = readSpanText(parser).trim()
-                                if (text.isNotEmpty()) {
-                                    companions.add(
-                                        PipoLyricLine(
-                                            startMs = pBegin,
-                                            durationMs = (pEnd - pBegin).coerceAtLeast(1L),
-                                            text = text,
-                                            timing = PipoLyricTiming.Line,
-                                            role = PipoLyricRole.Translation,
-                                        )
-                                    )
-                                }
+                                val content = parseSupplementaryContent(parser)
+                                addSupplementaryContent(
+                                    content = content,
+                                    role = PipoLyricRole.Translation,
+                                    startMs = pBegin,
+                                    endMs = pEnd,
+                                    mainDestination = companions,
+                                    backgroundDestination = backgroundSupplementaries,
+                                )
                             }
                             "x-roman" -> {
-                                val text = readSpanText(parser).trim()
-                                if (text.isNotEmpty()) {
-                                    companions.add(
-                                        PipoLyricLine(
-                                            startMs = pBegin,
-                                            durationMs = (pEnd - pBegin).coerceAtLeast(1L),
-                                            text = text,
-                                            timing = PipoLyricTiming.Line,
-                                            role = PipoLyricRole.Romaji,
-                                        )
-                                    )
-                                }
+                                val content = parseSupplementaryContent(parser)
+                                addSupplementaryContent(
+                                    content = content,
+                                    role = PipoLyricRole.Romaji,
+                                    startMs = pBegin,
+                                    endMs = pEnd,
+                                    mainDestination = companions,
+                                    backgroundDestination = backgroundSupplementaries,
+                                )
                             }
                             "x-bg" -> {
                                 // 背景人声 / 合唱：x-bg span 自己带 begin/end，内部嵌套字级 <span> 子节点。
@@ -159,20 +178,27 @@ object AmllTtmlParser {
                                 if (bgLine != null) companions.add(bgLine)
                             }
                             null -> {
-                                // 字级 timing 的 span
-                                val spanBegin = parseTimeAttr(parser, "begin")
-                                val spanEnd = parseTimeAttr(parser, "end")
-                                val text = readSpanText(parser)
-                                if (text.isNotEmpty()) {
-                                    mainTextBuilder.append(text)
-                                    if (spanBegin != null && spanEnd != null && spanEnd > spanBegin) {
-                                        chars.add(
-                                            PipoLyricChar(
-                                                startMs = spanBegin,
-                                                durationMs = spanEnd - spanBegin,
-                                                text = text,
+                                if (isRubyContainer(parser)) {
+                                    parseRubyContainer(parser, pBegin, pEnd)?.let { rubyChar ->
+                                        mainTextBuilder.append(rubyChar.text)
+                                        chars.add(rubyChar)
+                                    }
+                                } else {
+                                    // 字级 timing 的 span
+                                    val spanBegin = parseTimeAttr(parser, "begin")
+                                    val spanEnd = parseTimeAttr(parser, "end")
+                                    val text = readSpanText(parser)
+                                    if (text.isNotEmpty()) {
+                                        mainTextBuilder.append(text)
+                                        if (spanBegin != null && spanEnd != null && spanEnd > spanBegin) {
+                                            chars.add(
+                                                PipoLyricChar(
+                                                    startMs = spanBegin,
+                                                    durationMs = spanEnd - spanBegin,
+                                                    text = text,
+                                                )
                                             )
-                                        )
+                                        }
                                     }
                                 }
                             }
@@ -207,10 +233,11 @@ object AmllTtmlParser {
         return ParsedP(
             beginMs = pBegin,
             endMs = pEnd,
+            key = pKey,
             agent = pAgent,
             text = mainTextBuilder.toString(),
             chars = mergedChars,
-            companions = companions,
+            companions = attachBackgroundSupplementaries(companions, backgroundSupplementaries),
         )
     }
 
@@ -225,6 +252,7 @@ object AmllTtmlParser {
         bgEnd: Long,
     ): PipoLyricLine? {
         val bgChars = mutableListOf<PipoLyricChar>()
+        val supplementaries = mutableListOf<PipoLyricLine>()
         val textBuilder = StringBuilder()
         var event = parser.next()
         while (!(event == XmlPullParser.END_TAG && parser.name == "span")) {
@@ -234,25 +262,48 @@ object AmllTtmlParser {
                     if (parser.name == "span") {
                         val role = parser.getAttributeValue(TTM_NS, "role")
                             ?: parser.getAttributeValue(null, "ttm:role")
-                        if (role == null) {
-                            val spanBegin = parseTimeAttr(parser, "begin")
-                            val spanEnd = parseTimeAttr(parser, "end")
-                            val text = readSpanText(parser)
-                            if (text.isNotEmpty()) {
-                                textBuilder.append(text)
-                                if (spanBegin != null && spanEnd != null && spanEnd > spanBegin) {
-                                    bgChars.add(
-                                        PipoLyricChar(
-                                            startMs = spanBegin,
-                                            durationMs = spanEnd - spanBegin,
-                                            text = text,
-                                        )
-                                    )
+                        when (role) {
+                            null -> {
+                                if (isRubyContainer(parser)) {
+                                    parseRubyContainer(parser, bgBegin, bgEnd)?.let { rubyChar ->
+                                        textBuilder.append(rubyChar.text)
+                                        bgChars.add(rubyChar)
+                                    }
+                                } else {
+                                    val spanBegin = parseTimeAttr(parser, "begin")
+                                    val spanEnd = parseTimeAttr(parser, "end")
+                                    val text = readSpanText(parser)
+                                    if (text.isNotEmpty()) {
+                                        textBuilder.append(text)
+                                        if (spanBegin != null && spanEnd != null && spanEnd > spanBegin) {
+                                            bgChars.add(
+                                                PipoLyricChar(
+                                                    startMs = spanBegin,
+                                                    durationMs = spanEnd - spanBegin,
+                                                    text = text,
+                                                )
+                                            )
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            // x-bg 里再嵌 x-translation/x-roman 极罕见，按"忽略 + 跳过"处理
-                            skipElement(parser)
+                            "x-translation", "x-roman" -> {
+                                val content = parseSupplementaryContent(parser)
+                                val supplementaryRole = if (role == "x-translation") {
+                                    PipoLyricRole.Translation
+                                } else {
+                                    PipoLyricRole.Romaji
+                                }
+                                addSupplementaryContent(
+                                    content = content,
+                                    role = supplementaryRole,
+                                    startMs = bgBegin,
+                                    endMs = bgEnd,
+                                    mainDestination = supplementaries,
+                                    backgroundDestination = supplementaries,
+                                )
+                            }
+                            else -> skipElement(parser)
                         }
                     } else {
                         skipElement(parser)
@@ -287,11 +338,246 @@ object AmllTtmlParser {
             text = finalText,
             chars = mergedBgChars,
             timing = if (mergedBgChars.isNotEmpty()) PipoLyricTiming.Word else PipoLyricTiming.Line,
+            companionLines = distinctSupplementaries(supplementaries),
             role = PipoLyricRole.Companion,
         )
     }
 
-    /** 把当前 `<span>` 的所有文本子节点拼起来 —— 不递归取嵌套 span（AMLL 实际只有一层）。 */
+    /**
+     * 读取 x-translation / x-roman（以及 head sidecar 的 text）。
+     * AMLL 规范允许其内嵌 x-bg：普通文本属于主唱，x-bg 文本属于背景人声。
+     */
+    private fun parseSupplementaryContent(parser: XmlPullParser): ParsedSupplementaryContent {
+        val rootName = parser.name
+        val main = StringBuilder()
+        val background = StringBuilder()
+        var event = parser.next()
+        while (!(event == XmlPullParser.END_TAG && parser.name == rootName)) {
+            if (event == XmlPullParser.END_DOCUMENT) break
+            when (event) {
+                XmlPullParser.START_TAG -> {
+                    val role = parser.getAttributeValue(TTM_NS, "role")
+                        ?: parser.getAttributeValue(null, "ttm:role")
+                    val text = readElementText(parser)
+                    if (role == "x-bg") {
+                        background.append(text)
+                    } else {
+                        main.append(text)
+                    }
+                }
+                XmlPullParser.TEXT -> main.append(parser.text)
+            }
+            event = parser.next()
+        }
+        return ParsedSupplementaryContent(
+            mainText = main.toString().trim(),
+            backgroundText = background.toString().trim(),
+        )
+    }
+
+    private fun readElementText(parser: XmlPullParser): String {
+        val text = StringBuilder()
+        var depth = 1
+        while (depth > 0) {
+            when (parser.next()) {
+                XmlPullParser.START_TAG -> depth++
+                XmlPullParser.END_TAG -> depth--
+                XmlPullParser.TEXT -> text.append(parser.text)
+                XmlPullParser.END_DOCUMENT -> return text.toString()
+            }
+        }
+        return text.toString()
+    }
+
+    private fun isRubyContainer(parser: XmlPullParser): Boolean {
+        val ruby = parser.getAttributeValue(TTS_NS, "ruby")
+            ?: parser.getAttributeValue(null, "tts:ruby")
+        return ruby == "container"
+    }
+
+    /**
+     * Pipo 当前没有 ruby 注音展示模型，但不能因此把主歌词 base 也丢掉。
+     * 保留 tts:ruby="base" 文本，并用 ruby text 的最早 begin / 最晚 end 作为该 base 的扫色区间。
+     */
+    private fun parseRubyContainer(
+        parser: XmlPullParser,
+        fallbackStartMs: Long,
+        fallbackEndMs: Long,
+    ): PipoLyricChar? {
+        val base = StringBuilder()
+        var timedStartMs: Long? = null
+        var timedEndMs: Long? = null
+        var depth = 1
+        while (depth > 0) {
+            when (parser.next()) {
+                XmlPullParser.START_TAG -> {
+                    val ruby = parser.getAttributeValue(TTS_NS, "ruby")
+                        ?: parser.getAttributeValue(null, "tts:ruby")
+                    when (ruby) {
+                        "base" -> base.append(readElementText(parser))
+                        "text" -> {
+                            val startMs = parseTimeAttr(parser, "begin")
+                            val endMs = parseTimeAttr(parser, "end")
+                            readElementText(parser)
+                            if (startMs != null && endMs != null && endMs > startMs) {
+                                timedStartMs = minOf(timedStartMs ?: startMs, startMs)
+                                timedEndMs = maxOf(timedEndMs ?: endMs, endMs)
+                            }
+                        }
+                        else -> depth++
+                    }
+                }
+                XmlPullParser.END_TAG -> depth--
+                XmlPullParser.END_DOCUMENT -> return null
+            }
+        }
+        val text = base.toString().trim()
+        if (text.isEmpty()) return null
+        val startMs = timedStartMs ?: fallbackStartMs
+        val endMs = (timedEndMs ?: fallbackEndMs).coerceAtLeast(startMs + 1L)
+        return PipoLyricChar(
+            startMs = startMs,
+            durationMs = endMs - startMs,
+            text = text,
+            timingParts = listOf(PipoLyricTimingPart(startMs, endMs - startMs, text)),
+        )
+    }
+
+    private fun parseSidecarContainer(
+        parser: XmlPullParser,
+        role: PipoLyricRole,
+        sidecars: MutableMap<String, SidecarExtras>,
+    ) {
+        val rootName = parser.name
+        var event = parser.next()
+        while (!(event == XmlPullParser.END_TAG && parser.name == rootName)) {
+            if (event == XmlPullParser.END_DOCUMENT) return
+            if (event == XmlPullParser.START_TAG) {
+                if (parser.name == "text") {
+                    val lineId = parser.getAttributeValue(null, "for")
+                        ?: parser.attributeValueByLocalName("for")
+                    val content = parseSupplementaryContent(parser)
+                    if (!lineId.isNullOrBlank()) {
+                        val extras = sidecars.getOrPut(lineId) { SidecarExtras() }
+                        content.mainText.takeIf(String::isNotBlank)?.let { text ->
+                            extras.main.add(SidecarEntry(role, text))
+                        }
+                        content.backgroundText.takeIf(String::isNotBlank)?.let { text ->
+                            extras.background.add(SidecarEntry(role, text))
+                        }
+                    }
+                } else {
+                    skipElement(parser)
+                }
+            }
+            event = parser.next()
+        }
+    }
+
+    private fun addSupplementaryContent(
+        content: ParsedSupplementaryContent,
+        role: PipoLyricRole,
+        startMs: Long,
+        endMs: Long,
+        mainDestination: MutableList<PipoLyricLine>,
+        backgroundDestination: MutableList<PipoLyricLine>,
+    ) {
+        content.mainText.takeIf(String::isNotBlank)?.let { text ->
+            mainDestination.add(supplementaryLine(text, role, startMs, endMs))
+        }
+        content.backgroundText.takeIf(String::isNotBlank)?.let { text ->
+            backgroundDestination.add(supplementaryLine(text, role, startMs, endMs))
+        }
+    }
+
+    private fun supplementaryLine(
+        text: String,
+        role: PipoLyricRole,
+        startMs: Long,
+        endMs: Long,
+    ): PipoLyricLine {
+        return PipoLyricLine(
+            startMs = startMs,
+            durationMs = (endMs - startMs).coerceAtLeast(1L),
+            text = text,
+            timing = PipoLyricTiming.Line,
+            role = role,
+        )
+    }
+
+    private fun attachSidecar(line: PipoLyricLine, extras: SidecarExtras?): PipoLyricLine {
+        if (extras == null) return line
+        val mainExtras = extras.main.map { entry ->
+            supplementaryLine(
+                text = entry.text,
+                role = entry.role,
+                startMs = line.startMs,
+                endMs = line.startMs + line.durationMs,
+            )
+        }
+        var companions = distinctSupplementaries(line.companionLines + mainExtras)
+        if (extras.background.isNotEmpty()) {
+            val backgroundIndex = companions.indexOfFirst { it.role == PipoLyricRole.Companion }
+            if (backgroundIndex >= 0) {
+                val background = companions[backgroundIndex]
+                val backgroundExtras = extras.background.map { entry ->
+                    supplementaryLine(
+                        text = entry.text,
+                        role = entry.role,
+                        startMs = background.startMs,
+                        endMs = background.startMs + background.durationMs,
+                    )
+                }
+                companions = companions.toMutableList().also { updated ->
+                    updated[backgroundIndex] = background.copy(
+                        companionLines = distinctSupplementaries(
+                            background.companionLines + backgroundExtras,
+                        ),
+                    )
+                }
+            }
+        }
+        return line.copy(companionLines = companions)
+    }
+
+    private fun attachBackgroundSupplementaries(
+        companions: List<PipoLyricLine>,
+        supplementaries: List<PipoLyricLine>,
+    ): List<PipoLyricLine> {
+        if (supplementaries.isEmpty()) return companions
+        val backgroundIndex = companions.indexOfFirst { it.role == PipoLyricRole.Companion }
+        if (backgroundIndex < 0) return companions
+        return companions.toMutableList().also { updated ->
+            val background = updated[backgroundIndex]
+            updated[backgroundIndex] = background.copy(
+                companionLines = distinctSupplementaries(
+                    background.companionLines + supplementaries,
+                ),
+            )
+        }
+    }
+
+    private fun distinctSupplementaries(lines: List<PipoLyricLine>): List<PipoLyricLine> {
+        // 简化的 Pipo 行模型没有语言维度；sidecar 同一行可能同时带英文、中文等多个版本。
+        // 对齐 AMLL 降级到简化歌词时的规则：主唱 / 背景人声各保留第一条翻译和第一条音译。
+        // Companion 本身可以有多条，不能按 role 去重。
+        val seenSupplementaryRoles = mutableSetOf<PipoLyricRole>()
+        return lines.filter { line ->
+            when (line.role) {
+                PipoLyricRole.Translation, PipoLyricRole.Romaji -> seenSupplementaryRoles.add(line.role)
+                else -> true
+            }
+        }
+    }
+
+    private fun XmlPullParser.attributeValueByLocalName(localName: String): String? {
+        for (index in 0 until attributeCount) {
+            if (getAttributeName(index) == localName) return getAttributeValue(index)
+        }
+        return null
+    }
+
+    /** 把当前普通 `<span>` 的直接文本子节点拼起来；ruby 由 [parseRubyContainer] 单独解析。 */
     private fun readSpanText(parser: XmlPullParser): String {
         val sb = StringBuilder()
         var depth = 1
@@ -361,6 +647,7 @@ object AmllTtmlParser {
     private data class ParsedP(
         val beginMs: Long,
         val endMs: Long,
+        val key: String?,
         val agent: String?,
         val text: String,
         val chars: List<PipoLyricChar>,
@@ -394,9 +681,27 @@ object AmllTtmlParser {
     }
 
     private const val TTM_NS = "http://www.w3.org/ns/ttml#metadata"
+    private const val TTS_NS = "http://www.w3.org/ns/ttml#styling"
     private const val XML_NS = "http://www.w3.org/XML/1998/namespace"
+    private const val ITUNES_NS = "http://music.apple.com/lyric-ttml-internal"
     private const val DEFAULT_AGENT_ID = "v1"
     private const val AGENT_TYPE_GROUP = "group"
+    private const val AGENT_TYPE_OTHER = "other"
+
+    private data class ParsedSupplementaryContent(
+        val mainText: String,
+        val backgroundText: String,
+    )
+
+    private data class SidecarEntry(
+        val role: PipoLyricRole,
+        val text: String,
+    )
+
+    private class SidecarExtras {
+        val main = mutableListOf<SidecarEntry>()
+        val background = mutableListOf<SidecarEntry>()
+    }
 
     private data class AgentInfo(
         val id: String,

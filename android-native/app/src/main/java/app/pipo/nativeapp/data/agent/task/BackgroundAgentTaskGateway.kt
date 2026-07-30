@@ -11,6 +11,7 @@ import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.RecommendationLog
 import app.pipo.nativeapp.data.agent.domain.*
 import app.pipo.nativeapp.data.agent.execute.AgentActionExecutor
+import app.pipo.nativeapp.data.agent.execute.PlaylistImportService
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 import app.pipo.nativeapp.data.agent.runtime.AgentTurnExecutionException
 import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
@@ -47,7 +48,7 @@ class BackgroundAgentTaskGateway(private val context: Context) : AgentTaskGatewa
         val history = runCatching { PipoGraph.petMemory.conversationContext() }.getOrNull()
         val input = AgentTurnInput(
             userText = task.userText,
-            history = history?.turns ?: emptyList(),
+            history = history?.turns?.filterNot { it.taskId == task.id } ?: emptyList(),
             historySummary = history?.summary.orEmpty(),
             musicReferences = history?.musicReferences ?: emptyList(),
             currentTrack = current,
@@ -91,6 +92,7 @@ private class BackgroundPlayerAgentExecutor(
     private val repository: app.pipo.nativeapp.data.PipoRepository,
 ) : AgentActionExecutor {
     private val factory = PlayerMediaFactory(PipoGraph.audioFeaturesStore)
+    private val playlistImportService = PlaylistImportService(repository)
     private val playbackUrlResolver = PlaybackUrlResolver(
         repository = repository,
         streamLevelFallbacks = STREAM_LEVEL_FALLBACKS,
@@ -227,6 +229,12 @@ private class BackgroundPlayerAgentExecutor(
         return runCatching { repository.playlistModifyTracks(playlist.id, if (add) "add" else "del", listOf(tid)); ok(actionId, "playlist", if (add) "已加入歌单" else "已移出歌单") }
             .getOrElse { ActionExecutionResult(actionId, "playlist", false, "歌单操作失败", acceptedByPlayer = false) }
     }
+
+    override suspend fun createPlaylist(
+        actionId: String,
+        playlistName: String,
+        tracks: List<TrackRequirement>,
+    ): ActionExecutionResult = playlistImportService.create(actionId, playlistName, tracks)
 
     private companion object {
         val STREAM_LEVEL_FALLBACKS = listOf("lossless", "exhigh", "higher", "standard")

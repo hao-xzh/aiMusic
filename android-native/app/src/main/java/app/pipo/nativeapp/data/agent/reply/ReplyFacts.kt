@@ -32,6 +32,7 @@ data class ReplyFacts(
     val validationPassed: Boolean = true,
     val warnings: List<String> = emptyList(),
     val errorMessage: String = "",
+    val resultMessage: String = "",
 )
 
 object ReplyFactsBuilder {
@@ -88,6 +89,7 @@ object ReplyFactsBuilder {
             validationPassed = validationPassed,
             warnings = warnings,
             errorMessage = failed?.errorMessage ?: failed?.message.orEmpty(),
+            resultMessage = firstResult?.message.orEmpty(),
         )
     }
 }

@@ -77,11 +77,26 @@ internal object PetChatStore {
     fun hydrateOnce(turns: List<PetMemory.ConversationTurn>) {
         if (hydrated) return
         hydrated = true
-        if (messages.isNotEmpty()) return
         for (t in turns) {
             if (t.text.isBlank()) continue
-            messages.add(PetMessage(fromUser = t.role == PetMemory.ROLE_USER, text = t.text))
+            val fromUser = t.role == PetMemory.ROLE_USER
+            val alreadyPresent = if (t.taskId.isNotBlank()) {
+                messages.any { it.taskId == t.taskId && it.fromUser == fromUser && it.card == null }
+            } else {
+                messages.any { it.taskId == null && it.fromUser == fromUser && it.text == t.text }
+            }
+            if (!alreadyPresent) {
+                messages.add(
+                    PetMessage(
+                        fromUser = fromUser,
+                        text = t.text,
+                        createdAtMillis = t.tsSec * 1000L,
+                        taskId = t.taskId.ifBlank { null },
+                    ),
+                )
+            }
         }
+        messages.sortBy { it.createdAtMillis }
     }
 
     /** 清空对话流（配合 PetMemory.clearConversation()）。清空后标记已水合，避免又被回填。 */

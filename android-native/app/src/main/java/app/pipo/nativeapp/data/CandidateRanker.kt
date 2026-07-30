@@ -53,6 +53,7 @@ object CandidateRanker {
                 c.track,
                 intent.hardArtists, intent.hardTracks,
                 intent.textArtists, intent.textTracks,
+                intent.textAlbums,
             )
             if (c.semanticProfile != null && !explicitlyMentioned &&
                 !TagRecall.passesHardConstraints(c.semanticProfile, intent)

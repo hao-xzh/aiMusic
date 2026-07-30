@@ -751,6 +751,33 @@ class RustBridgeRepository(
         }
     }
 
+    override suspend fun createPlaylist(name: String): Long {
+        val cleanName = name.trim()
+        require(cleanName.isNotEmpty()) { "歌单名称不能为空" }
+        return try {
+            bridge.neteasePlaylistCreate(cleanName).also { playlistId ->
+                DiagnosticsLogStore.record(
+                    area = "library",
+                    event = "playlist_create_ok",
+                    fields = mapOf("playlistId" to playlistId, "name" to cleanName),
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DiagnosticsLogStore.record(
+                area = "library",
+                event = "playlist_create_failed",
+                fields = mapOf(
+                    "name" to cleanName,
+                    "errorType" to e::class.java.simpleName,
+                    "message" to e.message,
+                ),
+            )
+            throw e
+        }
+    }
+
     override suspend fun updateSettings(settings: NativeSettings) {
         settingsStore?.update(settings) ?: fallback.updateSettings(settings)
     }
@@ -945,6 +972,7 @@ interface RustPipoBridge {
     suspend fun neteaseSongLyric(trackId: String): List<PipoLyricLine>
     suspend fun neteaseCloudLyric(songId: Long, userId: Long): List<PipoLyricLine>
     suspend fun neteaseLikeSong(id: Long, like: Boolean)
+    suspend fun neteasePlaylistCreate(name: String): Long
     suspend fun neteasePlaylistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>)
     suspend fun audioCacheStats(): AudioCacheStats
     suspend fun audioCacheSetMaxMb(mb: Long)

@@ -7,10 +7,12 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.SmoothQueue
 import app.pipo.nativeapp.data.TransitionScore
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
+import app.pipo.nativeapp.data.agent.domain.CatalogConstraint
 import app.pipo.nativeapp.data.agent.domain.CommittedQueueSummary
 import app.pipo.nativeapp.data.agent.domain.MusicGoal
 import app.pipo.nativeapp.data.agent.domain.TrackPlacement
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
+import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 import app.pipo.nativeapp.playback.PlaybackSessionClock
 import app.pipo.nativeapp.playback.SeamlessRuntimeFlags
@@ -116,6 +118,8 @@ data class QueueHardConstraints(
     val excludedArtists: List<String> = emptyList(),
     val excludedLanguages: List<String> = emptyList(),
     val excludedTrackIds: List<String> = emptyList(),
+    val catalogConstraint: CatalogConstraint = CatalogConstraint(),
+    val catalogExceptionTracks: List<TrackRequirement> = emptyList(),
 ) {
     companion object {
         fun fromUserText(text: String): QueueHardConstraints {
@@ -153,6 +157,8 @@ data class QueueHardConstraints(
                 ),
                 requiredArtists = requiredArtists,
                 artistScope = if (requiredArtists.isNotEmpty()) goal.artistScope else textConstraints.artistScope,
+                catalogConstraint = goal.catalogConstraint,
+                catalogExceptionTracks = mergeRequirements(goal.mustInclude + listOfNotNull(goal.closer)),
             )
         }
 
@@ -826,6 +832,7 @@ private class QueueValidator {
         val requiredArtists = request.hardConstraints.requiredArtists.filter { it.isNotBlank() }
         val excludedArtists = request.hardConstraints.excludedArtists.filter { it.isNotBlank() }
         val excludedTrackIds = request.hardConstraints.excludedTrackIds.toSet()
+        val catalogConstraint = request.hardConstraints.catalogConstraint
         if (request.operation == QueueOperation.InsertNext && tracks.firstOrNull() == null) {
             messages.add("下一首插入目标为空")
         }
@@ -877,6 +884,23 @@ private class QueueValidator {
         }
         if (excludedTrackIds.isNotEmpty() && tracks.any { it.id in excludedTrackIds }) {
             messages.add("队列包含了用户排除的歌曲")
+        }
+        if (catalogConstraint.isActive) {
+            val exceptionRequirements = request.hardConstraints.catalogExceptionTracks
+            val catalogTracks = tracks.filterNot { track ->
+                exceptionRequirements.any { requirement ->
+                    val title = CommandTextSignals.normalizeForMatch(track.title)
+                    val expected = CommandTextSignals.normalizeForMatch(requirement.title)
+                    expected.isNotBlank() && (title == expected || title.contains(expected) || expected.contains(title))
+                }
+            }
+            val mismatched = catalogTracks.filterNot { CatalogConstraintMatcher.matches(it, catalogConstraint) }
+            if (catalogTracks.isEmpty() || mismatched.isNotEmpty()) {
+                messages.add(
+                    "队列偏离具名作品「${catalogConstraint.name}」:" +
+                        mismatched.take(3).joinToString("|") { "${it.title}-${it.artist}" },
+                )
+            }
         }
         val overMoved = plan.slots.withIndex().firstOrNull { (finalIndex, slot) ->
             !slot.locked && abs(slot.originalIndex - finalIndex) > request.mixPolicy.maxReorderDistance

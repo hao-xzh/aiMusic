@@ -75,6 +75,12 @@ sealed class PlannedAction {
         val playlistName: String,
     ) : PlannedAction()
 
+    data class CreatePlaylist(
+        override val actionId: String,
+        val playlistName: String,
+        val tracks: List<TrackRequirement>,
+    ) : PlannedAction()
+
     data class SkipCurrent(
         override val actionId: String,
     ) : PlannedAction()
@@ -124,6 +130,16 @@ data class MusicGoal(
     val aiAdjacentStyles: List<String> = emptyList(),
     val aiAvoidStyles: List<String> = emptyList(),
     val searchSeeds: List<String> = emptyList(),
+    /** LLM 对本次选歌边界的显式判断；Unknown 不允许进入自动提交。 */
+    val selectionMode: MusicSelectionMode = MusicSelectionMode.Unknown,
+    /**
+     * 用户明确点名的目录实体，例如专辑、原声、音乐剧、影视/游戏作品或其它具名作品。
+     *
+     * 这不是用关键词猜意图：由 LLM 根据完整语境提供原名、可出现在曲目元数据里的
+     * 别名，以及适合目录检索的查询。Resolver 用它防止“明确要 A，最后却按画像播放 B”；
+     * 开放式情绪/场景/风格推荐保持为空，继续允许画像探索和相邻风格扩展。
+     */
+    val catalogConstraint: CatalogConstraint = CatalogConstraint(),
     val useCurrentStyleAnchor: Boolean = false,
     val continuationKey: String = "",
     /**
@@ -140,6 +156,83 @@ data class MusicGoal(
     /** 用户要求“中间加一首周杰伦 / 夹一点女歌手 / 加一个别的歌手”时的艺人槽。 */
     val includeArtists: List<String> = emptyList(),
 )
+
+data class CatalogConstraint(
+    /** 用户原话中的具名对象，主要用于诊断和回复，不直接依赖中文规则解析。 */
+    val name: String = "",
+    /** 可能真实出现在 album 元数据中的完整原名、译名或通行别名。 */
+    val aliases: List<String> = emptyList(),
+    /** LLM 针对音乐目录生成的精确查询，可包含原文、原名和版本限定。 */
+    val searchQueries: List<String> = emptyList(),
+) {
+    val isActive: Boolean
+        get() = name.isNotBlank() || aliases.isNotEmpty() || searchQueries.isNotEmpty()
+
+    val matchTerms: List<String>
+        get() = aliases
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .filter(::isVerifiableMetadataAlias)
+            .distinctBy { it.lowercase() }
+
+    /**
+     * 至少有一个非泛类目的 album 元数据名。单词专辑名仍可精确相等，避免误伤
+     * Thriller/1989 这类真实目录；只有更完整的别名才允许子串匹配。
+     */
+    val hasVerifiableMetadataAlias: Boolean
+        get() = matchTerms.isNotEmpty()
+
+    companion object {
+        private val genericLatinTokens = setOf(
+            "a", "an", "the", "music", "song", "songs", "album", "soundtrack", "ost", "musical",
+            "movie", "film", "game", "anime", "original", "motion", "picture", "score", "cast",
+            "recording", "broadway", "deluxe", "edition", "version", "series",
+        )
+        private val genericCjkAliases = setOf(
+            "音乐", "歌曲", "专辑", "原声", "原声带", "音乐剧", "电影", "影视", "游戏", "动漫", "作品", "系列",
+        )
+
+        fun isVerifiableMetadataAlias(raw: String): Boolean {
+            val value = raw.trim()
+            if (value.isBlank() || value in genericCjkAliases) return false
+            val cjkCount = value.count { ch -> Character.UnicodeScript.of(ch.code) == Character.UnicodeScript.HAN }
+            if (cjkCount >= 2) return true
+            val tokens = latinTokens(value)
+            if (tokens.isEmpty()) return false
+            val distinctive = tokens.filterNot(genericLatinTokens::contains)
+            if (distinctive.isEmpty()) return false
+            // “Hamilton Musical / Frozen Soundtrack”不是完整元数据名，既不能做子串锚点，
+            // 也不能作为唯一作品别名；单独的 Hamilton/Frozen 仍保留 album 精确相等能力。
+            if (tokens.size in 2..3 && distinctive.size == 1 && tokens.any(genericLatinTokens::contains)) {
+                return false
+            }
+            return true
+        }
+
+        fun isStrongMetadataAlias(raw: String): Boolean {
+            val value = raw.trim()
+            if (value.isBlank()) return false
+            val cjkCount = value.count { ch -> Character.UnicodeScript.of(ch.code) == Character.UnicodeScript.HAN }
+            if (cjkCount >= 2) return true
+            val tokens = latinTokens(value)
+            val distinctiveCount = tokens.count { it !in genericLatinTokens }
+            return distinctiveCount >= 2 || distinctiveCount >= 1 && tokens.size >= 4
+        }
+
+        private fun latinTokens(value: String): List<String> =
+            Regex("[A-Za-z0-9]+").findAll(value).map { it.value.lowercase() }.toList()
+    }
+}
+
+enum class MusicSelectionMode {
+    Unknown,
+    ExactCatalog,
+    ExactTrack,
+    ArtistFocus,
+    Playlist,
+    OpenRecommendation,
+    ContextualContinuation,
+}
 
 data class MusicStyleProfile(
     val semanticQuery: String = "",

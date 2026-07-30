@@ -81,6 +81,8 @@ class EmptyPipoRepository : PipoRepository {
 
     override suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine> = emptyList()
     override suspend fun likeSong(id: Long, like: Boolean) = Unit
+    override suspend fun createPlaylist(name: String): Long =
+        throw IllegalStateException("Native bridge unavailable")
     override suspend fun playlistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>) = Unit
 
     override suspend fun updateSettings(settings: NativeSettings) {

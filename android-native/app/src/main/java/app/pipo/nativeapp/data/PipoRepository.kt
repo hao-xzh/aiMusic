@@ -203,6 +203,8 @@ interface PipoRepository {
     suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine>
     /** 收藏 / 取消收藏单曲（写到网易云"我喜欢的音乐"红心歌单） */
     suspend fun likeSong(id: Long, like: Boolean)
+    /** 创建普通网易云歌单，返回服务端生成的歌单 id。 */
+    suspend fun createPlaylist(name: String): Long
     /** 歌单加 / 删歌；op = "add" | "del" */
     suspend fun playlistModifyTracks(playlistId: Long, op: String, trackIds: List<Long>)
     suspend fun updateSettings(settings: NativeSettings)

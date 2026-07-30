@@ -338,8 +338,6 @@ class PlayerViewModel(
     private var queueExtendFailureCount = 0
     private var queueExtendSkipDiagKey: String? = null
     private var queueExtendSkipDiagAtMs = 0L
-    private var lastMediaTransitionWasAuto = false
-    private var lastAutoWrapForceExtendAtMs = 0L
     private var stablePlaybackResetJob: Job? = null
     private var userPausedPlayback = false
     private var resolvingPlayback = false
@@ -354,7 +352,6 @@ class PlayerViewModel(
             mediaItem: androidx.media3.common.MediaItem?,
             reason: Int,
         ) {
-            lastMediaTransitionWasAuto = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
             DiagnosticsLogStore.record(
                 area = "playback",
                 event = "media_transition",
@@ -369,7 +366,9 @@ class PlayerViewModel(
                 logEventForPrev(BehaviorType.Completed, completionPctOverride = 1f)
                 logEventForCurrent(BehaviorType.PlayStarted)
                 maybeExtendQueue(trigger = "media_transition_auto", logSkips = true)
-                maybeForceExtendAfterAutoWrap(mediaItem)
+                // 自动 wrap 时新曲已经开始播放；这里只做无打断扩队，不能再走
+                // force-next/fallback seek，否则会把同一首已经播出的开头归零重放。
+                recordAutoWrapPlaybackPreserved(mediaItem)
             } else {
                 // 用户主动切：next/previous 里已经 log 过 Skipped/ManualCut
                 logEventForCurrent(BehaviorType.PlayStarted)
@@ -1789,8 +1788,10 @@ class PlayerViewModel(
     }
 
     private fun triggerForceExtendAndPlayNext(player: Player) {
+        val anchorMediaId = player.currentMediaItem?.mediaId
+        val anchorIndex = player.currentMediaItemIndex
         val sourceSnapshot = continuousSource ?: run {
-            fallbackWrapAround(player)
+            fallbackWrapAround(player, anchorMediaId, anchorIndex)
             return
         }
         val queueVersion = PlaybackSessionClock.bump("force_extend_and_play_next")
@@ -1831,7 +1832,7 @@ class PlayerViewModel(
                         remaining = remaining,
                         extra = mapOf("source" to continuousSourceKind(sourceSnapshot)),
                     )
-                    fallbackWrapAround(player)
+                    fallbackWrapAround(player, anchorMediaId, anchorIndex)
                     return@launch
                 }
                 val resolved = try {
@@ -1851,7 +1852,7 @@ class PlayerViewModel(
                             "source" to continuousSourceKind(sourceSnapshot),
                         ),
                     )
-                    fallbackWrapAround(player)
+                    fallbackWrapAround(player, anchorMediaId, anchorIndex)
                     return@launch
                 }
                 val append = selectQueueRecommendationAppend(
@@ -1873,7 +1874,7 @@ class PlayerViewModel(
                             "source" to continuousSourceKind(sourceSnapshot),
                         ),
                     )
-                    fallbackWrapAround(player)
+                    fallbackWrapAround(player, anchorMediaId, anchorIndex)
                     return@launch
                 }
                 val live = controller ?: return@launch
@@ -1884,11 +1885,27 @@ class PlayerViewModel(
                 live.addMediaItems(toMediaItems(smartAppend, plannedQueue))
                 rememberQueueRecommendations(smartAppend)
 
-                live.seekTo(insertIdx, 0L)
-                ensurePlayerLive(live)
-                live.prepare()
-                userPausedPlayback = false
-                live.play()
+                if (isPlaybackAnchorCurrent(live, anchorMediaId, anchorIndex)) {
+                    live.seekTo(insertIdx, 0L)
+                    ensurePlayerLive(live)
+                    live.prepare()
+                    userPausedPlayback = false
+                    live.play()
+                } else {
+                    DiagnosticsLogStore.record(
+                        area = "queue",
+                        event = "force_extend_handoff_preserved",
+                        fields = mapOf(
+                            "reason" to "playback_already_advanced",
+                            "anchorMediaId" to anchorMediaId,
+                            "anchorIndex" to anchorIndex,
+                            "currentMediaId" to live.currentMediaItem?.mediaId,
+                            "currentIndex" to live.currentMediaItemIndex,
+                            "positionMs" to live.currentPosition.coerceAtLeast(0L),
+                            "appendCount" to smartAppend.size,
+                        ),
+                    )
+                }
                 DiagnosticsLogStore.record(
                     area = "playback_orchestrator",
                     event = "queue_commit",
@@ -1926,7 +1943,26 @@ class PlayerViewModel(
         }
     }
 
-    private fun fallbackWrapAround(player: Player) {
+    private fun fallbackWrapAround(
+        player: Player,
+        anchorMediaId: String?,
+        anchorIndex: Int,
+    ) {
+        if (!isPlaybackAnchorCurrent(player, anchorMediaId, anchorIndex)) {
+            DiagnosticsLogStore.record(
+                area = "queue",
+                event = "fallback_wrap_suppressed",
+                fields = mapOf(
+                    "reason" to "playback_already_advanced",
+                    "anchorMediaId" to anchorMediaId,
+                    "anchorIndex" to anchorIndex,
+                    "currentMediaId" to player.currentMediaItem?.mediaId,
+                    "currentIndex" to player.currentMediaItemIndex,
+                    "positionMs" to player.currentPosition.coerceAtLeast(0L),
+                ),
+            )
+            return
+        }
         val count = player.mediaItemCount
         if (count > 0) {
             val queueVersion = PlaybackSessionClock.bump("fallback_wrap_around")
@@ -1941,6 +1977,14 @@ class PlayerViewModel(
             )
         }
     }
+
+    private fun isPlaybackAnchorCurrent(
+        player: Player,
+        anchorMediaId: String?,
+        anchorIndex: Int,
+    ): Boolean =
+        player.currentMediaItemIndex == anchorIndex &&
+            player.currentMediaItem?.mediaId == anchorMediaId
 
     private fun recoverFromStateQueue(player: Player, offset: Int): Boolean {
         val queue = state.queue
@@ -2190,14 +2234,11 @@ class PlayerViewModel(
 
     private fun syncFrom(player: Player) {
         val queue = state.queue
-        val previousIndex = state.currentIndex
         // 关键：trackId 以 player.currentMediaItem.mediaId 为权威源，不再相信 state.queue[index]。
         // 之前 phase-1/phase-2 期间（state.queue 还没追上 player 实际队列）会出现
         // "用 queue 里的旧 track.id 拉歌词、配上 player 实际在播的另一首" → 歌词不对。
         val playerMediaId = player.currentMediaItem?.mediaId
         val index = currentQueueIndexFor(player, queue)
-        val wasAutoTransition = lastMediaTransitionWasAuto
-        lastMediaTransitionWasAuto = false
         val track = playerMediaId?.let { id -> queue.firstOrNull { it.id == id } } ?: queue.getOrNull(index)
         val authoritativeTrackId = playerMediaId ?: track?.id
         if (authoritativeTrackId != null && loadedLyricsFor != authoritativeTrackId) {
@@ -2308,9 +2349,6 @@ class PlayerViewModel(
         }
         // 续杯：current 后剩 < 阈值时调一次 fetchMore
         maybeExtendQueue()
-        if (shouldForceExtendAfterAutoWrap(player, queue, previousIndex, index, wasAutoTransition)) {
-            triggerAutoWrapForceExtend(player, "sync_auto_wrap")
-        }
         maybePrepareAutoMix(player)
         // 节流持久化：杀掉冷启动黑屏 + 跳到 playlist[0] 的尴尬
         if (queue.isNotEmpty()) {
@@ -2533,53 +2571,29 @@ class PlayerViewModel(
         return raw.takeIf { it in 0 until count }
     }
 
-    private fun maybeForceExtendAfterAutoWrap(mediaItem: androidx.media3.common.MediaItem?) {
+    private fun recordAutoWrapPlaybackPreserved(mediaItem: androidx.media3.common.MediaItem?) {
         val player = controller ?: return
         val queue = state.queue
-        if (
-            shouldForceExtendAfterAutoWrap(
-                player = player,
-                queue = queue,
-                previousIndex = state.currentIndex,
-                newIndex = queue.indexOfFirst { it.id == mediaItem?.mediaId },
-                wasAutoTransition = true,
-            )
-        ) {
-            triggerAutoWrapForceExtend(player, "media_transition_auto_wrap")
-        }
-    }
-
-    private fun shouldForceExtendAfterAutoWrap(
-        player: Player,
-        queue: List<NativeTrack>,
-        previousIndex: Int,
-        newIndex: Int,
-        wasAutoTransition: Boolean,
-    ): Boolean {
-        if (!wasAutoTransition) return false
-        if (state.playbackMode != PlaybackQueueMode.AiRadio) return false
-        if (!player.playWhenReady || queue.size <= 1) return false
-        if (newIndex != 0) return false
+        if (state.playbackMode != PlaybackQueueMode.AiRadio) return
+        if (!player.playWhenReady || queue.size <= 1) return
+        val previousIndex = state.currentIndex
+        val newIndex = queue.indexOfFirst { it.id == mediaItem?.mediaId }
+        if (newIndex != 0) return
         val tailWindowStart = (queue.lastIndex - extendThreshold).coerceAtLeast(0)
-        return previousIndex >= tailWindowStart
-    }
-
-    private fun triggerAutoWrapForceExtend(player: Player, trigger: String) {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastAutoWrapForceExtendAtMs < AUTO_WRAP_FORCE_EXTEND_DEBOUNCE_MS) return
-        lastAutoWrapForceExtendAtMs = now
+        if (previousIndex < tailWindowStart) return
         DiagnosticsLogStore.record(
             area = "queue",
-            event = "ai_radio_auto_wrap_force_extend",
+            event = "ai_radio_auto_wrap_playback_preserved",
             fields = mapOf(
-                "trigger" to trigger,
                 "queueSize" to state.queue.size,
-                "currentIndex" to state.currentIndex,
+                "previousIndex" to previousIndex,
+                "currentIndex" to newIndex,
                 "mediaItemCount" to player.mediaItemCount,
                 "playbackMode" to state.playbackMode.name,
-            ) + currentTrackFields(),
+                "mediaId" to mediaItem?.mediaId,
+                "title" to mediaItem?.mediaMetadata?.title?.toString(),
+            ),
         )
-        triggerForceExtendAndPlayNext(player)
     }
 
     private fun queueExtendDiagFields(
@@ -2597,7 +2611,11 @@ class PlayerViewModel(
         )
 
     private fun continuousSourceKind(source: ContinuousQueueSource): String =
-        if (source === defaultContinuousSource) "default" else "agent"
+        when {
+            source === defaultContinuousSource -> "default"
+            !source.permitsDefaultFallback() -> "agent_strict"
+            else -> "agent"
+        }
 
     private fun recordQueueExtendSkip(
         trigger: String,
@@ -2741,12 +2759,10 @@ class PlayerViewModel(
                     return@launch
                 }
                 if (more.isEmpty()) {
-                    // source 跑空了 —— 不关闭循环，也不立刻放弃续杯：
-                    // agent 的“按本次需求搜索”源召回面窄（静态 query 的 top-N 被排除完即枯竭），
-                    // AI 电台模式下回退到 RecommendEngine 默认源（本地库+口味画像+行为，召回深得多），
-                    // 电台才能一直在线；默认源也跑空才彻底拆除——保留 REPEAT_MODE_ALL
-                    // 让现有队列循环，至少能听（旧行为：一跑空就拆，用户看到“AI 不补歌了，变列表循环”）。
+                    // source 跑空：开放推荐可回退到 RecommendEngine 保持电台在线；精确目录 source
+                    // 明确禁止降级，宁可停止补歌并循环已核验队列，也不能混入作品外曲目。
                     val fallback = defaultContinuousSource.takeIf {
+                        sourceSnapshot.permitsDefaultFallback() &&
                         state.playbackMode == PlaybackQueueMode.AiRadio && sourceSnapshot !== defaultContinuousSource
                     }
                     if (continuousSource === sourceSnapshot) {
@@ -2766,7 +2782,7 @@ class PlayerViewModel(
                     resetQueueExtendBackoff()
                     return@launch
                 }
-                val resolved = try {
+                val playable = try {
                     resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }
                 } catch (e: CancellationException) {
                     throw e
@@ -2775,11 +2791,31 @@ class PlayerViewModel(
                     armQueueExtendBackoff()
                     return@launch
                 }
+                val resolved = playable.filter(sourceSnapshot::acceptsResolved)
                 if (!isQueueExtendStillCurrent(gen, sourceSnapshot, queueSnapshot)) {
                     recordQueueExtendAbort(trigger, "stale_after_resolve", queueSnapshot, remaining)
                     return@launch
                 }
                 if (resolved.isEmpty()) {
+                    if (playable.isNotEmpty() && !sourceSnapshot.permitsDefaultFallback()) {
+                        if (continuousSource === sourceSnapshot) {
+                            continuousSource = null
+                        }
+                        if (lastAgentContinuousSource === sourceSnapshot) {
+                            lastAgentContinuousSource = null
+                        }
+                        DiagnosticsLogStore.record(
+                            area = "queue",
+                            event = "continuous_source_guard_exhausted",
+                            fields = queueExtendDiagFields(trigger, queueSnapshot, remaining) + mapOf(
+                                "source" to continuousSourceKind(sourceSnapshot),
+                                "candidateCount" to more.size,
+                                "playableCount" to playable.size,
+                            ),
+                        )
+                        resetQueueExtendBackoff()
+                        return@launch
+                    }
                     recordQueueExtendFailure(trigger, "resolved_empty", queueSnapshot, remaining)
                     armQueueExtendBackoff()
                     return@launch
@@ -3223,7 +3259,6 @@ class PlayerViewModel(
         private const val QUEUE_EXTEND_SKIP_LOG_THROTTLE_MS = 15_000L
         private const val QUEUE_EXTEND_FETCH_CANDIDATE_COUNT = 24
         private const val QUEUE_EXTEND_APPEND_TARGET = 8
-        private const val AUTO_WRAP_FORCE_EXTEND_DEBOUNCE_MS = 5_000L
         private const val QUEUE_RECOMMENDATION_AVOID_MAX = 512
         private const val PLAYLIST_APPEND_RESOLVE_CHUNK_SIZE = 40
         private const val INITIAL_APPEND_RESOLVE_CHUNK_SIZE = 8

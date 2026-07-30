@@ -152,16 +152,28 @@ fun NativeAiPet(
     LaunchedEffect(Unit) {
         PipoGraph.agentTasks.store.tasks.collect { tasks ->
             pending = tasks.any { it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.QUEUED || it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.RUNNING }
-            tasks.filter {
-                (it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.SUCCEEDED ||
-                    it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.FAILED) &&
-                    it.resultReply.isNotBlank()
-            }
-                .takeLast(3)
+            tasks.takeLast(3)
                 .forEach { task ->
-                    val alreadyDelivered = messages.any { it.taskId == task.id } ||
-                        messages.any { !it.fromUser && it.taskId == null && it.text == task.resultReply }
-                    if (!alreadyDelivered) {
+                    val hasUser = messages.any {
+                        it.taskId == task.id && it.fromUser && it.card == null
+                    }
+                    if (!hasUser && task.userText.isNotBlank()) {
+                        messages += PetMessage(
+                            fromUser = true,
+                            text = task.userText,
+                            createdAtMillis = task.createdAt,
+                            taskId = task.id,
+                        )
+                    }
+                    val completed =
+                        task.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.SUCCEEDED ||
+                            task.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.FAILED
+                    val hasReply = messages.any {
+                        it.taskId == task.id && !it.fromUser && it.card == null
+                    } || messages.any {
+                        !it.fromUser && it.taskId == null && it.text == task.resultReply
+                    }
+                    if (completed && task.resultReply.isNotBlank() && !hasReply) {
                         messages += PetMessage(fromUser = false, text = task.resultReply, taskId = task.id)
                     }
                 }
@@ -202,7 +214,9 @@ fun NativeAiPet(
                 return agentRuntime.handle(
                     input = AgentTurnInput(
                         userText = task.userText,
-                        history = promptContext.turns,
+                        // The current question is persisted at enqueue time for crash
+                        // safety, but userText already carries it into this turn.
+                        history = promptContext.turns.filterNot { it.taskId == task.id },
                         historySummary = promptContext.summary,
                         musicReferences = promptContext.musicReferences,
                         currentTrack = snapshotTrack,
@@ -575,7 +589,6 @@ fun NativeAiPet(
                     val text = input.trim()
                     if (text.isEmpty()) return@PetCommandBar
                     input = ""
-                    messages += PetMessage(fromUser = true, text = text)
                     PetBubbleState.lastUserContext = text
                     runCatching { PipoGraph.petMemory.recordUtterance(text) }
                     pending = true
@@ -590,7 +603,7 @@ fun NativeAiPet(
                         scope.launch {
                             result.fold(
                                 onSuccess = { outcome ->
-                                    if (messages.none { it.taskId == submittedTaskId && it.card == null }) {
+                                    if (messages.none { it.taskId == submittedTaskId && !it.fromUser && it.card == null }) {
                                         messages += PetMessage(fromUser = false, text = outcome.reply, taskId = submittedTaskId)
                                     }
                                     outcome.cards.forEach { card -> messages += PetMessage(false, "", card.toPetResultCard(), taskId = submittedTaskId) }
@@ -599,7 +612,7 @@ fun NativeAiPet(
                                 },
                                 onFailure = {
                                     val reply = "这次请求没能完成，请检查网络或 AI 配置后重试。"
-                                    if (messages.none { it.taskId == submittedTaskId && it.card == null }) {
+                                    if (messages.none { it.taskId == submittedTaskId && !it.fromUser && it.card == null }) {
                                         messages += PetMessage(fromUser = false, text = reply, taskId = submittedTaskId)
                                     }
                                     latestReply = reply
@@ -610,6 +623,14 @@ fun NativeAiPet(
                         }
                     })
                     submittedTaskId = submittedTask.id
+                    if (messages.none { it.taskId == submittedTask.id && it.fromUser && it.card == null }) {
+                        messages += PetMessage(
+                            fromUser = true,
+                            text = text,
+                            createdAtMillis = submittedTask.createdAt,
+                            taskId = submittedTask.id,
+                        )
+                    }
                 },
             )
         }

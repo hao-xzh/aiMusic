@@ -12,7 +12,9 @@ import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
 import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
 import app.pipo.nativeapp.data.agent.domain.AgentUiCard
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
+import app.pipo.nativeapp.data.agent.domain.CatalogConstraint
 import app.pipo.nativeapp.data.agent.domain.MusicGoal
+import app.pipo.nativeapp.data.agent.domain.MusicSelectionMode
 import app.pipo.nativeapp.data.agent.domain.MusicStyleProfile
 import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
@@ -443,6 +445,7 @@ class AgentToolLoop(
                 )
                 "like_track" -> likeTrack(call.arguments, input, executor, state)
                 "modify_playlist_current" -> modifyPlaylist(call.arguments, input, executor, state)
+                "create_playlist_from_tracks" -> createPlaylist(call.arguments, input, executor, state)
                 else -> JSONObject()
                     .put("ok", false)
                     .put("error", "unknown_tool:${call.name}")
@@ -554,6 +557,23 @@ class AgentToolLoop(
         state: LoopState,
     ): JSONObject {
         val action = playRequestFromArgs(args, input)
+        selectionContractError(action)?.let { (error, message) ->
+            state.trace("draft_queue:$error")
+            return JSONObject()
+                .put("ok", false)
+                .put("error", error)
+                .put("message", message)
+        }
+        if (!hasMusicSelectionSignal(action)) {
+            state.trace("draft_queue:missing_music_selection_signal")
+            return JSONObject()
+                .put("ok", false)
+                .put("error", "missing_music_selection_signal")
+                .put(
+                    "message",
+                    "这次 draft_queue 没有携带任何选歌语义。请重新理解用户原话，并至少提供 target、artists、query、catalog、playlist、风格/场景条件或明确的上下文引用；不能退化成纯画像随机播放。",
+                )
+        }
         val basePlan = MusicTurnPlan(
             turnId = state.turnId,
             userText = input.userText,
@@ -607,6 +627,111 @@ class AgentToolLoop(
             .put("error", if (play == null || play.tracks.isEmpty()) "empty_draft_queue" else JSONObject.NULL)
     }
 
+    private fun hasMusicSelectionSignal(action: PlannedAction.PlayRequest): Boolean {
+        val goal = action.primaryGoal
+        return action.target != null ||
+            action.similar ||
+            goal.catalogConstraint.isActive ||
+            goal.primaryArtists.isNotEmpty() ||
+            goal.playlistName.isNotBlank() ||
+            goal.primaryTracks.isNotEmpty() ||
+            goal.mustInclude.isNotEmpty() ||
+            goal.closer != null ||
+            goal.searchSeeds.isNotEmpty() ||
+            goal.hardGenres.isNotEmpty() ||
+            goal.hardLanguages.isNotEmpty() ||
+            goal.hardVocalTypes.isNotEmpty() ||
+            goal.softMoods.isNotEmpty() ||
+            goal.softScenes.isNotEmpty() ||
+            goal.softTextures.isNotEmpty() ||
+            goal.softQualityWords.isNotEmpty() ||
+            goal.refStyles.isNotEmpty() ||
+            goal.aiMainStyles.isNotEmpty() ||
+            goal.includeArtists.isNotEmpty() ||
+            goal.styleProfile.hasSignal ||
+            goal.referenceContext != ReferenceContext.None ||
+            goal.useCurrentStyleAnchor
+    }
+
+    /**
+     * 选歌意图先由模型基于完整语境显式分类，再由代码核对该分类所需的结构化证据。
+     * 这里不靠作品词表猜“汉密尔顿/歌剧魅影/某电影”是什么，只阻止模型把未完成理解的
+     * 普通 query 当成可自动提交的精确结果。
+     */
+    private fun selectionContractError(action: PlannedAction.PlayRequest): Pair<String, String>? {
+        val goal = action.primaryGoal
+        val catalog = goal.catalogConstraint
+        if (goal.selectionMode == MusicSelectionMode.Unknown) {
+            return "missing_intent_mode" to
+                "必须先根据用户完整语境声明 intent_mode，再起草队列；不能把具名作品退化成普通关键词搜索。"
+        }
+        if (catalog.isActive &&
+            (catalog.name.isBlank() || catalog.aliases.isEmpty() || catalog.searchQueries.isEmpty())
+        ) {
+            return "invalid_catalog_constraint" to
+                "catalog 必须同时提供 name、完整作品元数据 aliases 和精确 search_queries。请补齐后重试。"
+        }
+        if (catalog.isActive && !catalog.hasVerifiableMetadataAlias) {
+            return "weak_catalog_alias" to
+                "catalog.aliases 至少要有一个可在 album 元数据中核对的非泛类目作品名；共享词、姓氏加泛类目或空泛版本名不能作为作品边界。"
+        }
+
+        return when (goal.selectionMode) {
+            MusicSelectionMode.Unknown -> null
+            MusicSelectionMode.ExactCatalog -> if (!catalog.isActive) {
+                "missing_catalog_constraint" to
+                    "intent_mode=exact_catalog 时必须提供 catalog={name, aliases, search_queries}，不能只传 query。"
+            } else {
+                null
+            }
+            MusicSelectionMode.ExactTrack -> if (action.target == null && goal.primaryTracks.isEmpty()) {
+                "missing_exact_track" to "intent_mode=exact_track 时必须提供 target_title（需要时加 target_artist）。"
+            } else {
+                null
+            }
+            MusicSelectionMode.ArtistFocus -> if (goal.primaryArtists.isEmpty()) {
+                "missing_artist_focus" to "intent_mode=artist_focus 时必须提供 artists。"
+            } else if (catalog.isActive) {
+                "conflicting_catalog_mode" to "点名作品时请使用 intent_mode=exact_catalog；artists 只能作为作品内的附加约束。"
+            } else {
+                null
+            }
+            MusicSelectionMode.Playlist -> if (goal.playlistName.isBlank()) {
+                "missing_playlist" to "intent_mode=playlist 时必须提供 playlist_name。"
+            } else {
+                null
+            }
+            MusicSelectionMode.OpenRecommendation -> if (catalog.isActive) {
+                "conflicting_catalog_mode" to "开放推荐不能携带 catalog；点名作品请使用 intent_mode=exact_catalog。"
+            } else if (!hasOpenRecommendationSignal(goal)) {
+                "missing_open_recommendation_signal" to "开放推荐必须提供 query、style、情绪、场景、流派或语言等选歌语义。"
+            } else {
+                null
+            }
+            MusicSelectionMode.ContextualContinuation -> if (catalog.isActive) {
+                "conflicting_catalog_mode" to "继续播放某个具名作品仍应使用 intent_mode=exact_catalog，而不是开放式上下文续播。"
+            } else if (!action.similar && goal.referenceContext == ReferenceContext.None && !goal.useCurrentStyleAnchor) {
+                "missing_context_reference" to
+                    "intent_mode=contextual_continuation 时必须声明 similar、reference_context 或 use_current_style_anchor。"
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun hasOpenRecommendationSignal(goal: MusicGoal): Boolean =
+        goal.searchSeeds.isNotEmpty() ||
+            goal.hardGenres.isNotEmpty() ||
+            goal.hardLanguages.isNotEmpty() ||
+            goal.hardVocalTypes.isNotEmpty() ||
+            goal.softMoods.isNotEmpty() ||
+            goal.softScenes.isNotEmpty() ||
+            goal.softTextures.isNotEmpty() ||
+            goal.softQualityWords.isNotEmpty() ||
+            goal.refStyles.isNotEmpty() ||
+            goal.aiMainStyles.isNotEmpty() ||
+            goal.styleProfile.hasSignal
+
     private fun hasLikelyMultipleActions(userText: String): Boolean {
         val compact = userText.replace(Regex("\\s+"), "")
         val connector = listOf("然后", "同时", "并且", "并").any { it in compact }
@@ -638,13 +763,31 @@ class AgentToolLoop(
             return JSONObject().put("ok", false).put("error", "empty_track_keys")
         }
         val modeForCommit = playMode(args.optString("operation"), PlayMode.ReplaceQueue)
+        val directGoal = goalFromArgs(args)
+        val contractTarget = tracks.firstOrNull()
+            ?.takeIf { directGoal.selectionMode == MusicSelectionMode.ExactTrack }
+            ?.let { TrackRequirement(title = it.title, artist = it.artist) }
+        val contractAction = PlannedAction.PlayRequest(
+            actionId = "commit_contract",
+            mode = modeForCommit,
+            primaryGoal = directGoal,
+            target = contractTarget,
+            similar = args.optBoolean("similar", false),
+        )
+        selectionContractError(contractAction)?.let { (error, message) ->
+            state.trace("commit_queue:$error")
+            return JSONObject()
+                .put("ok", false)
+                .put("error", error)
+                .put("message", message)
+        }
         val continuous = directCommitContinuousSource(args, input, modeForCommit, tracks.size)
         val action = PlannedAction.PlayTracks(
             actionId = "commit",
             mode = modeForCommit,
             tracks = tracks,
             continuous = continuous,
-            primaryGoal = goalFromArgs(args),
+            primaryGoal = directGoal,
             target = trackRequirement(args.optJSONObject("target"), TrackPlacement.Now),
             similar = args.optBoolean("similar", false),
             jumpToInserted = args.optBoolean("jump_to_inserted", defaultJumpToInserted(modeForCommit)),
@@ -801,6 +944,107 @@ class AgentToolLoop(
         )
     }
 
+    private suspend fun createPlaylist(
+        args: JSONObject,
+        input: AgentTurnInput,
+        executor: AgentActionExecutor,
+        state: LoopState,
+    ): JSONObject {
+        val playlistName = args.optString("playlist_name").ifBlank { args.optString("playlistName") }.trim()
+        val tracks = requestedTracks(args.optJSONArray("tracks"))
+        val plan = MusicTurnPlan(
+            turnId = state.turnId,
+            userText = input.userText,
+            actions = listOf(PlannedAction.CreatePlaylist("create_playlist", playlistName, tracks)),
+            plannerRaw = "tool_loop",
+        )
+        val gateFailure = playlistCreationGateFailure(input.userText, playlistName, tracks)
+        val validation = QueueValidation(
+            passed = gateFailure == null,
+            messages = listOfNotNull(gateFailure?.first),
+        )
+        val result = if (gateFailure == null) {
+            executor.createPlaylist("create_playlist", playlistName, tracks)
+        } else {
+            ActionExecutionResult(
+                actionId = "create_playlist",
+                type = "playlist_create",
+                success = false,
+                message = gateFailure.second,
+                acceptedByPlayer = false,
+                errorMessage = gateFailure.second,
+            )
+        }
+        return commitSimple(
+            state = state,
+            plan = plan,
+            validation = validation,
+            result = result,
+        )
+    }
+
+    /**
+     * 创建歌单是持久化写操作：即使模型误选了工具，也必须由用户当前原话中的明确意图、
+     * 歌单名和每个歌名共同解锁。这样不会把普通播放、推荐或打开已有歌单误变成创建动作。
+     */
+    private fun playlistCreationGateFailure(
+        userText: String,
+        playlistName: String,
+        tracks: List<TrackRequirement>,
+    ): Pair<String, String>? {
+        if (playlistName.isBlank()) {
+            return "playlist_create_missing_name" to "请先告诉我新歌单的名称，我还没有创建。"
+        }
+        if (tracks.isEmpty()) {
+            return "playlist_create_missing_tracks" to "请明确列出要添加的歌名，我还没有创建歌单。"
+        }
+        if (!hasExplicitPlaylistCreationIntent(userText)) {
+            return "playlist_create_intent_not_explicit" to "你这句话没有明确要求创建新歌单，我没有执行创建。"
+        }
+        val normalizedText = CommandTextSignals.normalizeForMatch(userText)
+        val normalizedName = CommandTextSignals.normalizeForMatch(playlistName)
+        if (normalizedName.isBlank() || normalizedName !in normalizedText) {
+            return "playlist_create_name_not_in_user_text" to "歌单名称不是你这句话里明确给出的，我没有执行创建。"
+        }
+        val unmentioned = tracks.firstOrNull { track ->
+            val normalizedTitle = CommandTextSignals.normalizeForMatch(track.title)
+            normalizedTitle.isBlank() || normalizedTitle !in normalizedText
+        }
+        if (unmentioned != null) {
+            return "playlist_create_track_not_in_user_text" to
+                "「${unmentioned.title}」不是你这句话里明确给出的歌名，我没有创建歌单。"
+        }
+        val unmentionedArtist = tracks.firstOrNull { track ->
+            val normalizedArtist = CommandTextSignals.normalizeForMatch(track.artist.orEmpty())
+            normalizedArtist.isNotBlank() && normalizedArtist !in normalizedText
+        }
+        if (unmentionedArtist != null) {
+            return "playlist_create_artist_not_in_user_text" to
+                "「${unmentionedArtist.artist}」不是你这句话里明确给出的歌手，我没有创建歌单。"
+        }
+        return null
+    }
+
+    private fun hasExplicitPlaylistCreationIntent(userText: String): Boolean {
+        val compact = CommandTextSignals.normalizeCommandText(userText)
+        val chineseSignals = listOf(
+            "创建歌单", "创建一个歌单", "创建个歌单",
+            "新建歌单", "新建一个歌单", "新建个歌单",
+            "建歌单", "建一个歌单", "建个歌单",
+            "创建播放列表", "新建播放列表", "建播放列表",
+        )
+        if (chineseSignals.any { it in compact }) return true
+        if (Regex("(?:创建|新建|建|做)(?:一个|个)?[^，。,.!！?？]{0,40}(?:歌单|播放列表)")
+                .containsMatchIn(userText)
+        ) {
+            return true
+        }
+        return Regex(
+            "\\b(?:create|make|build|new)\\b.{0,40}\\bplaylist\\b",
+            RegexOption.IGNORE_CASE,
+        ).containsMatchIn(userText)
+    }
+
     private fun commitSimple(
         state: LoopState,
         plan: MusicTurnPlan,
@@ -838,7 +1082,7 @@ class AgentToolLoop(
                 .put(
                     "message",
                     "你在 final_response 里说了已放/切了/收藏了/排好了，但本轮没有任何执行工具成功提交。" +
-                        "要么先真正调用 draft_queue+commit_queue / like / skip 完成动作，要么改成‘还没执行 / 没找到’的诚实说明再 final_response。",
+                        "要么先真正调用对应的播放 / 收藏 / 跳过 / 建歌单工具完成动作，要么改成‘还没执行 / 没找到’的诚实说明再 final_response。",
                 )
         }
         state.done = true
@@ -942,9 +1186,30 @@ class AgentToolLoop(
             softMoods = stringArray(args, "moods"),
             softScenes = stringArray(args, "scenes"),
             searchSeeds = listOf(args.optString("query")).filter { it.isNotBlank() },
+            selectionMode = selectionMode(
+                args.optString("intent_mode").ifBlank { args.optString("selection_mode") },
+            ),
+            catalogConstraint = catalogConstraintFromArgs(args),
+            useCurrentStyleAnchor = args.optBoolean("use_current_style_anchor", false),
             styleProfile = style,
             referenceContext = referenceContext(args.optString("reference_context").ifBlank { args.optString("referenceContext") }),
             includeArtists = stringArray(args, "include_artists").ifEmpty { stringArray(args, "includeArtists") },
+        )
+    }
+
+    private fun catalogConstraintFromArgs(args: JSONObject): CatalogConstraint {
+        val catalog = args.optJSONObject("catalog")
+        val name = catalog?.optString("name").orEmpty()
+            .ifBlank { args.optString("catalog_name") }
+        val aliases = stringArray(catalog, "aliases")
+            .ifEmpty { stringArray(args, "catalog_aliases") }
+        val queries = stringArray(catalog, "search_queries")
+            .ifEmpty { stringArray(catalog, "searchQueries") }
+            .ifEmpty { stringArray(args, "catalog_queries") }
+        return CatalogConstraint(
+            name = name.trim().take(120),
+            aliases = aliases.take(8),
+            searchQueries = queries.take(6),
         )
     }
 
@@ -981,6 +1246,17 @@ class AgentToolLoop(
             "similar", "style" -> ArtistScope.Similar
             "focus", "primary", "mostly" -> ArtistScope.Focus
             else -> fallback
+        }
+
+    private fun selectionMode(raw: String): MusicSelectionMode =
+        when (raw.trim().lowercase()) {
+            "exact_catalog", "exactcatalog" -> MusicSelectionMode.ExactCatalog
+            "exact_track", "exacttrack" -> MusicSelectionMode.ExactTrack
+            "artist_focus", "artistfocus" -> MusicSelectionMode.ArtistFocus
+            "playlist" -> MusicSelectionMode.Playlist
+            "open_recommendation", "openrecommendation" -> MusicSelectionMode.OpenRecommendation
+            "contextual_continuation", "contextualcontinuation" -> MusicSelectionMode.ContextualContinuation
+            else -> MusicSelectionMode.Unknown
         }
 
     private fun referenceContext(raw: String): ReferenceContext =
@@ -1034,6 +1310,30 @@ class AgentToolLoop(
         return out
     }
 
+    private fun requestedTracks(arr: JSONArray?): List<TrackRequirement> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<TrackRequirement>()
+        for (i in 0 until arr.length()) {
+            when (val item = arr.opt(i)) {
+                is JSONObject -> {
+                    val title = item.optString("title").trim()
+                    if (title.isNotBlank()) {
+                        out.add(
+                            TrackRequirement(
+                                title = title,
+                                artist = item.optString("artist").trim().takeIf(String::isNotBlank),
+                            ),
+                        )
+                    }
+                }
+                is String -> item.trim().takeIf(String::isNotBlank)?.let { title ->
+                    out.add(TrackRequirement(title = title))
+                }
+            }
+        }
+        return out
+    }
+
     private fun List<NativeTrack>.toTrackArray(state: LoopState): JSONArray {
         val arr = JSONArray()
         take(50).forEach { track -> arr.put(trackJson(track, state.trackKey(track))) }
@@ -1068,6 +1368,8 @@ class AgentToolLoop(
             .put("actuallyStarted", result.actuallyStarted)
             .put("error", result.errorMessage ?: JSONObject.NULL)
             .put("warnings", JSONArray(result.warnings))
+            .put("playlistName", result.playlistName ?: JSONObject.NULL)
+            .put("trackCount", result.tracks.size)
 
     private fun stringArray(obj: JSONObject?, key: String): List<String> {
         val arr = obj?.optJSONArray(key) ?: return emptyList()
@@ -1178,7 +1480,7 @@ class AgentToolLoop(
                 appendLine("- ${ref.artist.orEmpty()} - ${ref.title}")
             }
         }
-        appendLine("必须先调用工具观察真实候选；需要播放/收藏/改歌单时必须以 commit/动作工具结束。")
+        appendLine("必须先调用工具观察真实候选；需要播放/收藏/改歌单/创建歌单时必须以 commit/动作工具结束。")
     }
 
     /** 对齐 PetMemory.cleanConversationText 的归一化（折叠空白），保证 ledger 与对话轮能配上。 */
@@ -1196,12 +1498,13 @@ class AgentToolLoop(
 
     private fun describeAction(action: PlannedAction): String =
         when (action) {
-            is PlannedAction.PlayRequest -> "${action.mode}:request:${action.target?.title.orEmpty()}:${action.primaryGoal.primaryArtists.joinToString("/")}"
-            is PlannedAction.PlayTracks -> "${action.mode}:tracks:${action.tracks.take(3).joinToString("/") { it.title }}"
+            is PlannedAction.PlayRequest -> "${action.mode}:${action.primaryGoal.selectionMode}:request:${action.target?.title.orEmpty()}:${action.primaryGoal.primaryArtists.joinToString("/")}"
+            is PlannedAction.PlayTracks -> "${action.mode}:${action.primaryGoal.selectionMode}:tracks:${action.tracks.take(3).joinToString("/") { it.title }}"
             is PlannedAction.PlayPlaylist -> "playlist:${action.name}:${action.tracks.size}"
             is PlannedAction.LikeCurrent -> "like:${action.like}"
             is PlannedAction.LikeTrack -> "likeTrack:${action.target.artist.orEmpty()}-${action.target.title}:${action.like}"
             is PlannedAction.ModifyPlaylist -> "playlistModify:${action.playlistName}"
+            is PlannedAction.CreatePlaylist -> "playlistCreate:${action.playlistName}:${action.tracks.size}"
             is PlannedAction.SkipCurrent -> "skip"
             is PlannedAction.Say -> "say"
             is PlannedAction.Clarify -> "clarify"
@@ -1229,6 +1532,13 @@ class AgentToolLoop(
                 kind = if (result.message.contains("移出")) AgentUiCard.Kind.PlaylistRemove else AgentUiCard.Kind.PlaylistAdd,
                 label = result.message,
             )
+            "playlist_create" -> AgentUiCard(
+                kind = AgentUiCard.Kind.PlaylistAdd,
+                label = result.message,
+                count = result.tracks.size,
+                artists = result.tracks.map { it.artist }.filter(String::isNotBlank).distinct().take(3).joinToString("、"),
+                covers = result.tracks.mapNotNull { it.artworkUrl }.take(3),
+            )
             else -> null
         }
     }
@@ -1237,7 +1547,7 @@ class AgentToolLoop(
         .put(
             functionTool(
                 "final_response",
-                "Use only for pure chat, clarification, or an honest cannot-do response. Do not use it to claim playback/queue/like success.",
+                "Use only for pure chat, clarification, or an honest cannot-do response. Do not use it to claim playback, queue, like, or playlist-creation success.",
                 JSONObject()
                     .put("message", stringSchema("Short response to the user"))
                     .put("reason", stringSchema("Why no playback/control tool is needed")),
@@ -1271,7 +1581,7 @@ class AgentToolLoop(
                 "draft_queue",
                 "Ask the local resolver/ranker to build and validate a queue candidate. Use this before commit_queue for most playback requests.",
                 queueDraftProperties(),
-                emptyList(),
+                listOf("intent_mode"),
             ),
         )
         .put(
@@ -1279,7 +1589,7 @@ class AgentToolLoop(
                 "commit_queue",
                 "Commit a validated draft or explicit track keys to playback. If it fails, observe the reason and repair with more tools.",
                 queueCommitProperties(),
-                emptyList(),
+                listOf("intent_mode"),
             ),
         )
         .put(
@@ -1323,11 +1633,24 @@ class AgentToolLoop(
                 listOf("playlist_name"),
             ),
         )
+        .put(
+            functionTool(
+                "create_playlist_from_tracks",
+                "Create a real NetEase playlist and batch-add the user's explicitly named songs. This tool resolves every named track, refuses ambiguity, creates the playlist, and verifies that all requested tracks were added. Track order is not managed.",
+                JSONObject()
+                    .put("playlist_name", stringSchema("Exact playlist name requested by the user"))
+                    .put("tracks", requestedTrackArraySchema())
+                    .put("more_actions_pending", moreActionsPendingSchema()),
+                listOf("playlist_name", "tracks"),
+            ),
+        )
 
     private fun queueDraftProperties(): JSONObject =
         JSONObject()
+            .put("intent_mode", intentModeSchema())
             .put("operation", enumSchema("Queue operation", listOf("replace_queue", "play_now", "insert_next")))
             .put("query", stringSchema("Natural language music query/style"))
+            .put("catalog", catalogConstraintSchema())
             .put("playlist_name", stringSchema("Scope to a playlist/cloud disk when requested"))
             .put("artists", arraySchema("Primary real artist names"))
             .put("artist_scope", enumSchema("Artist scope", listOf("Strict", "Focus", "Similar")))
@@ -1335,6 +1658,9 @@ class AgentToolLoop(
             .put("target_title", stringSchema("Specific first/next track title"))
             .put("target_artist", stringSchema("Specific first/next artist hint"))
             .put("jump_to_inserted", booleanSchema("LLM semantic decision for insert_next: true means jump immediately, false means keep current song playing and only queue next"))
+            .put("similar", booleanSchema("true only for a similar/style continuation, never for an exact named catalog"))
+            .put("reference_context", enumSchema("Context anchor", listOf("current_track", "current_style", "current_queue", "previous_intent", "mentioned_track")))
+            .put("use_current_style_anchor", booleanSchema("Whether to continue from the current track/style context"))
             .put("more_actions_pending", moreActionsPendingSchema())
             .put("must_include_titles", arraySchema("Track titles that must appear"))
             .put("closer_title", stringSchema("Track title requested at the end"))
@@ -1352,7 +1678,44 @@ class AgentToolLoop(
             .put("operation", enumSchema("Queue operation", listOf("replace_queue", "play_now", "insert_next")))
             .put("jump_to_inserted", booleanSchema("For insert_next, true only when the user explicitly asks to jump immediately; 下一首想听/接下来想听 should be false"))
             .put("similar", booleanSchema("Whether this is a similar/style continuation"))
+            .put("intent_mode", intentModeSchema())
+            .put("catalog", catalogConstraintSchema())
+            .put("playlist_name", stringSchema("Playlist name when intent_mode=playlist"))
+            .put("artists", arraySchema("Primary artists when intent_mode=artist_focus"))
+            .put("query", stringSchema("Selection query when intent_mode=open_recommendation"))
+            .put("reference_context", enumSchema("Context anchor", listOf("current_track", "current_style", "current_queue", "previous_intent", "mentioned_track")))
+            .put("use_current_style_anchor", booleanSchema("Whether to continue from the current track/style context"))
+            .put("style", JSONObject().put("type", "object"))
             .put("more_actions_pending", moreActionsPendingSchema())
+
+    private fun intentModeSchema(): JSONObject =
+        enumSchema(
+            "Required semantic classification: exact_catalog for a named album/soundtrack/musical/work; exact_track for one named song; artist_focus for an artist; playlist for an existing playlist; open_recommendation for mood/scene/genre discovery; contextual_continuation for similar/current-context discovery.",
+            listOf(
+                "exact_catalog",
+                "exact_track",
+                "artist_focus",
+                "playlist",
+                "open_recommendation",
+                "contextual_continuation",
+            ),
+        )
+
+    private fun catalogConstraintSchema(): JSONObject =
+        JSONObject()
+            .put("type", "object")
+            .put(
+                "description",
+                "Only for an exact named catalog object (album, soundtrack, musical, film/game/anime work, franchise, compilation, or another named work). Leave absent for mood/scene/genre/similar/open recommendations.",
+            )
+            .put(
+                "properties",
+                JSONObject()
+                    .put("name", stringSchema("The exact named object from the user's meaning"))
+                    .put("aliases", arraySchema("Complete canonical/original/translated catalog names that can be verified against album metadata; include at least one full metadata-level name, never a shared keyword or surname"))
+                    .put("search_queries", arraySchema("1-4 precise catalog queries, ordered from most exact to broader fallback")),
+            )
+            .put("required", JSONArray(listOf("name", "aliases", "search_queries")))
 
     private fun moreActionsPendingSchema(): JSONObject =
         booleanSchema(
@@ -1360,6 +1723,25 @@ class AgentToolLoop(
                 "and the reply is generated from real results (no final_response needed). " +
                 "Set true only when you still need to execute more tools this turn (e.g. 用户还要求了插播/收藏).",
         )
+
+    private fun requestedTrackArraySchema(): JSONObject =
+        JSONObject()
+            .put("type", "array")
+            .put("description", "Explicitly named songs to add. Include every requested song and never add recommendations. Order is not significant. Supply artist when the user gave one or when needed to disambiguate.")
+            .put("minItems", 1)
+            .put("maxItems", 50)
+            .put(
+                "items",
+                JSONObject()
+                    .put("type", "object")
+                    .put(
+                        "properties",
+                        JSONObject()
+                            .put("title", stringSchema("Exact song title"))
+                            .put("artist", stringSchema("Artist name when known")),
+                    )
+                    .put("required", JSONArray(listOf("title"))),
+            )
 
     private fun functionTool(
         name: String,
@@ -1514,12 +1896,14 @@ class AgentToolLoop(
         /** 带 more_actions_pending 语义的执行类工具：成功且显式传 false ⇒ 本轮直接收尾。 */
         private val EXECUTION_TOOLS = setOf(
             "commit_queue", "skip_current", "like_current", "like_track", "modify_playlist_current",
+            "create_playlist_from_tracks",
         )
 
         /** final_response 自述里出现这些词即视为「声称动作已完成」，需要有真实成功动作背书。 */
         private val SUCCESS_CLAIM_WORDS = listOf(
             "已放", "放了", "放好", "切了", "切过去", "插了", "插好", "接上了",
             "收藏了", "已收藏", "加好了", "已加入", "打开了", "排好了",
+            "创建好了", "已创建", "建好了", "导入好了",
             "已经放", "已经播放", "已播放", "专场",
         )
 
@@ -1528,24 +1912,33 @@ class AgentToolLoop(
 
 【循环纪律】
 1. 每一轮都必须至少调用一个工具。纯聊天 / 澄清 / 诚实说明做不到时，调用 final_response。
-2. 要播放、排歌、插歌、打开歌单、收藏、改歌单，必须真正调用对应执行工具；绝不能只在 final_response 里口头答应。
-3. 先观察再提交：用 list_playlists / get_playlist_tracks / search_tracks / draft_queue 看到真实候选。draft_queue 会跑本地解析+排序+校验；单一播放请求校验成功时会自动 commit，只有要继续其它动作时才传 more_actions_pending=true 并随后 commit_queue。
+2. 要播放、排歌、插歌、打开歌单、收藏、改歌单或创建歌单，必须真正调用对应执行工具；绝不能只在 final_response 里口头答应。
+3. 先观察再提交：用 list_playlists / get_playlist_tracks / search_tracks / draft_queue 看到真实候选。draft_queue 会跑本地解析+排序+校验；单一播放请求校验成功时会自动 commit，只有要继续其它动作时才传 more_actions_pending=true 并随后 commit_queue。手动 commit_queue 也必须传与本次选择一致的 intent_mode；精确作品还必须原样携带 catalog。
 4. 工具失败时按 observation 修复：换 query、换 playlist、搜具体歌、放宽 artist_scope、重新 draft，再 commit，直到能播。draft_queue 校验成功且没有后续动作时会自动提交，不要再重复 commit；若这句话还有后续动作，请给 draft_queue 传 more_actions_pending=true。
 5. 不要编造歌名、歌手、歌单名或“已经放好”。final_response 只能描述工具已成功提交的动作；没成功就如实说没找到 / 没放成，不要假装完成。
-6. 执行工具（commit_queue / skip_current / like_current / like_track / modify_playlist_current）都有 more_actions_pending 参数：这是本轮最后一个动作就传 false——成功后回合立即结束，回复由系统按真实结果生成，不用再调 final_response；这句话里还有别的动作没做就传 true。
+6. 执行工具（commit_queue / skip_current / like_current / like_track / modify_playlist_current / create_playlist_from_tracks）都有 more_actions_pending 参数：这是本轮最后一个动作就传 false——成功后回合立即结束，回复由系统按真实结果生成，不用再调 final_response；这句话里还有别的动作没做就传 true。
 
 【多动作混搭】
 7. 一句话里有多个动作时一个都不能漏，并按依赖顺序执行：先整组排队列（replace_queue/play_now），再插播（insert_next），最后收藏/改歌单。整组重排会清掉之前插的歌，所以插播必须排在重排之后。
-8. 例：“放一组林俊杰，下一首先插江南，再把现在这首收藏了” → ①draft_queue(replace_queue, artists=[林俊杰]) + commit_queue(more_actions_pending=true) ②draft_queue(insert_next, target_title=江南, jump_to_inserted=false) + commit_queue(more_actions_pending=true) ③like_current(more_actions_pending=false)。
-9. 用户指「队列里第 N 首 / 队列里那首 X」时，直接用上下文队列行里的 [key]：比如“从第五首开始放” → commit_queue(track_keys=[第5首及之后的 key], operation="play_now")，不用再搜索。
+8. 例：“放一组林俊杰，下一首先插江南，再把现在这首收藏了” → ①draft_queue(intent_mode="artist_focus", replace_queue, artists=[林俊杰]) + commit_queue(intent_mode="artist_focus", more_actions_pending=true) ②draft_queue(intent_mode="exact_track", insert_next, target_title=江南, jump_to_inserted=false) + commit_queue(intent_mode="exact_track", more_actions_pending=true) ③like_current(more_actions_pending=false)。
+9. 用户指「队列里第 N 首 / 队列里那首 X」时，直接用上下文队列行里的 [key]：比如“从第五首开始放” → commit_queue(intent_mode="exact_track", track_keys=[第5首及之后的 key], operation="play_now")，不用再搜索。
 
 【动作区分】
-10. “播放/放/听 +（某歌手的）某首歌” = 立即播放：draft_queue(operation="play_now", target_title=歌名, target_artist=歌手) 再 commit_queue。
-11. “下一首/插到下一首/等这首放完/不要打断” = 排到下一首：draft_queue(operation="insert_next", target_title=歌名, jump_to_inserted=false)；只有用户明确“现在就切过去”才 jump_to_inserted=true。
-11b. 批量插播：“这首听完之后放 X 的歌 / 下一首开始听 Taylor / 接下来来一批 Y / 听完放某张专辑” = draft_queue(operation="insert_next", artists=[X] 或 query=专辑名/风格, count=想插的张数(歌手/专辑默认 6~8), jump_to_inserted=false)——整批插在当前歌后面、不打断当前播放。专辑也可以先 search_tracks(专辑名) 再 commit_queue(track_keys=[整批 key], operation="insert_next", jump_to_inserted=false)。批量插播是“加塞”，不要用 replace_queue（那会清掉用户当前队列）。
-12. “我想听 X，加一首 Y / 带上 Y / 包含 Y” = 重排队列且必含：draft_queue(operation="replace_queue", artists=[X], must_include_titles=[Y])。X 是主目标，Y 只是必含；Y 默认不能排第一首，除非用户明确说“先放 Y / 开头放 Y”。别让附加的 Y 抢掉主目标 X。
+10. “播放/放/听 +（某歌手的）某首歌” = 立即播放：draft_queue(intent_mode="exact_track", operation="play_now", target_title=歌名, target_artist=歌手)；如果没有自动提交，再 commit_queue(intent_mode="exact_track")。
+11. “下一首/插到下一首/等这首放完/不要打断” = 排到下一首：draft_queue(intent_mode="exact_track", operation="insert_next", target_title=歌名, jump_to_inserted=false)；只有用户明确“现在就切过去”才 jump_to_inserted=true。
+11b. 批量插播：“这首听完之后放 X 的歌 / 下一首开始听 Taylor / 接下来来一批 Y / 听完放某张专辑” = draft_queue(operation="insert_next", intent_mode 按对象选择 artist_focus / open_recommendation / exact_catalog，count=想插的张数(歌手/专辑默认 6~8), jump_to_inserted=false)——整批插在当前歌后面、不打断当前播放。点名专辑/作品必须带 catalog，不可只传 query；批量插播是“加塞”，不要用 replace_queue（那会清掉用户当前队列）。
+12. “我想听 X，加一首 Y / 带上 Y / 包含 Y” = 重排队列且必含：如果 X 是歌手，用 draft_queue(intent_mode="artist_focus", operation="replace_queue", artists=[X], must_include_titles=[Y])；如果 X 是具名作品，用 exact_catalog + catalog。X 是主目标，Y 只是必含；Y 默认不能排第一首，除非用户明确说“先放 Y / 开头放 Y”。别让附加的 Y 抢掉主目标 X。
 13. “最后/收尾/结尾用 Z 收住” → closer_title=Z。
 14. “不要/别/不想听 …”（歌手、语言、风格）→ exclude_terms；“别太吵/别太炸/别太苦” → style.avoid_tags。
+
+【语境理解与目录实体】
+14a. 每次 draft_queue 都必须先按完整语境声明 intent_mode，不能靠单个关键词机械判断，也不能漏掉分类后直接 search：
+- exact_catalog：用户明确要某张专辑、原声、音乐剧、影视/游戏/动漫作品、系列或其它有专名的作品集合。
+- exact_track：明确的一首歌；artist_focus：某位歌手/乐队；playlist：已有歌单。
+- open_recommendation：情绪、场景、流派、年代、语言、“适合/来点”等探索型请求；contextual_continuation：“类似这首/延续当前风格”等上下文探索。
+14b. exact_catalog 必须传 catalog={name, aliases, search_queries}，不能只传 query。aliases 必须含至少一个可在 album 字段核对的完整作品/版本名，不能只给共享词、姓氏或泛类目；search_queries 根据音乐目录语境生成。若不确定目录名，先 search_tracks 检查候选的 album，再补齐 catalog；没有可靠归属证据就不要提交。
+14c. catalog 是“忠于点名对象”的执行契约，不是关键词模板。例如播放语境中的“我要听《汉密尔顿》”指向具名音乐剧，应选 exact_catalog，并用完整 cast recording/album 元数据名约束；绝不能只搜 Hamilton，也不能把 Hamilton 当 artists。用户若说“类似《汉密尔顿》/受它启发/同氛围”，才是 open_recommendation 或 contextual_continuation，catalog 应为空。
+14d. draft_queue 绝不能丢空选歌语义。至少传 target、artists、query、catalog、playlist、style/场景约束或明确上下文引用之一；否则工具会拒绝，必须重新理解用户原话再调用，不能拿个人画像随便顶一组歌。
 
 【艺人范围 artist_scope】
 15. 默认 "Focus"（以该歌手为主，可少量同味歌），避免硬塞导致排不出。
@@ -1554,8 +1947,10 @@ class AgentToolLoop(
 18. artists 只能填真实歌手/乐队名；“欢快的/嗨一点/开车/工作/忧郁点”是风格情绪场景，放进 query 和 style，不要塞进 artists。
 
 【歌单】
-19. “打开/播放 我的/某个 已有歌单（含‘我的网盘’）” → 先 get_playlist_tracks 再 commit_queue。
+19. “打开/播放 我的/某个 已有歌单（含‘我的网盘’）” → 先 get_playlist_tracks，再 commit_queue(intent_mode="playlist", playlist_name=实际歌单名)。
 20. “换一组/排一组，要包含某歌手的某歌” 不是打开旧歌单 → draft_queue(operation="replace_queue", must_include_titles=[那首]，需要时 artists=[那个歌手])。
+20a. “创建/新建一个歌单，名字叫 X，添加 A、B、C” → 直接调用 create_playlist_from_tracks(playlist_name=X, tracks=[A,B,C], more_actions_pending=false)。tracks 必须包含用户明确给出的每个歌名，只填歌曲，不要把歌单风格/名称当歌曲，不要擅自补推荐；用户给了歌手就一并填 artist。歌曲顺序不作为约束，工具会自行按歌名精确搜索、拒绝歧义、真实创建并批量添加，不需要先逐首调用 search_tracks。
+20b. 用户只说想创建某种风格歌单、但没有给明确歌曲清单时，不要假装已经创建；先用 final_response 问清楚是要用户给歌名，还是希望你推荐选歌。用户给出的歌名有歧义时，如实请他补歌手，不要猜错版本。
 
 【收藏】
 21. 收藏/取消收藏“当前正在放的这首” → like_current。
@@ -1565,7 +1960,7 @@ class AgentToolLoop(
 23. 用户像“陈奕迅呢？/不是这个/我说的是…/怎么只有暗号”这类纠错时，对照「最近对话」里用户轮后面的（实际执行：…）标注——那是那一轮真正放了什么——找出偏差，重新 draft+commit 修正。
 
 【宽泛 vibe】
-24. “开车/晚安/工作/学习/燃一点/忧郁一点/安静点”等没有具体歌名的需求 → draft_queue(operation="replace_queue", query=自然语言, style={energy/moods/scenes...})，交给本地库和语义索引排。
+24. “开车/晚安/工作/学习/燃一点/忧郁一点/安静点”等没有具体歌名的需求 → draft_queue(intent_mode="open_recommendation", operation="replace_queue", query=自然语言, style={energy/moods/scenes...})，交给本地库和语义索引排。
 25. skip_current 只用于用户明确要“跳过/换一首”当前这首、且没有指定要排的目标歌。
 """.trimIndent()
     }

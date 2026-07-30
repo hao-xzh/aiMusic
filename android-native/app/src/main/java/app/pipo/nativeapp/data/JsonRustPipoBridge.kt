@@ -228,6 +228,11 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         callRaw("netease_like_song", jsonObject("id" to id, "like" to like))
     }
 
+    override suspend fun neteasePlaylistCreate(name: String): Long {
+        val result = callObject("netease_playlist_create", jsonObject("name" to name))
+        return result.getLong("id")
+    }
+
     override suspend fun neteasePlaylistModifyTracks(
         playlistId: Long,
         op: String,

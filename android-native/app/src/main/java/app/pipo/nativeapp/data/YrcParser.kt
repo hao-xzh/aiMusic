@@ -10,7 +10,11 @@ package app.pipo.nativeapp.data
  */
 object YrcParser {
     private val lineHeader = Regex("""^\[(\d+),(\d+)]""")
-    private val tokenRegex = Regex("""\((\d+),(\d+),(?:-?\d+)\)([^()\[\]]*)""")
+    // 只识别 timing header，token 正文由当前 header 末尾截到下一个 header 起点。
+    // 旧正则用 `[^()\[\]]*` 取正文，会把 "hello (oh)" / “（和声）”直接丢掉，
+    // 后续 splitTrailingAdlib 根本看不到副词。以下一个合法数字 timing header 作边界，
+    // 既保留普通括号，也不会把下一个 token 的时间头吃进正文。
+    private val tokenHeader = Regex("""\((\d+),(\d+),(?:-?\d+)\)""")
     private val offsetTag = Regex("""\[(?:offset|offsetMs)\s*:\s*([+-]?\d+)]""", RegexOption.IGNORE_CASE)
     private val jsonOffset = Regex(""""offset"\s*:\s*([+-]?\d+)""", RegexOption.IGNORE_CASE)
 
@@ -29,16 +33,20 @@ object YrcParser {
 
             val rest = line.substring(header.range.last + 1)
             val chars = mutableListOf<PipoLyricChar>()
-            tokenRegex.findAll(rest).forEach { m ->
-                val tokenStart = ((m.groupValues[1].toLongOrNull() ?: return@forEach) + offsetMs).coerceAtLeast(0L)
-                val tokenDur = m.groupValues[2].toLongOrNull() ?: return@forEach
-                val text = m.groupValues[3]
-                if (text.isEmpty()) return@forEach
+            val tokenHeaders = tokenHeader.findAll(rest).toList()
+            tokenHeaders.forEachIndexed { tokenIndex, m ->
+                val tokenStart = ((m.groupValues[1].toLongOrNull() ?: return@forEachIndexed) + offsetMs)
+                    .coerceAtLeast(0L)
+                val tokenDur = m.groupValues[2].toLongOrNull() ?: return@forEachIndexed
+                val textStart = m.range.last + 1
+                val textEnd = tokenHeaders.getOrNull(tokenIndex + 1)?.range?.first ?: rest.length
+                val text = rest.substring(textStart, textEnd)
+                if (text.isEmpty()) return@forEachIndexed
                 // Apple Music Web 直接把歌词数据里的 word.content 渲染成一个 `.syllable`，
                 // 不会把中文 word 再拆成单字；英文异常粘连时仍按空格拆成多个 word。
                 // 空白和标点保留在它前一个非空白字符上，避免单独高亮一个空格闪烁。
                 val groups = splitIntoVisualChars(text)
-                if (groups.isEmpty()) return@forEach
+                if (groups.isEmpty()) return@forEachIndexed
                 val perDur = tokenDur / groups.size.coerceAtLeast(1)
                 groups.forEachIndexed { idx, charText ->
                     chars.add(
@@ -103,6 +111,10 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
     val primaryLines = mutableListOf<PipoLyricLine>()
     val duetLines = mutableListOf<PipoLyricLine>()
     val companionCandidates = mutableListOf<PipoLyricLine>()
+    // YRC 没有 agent id，只能把同一时刻的不同文本视为多位演唱者。
+    // 记住每个 primary 后已经附加了几个同时歌手，让 2/3/4... 位依次右/左/右交替，
+    // 而不是三人及以上全部堆到右侧。
+    val simultaneousSingerCounts = mutableListOf<Int>()
     for (line in lines) {
         if (isParentheticalLine(line.text)) {
             // 括号 ad-lib（"(yeah)" "(oh)"）= 和声，alignment 跟主行（默认 Start）。
@@ -114,11 +126,19 @@ private fun mergeSimultaneousYrcLines(lines: List<PipoLyricLine>): List<PipoLyri
                 kotlin.math.abs(line.startMs - previousPrimary.startMs) >= NEAR_SIMULTANEOUS_LINE_MS
             ) {
                 primaryLines.add(line)
+                simultaneousSingerCounts.add(0)
             } else if (!sameLyricText(line.text, previousPrimary.text)) {
                 // 同一时间戳附近出现第二条不同文本，网易 YRC 通常是在标副唱 / 对唱。
                 // 这类不是小号背景人声，而是第二演唱者主旋律：按 AMLL 的 duet line 处理，
                 // 保持完整字号并靠右；括号 ad-lib 才继续作为 Companion 小字显示。
-                duetLines.add(line.copy(alignment = PipoLyricAlignment.End))
+                val extraSingerIndex = simultaneousSingerCounts.lastOrNull() ?: 0
+                val alignment = if (extraSingerIndex % 2 == 0) {
+                    PipoLyricAlignment.End
+                } else {
+                    PipoLyricAlignment.Start
+                }
+                duetLines.add(line.copy(alignment = alignment))
+                simultaneousSingerCounts[simultaneousSingerCounts.lastIndex] = extraSingerIndex + 1
             }
         }
     }

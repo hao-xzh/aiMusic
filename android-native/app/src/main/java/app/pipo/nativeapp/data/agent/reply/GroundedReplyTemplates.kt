@@ -12,6 +12,7 @@ class GroundedReplyTemplates {
             "skip" -> skip(persona)
             "like" -> like(facts, persona)
             "playlist" -> playlist(facts, persona)
+            "playlist_create" -> playlistCreated(facts, persona)
             "say", "clarify" -> facts.errorMessage.ifBlank { "嗯。" }
             else -> safeFallback(facts, persona)
         }
@@ -40,6 +41,9 @@ class GroundedReplyTemplates {
     fun safeFallback(facts: ReplyFacts, persona: PetPersona): String {
         val track = formatTrack(facts.firstTrackTitle, facts.firstTrackArtist)
         if (!facts.success) {
+            if (facts.actionType == "playlist_create" && facts.errorMessage.isNotBlank()) {
+                return facts.errorMessage.take(180)
+            }
             return when (persona) {
                 PetPersona.TOXIC -> when {
                     facts.requiredArtist.isNotBlank() -> "${facts.requiredArtist}这组没接上，不硬塞别的。"
@@ -179,6 +183,19 @@ class GroundedReplyTemplates {
             PetPersona.COLD -> "$name，已处理。"
             PetPersona.KITTY -> "$name 弄好啦喵。"
             PetPersona.JIANGHU -> "妥，$name 处理好。"
+        }
+    }
+
+    private fun playlistCreated(facts: ReplyFacts, persona: PetPersona): String {
+        facts.resultMessage.takeIf(String::isNotBlank)?.let { return it.take(180) }
+        val name = facts.playlistName.ifBlank { "歌单" }
+        val count = facts.queueCount.takeIf { it > 0 }?.let { "，添加 $it 首歌" }.orEmpty()
+        return when (persona) {
+            PetPersona.TOXIC -> "行，$name 建好了$count。"
+            PetPersona.FRIENDLY -> "好，$name 创建好了$count。"
+            PetPersona.COLD -> "$name，已创建$count。"
+            PetPersona.KITTY -> "$name 建好啦$count，喵。"
+            PetPersona.JIANGHU -> "妥，$name 建好了$count。"
         }
     }
 }

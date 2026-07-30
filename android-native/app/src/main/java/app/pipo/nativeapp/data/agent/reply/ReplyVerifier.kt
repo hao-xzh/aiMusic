@@ -7,7 +7,12 @@ class ReplyVerifier {
         val compact = reply.replace(Regex("\\s+"), "")
         if (compact.isBlank()) return false
         if (results.any { !it.success } || !facts.success) {
-            val successWords = listOf("已放", "放了", "切了", "插了", "收藏了", "加好了", "打开了", "排好了", "专场")
+            val successWords = listOf("已放", "放了", "切了", "插了", "收藏了", "加好了", "打开了", "排好了", "专场") +
+                if (facts.actionType == "playlist_create") {
+                    listOf("已创建", "创建好了", "建好了", "导入好了")
+                } else {
+                    emptyList()
+                }
             if (successWords.any { it in compact }) return false
         }
         if ("下一首" in compact && results.none { it.type == "insert_next" && it.success }) return false

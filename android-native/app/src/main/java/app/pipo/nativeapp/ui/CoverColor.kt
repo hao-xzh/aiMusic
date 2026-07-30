@@ -228,13 +228,15 @@ private enum class EdgeSide { Top, Bottom, Left, Right, Lower, Seam }
 
 /**
  * 从缩略图里提取"最鲜艳的一簇颜色"作为封面主色调。
- *   - 跳过太灰（饱和度低）、太暗、太亮的像素，按饱和度加权平均剩下的。
+ *   - 跳过透明、太灰（饱和度低）、太暗、太亮的像素，按饱和度与透明度加权平均剩下的。
  *   - 灰度封面（几乎没有彩色像素）→ 返回 null（歌词不染色）。
  */
 private fun extractVibrant(pixels: IntArray): IntArray? {
     val hsv = FloatArray(3)
     var rSum = 0.0; var gSum = 0.0; var bSum = 0.0; var wSum = 0.0
     for (c in pixels) {
+        val alpha = ((c ushr 24) and 0xFF) / 255f
+        if (alpha <= 0.05f) continue
         val r = (c shr 16) and 0xFF
         val g = (c shr 8) and 0xFF
         val b = c and 0xFF
@@ -243,7 +245,7 @@ private fun extractVibrant(pixels: IntArray): IntArray? {
         val v = hsv[2]
         if (s < 0.35f || v < 0.25f || v > 0.96f) continue
         // 权重偏向高饱和 + 中等明度，避开发白/发黑的像素。
-        val w = (s * (1f - kotlin.math.abs(v - 0.62f))).toDouble()
+        val w = (s * (1f - kotlin.math.abs(v - 0.62f)) * alpha).toDouble()
         rSum += r * w; gSum += g * w; bSum += b * w; wSum += w
     }
     if (wSum < 0.5) return null
@@ -252,10 +254,10 @@ private fun extractVibrant(pixels: IntArray): IntArray? {
 
 /**
  * 歌词扫描交界处的"封面色微光"。把主色调拉到统一的鲜艳度/明度，深浅主题下都看得见；
- * 灰度封面没有可采样 accent 时回落到品牌薄荷色，保证中间色不会消失。
+ * 灰度封面没有可采样 accent 时保持透明，不用品牌色伪装成歌曲色。
  */
 fun lyricAccent(accent: IntArray?): Color {
-    if (accent == null || accent.size < 3) return PipoColors.Accent
+    if (accent == null || accent.size < 3) return Color.Transparent
     val hsv = FloatArray(3)
     android.graphics.Color.RGBToHSV(accent[0], accent[1], accent[2], hsv)
     // 提饱和、定明度，让交界处的微光是一抹明确的彩色，而不是灰扑扑的。

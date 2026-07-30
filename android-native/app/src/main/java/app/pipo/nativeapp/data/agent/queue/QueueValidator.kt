@@ -7,6 +7,7 @@ import app.pipo.nativeapp.data.agent.domain.PlannedAction
 import app.pipo.nativeapp.data.agent.domain.PlayMode
 import app.pipo.nativeapp.data.agent.domain.QueueValidation
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
+import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 
 class QueueValidator(
@@ -25,6 +26,7 @@ class QueueValidator(
         var primarySatisfied = true
         var mustIncludeSatisfied = true
         var closerSatisfied = true
+        val catalogSatisfied = validateCatalogScope(play, messages)
 
         validateStructuredTarget(play, messages)
 
@@ -69,7 +71,7 @@ class QueueValidator(
             messages.add("opening_energy_too_high")
         }
         return QueueValidation(
-            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied &&
+            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied && catalogSatisfied &&
                 messages.none(::isBlockingMessage),
             messages = messages.distinct(),
             primarySatisfied = primarySatisfied,
@@ -95,6 +97,7 @@ class QueueValidator(
         var primarySatisfied = true
         var mustIncludeSatisfied = true
         var closerSatisfied = true
+        val catalogSatisfied = validateCatalogScope(play, messages)
 
         validateDirectTarget(userText, play, messages)
 
@@ -147,7 +150,7 @@ class QueueValidator(
             messages.add("language_interleave_weak")
         }
         return QueueValidation(
-            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied &&
+            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied && catalogSatisfied &&
                 messages.none(::isBlockingMessage),
             messages = messages,
             primarySatisfied = primarySatisfied,
@@ -186,6 +189,36 @@ class QueueValidator(
         if (target != null && first?.let { titleMatches(it, target.title) } != true) {
             messages.add(if (play.mode == PlayMode.InsertNext) "insert_target_missed" else "direct_target_missed")
         }
+    }
+
+    private fun validateCatalogScope(
+        play: PlannedAction.PlayTracks?,
+        messages: MutableList<String>,
+    ): Boolean {
+        if (play == null) return true
+        val constraint = play.primaryGoal.catalogConstraint
+        if (!constraint.isActive) return true
+
+        // catalog 约束描述主集合；用户明确额外要求“带上/收尾”的曲目可以越出该集合。
+        // target / primaryTracks 仍属于主请求，必须接受同一作品归属校验，不能借点名绕过版本。
+        val exceptionRequirements = play.primaryGoal.mustInclude + listOfNotNull(play.primaryGoal.closer)
+        val catalogTracks = play.tracks.filterNot { track ->
+            exceptionRequirements.any { requirement -> titleMatches(track, requirement.title) }
+        }
+        if (catalogTracks.isEmpty()) {
+            messages.add("catalog_scope_empty:${constraint.name.take(48)}")
+            return false
+        }
+        val (matched, total) = CatalogConstraintMatcher.coverage(catalogTracks, constraint)
+        if (matched != total) {
+            val mismatched = catalogTracks
+                .filterNot { CatalogConstraintMatcher.matches(it, constraint) }
+                .take(3)
+                .joinToString("|") { "${it.title}-${it.artist}" }
+            messages.add("catalog_scope_mismatch:$matched/$total:$mismatched")
+            return false
+        }
+        return true
     }
 
     private fun titleMatches(track: NativeTrack, title: String): Boolean {

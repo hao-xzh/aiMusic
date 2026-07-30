@@ -6,6 +6,7 @@ import app.pipo.nativeapp.data.CandidateRanker
 import app.pipo.nativeapp.data.CandidateRecall
 import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.FunctionalMusicFilter
+import app.pipo.nativeapp.data.GuardedContinuousQueueSource
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetIntent
 import app.pipo.nativeapp.data.PipoGraph
@@ -19,6 +20,7 @@ import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
 import app.pipo.nativeapp.data.agent.domain.PlayMode
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
+import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CatalogLexicon
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 import kotlinx.coroutines.async
@@ -89,7 +91,28 @@ class MusicResolver(
         input: AgentTurnInput,
         localTracks: List<NativeTrack>,
     ): PlannedAction.PlayTracks {
-        val scopedTracks = scopedTracksFor(action.primaryGoal.playlistName, localTracks)
+        val catalogConstraint = action.primaryGoal.catalogConstraint
+        val unfilteredScopedTracks = scopedTracksFor(action.primaryGoal.playlistName, localTracks)
+        val scopedTracks = unfilteredScopedTracks
+            .let { tracks ->
+                if (catalogConstraint.isActive) {
+                    tracks.filter { CatalogConstraintMatcher.matches(it, catalogConstraint) }
+                } else {
+                    tracks
+                }
+            }
+        if (catalogConstraint.isActive) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "catalog_scope_local",
+                fields = mapOf(
+                    "catalog" to catalogConstraint.name.take(80),
+                    "before" to unfilteredScopedTracks.size,
+                    "matched" to scopedTracks.size,
+                    "aliases" to catalogConstraint.aliases.joinToString("|").take(160),
+                ),
+            )
+        }
         val allowOnline = action.primaryGoal.playlistName.isBlank()
         val tracks = when (action.mode) {
             PlayMode.PlayNow -> {
@@ -269,7 +292,8 @@ class MusicResolver(
             useTextSignals -> CommandTextSignals.energyHint(plan.userText)
             else -> "any"
         }
-        val semanticQuery = style.semanticQuery
+        val semanticQuery = goal.catalogConstraint.searchQueries.firstOrNull().orEmpty()
+            .ifBlank { style.semanticQuery }
             .ifBlank { goal.searchSeeds.firstOrNull().orEmpty() }
             .ifBlank { if (useTextSignals) plan.userText else structuredSearchQuery(action) }
         val styleTerms = mergeTextHints(softMoods, softScenes, softTextures, softQualityWords, refStyles)
@@ -282,6 +306,9 @@ class MusicResolver(
             textArtists = artistHints,
             hardTracks = if (action.mode == PlayMode.PlayNow || action.mode == PlayMode.InsertNext) trackHints else emptyList(),
             textTracks = trackHints,
+            textAlbums = goal.catalogConstraint.matchTerms,
+            catalogAnchors = goal.catalogConstraint.matchTerms,
+            catalogQueries = goal.catalogConstraint.searchQueries,
             excludeArtists = excludeTerms.filterNot(::looksLikeLanguage),
             excludeLanguages = if (useTextSignals) CommandTextSignals.languageExcludes(plan.userText) else emptyList(),
             excludeTags = excludeTerms.filterNot(::looksLikeLanguage),
@@ -400,12 +427,15 @@ class MusicResolver(
             ).take(desired)
             ArtistScope.Similar -> capTitles(diversifyByArtist(scoped)).take(desired)
         }
-        return if (localResult.isNotEmpty()) {
-            localResult
-        } else if (allowOnline) {
-            onlineBackfill(intent, desired, artistScope)
-        } else {
-            emptyList()
+        return when {
+            localResult.size >= desired -> localResult
+            // 具名作品不能因为本地只碰巧有一两首就停止联网召回；保留本地命中，
+            // 再从同一 catalog gate 下补齐，仍不允许画像候选越出作品范围。
+            localResult.isNotEmpty() && allowOnline && intent.catalogAnchors.isNotEmpty() ->
+                mergeUnique(localResult, onlineBackfill(intent, desired, artistScope)).take(desired)
+            localResult.isNotEmpty() -> localResult
+            allowOnline -> onlineBackfill(intent, desired, artistScope)
+            else -> emptyList()
         }
     }
 
@@ -436,7 +466,8 @@ class MusicResolver(
             .filter { it.isNotBlank() }
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
-        val genericRecommendation = intent.hardTracks.isEmpty() && intent.textTracks.isEmpty()
+        var catalogRejected = 0
+        val genericRecommendation = intent.hardTracks.isEmpty() && intent.textTracks.isEmpty() && intent.catalogAnchors.isEmpty()
         val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
             .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
         // 分批并行搜（批内 3 个并行，凑够目标不开下一批）。query 按「具体歌→歌手→风格」
@@ -465,6 +496,12 @@ class MusicResolver(
                     else -> hits
                 }
                 for (track in scopedHits) {
+                    if (intent.catalogAnchors.isNotEmpty() &&
+                        !CatalogConstraintMatcher.matches(track, intent.catalogAnchors)
+                    ) {
+                        catalogRejected++
+                        continue
+                    }
                     if (hardRejected.contains(track)) continue
                     // 情绪词搜索的助眠/养生流水线内容不进候选（明确要纯音乐/点名歌手除外）。
                     if (!allowFunctional &&
@@ -477,6 +514,18 @@ class MusicResolver(
                     if (out.size >= poolTarget) break
                 }
             }
+        }
+        if (intent.catalogAnchors.isNotEmpty()) {
+            DiagnosticsLogStore.record(
+                area = "ai_agent",
+                event = "catalog_scope_online",
+                fields = mapOf(
+                    "anchors" to intent.catalogAnchors.joinToString("|").take(160),
+                    "accepted" to out.size,
+                    "rejected" to catalogRejected,
+                    "queries" to queries.joinToString("|").take(200),
+                ),
+            )
         }
         val feedbackFiltered = filterContextFeedback(out, intent)
         val tasteReranked = rerankOnlineCandidates(feedbackFiltered, intent, poolTarget)
@@ -598,17 +647,34 @@ class MusicResolver(
         val preferLatin = intent.hardLanguages.any { lang ->
             "英" in lang || lang.lowercase().startsWith("eng")
         }
-        return ContinuousQueueSource { excludeIds ->
+        val fetcher: suspend (Set<Long>) -> List<NativeTrack> = { excludeIds ->
             val local = localContinuation(intent, input, localTracks, artistScope, excludeIds)
             if (local.size >= CONTINUATION_WANT_COUNT) {
                 local
             } else {
                 val haveKeys = local.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-                val online = searchContinuation(seedQueries, artistScope, artistKeys, excludeIds, allowFunctional, preferLatin)
+                val online = searchContinuation(
+                    seedQueries,
+                    artistScope,
+                    artistKeys,
+                    excludeIds,
+                    allowFunctional,
+                    preferLatin,
+                    intent.catalogAnchors,
+                )
                     .let { filterContextFeedback(it, intent) }
                     .filter { TrackDedupe.songKey(it) !in haveKeys }
                 (local + online).take(CONTINUATION_WANT_COUNT)
             }
+        }
+        return if (intent.catalogAnchors.isNotEmpty()) {
+            GuardedContinuousQueueSource(
+                allowDefaultFallback = false,
+                acceptsTrack = { track -> CatalogConstraintMatcher.matches(track, intent.catalogAnchors) },
+                fetcher = fetcher,
+            )
+        } else {
+            ContinuousQueueSource { excludeIds -> fetcher(excludeIds) }
         }
     }
 
@@ -714,6 +780,7 @@ class MusicResolver(
         excludeIds: Set<Long>,
         allowFunctional: Boolean,
         preferLatin: Boolean,
+        catalogAnchors: List<String>,
     ): List<NativeTrack> {
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
@@ -740,6 +807,11 @@ class MusicResolver(
                 for (track in scopedHits) {
                     val id = track.neteaseId
                     if (id != null && id in excludeIds) continue
+                    if (catalogAnchors.isNotEmpty() &&
+                        !CatalogConstraintMatcher.matches(track, catalogAnchors)
+                    ) {
+                        continue
+                    }
                     if (hardRejected.contains(track)) continue
                     // 续杯是无人值守的：情绪词搜索返回的助眠/养生流水线内容必须挡掉
                     //（点名歌手的结果放行），否则一次续杯就把电台灌满纯音乐。
@@ -801,6 +873,8 @@ class MusicResolver(
 
     private fun buildSearchQueries(intent: PetIntent): List<String> {
         val out = mutableListOf<String>()
+        out.addAll(intent.catalogQueries)
+        out.addAll(intent.catalogAnchors)
         for (track in intent.textTracks + intent.hardTracks) {
             val artist = (intent.textArtists + intent.hardArtists).firstOrNull().orEmpty()
             out.add(listOf(artist, track).filter { it.isNotBlank() }.joinToString(" "))

@@ -648,6 +648,36 @@ impl NeteaseClient {
         Ok(true)
     }
 
+    /// 创建普通歌单，返回服务端生成的歌单 id。
+    pub async fn playlist_create(&self, name: &str) -> Result<i64> {
+        let clean_name = name.trim();
+        if clean_name.is_empty() {
+            return Err(anyhow!("playlist_create: name must not be empty"));
+        }
+        let resp: PlaylistCreateResp = self
+            .weapi(
+                "playlist/create",
+                json!({
+                    "name": clean_name,
+                    "privacy": "0",
+                    "type": "NORMAL",
+                }),
+            )
+            .await?;
+        if resp.code != 200 {
+            return Err(anyhow!(
+                "playlist_create code={} msg={:?}",
+                resp.code,
+                resp.message
+            ));
+        }
+        resp.playlist
+            .map(|playlist| playlist.id)
+            .or(resp.id)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| anyhow!("playlist_create missing playlist id"))
+    }
+
     /// 歌单加 / 删歌 —— op = "add" | "del"。
     /// weapi: playlist/manipulate/tracks，trackIds 必须是 JSON 字符串形式（网易服务端要求）。
     /// code 200 = 成功；code 502 = "已存在 / 不存在" 算无需操作也当 ok 不抛错。

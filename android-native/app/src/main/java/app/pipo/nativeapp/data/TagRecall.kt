@@ -158,6 +158,10 @@ data class PetIntent(
     val textArtists: List<String> = emptyList(),
     val textTracks: List<String> = emptyList(),
     val textAlbums: List<String> = emptyList(),
+    /** LLM 识别出的具名目录实体锚点；非具名的开放推荐必须保持为空。 */
+    val catalogAnchors: List<String> = emptyList(),
+    /** 针对该实体生成的目录搜索词，按精确度排序。 */
+    val catalogQueries: List<String> = emptyList(),
     val softMoods: List<String> = emptyList(),
     val softScenes: List<String> = emptyList(),
     val softTextures: List<String> = emptyList(),

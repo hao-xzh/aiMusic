@@ -102,16 +102,24 @@ object TrackDedupe {
     }
 
     /** 用户原话明确点名了某首/某人/某专辑 —— 用于跳过去重和负向过滤 */
-    fun queryExplicitlyMentions(track: NativeTrack, hardArtists: List<String>, hardTracks: List<String>, textArtists: List<String>, textTracks: List<String>): Boolean {
+    fun queryExplicitlyMentions(
+        track: NativeTrack,
+        hardArtists: List<String>,
+        hardTracks: List<String>,
+        textArtists: List<String>,
+        textTracks: List<String>,
+        textAlbums: List<String> = emptyList(),
+    ): Boolean {
         val title = normalizeTitle(track.title)
         val firstArtist = track.artist.split("/", "&", ",").firstOrNull()?.trim().orEmpty()
         val artist = normalizeTitle(firstArtist)
         val album = normalizeTitle(track.album)
         val trackHints = (hardTracks + textTracks).map(::normalizeTitle).filter { it.isNotBlank() }
         val artistHints = (hardArtists + textArtists).map(::normalizeTitle).filter { it.isNotBlank() }
+        val albumHints = textAlbums.map(::normalizeTitle).filter { it.isNotBlank() }
         return (title.isNotEmpty() && trackHints.any { it in title || title in it }) ||
             (artist.isNotEmpty() && artistHints.any { it in artist || artist in it }) ||
-            (album.isNotEmpty() && trackHints.any { it in album || album in it })
+            (album.isNotEmpty() && (trackHints + albumHints).any { it in album || album in it })
     }
 
     /** 是否在找特定版本（live/remix/伴奏/...）—— 命中时不要把这些版本去掉 */

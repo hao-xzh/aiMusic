@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.ui
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -74,12 +76,17 @@ internal fun LandscapePlayerLyricsScreen(
     val ambientColor = rgbToColor(ambientRgb, fallback = PipoColors.Bg1)
     val seamColor = appleMusicLandscapeSurfaceColor(edges, fallback = ambientColor)
     val coverEdgeColor = appleMusicLandscapeCoverColor(edges, fallback = seamColor)
-    val accentRgb = blendRgb(edges.accent ?: edges.right, ambientRgb, 0.22f)
+    // 只有真正提取到高色度 accent 才给歌词染色；灰度封面保持透明。
+    val accentRgb = edges.accent?.let { blendRgb(it, ambientRgb, 0.22f) }
     val tone = toneForColor(seamColor)
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
-    val landscapeAccent = rgbToColor(accentRgb, fallback = ambientColor)
+    val landscapeAccentState = animateColorAsState(
+        targetValue = rgbToColor(accentRgb, fallback = Color.Transparent),
+        animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
+        label = "landscapeLyricAccent",
+    )
 
     Box(modifier = Modifier.fillMaxSize()) {
         LandscapeBackdrop(
@@ -120,7 +127,7 @@ internal fun LandscapePlayerLyricsScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides landscapeAccent) {
+                    androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides landscapeAccentState) {
                         AppleMusicLyricColumn(
                             lines = lyrics,
                             sessionId = trackId,

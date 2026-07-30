@@ -107,6 +107,23 @@ pub struct UserPlaylistsResp {
     pub playlist: Vec<PlaylistInfo>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PlaylistCreateResp {
+    pub code: i32,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub playlist: Option<CreatedPlaylistInfo>,
+    /// 部分接口版本会把新歌单 id 直接放在根节点，保留兼容兜底。
+    #[serde(default)]
+    pub id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatedPlaylistInfo {
+    pub id: i64,
+}
+
 //
 // --- 歌单详情 + 歌曲 ---
 //

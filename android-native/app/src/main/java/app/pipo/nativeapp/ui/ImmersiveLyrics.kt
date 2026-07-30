@@ -1,5 +1,6 @@
 package app.pipo.nativeapp.ui
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -20,9 +21,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -142,9 +145,12 @@ fun ImmersiveBackdrop(
     }
 }
 
-// 歌词扫描交界处的"封面色微光"。每首歌从封面提一抹主色，沿 sweepX 连续随字母流动。
-// 默认 Color.Unspecified = 不染色（灰度封面 / 非沉浸场景）。
-internal val LocalLyricAccent = androidx.compose.runtime.compositionLocalOf { Color.Unspecified }
+// 歌词扫描交界处的"封面色微光"。Local 传递稳定的 State，而不是逐帧变化的 Color；
+// 歌词在 draw 阶段读取 value，切歌颜色动画只触发重绘，不让整棵歌词子树逐帧重组。
+private val NoLyricAccentState = object : State<Color> {
+    override val value: Color = Color.Unspecified
+}
+internal val LocalLyricAccent = staticCompositionLocalOf<State<Color>> { NoLyricAccentState }
 
 @Composable
 fun ImmersiveLyricsOverlay(
@@ -172,7 +178,13 @@ fun ImmersiveLyricsOverlay(
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)
-    val lyricAccentColor = lyricAccent(edges.accent)
+    // 封面采样在 IO 完成后才更新。颜色与背景使用同一条 1100ms 过渡，
+    // 避免扫色带在切歌时从上一首硬跳到新主色。
+    val lyricAccentState = animateColorAsState(
+        targetValue = lyricAccent(edges.accent),
+        animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
+        label = "immersiveLyricAccent",
+    )
 
     // 切歌淡出淡入：title 变了就 fade 0 → 1。跟入场/出场的 contentProgress 解耦。
     var lastTitle by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
@@ -311,7 +323,7 @@ fun ImmersiveLyricsOverlay(
             fg = fg,
             fgDim = fgDim,
             fgUnsung = fgUnsung,
-            lyricAccentColor = lyricAccentColor,
+            lyricAccentState = lyricAccentState,
             showTranslation = showTranslation,
             onSeekToMs = onSeekToMs,
             enterProgress = lyricListEnter,
@@ -330,14 +342,14 @@ private fun ImmersiveLyricsColumnLayer(
     fg: Color,
     fgDim: Color,
     fgUnsung: Color,
-    lyricAccentColor: Color,
+    lyricAccentState: State<Color>,
     showTranslation: Boolean,
     onSeekToMs: (Long) -> Unit,
     enterProgress: Float,
     lyricsTopPadding: Dp,
     lyricsRiseDp: Dp,
 ) {
-    androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides lyricAccentColor) {
+    androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides lyricAccentState) {
         AppleMusicLyricColumn(
             lines = lyrics,
             sessionId = trackId,

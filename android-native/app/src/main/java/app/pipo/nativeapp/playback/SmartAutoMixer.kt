@@ -123,6 +123,10 @@ internal class SmartAutoMixer(
     }
 
     private fun tick() {
+        // CrossfadeController 从 start() 成功到结果回调期间独占这一对歌曲的交接。
+        // 若此时重新 arm，同一对歌曲会在曲尾再次落入 main-only seek：aux 已经播出的
+        // 下一曲开头会被 main 从 0 点重播，正是“接上后又重复一段”的来源。
+        if (realtimeCrossfadeOwnsTransition()) return
         active?.let {
             updateActiveMix(it)
             return
@@ -135,6 +139,8 @@ internal class SmartAutoMixer(
     }
 
     private fun maybeArmNextMix() {
+        // 这里保留第二道门禁，避免未来新增的非 tick 调用绕过 transition owner。
+        if (realtimeCrossfadeOwnsTransition()) return
         if (!mainPlayer.playWhenReady || mainPlayer.playbackState == Player.STATE_IDLE) return
         val plan = buildPlan()
         val remainingMs = remainingMs()
@@ -206,6 +212,19 @@ internal class SmartAutoMixer(
 
     private fun updateArmedMix(waiting: ArmedMix) {
         var plan = waiting.plan
+        if (realtimeCrossfadeOwnsTransition()) {
+            armed = null
+            logMixEvent(
+                "competing_transition_suppressed",
+                plan,
+                mapOf(
+                    "activeOwner" to "realtime-crossfade",
+                    "suppressedMode" to MAIN_ONLY_TRANSITION_MODE,
+                    "stage" to "armed",
+                ),
+            )
+            return
+        }
         if (!PlaybackSessionClock.isCurrent(plan.queueVersion)) {
             if (isPlanQueuePairLive(plan)) {
                 val liveQueueVersion = PlaybackSessionClock.currentQueueVersion()
@@ -313,6 +332,7 @@ internal class SmartAutoMixer(
             "realtime_crossfade_started",
             plan,
             mapOf(
+                "transitionOwner" to "realtime-crossfade",
                 "remainingMs" to remainingMs,
                 "nextStartPositionMs" to plan.nextStartPositionMs,
                 "beatmatchSpeed" to "%.4f".format(plan.nextTempoScale),
@@ -332,6 +352,20 @@ internal class SmartAutoMixer(
 
     private fun startMainOnlyNext(waiting: ArmedMix, remainingMs: Long) {
         val plan = waiting.plan
+        if (realtimeCrossfadeOwnsTransition()) {
+            armed = null
+            logMixEvent(
+                "competing_transition_suppressed",
+                plan,
+                mapOf(
+                    "activeOwner" to "realtime-crossfade",
+                    "suppressedMode" to MAIN_ONLY_TRANSITION_MODE,
+                    "stage" to "main-only-commit",
+                    "remainingMs" to remainingMs,
+                ),
+            )
+            return
+        }
         val outgoingPositionMs = mainPlayer.currentPosition.coerceAtLeast(0L)
         val startedAtMs = SystemClock.elapsedRealtime()
 
@@ -361,6 +395,10 @@ internal class SmartAutoMixer(
             ),
         )
         updateActiveMix(active ?: return)
+    }
+
+    private fun realtimeCrossfadeOwnsTransition(): Boolean {
+        return crossfadeController?.isRunning == true
     }
 
     private fun updateActiveMix(running: ActiveMix) {
