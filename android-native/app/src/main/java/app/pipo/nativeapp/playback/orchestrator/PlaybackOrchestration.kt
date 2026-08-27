@@ -961,7 +961,7 @@ private class QueueValidator {
                 if (ratio < 0.7) {
                     messages.add("focus_artist_ratio_low:$hit/${scopedTracks.size}")
                 }
-                true
+                ratio >= 0.7
             }
             ArtistScope.Similar -> true
         }
@@ -983,7 +983,6 @@ private class QueueValidator {
 
     private fun isBlockingMessage(message: String): Boolean =
         when {
-            message.startsWith("focus_artist_ratio_low") -> false
             message.startsWith("无缝优化移动") -> false
             else -> true
         }

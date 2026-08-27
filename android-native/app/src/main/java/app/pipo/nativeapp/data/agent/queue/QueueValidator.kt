@@ -261,7 +261,7 @@ class QueueValidator(
                 if (ratio < 0.7) {
                     messages.add("focus_artist_ratio_low:$hit/${scopedTracks.size}")
                 }
-                true
+                ratio >= 0.7
             }
             ArtistScope.Similar -> true
         }
@@ -272,7 +272,6 @@ class QueueValidator(
             message == "must_include_at_head" -> false
             message == "opening_energy_too_high" -> false
             message == "language_interleave_weak" -> false
-            message.startsWith("focus_artist_ratio_low") -> false
             else -> true
         }
 

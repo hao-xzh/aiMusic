@@ -36,6 +36,8 @@ class MusicResolver(
         const val CONTINUATION_LOCAL_POOL_COUNT = 96
         const val CONTINUATION_SEARCH_LIMIT = 50
         const val CONTINUATION_MAX_SEARCH_QUERIES = 16
+        const val ARTIST_FOCUS_MIN_NUMERATOR = 7
+        const val ARTIST_FOCUS_MIN_DENOMINATOR = 10
     }
 
     private val trackResolver = TrackResolver(repository)
@@ -422,17 +424,27 @@ class MusicResolver(
             else TrackDedupe.capRecommendationTitleFamily(items)
         val localResult = when (artistScope) {
             ArtistScope.Strict -> capTitles(scoped).take(desired)
-            ArtistScope.Focus -> capTitles(
-                diversifyByArtistButPreserveFocus(scoped, artistKeys),
-            ).take(desired)
+            ArtistScope.Focus -> takeWithinArtistScope(
+                tracks = capTitles(scoped),
+                artistKeys = artistKeys,
+                artistScope = artistScope,
+                desired = desired,
+            )
             ArtistScope.Similar -> capTitles(diversifyByArtist(scoped)).take(desired)
         }
         return when {
             localResult.size >= desired -> localResult
-            // 具名作品不能因为本地只碰巧有一两首就停止联网召回；保留本地命中，
-            // 再从同一 catalog gate 下补齐，仍不允许画像候选越出作品范围。
-            localResult.isNotEmpty() && allowOnline && intent.catalogAnchors.isNotEmpty() ->
-                mergeUnique(localResult, onlineBackfill(intent, desired, artistScope)).take(desired)
+            // 具名作品和明确艺人范围都不能因为本地只碰巧有一两首就停止联网召回；
+            // 保留本地命中，再从同一硬边界下补齐，仍不允许画像候选越界凑数。
+            localResult.isNotEmpty() && allowOnline &&
+                (intent.catalogAnchors.isNotEmpty() ||
+                    artistKeys.isNotEmpty() && artistScope != ArtistScope.Similar) ->
+                takeWithinArtistScope(
+                    tracks = mergeUnique(localResult, onlineBackfill(intent, desired, artistScope)),
+                    artistKeys = artistKeys,
+                    artistScope = artistScope,
+                    desired = desired,
+                )
             localResult.isNotEmpty() -> localResult
             allowOnline -> onlineBackfill(intent, desired, artistScope)
             else -> emptyList()
@@ -535,7 +547,12 @@ class MusicResolver(
         } else {
             freshFirst
         }
-        return titleCapped.take(desired)
+        return takeWithinArtistScope(
+            tracks = titleCapped,
+            artistKeys = artistKeys,
+            artistScope = artistScope,
+            desired = desired,
+        )
     }
 
     /**
@@ -664,7 +681,12 @@ class MusicResolver(
                 )
                     .let { filterContextFeedback(it, intent) }
                     .filter { TrackDedupe.songKey(it) !in haveKeys }
-                (local + online).take(CONTINUATION_WANT_COUNT)
+                takeWithinArtistScope(
+                    tracks = local + online,
+                    artistKeys = artistKeys,
+                    artistScope = artistScope,
+                    desired = CONTINUATION_WANT_COUNT,
+                )
             }
         }
         return if (intent.catalogAnchors.isNotEmpty()) {
@@ -711,7 +733,19 @@ class MusicResolver(
         val eligible = rankedPool.filter { track ->
             track.neteaseId?.let { it !in excludeIds } ?: true
         }
-        val sampled = sampleContinuation(eligible, CONTINUATION_WANT_COUNT)
+        val artistKeys = intent.hardArtists
+            .map(CommandTextSignals::normalizeForMatch)
+            .filter { it.isNotBlank() }
+        val sampled = if (artistKeys.isNotEmpty() && artistScope != ArtistScope.Similar) {
+            takeWithinArtistScope(
+                tracks = eligible,
+                artistKeys = artistKeys,
+                artistScope = artistScope,
+                desired = CONTINUATION_WANT_COUNT,
+            )
+        } else {
+            sampleContinuation(eligible, CONTINUATION_WANT_COUNT)
+        }
         DiagnosticsLogStore.record(
             area = "ai_agent",
             event = "continuous_source_local_sample",
@@ -834,13 +868,13 @@ class MusicResolver(
             out.addAll(other)
         }
         val deduped = TrackDedupe.dedupe(out)
-        val ordered = when (artistScope) {
-            ArtistScope.Strict -> deduped
-            ArtistScope.Focus -> diversifyByArtistButPreserveFocus(deduped, artistKeys)
-            ArtistScope.Similar -> diversifyByArtist(deduped)
-        }
-        return TrackDedupe.capRecommendationTitleFamily(demoteRecentlyRecommended(ordered))
-            .take(CONTINUATION_WANT_COUNT)
+        val ordered = if (artistScope == ArtistScope.Similar) diversifyByArtist(deduped) else deduped
+        return takeWithinArtistScope(
+            tracks = TrackDedupe.capRecommendationTitleFamily(demoteRecentlyRecommended(ordered)),
+            artistKeys = artistKeys,
+            artistScope = artistScope,
+            desired = CONTINUATION_WANT_COUNT,
+        )
     }
 
     private fun buildContinuationSearchQueries(intent: PetIntent): List<String> {
@@ -1104,18 +1138,47 @@ class MusicResolver(
         }
     }
 
-    private fun diversifyByArtistButPreserveFocus(
+    private fun takeWithinArtistScope(
         tracks: List<NativeTrack>,
         artistKeys: List<String>,
-        minFocusRatio: Double = 0.7,
+        artistScope: ArtistScope,
+        desired: Int,
     ): List<NativeTrack> {
-        if (artistKeys.isEmpty()) return diversifyByArtist(tracks)
+        if (desired <= 0) return emptyList()
+        if (artistKeys.isEmpty()) return tracks.take(desired)
+        return when (artistScope) {
+            ArtistScope.Strict -> tracks
+                .filter { track -> artistMatchesAny(track.artist, artistKeys) }
+                .take(desired)
+            ArtistScope.Focus -> takeArtistFocus(tracks, artistKeys, desired)
+            ArtistScope.Similar -> tracks.take(desired)
+        }
+    }
+
+    /**
+     * Focus 允许少量同味艺人，但提交的任意前缀至少保持 70% 目标艺人。
+     * 目标艺人不足时宁可返回更短列表触发在线补齐，也不拿无关歌曲凑满。
+     */
+    private fun takeArtistFocus(
+        tracks: List<NativeTrack>,
+        artistKeys: List<String>,
+        desired: Int,
+    ): List<NativeTrack> {
         val primary = tracks.filter { artistMatchesAny(it.artist, artistKeys) }
+        if (primary.isEmpty()) return emptyList()
         val rest = tracks.filterNot { artistMatchesAny(it.artist, artistKeys) }
-        val desiredPrimaryCount = (tracks.size * minFocusRatio).toInt().coerceAtLeast(1)
-        val head = primary.take(desiredPrimaryCount)
-        val tail = diversifyByArtist(primary.drop(desiredPrimaryCount) + rest)
-        return head + tail
+        val requiredPrimary = (
+            desired * ARTIST_FOCUS_MIN_NUMERATOR + ARTIST_FOCUS_MIN_DENOMINATOR - 1
+            ) / ARTIST_FOCUS_MIN_DENOMINATOR
+        val primaryHead = primary.take(requiredPrimary.coerceAtMost(desired))
+        val maxRestForRatio = primaryHead.size *
+            (ARTIST_FOCUS_MIN_DENOMINATOR - ARTIST_FOCUS_MIN_NUMERATOR) /
+            ARTIST_FOCUS_MIN_NUMERATOR
+        val restHead = rest.take(minOf(desired - primaryHead.size, maxRestForRatio))
+        val extraPrimary = primary
+            .drop(primaryHead.size)
+            .take(desired - primaryHead.size - restHead.size)
+        return primaryHead + restHead + extraPrimary
     }
 
     private fun artistMatchesAny(actualRaw: String, artistKeys: List<String>): Boolean =

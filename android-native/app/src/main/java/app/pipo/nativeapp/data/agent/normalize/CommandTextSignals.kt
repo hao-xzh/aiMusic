@@ -251,7 +251,7 @@ object CommandTextSignals {
         return null
     }
 
-    fun artistScope(text: String): ArtistScope {
+    fun explicitArtistScope(text: String): ArtistScope? {
         val key = normalizeCommandText(text)
         val focusCue = listOf(
             "为主", "主打", "混一点", "混点", "夹一点", "带一点", "穿插一点",
@@ -264,8 +264,10 @@ object CommandTextSignals {
         ).any { it in key }
         if (similarCue) return ArtistScope.Similar
 
-        return if (primaryArtistHints(text).isNotEmpty()) ArtistScope.Strict else ArtistScope.Focus
+        return ArtistScope.Strict.takeIf { primaryArtistHints(text).isNotEmpty() }
     }
+
+    fun artistScope(text: String): ArtistScope = explicitArtistScope(text) ?: ArtistScope.Focus
 
     fun genericSimilarRequest(text: String): Boolean {
         val key = normalizeCommandText(text)

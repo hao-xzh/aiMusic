@@ -557,6 +557,11 @@ class AgentToolLoop(
         state: LoopState,
     ): JSONObject {
         val action = playRequestFromArgs(args, input)
+        val requestedMode = playMode(
+            args.optString("operation").ifBlank { args.optString("action") },
+            PlayMode.ReplaceQueue,
+        )
+        recordOperationCorrection(state, requestedMode, action.mode, action.primaryGoal.selectionMode)
         selectionContractError(action)?.let { (error, message) ->
             state.trace("draft_queue:$error")
             return JSONObject()
@@ -753,17 +758,19 @@ class AgentToolLoop(
     ): JSONObject {
         val draftId = args.optString("draft_id").ifBlank { args.optString("draftId") }
         val draft = state.drafts[draftId]
-        val mode = draft?.play?.mode ?: playMode(args.optString("operation"), PlayMode.ReplaceQueue)
-        blockedCommitReason(mode, state)?.let { return it }
         if (draft != null) {
+            blockedCommitReason(draft.play.mode, state)?.let { return it }
             return commitPlayTracks(draft.plan, draft.queuePlan.validation, draft.play, executor, state)
         }
         val tracks = tracksForKeys(args.optJSONArray("track_keys"), state)
         if (tracks.isEmpty()) {
             return JSONObject().put("ok", false).put("error", "empty_track_keys")
         }
-        val modeForCommit = playMode(args.optString("operation"), PlayMode.ReplaceQueue)
-        val directGoal = goalFromArgs(args)
+        val directGoal = goalFromArgs(args, input.userText)
+        val requestedMode = playMode(args.optString("operation"), PlayMode.ReplaceQueue)
+        val modeForCommit = effectivePlayMode(requestedMode, directGoal, input.userText)
+        recordOperationCorrection(state, requestedMode, modeForCommit, directGoal.selectionMode)
+        blockedCommitReason(modeForCommit, state)?.let { return it }
         val contractTarget = tracks.firstOrNull()
             ?.takeIf { directGoal.selectionMode == MusicSelectionMode.ExactTrack }
             ?.let { TrackRequirement(title = it.title, artist = it.artist) }
@@ -1112,7 +1119,9 @@ class AgentToolLoop(
 
     private fun playRequestFromArgs(args: JSONObject, input: AgentTurnInput): PlannedAction.PlayRequest {
         val operation = args.optString("operation").ifBlank { args.optString("action") }
-        val mode = playMode(operation, PlayMode.ReplaceQueue)
+        val requestedMode = playMode(operation, PlayMode.ReplaceQueue)
+        val primaryGoal = goalFromArgs(args, input.userText)
+        val mode = effectivePlayMode(requestedMode, primaryGoal, input.userText)
         val target = trackRequirement(args.optJSONObject("target"), if (mode == PlayMode.InsertNext) TrackPlacement.Next else TrackPlacement.Now)
             ?: args.optString("target_title").takeIf { it.isNotBlank() }?.let {
                 TrackRequirement(
@@ -1121,6 +1130,8 @@ class AgentToolLoop(
                     placement = if (mode == PlayMode.InsertNext) TrackPlacement.Next else TrackPlacement.Now,
                 )
             }
+            ?: CommandTextSignals.artistTrackTarget(input.userText)
+                ?.copy(placement = if (mode == PlayMode.InsertNext) TrackPlacement.Next else TrackPlacement.Now)
         val explicitCount = args.optInt("count", args.optInt("desired_count", 0)).takeIf { it > 0 }
         // insert_next 默认插 1 首；带 artists/playlist 而无具体目标歌时视为“插一批”
         //（这首听完放 X 的歌 / 下一首开始听 Y），默认给一小组。
@@ -1138,7 +1149,7 @@ class AgentToolLoop(
         return PlannedAction.PlayRequest(
             actionId = "draft",
             mode = mode,
-            primaryGoal = goalFromArgs(args),
+            primaryGoal = primaryGoal,
             target = target,
             desiredCount = desiredCount,
             similar = args.optBoolean("similar", operation.contains("similar", ignoreCase = true)),
@@ -1166,9 +1177,86 @@ class AgentToolLoop(
 
     private fun defaultJumpToInserted(mode: PlayMode): Boolean = mode != PlayMode.InsertNext
 
-    private fun goalFromArgs(args: JSONObject): MusicGoal {
+    /**
+     * 动作只看当前用户原话，不能沿用上一轮“下一首/不打断”的历史动作。没有明确插播
+     * 语义时，即使工具模型传了 insert_next，单曲也恢复为 play_now，其余请求恢复为 replace_queue。
+     */
+    private fun effectivePlayMode(
+        requested: PlayMode,
+        goal: MusicGoal,
+        userText: String,
+    ): PlayMode {
+        if (goal.selectionMode == MusicSelectionMode.ExactTrack) {
+            return if (hasExplicitInsertCue(userText)) PlayMode.InsertNext else PlayMode.PlayNow
+        }
+        if (requested != PlayMode.InsertNext || hasExplicitInsertCue(userText)) return requested
+        return PlayMode.ReplaceQueue
+    }
+
+    private fun hasExplicitInsertCue(userText: String): Boolean {
+        val compact = CommandTextSignals.normalizeCommandText(userText)
+        if (listOf(
+                "不要插播", "别插播", "不插播", "不要加塞", "别加塞",
+                "直接替换", "替换队列", "替换播放列表", "全部替换", "替换所有",
+            ).any { it in compact }
+        ) {
+            return false
+        }
+        if (CommandTextSignals.noInterrupt(userText)) return true
+        if (listOf(
+                "下一首", "下首", "插播", "插一首", "插首", "加塞",
+                "这首听完", "听完这首", "这首放完", "放完这首", "这首播完", "播完这首",
+                "等这首", "接在这首后", "当前歌后面", "别替换", "不要替换", "保留当前这首", "保留现在这首",
+            ).any { it in compact }
+        ) {
+            return true
+        }
+        return Regex("(?:接下来|后面)(?:就|开始)?(?:来|放|播放|听|接|加)(?:一批|一组|几首|点|一首)")
+            .containsMatchIn(compact)
+    }
+
+    private fun recordOperationCorrection(
+        state: LoopState,
+        requested: PlayMode,
+        effective: PlayMode,
+        selectionMode: MusicSelectionMode,
+    ) {
+        if (requested == effective) return
+        state.trace("operation_guard:${requested.name}->${effective.name}:${selectionMode.name}")
+        DiagnosticsLogStore.record(
+            area = "ai_agent",
+            event = "operation_guard",
+            fields = mapOf(
+                "turnId" to state.turnId,
+                "requested" to requested.name,
+                "effective" to effective.name,
+                "selectionMode" to selectionMode.name,
+            ),
+        )
+    }
+
+    private fun goalFromArgs(args: JSONObject, userText: String): MusicGoal {
         val style = styleFromArgs(args.optJSONObject("style") ?: args.optJSONObject("styleProfile"), args.optString("query"))
         val artists = stringArray(args, "artists").ifEmpty { stringArray(args, "primary_artists") }
+        val requestedMode = selectionMode(
+            args.optString("intent_mode").ifBlank { args.optString("selection_mode") },
+        )
+        val hasStructuredTarget = trackRequirement(args.optJSONObject("target"), TrackPlacement.Now) != null ||
+            args.optString("target_title").isNotBlank()
+        val mode = if (hasStructuredTarget || CommandTextSignals.artistTrackTarget(userText) != null) {
+            MusicSelectionMode.ExactTrack
+        } else {
+            requestedMode
+        }
+        val requestedArtistScope = artistScope(
+            args.optString("artist_scope").ifBlank { args.optString("artistScope") },
+            ArtistScope.Strict,
+        )
+        val effectiveArtistScope = if (artists.isNotEmpty()) {
+            CommandTextSignals.explicitArtistScope(userText) ?: ArtistScope.Strict
+        } else {
+            requestedArtistScope
+        }
         val mustInclude = trackRequirements(args.optJSONArray("must_include"), TrackPlacement.MustInclude) +
             trackRequirements(args.optJSONArray("mustInclude"), TrackPlacement.MustInclude) +
             stringArray(args, "must_include_titles").map { TrackRequirement(it, placement = TrackPlacement.MustInclude) }
@@ -1176,7 +1264,7 @@ class AgentToolLoop(
             ?: args.optString("closer_title").takeIf { it.isNotBlank() }?.let { TrackRequirement(it, placement = TrackPlacement.Closer) }
         return MusicGoal(
             primaryArtists = artists,
-            artistScope = artistScope(args.optString("artist_scope").ifBlank { args.optString("artistScope") }, ArtistScope.Focus),
+            artistScope = effectiveArtistScope,
             playlistName = args.optString("playlist_name").ifBlank { args.optString("playlistName") },
             mustInclude = mustInclude,
             closer = closer,
@@ -1186,9 +1274,7 @@ class AgentToolLoop(
             softMoods = stringArray(args, "moods"),
             softScenes = stringArray(args, "scenes"),
             searchSeeds = listOf(args.optString("query")).filter { it.isNotBlank() },
-            selectionMode = selectionMode(
-                args.optString("intent_mode").ifBlank { args.optString("selection_mode") },
-            ),
+            selectionMode = mode,
             catalogConstraint = catalogConstraintFromArgs(args),
             useCurrentStyleAnchor = args.optBoolean("use_current_style_anchor", false),
             styleProfile = style,
@@ -1653,7 +1739,13 @@ class AgentToolLoop(
             .put("catalog", catalogConstraintSchema())
             .put("playlist_name", stringSchema("Scope to a playlist/cloud disk when requested"))
             .put("artists", arraySchema("Primary real artist names"))
-            .put("artist_scope", enumSchema("Artist scope", listOf("Strict", "Focus", "Similar")))
+            .put(
+                "artist_scope",
+                enumSchema(
+                    "Artist scope: direct named artist requests use Strict; Focus only when the user explicitly asks to mix in similar artists; Similar only for similar/style requests",
+                    listOf("Strict", "Focus", "Similar"),
+                ),
+            )
             .put("count", integerSchema("Desired count. For insert_next: omit/1 = 插单首；>1 = 批量插播（整批排在当前歌后面）"))
             .put("target_title", stringSchema("Specific first/next track title"))
             .put("target_artist", stringSchema("Specific first/next artist hint"))
@@ -1924,6 +2016,7 @@ class AgentToolLoop(
 9. 用户指「队列里第 N 首 / 队列里那首 X」时，直接用上下文队列行里的 [key]：比如“从第五首开始放” → commit_queue(intent_mode="exact_track", track_keys=[第5首及之后的 key], operation="play_now")，不用再搜索。
 
 【动作区分】
+9a. operation 只按“当前这句用户原话”判断，最近对话里的上一轮 insert_next/replace_queue 只是执行记录，绝不能继承成这一轮默认动作。
 10. “播放/放/听 +（某歌手的）某首歌” = 立即播放：draft_queue(intent_mode="exact_track", operation="play_now", target_title=歌名, target_artist=歌手)；如果没有自动提交，再 commit_queue(intent_mode="exact_track")。
 11. “下一首/插到下一首/等这首放完/不要打断” = 排到下一首：draft_queue(intent_mode="exact_track", operation="insert_next", target_title=歌名, jump_to_inserted=false)；只有用户明确“现在就切过去”才 jump_to_inserted=true。
 11b. 批量插播：“这首听完之后放 X 的歌 / 下一首开始听 Taylor / 接下来来一批 Y / 听完放某张专辑” = draft_queue(operation="insert_next", intent_mode 按对象选择 artist_focus / open_recommendation / exact_catalog，count=想插的张数(歌手/专辑默认 6~8), jump_to_inserted=false)——整批插在当前歌后面、不打断当前播放。点名专辑/作品必须带 catalog，不可只传 query；批量插播是“加塞”，不要用 replace_queue（那会清掉用户当前队列）。
@@ -1941,8 +2034,8 @@ class AgentToolLoop(
 14d. draft_queue 绝不能丢空选歌语义。至少传 target、artists、query、catalog、playlist、style/场景约束或明确上下文引用之一；否则工具会拒绝，必须重新理解用户原话再调用，不能拿个人画像随便顶一组歌。
 
 【艺人范围 artist_scope】
-15. 默认 "Focus"（以该歌手为主，可少量同味歌），避免硬塞导致排不出。
-16. 只有用户明确“只听本人/就听 X 一个人/不要别人”才用 "Strict"。
+15. 直接点名歌手（“听 X / 放 X 的歌”）默认且必须用 "Strict"，找不够就少排或继续搜索，不能拿别的歌手凑数。
+16. 只有用户明确“以 X 为主、混一点同味歌/穿插类似歌手”才用 "Focus"。
 17. “类似 X / X 那种 / X 风格 / 像 X” 用 "Similar"。
 18. artists 只能填真实歌手/乐队名；“欢快的/嗨一点/开车/工作/忧郁点”是风格情绪场景，放进 query 和 style，不要塞进 artists。
 
