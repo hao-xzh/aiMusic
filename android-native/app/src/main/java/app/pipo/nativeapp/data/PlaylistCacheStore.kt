@@ -2,12 +2,16 @@ package app.pipo.nativeapp.data
 
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.ArrayDeque
+import java.util.LinkedHashMap
 
 /**
  * 歌单列表 + 每张歌单 tracks 的磁盘持久化。
@@ -15,7 +19,7 @@ import java.io.File
  * 当前 RustBridgeRepository 只在进程内存里缓存，冷启动后重新走网。
  * 这层让冷启动直接看到上次的歌单（stale-while-revalidate）：
  *
- *   - load(userId)：app 启动时同步读，喂给 playlistState / tracksMemoryCache。
+ *   - load()：app 启动后的 IO 恢复，喂给 playlistState / tracksMemoryCache。
  *   - save(...)：每次 refreshPlaylists / tracksForPlaylist 网络成功后异步落盘。
  *   - clear(userId)：换账号 / 退登时清掉旧数据。
  *
@@ -27,7 +31,11 @@ import java.io.File
 class PlaylistCacheStore(context: Context) {
 
     private val file: File = File(context.applicationContext.filesDir, FILE_NAME)
+    private val tempFile: File = File(file.absolutePath + ".tmp")
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val writeLock = Any()
+    private val pendingWrites = ArrayDeque<WriteOperation>()
+    private var writerRunning = false
 
     data class Snapshot(
         val userId: Long,
@@ -40,10 +48,14 @@ class PlaylistCacheStore(context: Context) {
         val isStale: Boolean get() = ageMs > STALE_AFTER_MS
     }
 
-    /** 同步读 —— 在 RustBridgeRepository.init 调用，必须秒回。 */
+    /** 只能从 IO coroutine 调用；超限文件在读入/解析前直接废弃。 */
     fun load(): Snapshot? {
         if (!file.exists()) return null
         return try {
+            if (file.length() > MAX_CACHE_BYTES) {
+                deleteCacheFiles()
+                return null
+            }
             val raw = file.readText()
             val obj = JSONObject(raw)
             if (obj.optInt("v") != VERSION) return null
@@ -54,7 +66,7 @@ class PlaylistCacheStore(context: Context) {
             // 一下,体验比直接显示空 EmptyState 还差。直接当作无 cache 让用户看到
             // "正在加载"几百 ms 更干净。
             if (savedAtMs > 0 && System.currentTimeMillis() - savedAtMs > MAX_AGE_MS) {
-                runCatching { file.delete() }
+                deleteCacheFiles()
                 return null
             }
             val plArr = obj.optJSONArray("playlists") ?: return null
@@ -64,7 +76,8 @@ class PlaylistCacheStore(context: Context) {
                 playlists.add(decodePlaylist(p) ?: continue)
             }
             val tracksObj = obj.optJSONObject("tracks")
-            val tracksMap = HashMap<Long, List<NativeTrack>>()
+            // JSON 键的落盘顺序就是 LRU 从旧到新的顺序，恢复时必须保留它。
+            val tracksMap = LinkedHashMap<Long, List<NativeTrack>>()
             if (tracksObj != null) {
                 tracksObj.keys().forEach { k ->
                     val pid = k.toLongOrNull() ?: return@forEach
@@ -80,7 +93,7 @@ class PlaylistCacheStore(context: Context) {
             Snapshot(userId, savedAtMs, playlists, tracksMap)
         } catch (_: Exception) {
             // 坏文件直接清 —— 别让坏 JSON 永久卡住启动
-            runCatching { file.delete() }
+            deleteCacheFiles()
             null
         }
     }
@@ -91,40 +104,128 @@ class PlaylistCacheStore(context: Context) {
      */
     fun save(userId: Long, playlists: List<PipoPlaylist>, tracks: Map<Long, List<NativeTrack>>) {
         if (userId == 0L || playlists.isEmpty()) return
-        // 主线程只做引用快照（List/Map 不可变下的 immutable copy 太贵就跳过），
-        // 实际 JSON 序列化在 IO 线程
+        // 主线程只复制集合边界；实际 JSON 序列化只在单一 IO writer 中进行。
         val plSnapshot = playlists.toList()
-        val tracksSnapshot = HashMap(tracks)
-        ioScope.launch { writeToDisk(userId, plSnapshot, tracksSnapshot) }
+        val tracksSnapshot = LinkedHashMap(tracks)
+        synchronized(writeLock) {
+            val request = SaveRequest(userId, plSnapshot, tracksSnapshot)
+            // 连续保存只保留最新全量快照；clear 是严格边界，不能跨过它合并。
+            if (pendingWrites.lastOrNull() is SaveRequest) {
+                pendingWrites.removeLast()
+            }
+            pendingWrites.addLast(request)
+            startWriterLocked()
+        }
     }
 
-    fun clear() {
-        ioScope.launch { runCatching { file.delete() } }
+    fun clear(): Deferred<Unit> {
+        val completion = CompletableDeferred<Unit>()
+        synchronized(writeLock) {
+            // 排队中的旧快照全部失效；正在执行的旧写完成后，clear 会作为下一项删除它。
+            pendingWrites.removeAll { it is SaveRequest }
+            pendingWrites.addLast(ClearRequest(completion))
+            startWriterLocked()
+        }
+        return completion
+    }
+
+    private fun startWriterLocked() {
+        if (writerRunning) return
+        writerRunning = true
+        ioScope.launch { drainWrites() }
+    }
+
+    private fun drainWrites() {
+        try {
+            while (true) {
+                val request = synchronized(writeLock) { pendingWrites.pollFirst() } ?: return
+                when (request) {
+                    // 编码失败只放弃当前快照，不能让 writer 停在 running 状态而卡住后续 clear。
+                    is SaveRequest -> runCatching {
+                        writeToDisk(request.userId, request.playlists, request.tracks)
+                    }
+                    is ClearRequest -> {
+                        try {
+                            deleteCacheFiles()
+                        } finally {
+                            request.completion.complete(Unit)
+                        }
+                    }
+                }
+            }
+        } finally {
+            synchronized(writeLock) {
+                writerRunning = false
+                if (pendingWrites.isNotEmpty()) {
+                    startWriterLocked()
+                }
+            }
+        }
     }
 
     private fun writeToDisk(userId: Long, playlists: List<PipoPlaylist>, tracks: Map<Long, List<NativeTrack>>) {
-        val plArr = JSONArray()
-        playlists.forEach { plArr.put(encodePlaylist(it)) }
-        val tracksObj = JSONObject()
-        tracks.forEach { (pid, list) ->
-            val arr = JSONArray()
-            list.forEach { arr.put(encodeTrack(it)) }
-            tracksObj.put(pid.toString(), arr)
+        val savedAtMs = System.currentTimeMillis()
+        val playlistJson = JSONArray().also { array -> playlists.forEach { array.put(encodePlaylist(it)) } }.toString()
+        val prefix = "{\"v\":$VERSION,\"userId\":$userId,\"savedAtMs\":$savedAtMs,\"playlists\":$playlistJson,\"tracks\":{"
+        val entries = tracks.map { (playlistId, list) ->
+            val tracksJson = JSONArray().also { array -> list.forEach { array.put(encodeTrack(it)) } }.toString()
+            EncodedTracks(playlistId, tracksJson, "\"$playlistId\":$tracksJson".toByteArray(Charsets.UTF_8).size)
+        }.toMutableList()
+        var payloadBytes = prefix.toByteArray(Charsets.UTF_8).size + TRACKS_SUFFIX_BYTES
+        // 到达磁盘上限时仅整张丢弃最久未访问的曲目列表，绝不截短一张歌单。
+        entries.forEachIndexed { index, entry ->
+            payloadBytes += entry.byteCount + if (index == 0) 0 else 1
         }
-        val obj = JSONObject().apply {
-            put("v", VERSION)
-            put("userId", userId)
-            put("savedAtMs", System.currentTimeMillis())
-            put("playlists", plArr)
-            put("tracks", tracksObj)
+        while (payloadBytes > MAX_CACHE_BYTES && entries.isNotEmpty()) {
+            val removed = entries.removeAt(0)
+            payloadBytes -= removed.byteCount
+            if (entries.isNotEmpty()) payloadBytes -= 1
         }
-        runCatching {
-            // 写到 .tmp 再 rename：避免写到一半被 kill 留下半截 JSON
-            val tmp = File(file.absolutePath + ".tmp")
-            tmp.writeText(obj.toString())
-            tmp.renameTo(file)
+        if (payloadBytes > MAX_CACHE_BYTES) {
+            deleteCacheFiles()
+            return
+        }
+        val payload = buildString(payloadBytes) {
+            append(prefix)
+            entries.forEachIndexed { index, entry ->
+                if (index > 0) append(',')
+                append('"').append(entry.playlistId).append("\":").append(entry.tracksJson)
+            }
+            append("}}")
+        }
+        try {
+            tempFile.writeText(payload, Charsets.UTF_8)
+            // 同目录 rename 才是原子替换；不能把 rename 失败当作保存成功。
+            if (!tempFile.renameTo(file)) {
+                tempFile.delete()
+            }
+        } catch (_: Exception) {
+            tempFile.delete()
         }
     }
+
+    private fun deleteCacheFiles() {
+        runCatching { file.delete() }
+        runCatching { tempFile.delete() }
+    }
+
+    private sealed class WriteOperation
+
+    private class SaveRequest(
+        val userId: Long,
+        val playlists: List<PipoPlaylist>,
+        val tracks: Map<Long, List<NativeTrack>>,
+    ) : WriteOperation()
+
+    private class ClearRequest(
+        val completion: CompletableDeferred<Unit>,
+    ) : WriteOperation()
+
+    private class EncodedTracks(
+        val playlistId: Long,
+        val tracksJson: String,
+        val byteCount: Int,
+    )
 
     private fun encodePlaylist(p: PipoPlaylist): JSONObject = JSONObject().apply {
         put("id", p.id)
@@ -177,5 +278,7 @@ class PlaylistCacheStore(context: Context) {
         private const val VERSION = 1
         private const val STALE_AFTER_MS = 24L * 3600 * 1000  // 24h:isStale 阈值
         private const val MAX_AGE_MS = 7L * 24 * 3600 * 1000  // 7d:超过这个直接废弃 cache
+        private const val MAX_CACHE_BYTES = 8L * 1024 * 1024
+        private const val TRACKS_SUFFIX_BYTES = 2
     }
 }

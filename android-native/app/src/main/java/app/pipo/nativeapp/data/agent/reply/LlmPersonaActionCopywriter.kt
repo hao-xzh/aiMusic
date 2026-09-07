@@ -37,8 +37,9 @@ class LlmPersonaActionCopywriter(
 2. 成功=false 时绝不能说“放了/切了/收了/排好了/打开了”，要如实说没成或没找到，别硬装完成。
 3. 队列类成功用“接上了/排上了/待会儿给你放”这种说法；除非 FACTS 明说已切歌，别说“已经在放/切过去了”。
 4. 不要报菜名式罗列整列队列，最多点开场那首或关键一两首。
-5. ≤2 句、口语、自然，别像模板或客服。不要感叹号，不要“亲/宝/主人”，不要双形容词对仗（既…又…）。
-6. 只输出这一句话本身，不要解释、不要 JSON、不要整句加引号。
+5. 动作=insert_next 且队列长度>1 是批量插播，必须提真实数量“N首/共接N首”，不能说成插一首。
+6. ≤2 句、口语、自然，别像模板或客服。不要感叹号，不要“亲/宝/主人”，不要双形容词对仗（既…又…）。
+7. 只输出这一句话本身，不要解释、不要 JSON、不要整句加引号。
 """.trimIndent()
     }
 
@@ -56,7 +57,11 @@ class LlmPersonaActionCopywriter(
         val sample = facts.includedTitles.filter { it.isNotBlank() }.distinct().take(5)
         if (sample.isNotEmpty()) appendLine("队列里有（可点一两首，别全报）：${sample.joinToString("、")}")
         if (facts.closerTitle.isNotBlank()) appendLine("结尾收住：${facts.closerTitle}")
-        if (facts.insertedTitle.isNotBlank()) {
+        if (facts.actionType == "insert_next" && facts.queueCount > 1) {
+            val startTitle = facts.insertedTitle.ifBlank { facts.firstTrackTitle }
+            val startArtist = facts.insertedArtist.ifBlank { facts.firstTrackArtist }.ifBlank { "?" }
+            appendLine("批量插播：下一首从${startArtist} - ${startTitle.ifBlank { "第一首" }}开始，共接${facts.queueCount}首")
+        } else if (facts.insertedTitle.isNotBlank()) {
             appendLine("插到下一首：${facts.insertedArtist.ifBlank { "?" }} - ${facts.insertedTitle}")
         }
         if (facts.likedTitle.isNotBlank()) appendLine("收藏的歌：${facts.likedTitle}")

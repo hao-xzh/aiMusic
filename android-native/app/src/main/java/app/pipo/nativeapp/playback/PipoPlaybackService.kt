@@ -1,6 +1,9 @@
 package app.pipo.nativeapp.playback
 
 import android.app.PendingIntent
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.media.AudioFocusRequest
@@ -10,6 +13,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -28,18 +32,26 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.LibraryResult
+import androidx.core.app.NotificationCompat
+import androidx.media3.session.CommandButton
+import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.MediaNotification
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaLibraryService.LibraryParams
 import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaStyleNotificationHelper
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.R
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.runtime.AppForeground
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.MoreExecutors
 import com.google.common.util.concurrent.SettableFuture
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,6 +61,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.util.Locale
 
 /**
@@ -86,15 +99,21 @@ class PipoPlaybackService : MediaLibraryService() {
     // 清零重试计数 → 永不升级、无限重踢(Good Days 日志里 attempt 一直=1 的根因)。
     private var maxReachedPositionMs: Long = -1L
     private var lastProgressAtMs: Long = 0L
+    private var maxBufferedPositionMs: Long = -1L
+    private var lastBufferProgressAtMs: Long = 0L
     private var progressStallAttemptMediaId: String? = null
     private var progressStallAttempts: Int = 0
-    private var progressStallSkipAheadMediaId: String? = null
     private var progressWatchdogInternalSeekUntilMs: Long = 0L
     private var singleItemStallRetryAfterMs: Long = 0L
-    private val learnedProgressStallSkips = LinkedHashMap<String, ProgressStallSkip>()
     private var lastTransientNetworkErrorAtMs: Long = 0L
     private var badSourceRefreshJob: Job? = null
     private var audioFocusResumeJob: Job? = null
+    private var audioFocusForegroundExpiryJob: Job? = null
+    private var autoResumeForegroundUntilMs = 0L
+    private var playbackResumptionJob: Job? = null
+    private var playbackResumptionEpoch = 0L
+    private var resumptionForegroundStarted = false
+    private var resumptionForegroundTimeoutJob: Job? = null
     private var audioFocusPauseJob: Job? = null
     private var resumeAfterAudioFocusLoss = false
     private var autoResumeState: AutoResumeState? = null
@@ -156,12 +175,6 @@ class PipoPlaybackService : MediaLibraryService() {
             handleExternalAudioPolicy("playback-callback", configs)
         }
     }
-    private data class ProgressStallSkip(
-        val fromMs: Long,
-        val toMs: Long,
-        val learnedAtMs: Long,
-    )
-
     private data class AutoResumeState(
         val epoch: Long,
         val mediaId: String,
@@ -420,25 +433,73 @@ class PipoPlaybackService : MediaLibraryService() {
             controller: MediaSession.ControllerInfo,
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
             val player = mediaSession.player
-            val items = currentQueuePlayableItems(player)
-            val startIndex = if (items.isEmpty()) {
-                C.INDEX_UNSET
-            } else {
-                player.currentMediaItemIndex.coerceIn(0, items.lastIndex)
+            if (player.mediaItemCount > 0) {
+                return Futures.immediateFuture(currentPlaybackResumption(player))
             }
-            val positionMs = if (startIndex == C.INDEX_UNSET) {
-                C.TIME_UNSET
-            } else {
-                player.currentPosition.coerceAtLeast(0L)
+            val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+            val resumptionEpoch = ++playbackResumptionEpoch
+            playbackResumptionJob?.cancel()
+            val job = serviceScope.launch {
+                try {
+                    val restored = withContext(Dispatchers.IO) {
+                        withTimeout(PLAYBACK_RESUMPTION_TIMEOUT_MS) {
+                            val snapshot = PipoGraph.lastPlayback.load() ?: return@withTimeout null
+                            val resolved = urlResolver.resolvePlayableQueue(snapshot.queue)
+                                .mapIndexedNotNull { index, track ->
+                                    if (track.streamUrl.isBlank()) null else index to track
+                                }
+                            if (resolved.isEmpty()) return@withTimeout null
+                            val originalIndex = resolved.indexOfFirst { it.first == snapshot.currentIndex }
+                            val startIndex = originalIndex.takeIf { it >= 0 }
+                                ?: resolved.indexOfFirst { it.first >= snapshot.currentIndex }.coerceAtLeast(0)
+                            val positionMs = if (originalIndex >= 0) snapshot.positionMs else 0L
+                            Triple(resolved.map { it.second }, startIndex, positionMs)
+                        }
+                    }
+                    if (resumptionEpoch != playbackResumptionEpoch) {
+                        future.cancel(false)
+                        return@launch
+                    }
+                    // 网络解析期间 UI/其它控制器可能已经装上新队列，不能覆盖新选择。
+                    if (player.mediaItemCount > 0 || restored == null) {
+                        future.set(currentPlaybackResumption(player))
+                        if (player.mediaItemCount == 0) finishResumptionForeground()
+                        return@launch
+                    }
+                    val (tracks, startIndex, savedPositionMs) = restored
+                    val items = tracks.map { mediaFactory.toMediaItem(it) }
+                    val durationMs = tracks[startIndex].durationMs
+                    val positionMs = if (durationMs > 0L && savedPositionMs >= durationMs - 1_000L) {
+                        0L
+                    } else {
+                        savedPositionMs.coerceAtLeast(0L)
+                    }
+                    future.set(MediaSession.MediaItemsWithStartPosition(items, startIndex, positionMs))
+                    DiagnosticsLogStore.record(
+                        area = "playback_service",
+                        event = "playback_snapshot_restored",
+                        fields = mapOf("count" to items.size, "startIndex" to startIndex, "positionMs" to positionMs),
+                    )
+                } catch (error: CancellationException) {
+                    future.cancel(false)
+                    if (resumptionEpoch == playbackResumptionEpoch) finishResumptionForeground()
+                    throw error
+                } catch (error: Exception) {
+                    future.setException(error)
+                    if (resumptionEpoch == playbackResumptionEpoch) finishResumptionForeground()
+                }
             }
-            return Futures.immediateFuture(
-                MediaSession.MediaItemsWithStartPosition(items, startIndex, positionMs),
-            )
+            playbackResumptionJob = job
+            armResumptionForegroundTimeout()
+            future.addListener({ if (future.isCancelled) job.cancel() }, MoreExecutors.directExecutor())
+            job.invokeOnCompletion { if (it != null) future.cancel(false) }
+            return future
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        installMediaNotificationProvider()
         val cacheDataSourceFactory = PipoMediaDataSources.cacheFactory(this)
 
         val musicAttrs = AudioAttributes.Builder()
@@ -528,6 +589,7 @@ class PipoPlaybackService : MediaLibraryService() {
                     // tick 就起得来，随后靠 80ms 自循环持续到本场结束。幂等，无副作用。
                     override fun onEvents(player: Player, events: Player.Events) {
                         smartAutoMixer?.onMainPlayerEvent()
+                        BackgroundAgentContinuation.onPlayerEvent()
                     }
 
                     override fun onMediaItemTransition(
@@ -688,18 +750,19 @@ class PipoPlaybackService : MediaLibraryService() {
                             trackCacheWarmer?.cancel()
                             disarmNetworkRecovery()
                         }
-                        if (playWhenReady && !requestAudioFocusForPlayback("play-when-ready")) {
-                            pauseForAudioFocusRequestDenial(this@apply)
-                            updatePlaybackCallbackRegistration(this@apply)
-                            return
-                        }
                         if (playWhenReady) {
-                            if (this@apply.playbackState == Player.STATE_READY) {
-                                trackCacheWarmer?.maybeWarmCurrent(this@apply)
-                            }
+                            // Android 15+ 后台申请焦点之前必须已有前台服务。
                             notificationPlayer?.armRecoveryWindow()
                             mediaSession?.let { session ->
                                 updateNotificationSafely(session, true, "play-when-ready")
+                            }
+                            if (!requestAudioFocusForPlayback("play-when-ready")) {
+                                pauseForAudioFocusRequestDenial(this@apply)
+                                updatePlaybackCallbackRegistration(this@apply)
+                                return
+                            }
+                            if (this@apply.playbackState == Player.STATE_READY) {
+                                trackCacheWarmer?.maybeWarmCurrent(this@apply)
                             }
                         }
                         when (reason) {
@@ -834,6 +897,7 @@ class PipoPlaybackService : MediaLibraryService() {
         )
 
         trackCacheWarmer = TrackCacheWarmer(this, serviceScope)
+        BackgroundAgentContinuation.bind(serviceScope, player, urlResolver, mediaFactory)
 
         // 通知栏 / 锁屏的"点击区"指回主 Activity —— 没有这条，状态栏播放卡片被
         // 点击后系统找不到目标，整个通知体验不通畅。
@@ -860,8 +924,113 @@ class PipoPlaybackService : MediaLibraryService() {
         monitorForegroundPromotionRetry()
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 耳机按键可通过 startForegroundService 冷启动。先展示真实的恢复中媒体通知，
+        // 再异步解析已保存队列，不能把系统的前台启动时限耗在网络请求上。
+        if (intent?.action == Intent.ACTION_MEDIA_BUTTON &&
+            !isPlaybackOngoing && mediaSession?.player?.mediaItemCount == 0
+        ) {
+            val started = runCatching { startResumptionForeground() }.onFailure { error ->
+                DiagnosticsLogStore.record(
+                    area = "playback_service",
+                    event = "resumption_foreground_failed",
+                    fields = mapOf("errorType" to error::class.java.simpleName, "message" to error.message),
+                )
+            }
+            if (started.isFailure) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun startResumptionForeground() {
+        val session = mediaSession ?: return
+        if (resumptionForegroundStarted) return
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(RESUMPTION_CHANNEL_ID, getString(R.string.app_name), NotificationManager.IMPORTANCE_LOW),
+        )
+        val notification = NotificationCompat.Builder(this, RESUMPTION_CHANNEL_ID)
+            .setSmallIcon(androidx.media3.session.R.drawable.media3_notification_small_icon)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentIntent(session.sessionActivity)
+            .setStyle(MediaStyleNotificationHelper.MediaStyle(session))
+            .setProgress(0, 0, true)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        startForeground(RESUMPTION_NOTIFICATION_ID, notification)
+        resumptionForegroundStarted = true
+        armResumptionForegroundTimeout()
+    }
+
+    private fun armResumptionForegroundTimeout() {
+        if (!resumptionForegroundStarted) return
+        resumptionForegroundTimeoutJob?.cancel()
+        val resumptionEpoch = playbackResumptionEpoch
+        resumptionForegroundTimeoutJob = serviceScope.launch {
+            delay(PLAYBACK_RESUMPTION_TIMEOUT_MS)
+            if (!resumptionForegroundStarted || resumptionEpoch != playbackResumptionEpoch) return@launch
+            playbackResumptionJob?.cancel()
+            finishResumptionForeground()
+        }
+    }
+
+    private fun finishResumptionForeground() {
+        if (!resumptionForegroundStarted) return
+        resumptionForegroundStarted = false
+        resumptionForegroundTimeoutJob?.cancel()
+        resumptionForegroundTimeoutJob = null
+        // Media3 接管后仅移除启动通知，不能停止它刚刚建立的前台身份。
+        if (!isPlaybackOngoing) stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java).cancel(RESUMPTION_NOTIFICATION_ID)
+        if (!isPlaybackOngoing && mediaSession?.player?.mediaItemCount == 0) stopSelf()
+    }
+
+    private fun retainForegroundForAutoResume(player: Player): Boolean {
+        return isPlaybackOngoing && autoResumeStateFor(player) != null &&
+            SystemClock.elapsedRealtime() < autoResumeForegroundUntilMs
+    }
+
+    private fun installMediaNotificationProvider() {
+        val delegate = DefaultMediaNotificationProvider.Builder(this).build()
+        var generation = 0L
+        setMediaNotificationProvider(object : MediaNotification.Provider by delegate {
+            override fun createNotification(
+                session: MediaSession,
+                mediaButtonPreferences: ImmutableList<CommandButton>,
+                actionFactory: MediaNotification.ActionFactory,
+                onNotificationChangedCallback: MediaNotification.Provider.Callback,
+            ): MediaNotification {
+                val expectedGeneration = ++generation
+                return delegate.createNotification(session, mediaButtonPreferences, actionFactory) { notification ->
+                    if (generation == expectedGeneration && mediaSession === session) {
+                        if (retainForegroundForAutoResume(session.player)) {
+                            // Media3 1.5.1 的异步封面回调绕过 service override，会按暂停态降级。
+                            // 宽限期间只更新通知内容，不改变已存在的前台服务身份。
+                            notification.notification.extras.putParcelable(Notification.EXTRA_MEDIA_SESSION, session.platformToken)
+                            getSystemService(NotificationManager::class.java)
+                                .notify(notification.notificationId, notification.notification)
+                        } else {
+                            onNotificationChangedCallback.onNotificationChanged(notification)
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
         return mediaSession
+    }
+
+    private fun currentPlaybackResumption(player: Player): MediaSession.MediaItemsWithStartPosition {
+        val items = currentQueuePlayableItems(player)
+        val startIndex = if (items.isEmpty()) C.INDEX_UNSET else player.currentMediaItemIndex.coerceIn(0, items.lastIndex)
+        val positionMs = if (items.isEmpty()) C.TIME_UNSET else player.currentPosition.coerceAtLeast(0L)
+        return MediaSession.MediaItemsWithStartPosition(items, startIndex, positionMs)
     }
 
     private fun libraryRootItem(): MediaItem {
@@ -1226,6 +1395,16 @@ class PipoPlaybackService : MediaLibraryService() {
             pendingInternalPauseCommand = pendingInternalPauseCommand,
         )
         resumeAfterAudioFocusLoss = true
+        autoResumeForegroundUntilMs = SystemClock.elapsedRealtime() + AUDIO_FOCUS_FOREGROUND_GRACE_MS
+        audioFocusForegroundExpiryJob?.cancel()
+        audioFocusForegroundExpiryJob = serviceScope.launch {
+            delay(AUDIO_FOCUS_FOREGROUND_GRACE_MS)
+            if (autoResumeState?.epoch != epoch) return@launch
+            autoResumeForegroundUntilMs = 0L
+            mediaSession?.let { session ->
+                updateNotificationSafely(session, session.player.playWhenReady, "focus-grace-expired")
+            }
+        }
         waitingForAudioFocusGain = waitForAudioFocusGain
         focusGainWaitProbes = 0
         externalAudioObservedSincePause = observedExternalAudio
@@ -1315,6 +1494,9 @@ class PipoPlaybackService : MediaLibraryService() {
             )
             return
         }
+        playbackResumptionEpoch += 1L
+        playbackResumptionJob?.cancel()
+        finishResumptionForeground()
         // 即使 player 已处于暂停、不会再产生状态回调，也能在这里识别用户/智能控制器
         // 的明确 pause，保证之后绝不被旧的 quiet probe 自动拉起。
         clearAudioFocusAutoResume("session-pause-command")
@@ -1323,6 +1505,9 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     private fun handleSessionStopCommand() {
+        playbackResumptionEpoch += 1L
+        playbackResumptionJob?.cancel()
+        finishResumptionForeground()
         clearAudioFocusAutoResume("session-stop-command")
         abandonAudioFocus("session-stop-command")
         trackCacheWarmer?.cancel()
@@ -1410,6 +1595,19 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     private fun requestAudioFocusForPlayback(reason: String): Boolean {
+        if (Build.VERSION.SDK_INT >= 35 && !AppForeground.isForeground.value &&
+            !isPlaybackOngoing && !resumptionForegroundStarted
+        ) {
+            val session = mediaSession ?: return false
+            if (session.player.mediaItemCount == 0) return false
+            if (session.player.playbackState == Player.STATE_IDLE) {
+                session.player.prepare()
+            }
+            if (!updateNotificationSafely(session, true, "before-audio-focus-$reason")) {
+                lastAudioFocusRequestResult = AudioManager.AUDIOFOCUS_REQUEST_FAILED
+                return false
+            }
+        }
         if (hasAudioFocus) {
             lastAudioFocusRequestResult = AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             return true
@@ -2036,11 +2234,6 @@ class PipoPlaybackService : MediaLibraryService() {
         return mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION
     }
 
-    private fun hasRecentExternalFocusInterruption(): Boolean {
-        return SystemClock.elapsedRealtime() - lastExternalFocusInterruptionAtMs <=
-            EXTERNAL_MEDIA_FOCUS_LINK_WINDOW_MS
-    }
-
     private fun activeUsageSummary(configs: List<AudioPlaybackConfiguration>): String {
         return configs
             .map { playbackUsageName(it.audioAttributes.usage) }
@@ -2211,7 +2404,19 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     private fun clearAudioFocusAutoResume(reason: String) {
+        val hadForegroundGrace = autoResumeForegroundUntilMs > 0L
+        autoResumeForegroundUntilMs = 0L
+        audioFocusForegroundExpiryJob?.cancel()
+        audioFocusForegroundExpiryJob = null
         autoResumeState = null
+        if (hadForegroundGrace) {
+            // 显式暂停也可能发生在已暂停状态，必须主动结束前台宽限而不依赖 Player 回调。
+            mainHandler.post {
+                mediaSession?.let { session ->
+                    updateNotificationSafely(session, session.player.playWhenReady, "focus-cleared-$reason")
+                }
+            }
+        }
         audioFocusPauseJob?.cancel()
         audioFocusPauseJob = null
         if (!resumeAfterAudioFocusLoss) {
@@ -2365,7 +2570,7 @@ class PipoPlaybackService : MediaLibraryService() {
                     itemIndex,
                     liveItem.buildUpon()
                         .setUri(fresh.url)
-                        .setCustomCacheKey(liveItem.localConfiguration?.customCacheKey ?: fresh.cacheKey)
+                        .setCustomCacheKey(fresh.cacheKey)
                         .build(),
                 )
                 player.seekTo(itemIndex, resumePositionMs)
@@ -2471,7 +2676,8 @@ class PipoPlaybackService : MediaLibraryService() {
 
     private fun isWaitingForBadSourceController(player: Player, now: Long): Boolean {
         val mediaId = player.currentMediaItem?.mediaId ?: return false
-        return mediaId == badSourceRecoveryMediaId && now < badSourceRecoveryUntilMs
+        return mediaId == badSourceRecoveryMediaId &&
+            (now < badSourceRecoveryUntilMs || badSourceRefreshJob?.isActive == true)
     }
 
     private fun clearBadSourceRecovery(mediaId: String? = null) {
@@ -2523,7 +2729,6 @@ class PipoPlaybackService : MediaLibraryService() {
     private fun resetProgressStallAttempts() {
         progressStallAttemptMediaId = null
         progressStallAttempts = 0
-        progressStallSkipAheadMediaId = null
         singleItemStallRetryAfterMs = 0L
     }
 
@@ -2581,6 +2786,7 @@ class PipoPlaybackService : MediaLibraryService() {
         runCatching {
             // 与 monitorPlaybackProgress 的自愈一致:seek 回原位 + prepare,逼它重新拉流。
             // 若网络真没了,这一步会转成 ERROR_CODE_IO_NETWORK_* → 走既有报错恢复,也强过静默卡死。
+            markProgressWatchdogInternalSeek()
             player.seekTo(positionNow.coerceAtLeast(0L))
             player.prepare()
         }.onFailure { err ->
@@ -2600,6 +2806,8 @@ class PipoPlaybackService : MediaLibraryService() {
     private fun armProgressWatchdog(player: Player) {
         maxReachedPositionMs = player.currentPosition.coerceAtLeast(0L)
         lastProgressAtMs = SystemClock.elapsedRealtime()
+        maxBufferedPositionMs = player.bufferedPosition
+        lastBufferProgressAtMs = lastProgressAtMs
         resetProgressStallAttempts()
         scheduleProgressWatchdog(player)
     }
@@ -2626,47 +2834,44 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     /**
-     * 进度看门狗:只看 position 是否前进,不看 state。补 buffer_stall 的盲区 —— "buffering/ready 高频
-     * 抖动但 position 不动"会把 buffer_stall 的检查定时器反复 cancel,导致无限卡死(用户遇到
-     * 的"放着放着卡住、暂停加载暂停加载")。这里以 playWhenReady 为生命周期(抖动骗不过它),想播却
-     * ≥PROGRESS_STALL_THRESHOLD_MS 没前进就直接小步前跳。Good Days 这类固定坏片段原地 prepare 无效,
-     * 用户手动跳到 7~9s 能续播,所以自动恢复也走同一策略。
+     * READY/BUFFERING 抖动不能重置进度观察。正常补缓冲、系统抑制和短暂弱网不跳片段；
+     * 持续无进展才在原位置换源恢复，保留歌曲内容。
      */
     private fun evaluateProgressWatchdog(player: Player) {
-        if (!player.playWhenReady || player.mediaItemCount == 0) return // 暂停/空 → 歇着,等下次 arm
+        if (!player.playWhenReady || player.mediaItemCount == 0) return
+        if (player.playbackState == Player.STATE_ENDED) return
         val mediaId = player.currentMediaItem?.mediaId ?: return
         val now = SystemClock.elapsedRealtime()
-        if (isWaitingForBadSourceController(player, now)) {
-            // URL 重签 / 跳过正在进行,让它走完,别插手
+        if (isWaitingForBadSourceController(player, now) ||
+            player.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE
+        ) {
+            lastProgressAtMs = now
+            lastBufferProgressAtMs = now
             scheduleProgressWatchdog(player)
             return
         }
         val positionNow = player.currentPosition.coerceAtLeast(0L)
-        if (maybeSkipKnownProgressStall(player, mediaId, positionNow, now)) {
-            scheduleProgressWatchdog(player)
-            return
+        if (player.bufferedPosition > maxBufferedPositionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) {
+            maxBufferedPositionMs = player.bufferedPosition
+            lastBufferProgressAtMs = now
         }
-        // 只有"超过历史最大已播位置"才算真前进 —— buffering/ready 抖动里的倒退后小幅涨回不算,
-        // 否则反复清零重试计数 → 永不升级、无限重踢(Good Days 日志里 attempt 一直=1)。
         if (positionNow > maxReachedPositionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) {
             maxReachedPositionMs = positionNow
             lastProgressAtMs = now
             resetProgressStallAttempts()
-            scheduleProgressWatchdog(player)
-            return
-        }
-        if (now - lastProgressAtMs >= PROGRESS_STALL_THRESHOLD_MS) {
-            if (progressStallAttemptMediaId != mediaId) {
-                progressStallAttemptMediaId = mediaId
-                progressStallAttempts = 0
-                progressStallSkipAheadMediaId = null
-            }
-            if (progressStallSkipAheadMediaId != mediaId && tryProgressStallSkipAhead(player, mediaId, positionNow, now)) {
-                lastProgressAtMs = now
+        } else if (now - lastProgressAtMs >= PROGRESS_STALL_THRESHOLD_MS &&
+            (player.playbackState != Player.STATE_BUFFERING ||
+                now - lastBufferProgressAtMs >= PROGRESS_STALL_THRESHOLD_MS)
+        ) {
+            if (shouldWaitForNetworkBeforeSkipping()) {
+                holdStalledTrackForNetwork(player, "progress-watchdog", positionNow)
             } else {
-                // 小步前跳后还卡 = 不是单个坏片段,是这首在该位置源/URL 拉不到数据。
-                // 升级:重签 URL → 换 URI 续播;拿不到 / 已重签过 → 跳到下一首。不再干重踢。
+                if (progressStallAttemptMediaId != mediaId) {
+                    progressStallAttemptMediaId = mediaId
+                    progressStallAttempts = 0
+                }
                 progressStallAttempts += 1
+                lastProgressAtMs = now
                 DiagnosticsLogStore.record(
                     area = "playback_service",
                     event = "progress_stall_escalate",
@@ -2677,102 +2882,8 @@ class PipoPlaybackService : MediaLibraryService() {
                 )
                 recoverSilentStall(player)
             }
-            // 升级后交给 recoverSilentStall(进入 bad-source-recovery 窗口),这里不再插手
         }
         scheduleProgressWatchdog(player)
-    }
-
-    private fun tryProgressStallSkipAhead(player: Player, mediaId: String, positionMs: Long, now: Long): Boolean {
-        val targetMs = progressStallTargetMs(player, positionMs + PROGRESS_STALL_SKIP_AHEAD_MS)
-        if (targetMs <= positionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) return false
-        progressStallSkipAheadMediaId = mediaId
-        progressStallAttempts += 1
-        maxReachedPositionMs = targetMs
-        rememberProgressStallSkip(mediaId, positionMs, targetMs, now)
-        DiagnosticsLogStore.record(
-            area = "playback_service",
-            event = "progress_stall_skip_ahead",
-            fields = playerFields(player) + mapOf(
-                "attempt" to progressStallAttempts,
-                "fromPositionMs" to positionMs,
-                "toPositionMs" to targetMs,
-                "stalledMs" to (now - lastProgressAtMs),
-            ),
-        )
-        runCatching {
-            markProgressWatchdogInternalSeek()
-            player.seekTo(targetMs)
-            player.prepare()
-        }
-        return true
-    }
-
-    private fun maybeSkipKnownProgressStall(
-        player: Player,
-        mediaId: String,
-        positionMs: Long,
-        now: Long,
-    ): Boolean {
-        val learnedSkip = learnedProgressStallSkips[mediaId] ?: return false
-        if (now - learnedSkip.learnedAtMs > PROGRESS_STALL_LEARNED_SKIP_TTL_MS) {
-            learnedProgressStallSkips.remove(mediaId)
-            return false
-        }
-        val skipWindowStartMs = (learnedSkip.fromMs - PROGRESS_STALL_KNOWN_SKIP_LEAD_MS).coerceAtLeast(0L)
-        val skipWindowEndMs = learnedSkip.fromMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS
-        if (positionMs !in skipWindowStartMs..skipWindowEndMs) return false
-
-        val targetMs = progressStallTargetMs(player, learnedSkip.toMs)
-        if (targetMs <= positionMs + BUFFER_STALL_PROGRESS_TOLERANCE_MS) return false
-        maxReachedPositionMs = targetMs
-        lastProgressAtMs = now
-        DiagnosticsLogStore.record(
-            area = "playback_service",
-            event = "progress_stall_known_skip",
-            fields = playerFields(player) + mapOf(
-                "fromPositionMs" to positionMs,
-                "toPositionMs" to targetMs,
-                "learnedFromMs" to learnedSkip.fromMs,
-                "learnedToMs" to learnedSkip.toMs,
-            ),
-        )
-        runCatching {
-            markProgressWatchdogInternalSeek()
-            player.seekTo(targetMs)
-            player.prepare()
-        }
-        return true
-    }
-
-    private fun progressStallTargetMs(player: Player, requestedTargetMs: Long): Long {
-        val durationMs = player.duration.takeIf { it > 0L && it != C.TIME_UNSET }
-        val maxTargetMs = durationMs?.let { it - PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS }
-        return if (maxTargetMs != null) {
-            requestedTargetMs.coerceAtMost(maxTargetMs)
-        } else {
-            requestedTargetMs
-        }
-    }
-
-    private fun rememberProgressStallSkip(mediaId: String, fromMs: Long, toMs: Long, now: Long) {
-        if (mediaId.isBlank()) return
-        trimExpiredProgressStallSkips(now)
-        learnedProgressStallSkips.remove(mediaId)
-        learnedProgressStallSkips[mediaId] = ProgressStallSkip(fromMs = fromMs, toMs = toMs, learnedAtMs = now)
-        while (learnedProgressStallSkips.size > PROGRESS_STALL_LEARNED_SKIP_MAX) {
-            val oldestMediaId = learnedProgressStallSkips.keys.firstOrNull() ?: break
-            learnedProgressStallSkips.remove(oldestMediaId)
-        }
-    }
-
-    private fun trimExpiredProgressStallSkips(now: Long) {
-        val iterator = learnedProgressStallSkips.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (now - entry.value.learnedAtMs > PROGRESS_STALL_LEARNED_SKIP_TTL_MS) {
-                iterator.remove()
-            }
-        }
     }
 
     /**
@@ -2837,7 +2948,7 @@ class PipoPlaybackService : MediaLibraryService() {
                     idx,
                     mediaItem.buildUpon()
                         .setUri(fresh.url)
-                        .setCustomCacheKey(mediaItem.localConfiguration?.customCacheKey ?: fresh.cacheKey)
+                        .setCustomCacheKey(fresh.cacheKey)
                         .build(),
                 )
                 player.seekTo(idx, resumePositionMs)
@@ -3035,11 +3146,19 @@ class PipoPlaybackService : MediaLibraryService() {
         armProgressWatchdog(player)
     }
 
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        updateNotificationSafely(session, startInForegroundRequired, "media3")
+    }
+
     private fun updateNotificationSafely(
         session: MediaSession,
         startInForegroundRequired: Boolean,
         reason: String,
-    ) {
+    ): Boolean {
+        // 冷启动恢复期间 Media3 还没有可播队列；它的空闲通知更新不能撤掉启动通知。
+        if (resumptionForegroundStarted &&
+            (session.player.mediaItemCount == 0 || !startInForegroundRequired)
+        ) return true
         val now = SystemClock.elapsedRealtime()
         val appInForeground = AppForeground.isForeground.value
         if (appInForeground && foregroundStartDeniedUntilMs > now) {
@@ -3050,9 +3169,12 @@ class PipoPlaybackService : MediaLibraryService() {
             )
             foregroundStartDeniedUntilMs = 0L
         }
+        // 自动避让保留已有前台身份；用户暂停/停止会清掉状态。宽限到期后交还 Media3。
+        val retainForAutoResume = retainForegroundForAutoResume(session.player)
+        val foregroundRequired = startInForegroundRequired || retainForAutoResume
         val deniedBackoff = now < foregroundStartDeniedUntilMs
-        val startInForeground = startInForegroundRequired && !deniedBackoff
-        if (startInForegroundRequired && !appInForeground && !deniedBackoff) {
+        val startInForeground = foregroundRequired && !deniedBackoff
+        if (foregroundRequired && !appInForeground && !deniedBackoff) {
             DiagnosticsLogStore.record(
                 area = "playback_service",
                 event = "notification_foreground_background_start",
@@ -3061,7 +3183,7 @@ class PipoPlaybackService : MediaLibraryService() {
                     "appForeground" to appInForeground,
                 ),
             )
-        } else if (startInForegroundRequired && deniedBackoff) {
+        } else if (foregroundRequired && deniedBackoff) {
             DiagnosticsLogStore.record(
                 area = "playback_service",
                 event = "notification_foreground_deferred",
@@ -3072,10 +3194,11 @@ class PipoPlaybackService : MediaLibraryService() {
                 ),
             )
         }
-        runCatching {
-            onUpdateNotification(session, startInForeground)
+        val result = runCatching {
+            super.onUpdateNotification(session, startInForeground)
         }.onSuccess {
             if (startInForeground) foregroundStartDeniedUntilMs = 0L
+            if (isPlaybackOngoing) finishResumptionForeground()
         }.onFailure { err ->
             val foregroundDenied = isForegroundStartDenied(err)
             DiagnosticsLogStore.record(
@@ -3095,7 +3218,7 @@ class PipoPlaybackService : MediaLibraryService() {
             if (foregroundDenied && startInForeground) {
                 foregroundStartDeniedUntilMs =
                     SystemClock.elapsedRealtime() + FOREGROUND_START_DENIED_BACKOFF_MS
-                runCatching { onUpdateNotification(session, false) }
+                runCatching { super.onUpdateNotification(session, false) }
                     .onFailure { fallback ->
                         DiagnosticsLogStore.record(
                             area = "playback_service",
@@ -3109,12 +3232,17 @@ class PipoPlaybackService : MediaLibraryService() {
                     }
             }
         }
+        return result.isSuccess && (!foregroundRequired || isPlaybackOngoing)
     }
 
     private fun monitorForegroundPromotionRetry() {
         serviceScope.launch {
             AppForeground.isForeground.collect { appInForeground ->
-                if (!appInForeground || foregroundStartDeniedUntilMs <= 0L) return@collect
+                if (!appInForeground) return@collect
+                if (resumeAfterAudioFocusLoss) {
+                    maybeResumeAfterExternalAudioStops("app-foreground")
+                }
+                if (foregroundStartDeniedUntilMs <= 0L) return@collect
                 val session = mediaSession ?: return@collect
                 val player = session.player
                 if (!player.playWhenReady || player.mediaItemCount == 0) return@collect
@@ -3195,6 +3323,9 @@ class PipoPlaybackService : MediaLibraryService() {
     }
 
     override fun onDestroy() {
+        playbackResumptionEpoch += 1L
+        playbackResumptionJob?.cancel()
+        finishResumptionForeground()
         mediaSession?.player?.let { player ->
             DiagnosticsLogStore.record(
                 area = "playback_service",
@@ -3208,11 +3339,13 @@ class PipoPlaybackService : MediaLibraryService() {
         crossfadeController = null
         trackCacheWarmer?.cancel()
         trackCacheWarmer = null
+        BackgroundAgentContinuation.release()
         disarmNetworkRecovery()
         cancelBufferStallCheck()
         cancelProgressWatchdog()
         badSourceRefreshJob?.cancel()
         audioFocusResumeJob?.cancel()
+        audioFocusForegroundExpiryJob?.cancel()
         audioFocusPauseJob?.cancel()
         audioDuckingJob?.cancel()
         audioDuckingRestoreJob?.cancel()
@@ -3221,11 +3354,12 @@ class PipoPlaybackService : MediaLibraryService() {
         abandonAudioFocus("service-destroy")
         unregisterPlaybackCallback()
         serviceScope.cancel()
-        mediaSession?.let { session ->
+        val releasedSession = mediaSession
+        mediaSession = null
+        releasedSession?.let { session ->
             session.player.release()
             session.release()
         }
-        mediaSession = null
         notificationPlayer = null
         super.onDestroy()
     }
@@ -3235,6 +3369,9 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val KEEP_ALIVE_NOTIFICATION_DELAY_MS = 80L
         private const val FOREGROUND_START_DENIED_BACKOFF_MS = 2 * 60 * 1000L
         private const val STREAM_URL_TIMEOUT_MS = 15_000L
+        private const val PLAYBACK_RESUMPTION_TIMEOUT_MS = 30_000L
+        private const val RESUMPTION_CHANNEL_ID = "pipo-playback-resumption"
+        private const val RESUMPTION_NOTIFICATION_ID = 1002
         private const val BAD_SOURCE_SERVICE_REFRESH_GRACE_MS = STREAM_URL_TIMEOUT_MS + 2_000L
         private const val BAD_SOURCE_CONTROLLER_GRACE_MS = 5_000L
         // 静默缓冲卡顿:进入 BUFFERING 后等这么久,若缓冲 / 进度都没推进就判定卡死并重踢
@@ -3243,25 +3380,20 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val BUFFER_STALL_PROGRESS_TOLERANCE_MS = 250L
         // 同一首最多重踢几次,防止网络真没了时 prepare 风暴
         private const val BUFFER_STALL_MAX_ATTEMPTS = 4
-        // 进度看门狗:每 0.5s 看一次 position;想播却约 1.5s 没前进就判定卡住并小步前跳。
-        private const val PROGRESS_WATCHDOG_INTERVAL_MS = 500L
-        private const val PROGRESS_STALL_THRESHOLD_MS = 1_250L
-        private const val PROGRESS_STALL_SKIP_AHEAD_MS = 4_000L
-        private const val PROGRESS_STALL_SKIP_AHEAD_END_GUARD_MS = 1_500L
-        private const val PROGRESS_STALL_KNOWN_SKIP_LEAD_MS = 800L
-        private const val PROGRESS_STALL_LEARNED_SKIP_TTL_MS = 6 * 60 * 60 * 1000L
-        private const val PROGRESS_STALL_LEARNED_SKIP_MAX = 32
+        // 12s 缓冲检查先原位重试；仍持续无进展到 20s 才换源，不自动跳过音频片段。
+        private const val PROGRESS_WATCHDOG_INTERVAL_MS = 1_000L
+        private const val PROGRESS_STALL_THRESHOLD_MS = 20_000L
         private const val PROGRESS_WATCHDOG_INTERNAL_SEEK_GRACE_MS = 1_000L
         private const val SINGLE_ITEM_STALL_RETRY_COOLDOWN_MS = 15_000L
         private const val TRANSIENT_NETWORK_SKIP_DEFER_MS = 60_000L
         private const val NETWORK_RECOVERY_ARM_RETRY_BASE_MS = 1_500L
         private const val NETWORK_RECOVERY_ARM_MAX_ATTEMPTS = 3
+        private const val AUDIO_FOCUS_FOREGROUND_GRACE_MS = 10 * 60 * 1_000L
         private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
         private const val AUDIO_FOCUS_FAILED_RETRY_BASE_MS = 3_000L
         private const val AUDIO_FOCUS_RETRY_MAX_DELAY_MS = 30_000L
         private const val AUDIO_FOCUS_POLICY_CONFIRM_MS = 120L
         private const val EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS = 1_200L
-        private const val EXTERNAL_MEDIA_FOCUS_LINK_WINDOW_MS = 2_000L
         // 要覆盖 1.2s 的媒体确认/暂停阈值及主线程调度余量，否则 probe 稍晚就会
         // 被误判成“没有最近焦点信号”，持续外部媒体反而不会暂停。
         private const val EXTERNAL_FOCUS_FALLBACK_WINDOW_MS = 2_500L

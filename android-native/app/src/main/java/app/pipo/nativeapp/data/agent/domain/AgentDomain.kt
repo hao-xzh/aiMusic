@@ -39,6 +39,7 @@ sealed class PlannedAction {
         val desiredCount: Int = 12,
         val similar: Boolean = false,
         val jumpToInserted: Boolean = false,
+        val preserveCurrent: Boolean = false,
     ) : PlannedAction()
 
     data class PlayTracks(
@@ -50,6 +51,7 @@ sealed class PlannedAction {
         val target: TrackRequirement? = null,
         val similar: Boolean = false,
         val jumpToInserted: Boolean = false,
+        val preserveCurrent: Boolean = false,
     ) : PlannedAction()
 
     data class PlayPlaylist(

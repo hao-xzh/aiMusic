@@ -25,6 +25,7 @@ data class AgentQueueRequest(
     val operation: QueueOperation,
     val tracks: List<NativeTrack>,
     val continuous: ContinuousQueueSource? = null,
+    val preserveCurrent: Boolean = false,
     val jumpToInserted: Boolean = true,
     val desiredCount: Int = tracks.size,
     val mixPolicy: MixPolicy = MixPolicy.fromUserText(sourceUserText),
@@ -316,6 +317,7 @@ data class CommittedQueuePlan(
     val hardConstraints: QueueHardConstraints,
     val softPreferences: QueueSoftPreferences,
     val continuous: ContinuousQueueSource?,
+    val preserveCurrent: Boolean,
     val jumpToInserted: Boolean,
 ) {
     val tracks: List<NativeTrack> get() = slots.map { it.track }
@@ -330,6 +332,7 @@ data class CommittedQueuePlan(
             tracks: List<NativeTrack>,
             mixPolicy: MixPolicy = MixPolicy.fromUserText(sourceUserText),
             continuous: ContinuousQueueSource? = null,
+            preserveCurrent: Boolean = false,
         ): CommittedQueuePlan {
             val slots = tracks.mapIndexed { index, track ->
                 QueueSlot(
@@ -374,6 +377,7 @@ data class CommittedQueuePlan(
                 hardConstraints = QueueHardConstraints.fromUserText(sourceUserText),
                 softPreferences = QueueSoftPreferences.fromUserText(sourceUserText),
                 continuous = continuous,
+                preserveCurrent = preserveCurrent,
                 jumpToInserted = false,
             )
         }
@@ -462,6 +466,7 @@ class PlaybackSessionManager(
             operation = operation,
             tracks = tracks,
             continuous = continuous,
+            preserveCurrent = preserveCurrent,
             jumpToInserted = jumpToInserted,
             desiredCount = tracks.size,
             mixPolicy = mixPolicy,
@@ -531,6 +536,7 @@ class PlaybackOrchestrator(
             hardConstraints = request.hardConstraints,
             softPreferences = request.softPreferences,
             continuous = request.continuous,
+            preserveCurrent = request.preserveCurrent,
             jumpToInserted = request.jumpToInserted,
         )
         return sessionManager.commitQueue(plan)

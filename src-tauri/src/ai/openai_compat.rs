@@ -230,18 +230,26 @@ pub async fn chat_tools(
         .map_err(|e| anyhow!("读取响应体失败：{e}"))?;
 
     if !status.is_success() {
-        return Err(anyhow!("{status}：{text}"));
+        // Provider bodies may echo request data. Keep tool errors useful without
+        // forwarding raw prompts or credentials into the next model turn/log.
+        return Err(anyhow!("工具模型请求失败：HTTP {status}"));
     }
 
     let parsed: Value =
-        serde_json::from_str(&text).map_err(|e| anyhow!("响应解析失败：{e} / body={text}"))?;
+        serde_json::from_str(&text).map_err(|e| anyhow!("工具模型响应解析失败：{e}"))?;
 
-    parsed
+    let mut message = parsed
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .cloned()
-        .ok_or_else(|| anyhow!("AI 返回里没有 choices[0].message / body={text}"))
+        .ok_or_else(|| anyhow!("AI 返回里没有 choices[0].message"))?;
+    // Internal telemetry only. Android removes this field before forwarding the
+    // assistant message to the provider, so it never alters the chat protocol.
+    if let (Some(target), Some(usage)) = (message.as_object_mut(), parsed.get("usage")) {
+        target.insert("_pipo_usage".to_string(), usage.clone());
+    }
+    Ok(message)
 }
 
 // ---------------- embeddings ----------------

@@ -16,6 +16,7 @@ interface AgentActionExecutor {
         primaryGoal: MusicGoal,
         target: TrackRequirement?,
         similar: Boolean,
+        preserveCurrent: Boolean = false,
     ): ActionExecutionResult
 
     /** 插到当前歌后面；tracks 支持整批（“这首听完放 X 的歌/下一首开始听 Y”），保持批内顺序。 */

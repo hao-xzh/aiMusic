@@ -27,6 +27,19 @@ class AgentTaskStore(context: Context) {
     fun claim(id: String): AgentTask? {
         val current = readAll().firstOrNull { it.id == id } ?: return null
         if (current.status == AgentTaskStatus.SUCCEEDED || current.status == AgentTaskStatus.FAILED) return current
+        if (current.status == AgentTaskStatus.RUNNING) {
+            // A new coordinator can only observe RUNNING after the prior process stopped
+            // between a side effect and its terminal receipt. The completed subset is
+            // unknowable, so replaying this task could repeat playback or mutations.
+            val interrupted = current.copy(
+                status = AgentTaskStatus.FAILED,
+                error = INTERRUPTED_EXECUTION_RESULT_UNKNOWN,
+                resultReply = INTERRUPTED_EXECUTION_REPLY,
+                updatedAt = System.currentTimeMillis(),
+            )
+            write(readAll().map { if (it.id == id) interrupted else it })
+            return interrupted
+        }
         val claimed = current.copy(status = AgentTaskStatus.RUNNING, attempts = current.attempts + 1, updatedAt = System.currentTimeMillis())
         write(readAll().map { if (it.id == id) claimed else it })
         return claimed
@@ -51,10 +64,29 @@ class AgentTaskStore(context: Context) {
     }
 
     @Synchronized
-    fun fail(id: String, error: String, reply: String = "这次请求没能完成，请检查网络或 AI 配置后重试。") {
+    fun retryLatestFailed(): AgentTask? {
+        val tasks = readAll()
+        // Submission order is conversation order; a late background failure must not
+        // overtake a newer user request just because its updatedAt is more recent.
+        val failed = tasks.lastOrNull()
+            ?.takeIf { it.status == AgentTaskStatus.FAILED }
+            ?: return null
+        if (failed.error == INTERRUPTED_EXECUTION_RESULT_UNKNOWN) return failed
+        val retried = failed.copy(
+            status = AgentTaskStatus.QUEUED,
+            attempts = 0,
+            error = "",
+            resultReply = "",
+            updatedAt = System.currentTimeMillis(),
+        )
+        write(tasks.map { if (it.id == failed.id) retried else it })
+        return retried
+    }
+
+    @Synchronized
+    fun fail(id: String, error: String, reply: String = "这次请求没能完成，请重试。") {
         update(id) {
             it.copy(
-                contextJson = "",
                 status = AgentTaskStatus.FAILED,
                 error = error.take(500),
                 resultReply = reply.take(2000),
@@ -87,8 +119,20 @@ class AgentTaskStore(context: Context) {
         _tasks.value = tasks.takeLast(MAX_TASKS)
     }
 
-    companion object { private const val PREFS = "claudio_agent_tasks"; private const val KEY = "queue"; private const val MAX_TASKS = 32 }
+    companion object {
+        const val INTERRUPTED_EXECUTION_RESULT_UNKNOWN = "interrupted_execution_result_unknown"
+        const val INTERRUPTED_EXECUTION_REPLY = "上次请求被中断，可能已有部分操作完成。请先查看当前队列，再明确要继续的操作。"
+
+        private const val PREFS = "claudio_agent_tasks"
+        private const val KEY = "queue"
+        private const val MAX_TASKS = 32
+    }
 }
 
 data class AgentTask(val id: String, val userText: String, val contextJson: String = "", val status: AgentTaskStatus, val attempts: Int, val error: String, val resultReply: String, val createdAt: Long, val updatedAt: Long)
 enum class AgentTaskStatus { QUEUED, RUNNING, SUCCEEDED, FAILED; companion object { fun from(raw: String) = entries.firstOrNull { it.name == raw } ?: QUEUED } }
+
+internal fun isRetryOnlyRequest(userText: String): Boolean {
+    val normalized = userText.trim().replace(Regex("[\\s，。！!？?、]+"), "")
+    return normalized in setOf("再试", "再试试", "再试一下", "再试一次", "重试", "重试一下", "重试一次", "重新试", "重新试一下", "重新试一次")
+}

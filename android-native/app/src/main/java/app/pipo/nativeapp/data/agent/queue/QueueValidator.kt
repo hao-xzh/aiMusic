@@ -3,6 +3,7 @@ package app.pipo.nativeapp.data.agent.queue
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
+import app.pipo.nativeapp.data.agent.domain.MusicGoal
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
 import app.pipo.nativeapp.data.agent.domain.PlayMode
 import app.pipo.nativeapp.data.agent.domain.QueueValidation
@@ -11,7 +12,8 @@ import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 
 class QueueValidator(
-    private val constraintScorer: ConstraintScorer = ConstraintScorer(),
+    private val metadataForTrack: (NativeTrack) -> TrackConstraintMetadata = ConstraintScorer::pipoMetadata,
+    private val constraintScorer: ConstraintScorer = ConstraintScorer(metadataForTrack),
 ) {
     fun validateStructured(actions: List<PlannedAction>): QueueValidation {
         val play = actions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull()
@@ -27,13 +29,14 @@ class QueueValidator(
         var mustIncludeSatisfied = true
         var closerSatisfied = true
         val catalogSatisfied = validateCatalogScope(play, messages)
+        val hardSemanticsSatisfied = validateHardSemanticConstraints(tracks, goal, messages)
 
         validateStructuredTarget(play, messages)
 
         val primaryTracks = goal?.primaryTracks.orEmpty()
         if (primaryTracks.isNotEmpty() && play != null) {
             val missing = primaryTracks.filter { requirement ->
-                tracks.none { titleMatches(it, requirement.title) }
+                tracks.none { requirementMatches(it, requirement) }
             }
             if (missing.isNotEmpty()) {
                 messages.add("primary_tracks_missed:" + missing.take(3).joinToString("|") { it.title })
@@ -41,11 +44,11 @@ class QueueValidator(
             }
         }
 
-        if (requiredArtists.isNotEmpty() && play?.mode == PlayMode.ReplaceQueue) {
+        if (requiredArtists.isNotEmpty() && play != null) {
             val exceptionTitles = (includeRequirements + listOfNotNull(closer))
                 .map { CommandTextSignals.normalizeForMatch(it.title) }
                 .toSet()
-            primarySatisfied = validateArtistScope(
+            primarySatisfied = primarySatisfied && validateArtistScope(
                 tracks = tracks,
                 requiredArtists = requiredArtists,
                 artistScope = artistScope,
@@ -54,14 +57,14 @@ class QueueValidator(
             )
         }
         includeRequirements.forEach { requirement ->
-            val hit = tracks.any { titleMatches(it, requirement.title) }
+            val hit = tracks.any { requirementMatches(it, requirement) }
             if (!hit) {
                 messages.add("must_include_missed")
                 mustIncludeSatisfied = false
             }
         }
-        if (closer != null && play?.mode == PlayMode.ReplaceQueue && tracks.isNotEmpty()) {
-            closerSatisfied = tracks.takeLast(2).any { titleMatches(it, closer.title) }
+        if (closer != null && play?.mode != PlayMode.InsertNext && tracks.isNotEmpty()) {
+            closerSatisfied = requirementMatches(tracks.last(), closer)
             if (!closerSatisfied) messages.add("closer_missed")
         }
         if (excludeTerms.isNotEmpty() && tracks.any { constraintScorer.hitsAvoidTerm(it, excludeTerms) }) {
@@ -71,7 +74,7 @@ class QueueValidator(
             messages.add("opening_energy_too_high")
         }
         return QueueValidation(
-            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied && catalogSatisfied &&
+            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied && catalogSatisfied && hardSemanticsSatisfied &&
                 messages.none(::isBlockingMessage),
             messages = messages.distinct(),
             primarySatisfied = primarySatisfied,
@@ -98,13 +101,14 @@ class QueueValidator(
         var mustIncludeSatisfied = true
         var closerSatisfied = true
         val catalogSatisfied = validateCatalogScope(play, messages)
+        val hardSemanticsSatisfied = validateHardSemanticConstraints(tracks, play?.primaryGoal, messages)
 
         validateDirectTarget(userText, play, messages)
 
         val primaryTracks = play?.primaryGoal?.primaryTracks.orEmpty()
         if (primaryTracks.isNotEmpty() && play != null) {
             val missing = primaryTracks.filter { requirement ->
-                tracks.none { titleMatches(it, requirement.title) }
+                tracks.none { requirementMatches(it, requirement) }
             }
             if (missing.isNotEmpty()) {
                 messages.add("primary_tracks_missed:" + missing.take(3).joinToString("|") { it.title })
@@ -112,11 +116,11 @@ class QueueValidator(
             }
         }
 
-        if (requiredArtists.isNotEmpty() && play?.mode == PlayMode.ReplaceQueue) {
+        if (requiredArtists.isNotEmpty() && play != null) {
             val exceptionTitles = (
                 play.primaryGoal.mustInclude + listOfNotNull(play.primaryGoal.closer)
             ).map { CommandTextSignals.normalizeForMatch(it.title) }.toSet()
-            primarySatisfied = validateArtistScope(
+            primarySatisfied = primarySatisfied && validateArtistScope(
                 tracks = tracks,
                 requiredArtists = requiredArtists,
                 artistScope = artistScope,
@@ -131,8 +135,8 @@ class QueueValidator(
                 messages.add("must_include_at_head")
             }
         }
-        if (!closerTitle.isNullOrBlank() && play?.mode == PlayMode.ReplaceQueue && tracks.isNotEmpty()) {
-            closerSatisfied = tracks.takeLast(2).any { titleMatches(it, closerTitle) }
+        if (!closerTitle.isNullOrBlank() && play?.mode != PlayMode.InsertNext && tracks.isNotEmpty()) {
+            closerSatisfied = titleMatches(tracks.last(), closerTitle)
             if (!closerSatisfied) messages.add("closer_missed")
         }
         if (excludeTerms.isNotEmpty() && tracks.any { constraintScorer.hitsAvoidTerm(it, excludeTerms) }) {
@@ -150,7 +154,7 @@ class QueueValidator(
             messages.add("language_interleave_weak")
         }
         return QueueValidation(
-            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied && catalogSatisfied &&
+            passed = primarySatisfied && mustIncludeSatisfied && closerSatisfied && catalogSatisfied && hardSemanticsSatisfied &&
                 messages.none(::isBlockingMessage),
             messages = messages,
             primarySatisfied = primarySatisfied,
@@ -174,7 +178,7 @@ class QueueValidator(
             PlayMode.ReplaceQueue -> null
         }
         val first = play.tracks.firstOrNull()
-        if (target != null && first?.let { titleMatches(it, target.title) } != true) {
+        if (target != null && first?.let { requirementMatches(it, target) } != true) {
             messages.add(if (play.mode == PlayMode.InsertNext) "insert_target_missed" else "direct_target_missed")
         }
     }
@@ -186,7 +190,7 @@ class QueueValidator(
         if (play == null) return
         val target = play.target
         val first = play.tracks.firstOrNull()
-        if (target != null && first?.let { titleMatches(it, target.title) } != true) {
+        if (target != null && first?.let { requirementMatches(it, target) } != true) {
             messages.add(if (play.mode == PlayMode.InsertNext) "insert_target_missed" else "direct_target_missed")
         }
     }
@@ -203,7 +207,7 @@ class QueueValidator(
         // target / primaryTracks 仍属于主请求，必须接受同一作品归属校验，不能借点名绕过版本。
         val exceptionRequirements = play.primaryGoal.mustInclude + listOfNotNull(play.primaryGoal.closer)
         val catalogTracks = play.tracks.filterNot { track ->
-            exceptionRequirements.any { requirement -> titleMatches(track, requirement.title) }
+            exceptionRequirements.any { requirement -> requirementMatches(track, requirement) }
         }
         if (catalogTracks.isEmpty()) {
             messages.add("catalog_scope_empty:${constraint.name.take(48)}")
@@ -221,11 +225,55 @@ class QueueValidator(
         return true
     }
 
-    private fun titleMatches(track: NativeTrack, title: String): Boolean {
-        val left = CommandTextSignals.normalizeForMatch(track.title)
-        val right = CommandTextSignals.normalizeForMatch(title)
-        return right.isNotBlank() && (left == right || left.contains(right) || right.contains(left))
+    private fun validateHardSemanticConstraints(
+        tracks: List<NativeTrack>,
+        goal: MusicGoal?,
+        messages: MutableList<String>,
+    ): Boolean {
+        if (goal == null) return true
+        val languageSatisfied = validateHardEvidence(
+            tracks = tracks,
+            required = goal.hardLanguages,
+            label = "hard_language",
+            evidenceFor = constraintScorer::hardLanguageEvidence,
+            messages = messages,
+        )
+        val genreSatisfied = validateHardEvidence(
+            tracks = tracks,
+            required = goal.hardGenres,
+            label = "hard_genre",
+            evidenceFor = constraintScorer::hardGenreEvidence,
+            messages = messages,
+        )
+        return languageSatisfied && genreSatisfied
     }
+
+    private fun validateHardEvidence(
+        tracks: List<NativeTrack>,
+        required: List<String>,
+        label: String,
+        evidenceFor: (NativeTrack, List<String>) -> ConstraintEvidence,
+        messages: MutableList<String>,
+    ): Boolean {
+        if (required.isEmpty()) return true
+        val evidence = tracks.map { evidenceFor(it, required) }
+        if (evidence.isNotEmpty() && evidence.all { it == ConstraintEvidence.Match }) return true
+        val unknown = evidence.count { it == ConstraintEvidence.Unknown }
+        if (unknown > 0 || evidence.isEmpty()) {
+            messages.add("${label}_unknown:$unknown/${tracks.size}")
+        } else {
+            messages.add("${label}_mismatch")
+        }
+        return false
+    }
+
+    private fun titleMatches(track: NativeTrack, title: String): Boolean {
+        return CommandTextSignals.trackTitleMatches(track.title, title)
+    }
+
+    private fun requirementMatches(track: NativeTrack, requirement: TrackRequirement): Boolean =
+        titleMatches(track, requirement.title) &&
+            (requirement.artist.isNullOrBlank() || artistMatchesAny(track.artist, listOf(requirement.artist)))
 
     private fun validateArtistScope(
         tracks: List<NativeTrack>,
@@ -234,7 +282,7 @@ class QueueValidator(
         exceptionTitles: Set<String>,
         messages: MutableList<String>,
     ): Boolean {
-        if (requiredArtists.isEmpty() || tracks.isEmpty()) return true
+        if (requiredArtists.isEmpty()) return true
         val artistKeys = requiredArtists
             .map(CommandTextSignals::normalizeForMatch)
             .filter { it.isNotBlank() }
@@ -245,15 +293,19 @@ class QueueValidator(
         return when (artistScope) {
             ArtistScope.Strict -> {
                 val illegal = scopedTracks.filterNot { artistMatchesAny(it.artist, artistKeys) }
+                val missing = artistKeys.filterNot { expected ->
+                    tracks.any { track -> artistMatchesAny(track.artist, listOf(expected)) }
+                }
                 if (illegal.isNotEmpty()) {
                     messages.add(
                         "strict_artist_scope_violated:" +
                             illegal.take(3).joinToString("|") { "${it.title}-${it.artist}" },
                     )
-                    false
-                } else {
-                    true
                 }
+                if (missing.isNotEmpty()) {
+                    messages.add("strict_artist_coverage_missing:" + missing.take(3).joinToString("|"))
+                }
+                illegal.isEmpty() && missing.isEmpty()
             }
             ArtistScope.Focus -> {
                 val hit = scopedTracks.count { artistMatchesAny(it.artist, artistKeys) }
@@ -281,20 +333,18 @@ class QueueValidator(
             .filter { it.isNotBlank() }
             .any { actual ->
                 artistKeys.any { expected ->
-                    actual == expected || actual.contains(expected) || expected.contains(actual)
+                    actual == CommandTextSignals.normalizeForMatch(expected)
                 }
             }
     }
 
     private fun trackLanguage(track: NativeTrack): String? {
-        val profile = PipoGraph.trackSemanticStore.get(track.id)
-            ?: PipoGraph.semanticIndexer.buildRuleBasedProfile(track, PipoGraph.audioFeaturesStore.get(track.id))
-        return profile.language.key.takeIf { it != "unknown" }
+        return constraintScorer.verifiedLanguage(track)
     }
 
     private fun openingTooHighEnergy(track: NativeTrack?): Boolean {
         if (track == null) return false
-        val features = PipoGraph.audioFeaturesStore.get(track.id) ?: return false
+        val features = runCatching { PipoGraph.audioFeaturesStore.get(track.id) }.getOrNull() ?: return false
         val eMid = (features.introEnergy + features.outroEnergy) / 2.0
         return eMid > 0.62
     }

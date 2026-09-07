@@ -30,6 +30,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -168,13 +169,18 @@ fun NativeAiPet(
                     val completed =
                         task.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.SUCCEEDED ||
                             task.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.FAILED
-                    val hasReply = messages.any {
+                    val replyIndex = messages.indexOfFirst {
                         it.taskId == task.id && !it.fromUser && it.card == null
-                    } || messages.any {
+                    }
+                    val hasReply = replyIndex >= 0 || messages.any {
                         !it.fromUser && it.taskId == null && it.text == task.resultReply
                     }
-                    if (completed && task.resultReply.isNotBlank() && !hasReply) {
-                        messages += PetMessage(fromUser = false, text = task.resultReply, taskId = task.id)
+                    if (completed && task.resultReply.isNotBlank()) {
+                        if (replyIndex >= 0 && messages[replyIndex].text != task.resultReply) {
+                            messages[replyIndex] = messages[replyIndex].copy(text = task.resultReply)
+                        } else if (!hasReply) {
+                            messages += PetMessage(fromUser = false, text = task.resultReply, taskId = task.id)
+                        }
                     }
                 }
         }
@@ -188,6 +194,8 @@ fun NativeAiPet(
     val coverRect = anchor.state.value.rect
     // 封面采样色统一驱动宠物、输入条和回复气泡，避免常驻球体在播放页里突兀。
     val petPalette = rememberPetPalette(useCoverEdgeColors(coverUrl))
+    val latestCurrentTrack = rememberUpdatedState(currentTrack)
+    val latestCurrentQueue = rememberUpdatedState(currentQueue)
     val agentRuntime = remember(repository, context) {
         AgentRuntime(
             repository = repository,
@@ -197,15 +205,17 @@ fun NativeAiPet(
 
     // The durable coordinator owns execution; this gateway is only the current UI/player bridge.
     // It is registered process-wide and removed when this composable leaves the tree.
-    val taskGateway = remember(repository, context, currentTrackKey, currentQueueSignature, settings.personaId, settings.userFacts) {
+    val taskGateway = remember(repository, context, settings.personaId, settings.userFacts) {
         object : AgentTaskGateway {
             override suspend fun execute(task: AgentTask): app.pipo.nativeapp.data.agent.domain.TurnOutcome {
                 val promptContext = runCatching { PipoGraph.petMemory.conversationContext() }
                     .getOrDefault(app.pipo.nativeapp.data.PetMemory.ConversationContext())
-                val snapshotTrack = currentTrack
+                val snapshotTrack = latestCurrentTrack.value
+                val snapshotQueue = latestCurrentQueue.value
                 val executor = PlayerAgentExecutor(
                     repository = repository,
-                    currentTrackProvider = { snapshotTrack },
+                    currentTrackProvider = { latestCurrentTrack.value },
+                    currentQueueProvider = { latestCurrentQueue.value },
                     sourceUserText = task.userText,
                     onApplyAgentQueueRequest = onApplyAgentQueueRequest,
                     onSkip = onSkipFromAgent,
@@ -220,7 +230,7 @@ fun NativeAiPet(
                         historySummary = promptContext.summary,
                         musicReferences = promptContext.musicReferences,
                         currentTrack = snapshotTrack,
-                        currentQueue = currentQueue,
+                        currentQueue = snapshotQueue,
                         userFacts = settings.userFacts,
                         persona = app.pipo.nativeapp.data.PetPersona.fromId(settings.personaId),
                     ),
@@ -603,7 +613,10 @@ fun NativeAiPet(
                         scope.launch {
                             result.fold(
                                 onSuccess = { outcome ->
-                                    if (messages.none { it.taskId == submittedTaskId && !it.fromUser && it.card == null }) {
+                                    val replyIndex = messages.indexOfFirst { it.taskId == submittedTaskId && !it.fromUser && it.card == null }
+                                    if (replyIndex >= 0) {
+                                        messages[replyIndex] = messages[replyIndex].copy(text = outcome.reply)
+                                    } else {
                                         messages += PetMessage(fromUser = false, text = outcome.reply, taskId = submittedTaskId)
                                     }
                                     outcome.cards.forEach { card -> messages += PetMessage(false, "", card.toPetResultCard(), taskId = submittedTaskId) }
@@ -611,7 +624,9 @@ fun NativeAiPet(
                                     AiCaptionBus.show(outcome.reply)
                                 },
                                 onFailure = {
-                                    val reply = "这次请求没能完成，请检查网络或 AI 配置后重试。"
+                                    val reply = PipoGraph.agentTasks.store.tasks.value
+                                        .firstOrNull { it.id == submittedTaskId }?.resultReply
+                                        ?.takeIf { it.isNotBlank() } ?: "这次请求没能完成，请重试。"
                                     if (messages.none { it.taskId == submittedTaskId && !it.fromUser && it.card == null }) {
                                         messages += PetMessage(fromUser = false, text = reply, taskId = submittedTaskId)
                                     }

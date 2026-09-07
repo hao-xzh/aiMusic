@@ -15,8 +15,16 @@ import androidx.core.graphics.scale
 import coil.Coil
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
@@ -48,7 +56,16 @@ data class EdgeColors(
 
 enum class Tone { Light, Dark }
 
-private val coverEdgeColorsCache = ConcurrentHashMap<String, EdgeColors>()
+private const val COVER_EDGE_COLORS_CACHE_SIZE = 128
+private const val COVER_EDGE_COLORS_TIMEOUT_MS = 10_000L
+private val coverEdgeColorsCache = Collections.synchronizedMap(
+    object : LinkedHashMap<String, EdgeColors>(COVER_EDGE_COLORS_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, EdgeColors>?): Boolean =
+            size > COVER_EDGE_COLORS_CACHE_SIZE
+    },
+)
+private val coverEdgeColorsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+private val coverEdgeColorsInFlight = ConcurrentHashMap<String, Deferred<EdgeColors?>>()
 
 @Composable
 fun useCoverEdgeColors(url: String?): EdgeColors {
@@ -70,42 +87,65 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
             colors = cached
             return@LaunchedEffect
         }
-        val bitmap = withContext(Dispatchers.IO) {
-            runCatching {
-                // 之前每次切歌都 ImageLoader.Builder(context).build() 新建一个 loader,
-                // Coil ImageLoader 内部带线程池 + 内存/磁盘缓存,是重对象。频繁切歌时
-                // 旧 loader 持有 native bitmap 不释放 → 长时间听歌内存稳定上涨。
-                // 用 Coil 的全局单例 —— ImageLoader 全 app 共享一份,缓存命中率也更高。
-                val loader = Coil.imageLoader(context)
-                val request = ImageRequest.Builder(context)
-                    .data(url)
-                    .allowHardware(false)
-                    .build()
-                val res = loader.execute(request)
-                (res as? SuccessResult)?.drawable?.let { drawable ->
-                    (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
-                        ?: drawable.toBitmap(
-                            width = drawable.intrinsicWidth.coerceAtLeast(64),
-                            height = drawable.intrinsicHeight.coerceAtLeast(64),
-                            config = Config.ARGB_8888,
-                        )
-                }
-            }.getOrNull()
-        }
-        if (bitmap == null) {
+        val sampled = loadCoverEdgeColors(context, url)
+        if (sampled == null) {
             // 新封面获取失败时不能整首沿用上一首的颜色；回到中性 palette 也通过
             // backdrop 的 1100ms 色彩动画过渡，不会出现一帧硬闪。
             colors = EdgeColors(null, null, null)
             return@LaunchedEffect
         }
-
-        val sampled = withContext(Dispatchers.Default) {
-            sampleEdges(bitmap)
-        }
-        coverEdgeColorsCache[url] = sampled
         colors = sampled
     }
     return colors
+}
+
+private suspend fun loadCoverEdgeColors(context: android.content.Context, url: String): EdgeColors? {
+    coverEdgeColorsCache[url]?.let { return it }
+    val deferred = coverEdgeColorsInFlight.computeIfAbsent(url) {
+        // 外层 cache miss 后前一个任务可能刚好已经完成；这里再查一次，
+        // 避免在 map 插入竞态下为同一 URL 重复加载和采样。
+        coverEdgeColorsCache[url]?.let { return@computeIfAbsent CompletableDeferred<EdgeColors?>(it) }
+        val appContext = context.applicationContext
+        coverEdgeColorsScope.async {
+            try {
+                withTimeoutOrNull(COVER_EDGE_COLORS_TIMEOUT_MS) {
+                    val bitmap = try {
+                        // Coil 全局单例共享线程池与内存/磁盘缓存；相同 URL 的采样任务也只保留一份。
+                        val loader = Coil.imageLoader(appContext)
+                        val request = ImageRequest.Builder(appContext)
+                            .data(url)
+                            .allowHardware(false)
+                            .build()
+                        val res = loader.execute(request)
+                        (res as? SuccessResult)?.drawable?.let { drawable ->
+                            (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                                ?: drawable.toBitmap(
+                                    width = drawable.intrinsicWidth.coerceAtLeast(64),
+                                    height = drawable.intrinsicHeight.coerceAtLeast(64),
+                                    config = Config.ARGB_8888,
+                                )
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        null
+                    } ?: return@withTimeoutOrNull null
+
+                    withContext(Dispatchers.Default) { sampleEdges(bitmap) }
+                }?.also { sampled ->
+                    coverEdgeColorsCache[url] = sampled
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+    // 即使任务在 computeIfAbsent 返回前完成，回调注册也会立即移除刚写入的同一实例。
+    // 已完成（含失败）的任务不留在 in-flight 表；成功结果由有界 LRU 保留。
+    deferred.invokeOnCompletion { coverEdgeColorsInFlight.remove(url, deferred) }
+    return deferred.await()
 }
 
 private fun sampleEdges(bitmap: Bitmap): EdgeColors {

@@ -908,6 +908,7 @@ internal fun GlowBackdrop(
 @Composable
 internal fun PlayResultCard(card: PetResultCard.Play, palette: PetPalette) {
     val title = when {
+        card.insert && card.count > 1 -> "插播 · ${card.count} 首"
         card.insert -> "插一首"
         card.similar -> "配同款 · ${card.count} 首"
         else -> "开整 · ${card.count} 首"

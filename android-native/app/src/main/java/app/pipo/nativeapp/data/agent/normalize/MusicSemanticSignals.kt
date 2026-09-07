@@ -62,6 +62,9 @@ object MusicSemanticSignals {
         var tempo = "any"
 
         fun mentioned(vararg words: String): Boolean = words.any { it in key }
+        fun negatedStyle(vararg words: String): Boolean = words.any { word ->
+            Regex("(?:不要|别|不想听|不听)${Regex.escape(word)}").containsMatchIn(key)
+        }
         fun addSeeds(vararg values: String) { values.filterTo(seeds) { it.isNotBlank() } }
 
         // 语言 / 地区：这里是硬偏好，但仍允许 Resolver 结合用户排除词做过滤。
@@ -79,8 +82,16 @@ object MusicSemanticSignals {
         if (mentioned("摇滚", "rock")) { genres += "rock"; textures += "guitar"; addSeeds("燃 摇滚", "摇滚 热歌") }
         if (mentioned("民谣", "folk")) { genres += "folk"; textures += listOf("acoustic", "warm"); addSeeds("温柔 民谣", "民谣 治愈") }
         if (mentioned("爵士", "jazz")) { genres += "jazz"; textures += listOf("smooth", "sophisticated"); addSeeds("爵士 放松", "jazz chill") }
-        if (mentioned("电子", "电音", "edm", "dance", "house")) { genres += "electronic"; scenes += "party"; textures += "dance"; addSeeds("电子 动感", "EDM 派对") }
-        if (mentioned("嘻哈", "说唱", "rap", "hiphop", "hip-hop")) { genres += "hip-hop"; textures += "rhythmic"; addSeeds("说唱 热门", "hip hop 节奏") }
+        if (mentioned("电子", "电音", "edm", "dance", "house") &&
+            !negatedStyle("电子", "电音", "edm", "dance", "house")
+        ) {
+            genres += "electronic"; scenes += "party"; textures += "dance"; addSeeds("电子 动感", "EDM 派对")
+        }
+        if (mentioned("嘻哈", "说唱", "rap", "hiphop", "hip-hop") &&
+            !negatedStyle("嘻哈", "说唱", "rap", "hiphop", "hip-hop")
+        ) {
+            genres += "hip-hop"; textures += "rhythmic"; addSeeds("说唱 热门", "hip hop 节奏")
+        }
         if (mentioned("citypop", "city pop", "城市流行")) { genres += "pop"; mainStyles += "city pop"; addSeeds("city pop", "城市流行") }
         if (mentioned("lofi", "lo-fi", "lofi")) { textures += listOf("lo-fi", "soft"); scenes += "focus"; addSeeds("lofi 学习", "lo-fi chill") }
 
@@ -112,7 +123,11 @@ object MusicSemanticSignals {
             mainStyles += listOf("calm", "chill")
             addSeeds("安静 治愈 歌曲", "温柔 放松 音乐", "睡前 舒缓 歌曲", "深夜 温柔")
         }
-        if (mentioned("忧郁", "郁一点", "emo", "难过", "伤感", "失恋", "丧", "孤独", "寂寞", "心碎", "凌晨", "雨天", "下雨")) {
+        if (mentioned(
+                "忧郁", "郁一点", "emo", "难过", "伤感", "失恋", "丧", "孤独", "寂寞", "心碎", "凌晨", "雨天", "下雨",
+                "melancholic", "melancholy", "sad", "lonely", "heartbreak", "heartbroken",
+            )
+        ) {
             if (energy == "any" || energy == "high") energy = "mid_low"
             if (tempo == "any") tempo = "slow"
             moods += listOf("melancholic", "sad", "lonely", "night")

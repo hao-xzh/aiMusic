@@ -4,10 +4,16 @@ import android.content.Context
 import androidx.media3.common.util.UnstableApi
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.playback.PipoMediaCache
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import java.util.LinkedHashMap
 import java.util.Locale
 
 /**
@@ -48,30 +54,22 @@ class RustBridgeRepository(
     @Volatile
     private var cachedUserId: Long? = null
 
-    /** 曲目内存缓存：playlistId → tracks。冷启动 init 时灌入上次的快照，运行时累加 */
+    /** 曲目内存缓存：playlistId → tracks。按访问顺序保存，用于整体歌单 LRU。 */
     private val tracksCacheLock = Any()
-    private val tracksMemoryCache = mutableMapOf<Long, List<NativeTrack>>()
+    private val tracksMemoryCache = LinkedHashMap<Long, List<NativeTrack>>(
+        MAX_CACHED_PLAYLISTS,
+        0.75f,
+        true,
+    )
     private val cloudSearchMatchLock = Any()
     private val cloudSearchMatchCache = mutableMapOf<String, NativeTrack>()
-
-    init {
-        // 冷启动 sync 读盘：把上次的 playlist 列表 + 已知 tracks 灌进 in-memory state。
-        // 这样 PipoApplication.onCreate 装 Repository 之后，Compose 第一次 collectAsState
-        // 直接拿到非空 list，不再有"空白几秒等网"的尴尬。
-        val snap = playlistCache?.load()
-        if (snap != null) {
-            // 不在这里反推 accountState —— 实际 accountState 仍要靠 refreshAccount 走网拿 cookie
-            // 验证；只是把上一次的 playlists 显示出来当作 stale-while-revalidate
-            playlistState.value = snap.playlists
-            synchronized(tracksCacheLock) {
-                tracksMemoryCache.putAll(snap.tracks)
-            }
-            // 网盘也用同一磁盘 cache（sentinel id）——恢复后立刻 emit 到 Flow，让 cover-flow
-            // 那一页冷启动就有 cover / count，不用等 LaunchedEffect 触发再回填。
-            snap.tracks[CLOUD_DISK_PLAYLIST_ID]?.let { cloudTracksState.value = it }
-            cacheStale = snap.isStale
-            cachedUserId = snap.userId
-        }
+    private val cacheRecoveryLock = Any()
+    private var cacheRecoveryApplied = false
+    private val cacheGenerationLock = Any()
+    private var cacheGeneration = 0L
+    private val cacheRecoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cacheRecovery = cacheRecoveryScope.async {
+        playlistCache?.load()?.also(::applyRecoveredSnapshot)
     }
 
     override val account: Flow<PipoAccount?> = accountState.asStateFlow()
@@ -83,6 +81,8 @@ class RustBridgeRepository(
     override val aiConfig: Flow<AiConfigView> = aiConfigState.asStateFlow()
 
     override suspend fun refreshAccount() {
+        awaitCacheRecovery()
+        val requestGeneration = currentCacheGeneration()
         val acc = try {
             bridge.neteaseAccount()
         } catch (e: CancellationException) {
@@ -90,22 +90,24 @@ class RustBridgeRepository(
         } catch (_: Exception) {
             return
         }
-        accountState.value = acc
-        // 换账号 / 退登检查：当前 userId 跟上次缓存不匹配 → 清掉旧用户的歌单 + tracks
-        val newUserId = acc?.userId
-        val oldUserId = cachedUserId
-        if (
-            (newUserId == null && (oldUserId != null || playlistState.value.isNotEmpty())) ||
-            (newUserId != null && oldUserId != null && newUserId != oldUserId)
-        ) {
-            clearAccountCaches()
+        val reset = synchronized(cacheGenerationLock) {
+            if (requestGeneration != cacheGeneration) return
+            accountState.value = acc
+            // 账号提交与缓存失效必须原子完成，不能在锁外清掉后来的账号结果。
+            val newUserId = acc?.userId
+            val oldUserId = cachedUserId
+            if (
+                (newUserId == null && (oldUserId != null || playlistState.value.isNotEmpty())) ||
+                (newUserId != null && oldUserId != null && newUserId != oldUserId)
+            ) clearAccountCachesLocked() else null
         }
+        reset?.completion?.await()
     }
 
     override suspend fun logout() {
+        awaitCacheRecovery()
         safe({ bridge.neteaseLogout() }, { Unit })
-        accountState.value = null
-        clearAccountCaches()
+        clearAccountCaches(clearAccountState = true)
     }
 
     override suspend fun startQrLogin(): QrLoginStart {
@@ -163,6 +165,8 @@ class RustBridgeRepository(
     }
 
     override suspend fun refreshPlaylists() {
+        awaitCacheRecovery()
+        var requestGeneration = currentCacheGeneration()
         // stale-while-revalidate 的**正确**做法:UI 已经从 init 时的 cache 看到内容了,
         // 这里**总是后台拉网**覆盖。
         //
@@ -171,44 +175,60 @@ class RustBridgeRepository(
         // app 重启都看不到。用户感受是"歌单始终不更新"。
         val fresh = safe(
             {
-                val account = accountState.value ?: bridge.neteaseAccount().also { accountState.value = it }
+                val account = accountState.value ?: bridge.neteaseAccount()
+                val reset = synchronized(cacheGenerationLock) {
+                    if (requestGeneration != cacheGeneration) return@safe emptyList()
+                    accountState.value = account
+                    if (account != null && cachedUserId != null && cachedUserId != account.userId) {
+                        clearAccountCachesLocked()
+                    } else null
+                }
+                if (reset != null) {
+                    // 只能持有本次清理产生的 epoch，不能在等待后认领 logout 的新 epoch。
+                    requestGeneration = reset.generation
+                    reset.completion?.await()
+                }
                 account?.let { bridge.neteaseUserPlaylists(it.userId) }.orEmpty()
             },
             { emptyList() },
         )
         if (fresh.isNotEmpty()) {
-            // 用 updateTime 对比精准 invalidate:网易云对每张歌单维护 updateTime,
-            // 同一 id 的歌单 updateTime 变了 = tracks 也可能变了,旧 cache 不可信。
-            // 不变的 → cache 仍可复用,省一次 tracksForPlaylist 网络往返。
-            val oldByIdTime = playlistState.value.associate { it.id to it.updateTime }
-            val tracksSnapshot = synchronized(tracksCacheLock) {
-                for (p in fresh) {
-                    val oldTime = oldByIdTime[p.id]
-                    if (oldTime != null && p.updateTime != null && oldTime != p.updateTime) {
-                        tracksMemoryCache.remove(p.id)
+            synchronized(cacheGenerationLock) {
+                if (requestGeneration != cacheGeneration) return
+                // 用 updateTime 对比精准 invalidate:网易云对每张歌单维护 updateTime,
+                // 同一 id 的歌单 updateTime 变了 = tracks 也可能变了,旧 cache 不可信。
+                // 不变的 → cache 仍可复用,省一次 tracksForPlaylist 网络往返。
+                val oldByIdTime = playlistState.value.associate { it.id to it.updateTime }
+                val tracksSnapshot = synchronized(tracksCacheLock) {
+                    for (p in fresh) {
+                        val oldTime = oldByIdTime[p.id]
+                        if (oldTime != null && p.updateTime != null && oldTime != p.updateTime) {
+                            tracksMemoryCache.remove(p.id)
+                        }
                     }
+                    // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)。
+                    // 网盘 sentinel(CLOUD_DISK_PLAYLIST_ID)不是真实歌单，永远不在 freshIds 里，
+                    // 必须显式保留——否则每次 refresh 都连带把网盘 in-memory + 落盘 cache 误删，
+                    // 进网盘页只能重新拉网（其它歌单 id 在 freshIds 里所以静默更新正常）。
+                    val freshIds = fresh.mapTo(HashSet()) { it.id }
+                    freshIds.add(CLOUD_DISK_PLAYLIST_ID)
+                    tracksMemoryCache.keys.retainAll(freshIds)
+                    tracksSnapshotLocked()
                 }
-                // 删掉已经不在用户账号下的歌单(用户在网易云端删了/取关了)。
-                // 网盘 sentinel(CLOUD_DISK_PLAYLIST_ID)不是真实歌单，永远不在 freshIds 里，
-                // 必须显式保留——否则每次 refresh 都连带把网盘 in-memory + 落盘 cache 误删，
-                // 进网盘页只能重新拉网（其它歌单 id 在 freshIds 里所以静默更新正常）。
-                val freshIds = fresh.mapTo(HashSet()) { it.id }
-                freshIds.add(CLOUD_DISK_PLAYLIST_ID)
-                tracksMemoryCache.keys.retainAll(freshIds)
-                HashMap(tracksMemoryCache)
-            }
-
-            playlistState.value = fresh
-            cacheStale = false
-            val uid = accountState.value?.userId
-            if (uid != null) {
-                cachedUserId = uid
-                playlistCache?.save(uid, fresh, tracksSnapshot)
+                playlistState.value = fresh
+                cacheStale = false
+                val uid = accountState.value?.userId
+                if (uid != null) {
+                    cachedUserId = uid
+                    playlistCache?.save(uid, fresh, tracksSnapshot)
+                }
             }
         }
     }
 
     override suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean): List<NativeTrack> {
+        awaitCacheRecovery()
+        val requestGeneration = currentCacheGeneration()
         // 网盘 sentinel 不是真实 NetEase 歌单，neteasePlaylistTracks(-1) 拿不到东西——
         // 路由到 cloudDiskTracks（同样命中 tracksMemoryCache[sentinel] 缓存）。让 AI 的
         // play_playlist / get_playlist_tracks 和蒸馏 DistillEngine 都能把"我的网盘"当普通歌单用。
@@ -226,7 +246,11 @@ class RustBridgeRepository(
             }
         } else {
             // 手动下拉刷新：先抹掉 in-memory cache 让本次拿到 fresh 数据再重新写回。
-            synchronized(tracksCacheLock) { tracksMemoryCache.remove(playlistId) }
+            synchronized(cacheGenerationLock) {
+                if (requestGeneration == cacheGeneration) {
+                    synchronized(tracksCacheLock) { tracksMemoryCache.remove(playlistId) }
+                }
+            }
             DiagnosticsLogStore.record(
                 area = "library",
                 event = "playlist_tracks_force_refresh",
@@ -277,16 +301,20 @@ class RustBridgeRepository(
                     "count" to fresh.size,
                 ),
             )
-            val tracksSnapshot = synchronized(tracksCacheLock) {
-                tracksMemoryCache[playlistId] = fresh
-                HashMap(tracksMemoryCache)
-            }
-            // 拉到新一张歌单 tracks 后，把整个 in-memory cache 重新落盘
-            // （save 内部异步 IO，不阻塞调用方）
-            val uid = accountState.value?.userId ?: cachedUserId
-            val playlists = playlistState.value
-            if (uid != null && playlists.isNotEmpty()) {
-                playlistCache?.save(uid, playlists, tracksSnapshot)
+            synchronized(cacheGenerationLock) {
+                if (requestGeneration == cacheGeneration) {
+                    val tracksSnapshot = synchronized(tracksCacheLock) {
+                        cacheTracksLocked(playlistId, fresh)
+                        tracksSnapshotLocked()
+                    }
+                    // 拉到新一张歌单 tracks 后，把整个 in-memory cache 重新落盘
+                    // （save 内部异步 IO，不阻塞调用方）
+                    val uid = accountState.value?.userId ?: cachedUserId
+                    val playlists = playlistState.value
+                    if (uid != null && playlists.isNotEmpty()) {
+                        playlistCache?.save(uid, playlists, tracksSnapshot)
+                    }
+                }
             }
         }
         return fresh
@@ -296,6 +324,8 @@ class RustBridgeRepository(
         synchronized(tracksCacheLock) { tracksMemoryCache[playlistId] }
 
     override suspend fun cloudDiskTracks(forceRefresh: Boolean): List<NativeTrack> {
+        awaitCacheRecovery()
+        val requestGeneration = currentCacheGeneration()
         // 复用 tracksMemoryCache，用 sentinel ID 走和正常 playlist 一样的缓存/落盘链路。
         // PlaylistCacheStore 用 Long 当 key，负值跟正常 playlistId 永远不会冲突。
         val sentinel = CLOUD_DISK_PLAYLIST_ID
@@ -310,15 +340,21 @@ class RustBridgeRepository(
                 )
                 val hydrated = hydrateCloudFirstAvailableCover(it)
                 if (hydrated != it) {
-                    replaceCloudTracks(hydrated)
+                    replaceCloudTracks(hydrated, requestGeneration)
                 } else if (cloudTracksState.value !== it) {
                     // 确保 Flow 跟内存 cache 同步（init 已经灌过一次，这里幂等）
-                    cloudTracksState.value = it
+                    synchronized(cacheGenerationLock) {
+                        if (requestGeneration == cacheGeneration) cloudTracksState.value = it
+                    }
                 }
                 return hydrated
             }
         } else {
-            synchronized(tracksCacheLock) { tracksMemoryCache.remove(sentinel) }
+            synchronized(cacheGenerationLock) {
+                if (requestGeneration == cacheGeneration) {
+                    synchronized(tracksCacheLock) { tracksMemoryCache.remove(sentinel) }
+                }
+            }
             DiagnosticsLogStore.record(area = "library", event = "cloud_disk_tracks_force_refresh")
         }
         val fresh = try {
@@ -347,13 +383,20 @@ class RustBridgeRepository(
             ),
         )
         if (hydratedFresh.isNotEmpty()) {
-            replaceCloudTracks(hydratedFresh)
+            replaceCloudTracks(hydratedFresh, requestGeneration)
         }
         return hydratedFresh
     }
 
     override suspend fun searchTracks(query: String, limit: Int): List<NativeTrack> {
-        return safe({ bridge.neteaseSearch(query, limit) }, { fallback.searchTracks(query, limit) })
+        return try {
+            bridge.neteaseSearch(query, limit)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // 搜索不能退回 EmptyPipoRepository：空数组代表服务已成功响应但没有候选。
+            throw MusicSearchException(error)
+        }
     }
 
     override suspend fun songUrls(ids: List<Long>, level: String): List<NativeSongUrl> {
@@ -541,16 +584,19 @@ class RustBridgeRepository(
         return tracks
     }
 
-    private fun replaceCloudTracks(tracks: List<NativeTrack>) {
-        val tracksSnapshot = synchronized(tracksCacheLock) {
-            tracksMemoryCache[CLOUD_DISK_PLAYLIST_ID] = tracks
-            HashMap(tracksMemoryCache)
-        }
-        cloudTracksState.value = tracks
-        val uid = accountState.value?.userId ?: cachedUserId
-        val playlists = playlistState.value
-        if (uid != null && playlists.isNotEmpty()) {
-            playlistCache?.save(uid, playlists, tracksSnapshot)
+    private fun replaceCloudTracks(tracks: List<NativeTrack>, requestGeneration: Long) {
+        synchronized(cacheGenerationLock) {
+            if (requestGeneration != cacheGeneration) return
+            val tracksSnapshot = synchronized(tracksCacheLock) {
+                cacheTracksLocked(CLOUD_DISK_PLAYLIST_ID, tracks)
+                tracksSnapshotLocked()
+            }
+            cloudTracksState.value = tracks
+            val uid = accountState.value?.userId ?: cachedUserId
+            val playlists = playlistState.value
+            if (uid != null && playlists.isNotEmpty()) {
+                playlistCache?.save(uid, playlists, tracksSnapshot)
+            }
         }
     }
 
@@ -883,16 +929,65 @@ class RustBridgeRepository(
         return safe({ bridge.aiEmbed(inputs) }, { fallback.aiEmbed(inputs) })
     }
 
-    private fun clearAccountCaches() {
+    private suspend fun awaitCacheRecovery() {
+        cacheRecovery.await()
+    }
+
+    private fun applyRecoveredSnapshot(snap: PlaylistCacheStore.Snapshot) {
+        synchronized(cacheRecoveryLock) {
+            if (cacheRecoveryApplied) return
+            // 不从快照反推登录态；账号仍由 bridge 校验。只恢复 stale-while-revalidate 数据。
+            playlistState.value = snap.playlists
+            synchronized(tracksCacheLock) {
+                snap.tracks.forEach { (playlistId, tracks) -> cacheTracksLocked(playlistId, tracks) }
+                tracksMemoryCache[CLOUD_DISK_PLAYLIST_ID]?.let { cloudTracksState.value = it }
+            }
+            cacheStale = snap.isStale
+            cachedUserId = snap.userId
+            cacheRecoveryApplied = true
+        }
+    }
+
+    private fun cacheTracksLocked(playlistId: Long, tracks: List<NativeTrack>) {
+        if (tracks.size > MAX_CACHED_TRACKS) {
+            tracksMemoryCache.remove(playlistId)
+            return
+        }
+        tracksMemoryCache[playlistId] = tracks
+        var cachedTrackCount = tracksMemoryCache.values.sumOf { it.size }
+        while (
+            tracksMemoryCache.size > MAX_CACHED_PLAYLISTS ||
+            cachedTrackCount > MAX_CACHED_TRACKS
+        ) {
+            val leastRecentlyUsedId = tracksMemoryCache.entries.iterator().next().key
+            cachedTrackCount -= tracksMemoryCache.remove(leastRecentlyUsedId)?.size ?: 0
+        }
+    }
+
+    private fun tracksSnapshotLocked(): Map<Long, List<NativeTrack>> = LinkedHashMap(tracksMemoryCache)
+
+    private fun currentCacheGeneration(): Long = synchronized(cacheGenerationLock) { cacheGeneration }
+
+    private suspend fun clearAccountCaches(clearAccountState: Boolean = false) {
+        val reset = synchronized(cacheGenerationLock) { clearAccountCachesLocked(clearAccountState) }
+        reset.completion?.await()
+    }
+
+    private fun clearAccountCachesLocked(clearAccountState: Boolean = false): CacheReset {
+        cacheGeneration += 1L
+        if (clearAccountState) accountState.value = null
         playlistState.value = emptyList()
         cloudTracksState.value = emptyList()
         synchronized(tracksCacheLock) {
             tracksMemoryCache.clear()
         }
-        playlistCache?.clear()
         cachedUserId = null
         cacheStale = false
+        // 将磁盘 clear 屏障也排入同一原子协议，后续新账号保存一定排在它后面。
+        return CacheReset(cacheGeneration, playlistCache?.clear())
     }
+
+    private data class CacheReset(val generation: Long, val completion: Deferred<Unit>?)
 
     private suspend fun <T> safe(call: suspend () -> T, fallbackCall: suspend () -> T): T {
         return try {
@@ -943,6 +1038,8 @@ class RustBridgeRepository(
 const val CLOUD_DISK_PLAYLIST_ID: Long = -1L
 
 private const val CLOUD_COVER_MATCH_SCAN_LIMIT = 8
+private const val MAX_CACHED_PLAYLISTS = 32
+private const val MAX_CACHED_TRACKS = 5_000
 
 private val NO_LYRIC_PLACEHOLDERS = setOf(
     "暂无歌词",

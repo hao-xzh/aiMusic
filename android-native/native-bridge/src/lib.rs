@@ -116,7 +116,7 @@ fn dispatch(command: &str, args: Value) -> String {
                 .to_string();
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(30);
             run_json(async move {
-                let tracks = netease_client().search_tracks(&query, limit).await?;
+                let tracks = netease::search_tracks(netease_client(), &query, limit).await?;
                 Ok(serde_json::to_value(tracks)?)
             })
         }

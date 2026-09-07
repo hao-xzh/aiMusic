@@ -13,6 +13,7 @@ import app.pipo.nativeapp.data.AudioFeatures
 import app.pipo.nativeapp.data.AudioFeaturesStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.TransitionScore
+import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlan
 import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlanStore
 import app.pipo.nativeapp.playback.orchestrator.TransitionMode
 import app.pipo.nativeapp.playback.orchestrator.TransitionResult
@@ -43,6 +44,8 @@ internal class SmartAutoMixer(
     private var lastCompletedQueueVersion: Long = 0L
     private var lastCompletedAtMs: Long = 0L
     private var lastArmDiagAtMs: Long = 0L
+    private var cachedPlanInputs: PlanInputs? = null
+    private var cachedPlan: AutoMixPlan? = null
 
     private val tickRunnable = object : Runnable {
         override fun run() {
@@ -73,10 +76,10 @@ internal class SmartAutoMixer(
             } else {
                 updateActiveMix(running)
             }
-            if (shouldKeepTicking()) scheduleTick()
+            if (shouldKeepTicking()) scheduleTick(soon = true)
             return
         }
-        if (shouldKeepTicking()) scheduleTick()
+        if (shouldKeepTicking()) scheduleTick(soon = true)
         if (!mainPlayer.playWhenReady || mainPlayer.playbackState == Player.STATE_IDLE) {
             cancel("main-not-playing", keepMainVolume = true)
         }
@@ -107,6 +110,8 @@ internal class SmartAutoMixer(
     fun release() {
         handler.removeCallbacks(tickRunnable)
         tickPosted = false
+        cachedPlanInputs = null
+        cachedPlan = null
         cancel("release", keepMainVolume = false)
     }
 
@@ -116,10 +121,21 @@ internal class SmartAutoMixer(
             (mainPlayer.playWhenReady && mainPlayer.mediaItemCount > 1)
     }
 
-    private fun scheduleTick() {
-        if (tickPosted) return
+    private fun scheduleTick(soon: Boolean = false) {
+        if (tickPosted && !soon) return
+        if (tickPosted) handler.removeCallbacks(tickRunnable)
         tickPosted = true
-        handler.postDelayed(tickRunnable, TICK_MS)
+        handler.postDelayed(tickRunnable, if (soon) TICK_MS else nextTickDelayMs())
+    }
+
+    private fun nextTickDelayMs(): Long {
+        if (armed != null || active != null) return TICK_MS
+        val plan = cachedPlan ?: return IDLE_TICK_MS
+        val remaining = remainingMs() ?: return IDLE_TICK_MS
+        val untilPrepareMs = remaining - plan.mixMs - prepareLeadMs(plan)
+        val speed = mainPlayer.playbackParameters.speed.coerceAtLeast(0.1f)
+        // 到准备窗口前恢复原有精度；远离曲尾时无需每 80ms 轮询同一对歌曲。
+        return if (untilPrepareMs <= IDLE_TICK_MS * speed) TICK_MS else IDLE_TICK_MS
     }
 
     private fun tick() {
@@ -179,7 +195,7 @@ internal class SmartAutoMixer(
     }
 
     /**
-     * 接歌为什么从不 arm 的探针 —— 限频(≥2s)记录 arming 视角。一次复现就能区分：
+     * 准备窗口内每 2s、平稳播放期间每 30s 记录 arming 视角。
      * hasPlan=false → buildPlan 被某条件挡(缺特征/同专辑 gapless/曲太短)；
      * durationKnown=false → player 不知道时长(流没报 duration)，remainingMs 永远算不出；
      * remainingMs 一直 > armThresholdMs → 时长异常(位置/时长错)，永远进不了 arming 窗口。
@@ -187,7 +203,10 @@ internal class SmartAutoMixer(
      */
     private fun maybeLogArmDiag(plan: AutoMixPlan?, remainingMs: Long?) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastArmDiagAtMs < ARM_DIAG_INTERVAL_MS) return
+        val nearPrepare = plan != null && remainingMs != null &&
+            remainingMs <= plan.mixMs + prepareLeadMs(plan) + IDLE_TICK_MS
+        val intervalMs = if (nearPrepare) ARM_DIAG_INTERVAL_MS else IDLE_ARM_DIAG_INTERVAL_MS
+        if (now - lastArmDiagAtMs < intervalMs) return
         lastArmDiagAtMs = now
         val durationMs = mainPlayer.duration
         DiagnosticsLogStore.record(
@@ -595,30 +614,65 @@ internal class SmartAutoMixer(
     }
 
     private fun buildPlan(): AutoMixPlan? {
-        val currentIndex = mainPlayer.currentMediaItemIndex.takeIf { it >= 0 } ?: return null
-        val nextIndex = nextIndex(currentIndex) ?: return null
+        val currentIndex = mainPlayer.currentMediaItemIndex
+        val nextIndex = currentIndex.takeIf { it >= 0 }?.let(::nextIndex)
+        if (nextIndex == null) {
+            cachedPlanInputs = null
+            cachedPlan = null
+            return null
+        }
         val currentItem = mainPlayer.getMediaItemAt(currentIndex)
         val nextItem = mainPlayer.getMediaItemAt(nextIndex)
+        val currentFeatures = featuresStore.get(currentItem.mediaId)
+        val nextFeatures = featuresStore.get(nextItem.mediaId)
+        val currentDurationMs = mainPlayer.duration.takeIf { it > 0 && it != C.TIME_UNSET } ?: 0L
+        val queueVersion = PlaybackSessionClock.currentQueueVersion()
+        val committedPlan = CommittedQueuePlanStore.current()
+        val previous = cachedPlanInputs
+        if (previous != null &&
+            previous.currentIndex == currentIndex && previous.nextIndex == nextIndex &&
+            previous.currentItem === currentItem && previous.nextItem === nextItem &&
+            previous.currentFeatures === currentFeatures && previous.nextFeatures === nextFeatures &&
+            previous.currentDurationMs == currentDurationMs && previous.queueVersion == queueVersion &&
+            previous.committedPlan === committedPlan
+        ) return cachedPlan
+
+        val inputs = PlanInputs(
+            currentIndex, nextIndex, currentItem, nextItem, currentFeatures, nextFeatures,
+            currentDurationMs, queueVersion, committedPlan,
+        )
+        val plan = createPlan(inputs)
+        cachedPlanInputs = inputs
+        cachedPlan = plan
+        return plan
+    }
+
+    private fun createPlan(inputs: PlanInputs): AutoMixPlan? {
+        val currentIndex = inputs.currentIndex
+        val nextIndex = inputs.nextIndex
+        val currentItem = inputs.currentItem
+        val nextItem = inputs.nextItem
         val currentTrack = currentItem.toNativeTrack() ?: return null
         val nextTrack = nextItem.toNativeTrack() ?: return null
         if (currentTrack.streamUrl.isBlank() || nextTrack.streamUrl.isBlank()) return null
         // 特征时长与元数据不符 = 特征是从截断/不同版本音频上分析的，它描述的
         // outro/intro 根本不是这条音频的真实首尾——在这种特征上做切歌决策，
         // 就是“人声没唱完就切”的来源之一。当缺失处理（走活体幅度兜底）。
-        val currentFeatures = featuresStore.get(currentTrack.id)
+        val currentFeatures = inputs.currentFeatures
             ?.takeIf { featuresDurationAgrees(it, currentTrack, "current") }
-        val nextFeatures = featuresStore.get(nextTrack.id)
+        val nextFeatures = inputs.nextFeatures
             ?.takeIf { featuresDurationAgrees(it, nextTrack, "next") }
-        val currentDurationMs = mainPlayer.duration.takeIf { it > 0 && it != C.TIME_UNSET } ?: 0L
+        val currentDurationMs = inputs.currentDurationMs
         val currentClipSourceDurationMs = currentDurationMs +
             currentItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
         if (shouldLeaveAlbumGapless(currentTrack, nextTrack, currentFeatures, nextFeatures)) return null
-        val queueVersion = PlaybackSessionClock.currentQueueVersion()
-        val committedTransitionPlan = CommittedQueuePlanStore.transitionFor(
-            queueVersion = queueVersion,
-            fromTrackId = currentTrack.id,
-            toTrackId = nextTrack.id,
-        )
+        val queueVersion = inputs.queueVersion
+        val committedTransitionPlan = inputs.committedPlan
+            ?.takeIf { it.queueVersion == queueVersion }
+            ?.transitionPlans?.firstOrNull {
+                it.queueVersion == queueVersion &&
+                    it.fromTrackId == currentTrack.id && it.toTrackId == nextTrack.id
+            }
         if (committedTransitionPlan?.risk == TransitionRisk.High ||
             committedTransitionPlan?.mode == TransitionMode.NoMix ||
             committedTransitionPlan?.mode == TransitionMode.NativeGapless
@@ -1701,6 +1755,18 @@ internal class SmartAutoMixer(
         val diagnostics: Map<String, Any?>,
     )
 
+    private class PlanInputs(
+        val currentIndex: Int,
+        val nextIndex: Int,
+        val currentItem: MediaItem,
+        val nextItem: MediaItem,
+        val currentFeatures: AudioFeatures?,
+        val nextFeatures: AudioFeatures?,
+        val currentDurationMs: Long,
+        val queueVersion: Long,
+        val committedPlan: CommittedQueuePlan?,
+    )
+
     private data class ArmedMix(
         var plan: AutoMixPlan,
         var tailDipTicks: Int = 0,
@@ -1744,7 +1810,9 @@ internal class SmartAutoMixer(
 
     private companion object {
         private const val TICK_MS = 80L
+        private const val IDLE_TICK_MS = 1_000L
         private const val ARM_DIAG_INTERVAL_MS = 2_000L
+        private const val IDLE_ARM_DIAG_INTERVAL_MS = 30_000L
         private const val FADE_OUT_JUMP_THRESHOLD = 0.92f
         private const val SHORT_MIX_PREPARE_THRESHOLD_MS = 1_500L
         private const val TIGHT_MIX_PREPARE_THRESHOLD_MS = 2_300L

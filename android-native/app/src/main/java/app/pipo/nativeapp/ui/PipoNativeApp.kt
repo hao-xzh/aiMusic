@@ -76,15 +76,16 @@ import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
 import app.pipo.nativeapp.runtime.AppForeground
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 应用根 —— 镜像 src/app/layout.tsx + page.tsx 的根组合。
  *
  * 关键：immersive 进出动画用 coverProgress (0=compact, 1=immersive) 同时驱动：
- *   - TransitioningCover 形变（compact rect → 顶部全宽方块）
- *   - ImmersiveLyrics 的 backdrop / 标题 / 歌词 fade
+ *   - ImmersiveLyrics 的标题 / 歌词 fade
  *   - PlayerScreen 的 compact 封面 / nav 图标 hide
  */
 @Composable
@@ -278,9 +279,7 @@ fun PipoNativeApp(
 
         CompositionLocalProvider(LocalCoverAnchor provides coverAnchor) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // 主页 + 独立封面 FLIP 层一起作为 AI 背景。
-                // TransitioningCover 不在 PlayerScreen 里面；所以 blur 必须包住这整个播放组，
-                // 否则 compact cover 会清晰地浮在 AI 覆盖层上方。
+                // 播放页与沉浸式歌词一起作为 AI 覆盖层的背景。
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -297,6 +296,7 @@ fun PipoNativeApp(
                         showTranslation = showLyricTranslation && hasLyricTranslation,
                         hasTranslation = hasLyricTranslation,
                         onToggleTranslation = toggleLyricTranslation,
+                        isVisible = route == Route.Player,
                         viewModel = viewModel,
                     )
                     AnimatedVisibility(
@@ -454,13 +454,11 @@ private fun SkipCorrectionEffect(
             ledger = AgentLedgerStore(context),
         )
     }
-    val appInForeground by AppForeground.isForeground.collectAsState()
     val queueSignature = remember(playerState.queue) { skipCorrectionQueueSignature(playerState.queue) }
     var lastTriggerTs by remember { mutableStateOf(0L) }
     var queueStartedAtMs by remember { mutableStateOf(System.currentTimeMillis()) }
     val latestSettings by rememberUpdatedState(settings)
     val latestPlayerState by rememberUpdatedState(playerState)
-    val latestAppInForeground by rememberUpdatedState(appInForeground)
     val latestQueueStartedAtMs by rememberUpdatedState(queueStartedAtMs)
 
     LaunchedEffect(queueSignature) {
@@ -470,28 +468,22 @@ private fun SkipCorrectionEffect(
     LaunchedEffect(route, immersive, isLandscape) {
         while (route == Route.Player && !immersive && !isLandscape) {
             delay(20_000)
+            if (!AppForeground.isForeground.value) continue
             val activeQueueStartedAtMs = latestQueueStartedAtMs
-            val events = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
-            val skipped = events
-                .filter { it.type == BehaviorType.Skipped && it.tsMs >= activeQueueStartedAtMs }
-                .sortedBy { it.tsMs }
-                .takeLast(3)
+            val skipped = withContext(Dispatchers.IO) {
+                runCatching { PipoGraph.behaviorLog.readAll() }
+                    .getOrDefault(emptyList())
+                    .filter { it.type == BehaviorType.Skipped && it.tsMs >= activeQueueStartedAtMs }
+                    .sortedBy { it.tsMs }
+                    .takeLast(3)
+            }
+            if (!AppForeground.isForeground.value) continue
+            if (activeQueueStartedAtMs != latestQueueStartedAtMs) continue
             if (skipped.size < 3) continue
             val newest = skipped.last()
             val oldest = skipped.first()
             // 15 分钟窗口内连跳 3 首
             if (newest.tsMs - oldest.tsMs > SKIP_CORRECTION_WINDOW_MS) continue
-            if (!latestAppInForeground) {
-                DiagnosticsLogStore.record(
-                    area = "skip_correction",
-                    event = "suppressed",
-                    fields = mapOf(
-                        "reason" to "background",
-                        "skipCount" to skipped.size,
-                    ),
-                )
-                continue
-            }
             if (System.currentTimeMillis() - activeQueueStartedAtMs < SKIP_CORRECTION_FRESH_QUEUE_GRACE_MS) {
                 DiagnosticsLogStore.record(
                     area = "skip_correction",
@@ -537,6 +529,7 @@ private fun SkipCorrectionEffect(
                         primaryGoal: MusicGoal,
                         target: TrackRequirement?,
                         similar: Boolean,
+                        preserveCurrent: Boolean,
                     ): ActionExecutionResult {
                         if (tracks.isEmpty()) {
                             return ActionExecutionResult(actionId, "play_queue", success = false, message = "这次没排出能播的歌。")
@@ -551,6 +544,7 @@ private fun SkipCorrectionEffect(
                             },
                             tracks = tracks,
                             continuous = continuous,
+                            preserveCurrent = preserveCurrent,
                             desiredCount = tracks.size,
                         )
                         return when (val commit = onApplyAgentQueueRequest(request)) {

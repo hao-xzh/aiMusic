@@ -98,13 +98,14 @@ internal fun LandscapePlayerLyricsScreen(
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize(),
         ) {
-            val coverSide = maxHeight
+            // 高度驱动的封面在平板/窄横屏会挤空右栏，给歌词至少保留半屏宽度。
+            val coverPaneWidth = minOf(maxHeight + 42.dp, maxWidth * 0.5f)
             Row(modifier = Modifier.fillMaxSize()) {
                 LandscapeCoverPane(
                     coverUrl = coverUrl,
                     seamColor = coverEdgeColor,
                     modifier = Modifier
-                        .width(coverSide + 42.dp)
+                        .width(coverPaneWidth)
                         .fillMaxHeight(),
                 )
 
@@ -128,39 +129,44 @@ internal fun LandscapePlayerLyricsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
 
                     androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides landscapeAccentState) {
-                        AppleMusicLyricColumn(
-                            lines = lyrics,
-                            sessionId = trackId,
-                            isPlaying = isPlaying,
-                            positionProvider = positionProvider,
-                            fg = fg,
-                            fgDim = fgDim,
-                            fgUnsung = fgUnsung,
-                            showTranslation = showTranslation,
-                            onSeekToMs = onSeekToMs,
-                            horizontalPadding = 0.dp,
-                            rowMinHeight = 52.dp,
-                            rowVerticalPadding = 6.dp,
-                            lyricFontSize = 25.sp,
-                            lyricLineHeight = 30.sp,
-                            lyricFontWeight = FontWeight.Bold,
-                            bottomFadeStart = 0.90f,
-                            bottomFadeSoftEnd = 0.98f,
-                            // 锚点改到顶部后同步收窄渐隐区；否则高横屏按百分比计算的
-                            // 20% mask 会把已经贴近标题的当前句也压暗。
-                            topFadeTransparentEnd = 0f,
-                            topFadePartialEnd = 0.02f,
-                            topFadeSolidEnd = 0.05f,
-                            // 90dp 只保护极短横屏/分屏不把当前句裁到 viewport 外；常规与
-                            // 平板横屏均由 8dp 上限决定，锚点不会随可用高度越长越远离标题。
-                            anchorBiasDp = 90.dp,
-                            anchorTopCapDp = 8.dp,
-                            // 横屏也按真实可用宽度排满再换行，不为“两行等长”提前折行。
-                            naturalSyllableWrap = true,
+                        BoxWithConstraints(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth(),
-                        )
+                        ) {
+                            val typography = nativeLyricTypography(maxWidth, maxHeight)
+                            AppleMusicLyricColumn(
+                                lines = lyrics,
+                                sessionId = trackId,
+                                isPlaying = isPlaying,
+                                positionProvider = positionProvider,
+                                fg = fg,
+                                fgDim = fgDim,
+                                fgUnsung = fgUnsung,
+                                showTranslation = showTranslation,
+                                onSeekToMs = onSeekToMs,
+                                horizontalPadding = 0.dp,
+                                rowMinHeight = 52.dp,
+                                rowVerticalPadding = 6.dp,
+                                lyricFontSize = typography.fontSize,
+                                lyricLineHeight = typography.lineHeight,
+                                lyricFontWeight = FontWeight.Bold,
+                                bottomFadeStart = 0.90f,
+                                bottomFadeSoftEnd = 0.98f,
+                                // 锚点改到顶部后同步收窄渐隐区；否则高横屏按百分比计算的
+                                // 20% mask 会把已经贴近标题的当前句也压暗。
+                                topFadeTransparentEnd = 0f,
+                                topFadePartialEnd = 0.02f,
+                                topFadeSolidEnd = 0.05f,
+                                // 90dp 只保护极短横屏/分屏不把当前句裁到 viewport 外；常规与
+                                // 平板横屏均由 8dp 上限决定，锚点不会随可用高度越长越远离标题。
+                                anchorBiasDp = 90.dp,
+                                anchorTopCapDp = 8.dp,
+                                // 横屏也按真实可用宽度排满再换行，不为“两行等长”提前折行。
+                                naturalSyllableWrap = true,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
                     }
 
                     LandscapeBottomControls(

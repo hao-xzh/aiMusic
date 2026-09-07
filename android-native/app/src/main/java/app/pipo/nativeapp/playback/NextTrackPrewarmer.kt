@@ -9,8 +9,12 @@ import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.NativeTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.resume
 
 @UnstableApi
 class NextTrackPrewarmer(
@@ -31,7 +35,8 @@ class NextTrackPrewarmer(
         val writer = CacheWriter(dataSource, dataSpec, ByteArray(CacheWriter.DEFAULT_BUFFER_SIZE_BYTES), null)
         activeWriter.getAndSet(writer)?.cancel()
         try {
-            writer.cache()
+            if (!cache(writer)) return@withContext false
+            currentCoroutineContext().ensureActive()
             DiagnosticsLogStore.record(
                 area = "playback",
                 event = "prewarm_completed",
@@ -63,6 +68,21 @@ class NextTrackPrewarmer(
             false
         } finally {
             activeWriter.compareAndSet(writer, null)
+        }
+    }
+
+    private suspend fun cache(writer: CacheWriter): Boolean = withContext(Dispatchers.IO) {
+        suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation {
+                activeWriter.compareAndSet(writer, null)
+                writer.cancel()
+            }
+            try {
+                writer.cache()
+                continuation.resume(activeWriter.compareAndSet(writer, null))
+            } catch (error: Exception) {
+                continuation.resumeWith(Result.failure(error))
+            }
         }
     }
 

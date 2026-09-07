@@ -16,6 +16,9 @@ class ReplyVerifier {
             if (successWords.any { it in compact }) return false
         }
         if ("下一首" in compact && results.none { it.type == "insert_next" && it.success }) return false
+        if (facts.actionType == "insert_next" && facts.success && facts.queueCount > 1) {
+            if ("${facts.queueCount}首" !in compact) return false
+        }
         if (listOf("已经播放", "已播放", "开始播放", "开播", "切过去", "直接切").any { it in compact } &&
             !facts.actuallyStarted
         ) {

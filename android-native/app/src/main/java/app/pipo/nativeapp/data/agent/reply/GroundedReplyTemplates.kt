@@ -146,6 +146,16 @@ class GroundedReplyTemplates {
     private fun insert(facts: ReplyFacts, persona: PetPersona): String {
         val track = formatTrack(facts.insertedTitle, facts.insertedArtist)
             .ifBlank { formatTrack(facts.firstTrackTitle, facts.firstTrackArtist) }
+        val count = facts.queueCount
+        if (count > 1) {
+            return when (persona) {
+                PetPersona.TOXIC -> if (track.isBlank()) "下一首开始给你接，别催，共接${count}首。" else "下一首从${track}开始，别打断，共接${count}首。"
+                PetPersona.FRIENDLY -> if (track.isBlank()) "下一首开始给你接上，共接${count}首，不打断现在这首。" else "下一首从${track}开始，共接${count}首，不打断现在这首。"
+                PetPersona.COLD -> if (track.isBlank()) "下一首开始，共接${count}首。" else "下一首从${track}开始，共接${count}首。"
+                PetPersona.KITTY -> if (track.isBlank()) "下一首开始接上喵，共接${count}首。" else "下一首从${track}开始喵，共接${count}首。"
+                PetPersona.JIANGHU -> if (track.isBlank()) "下一首开始接上，稳着，共接${count}首。" else "下一首从${track}开始，稳着，共接${count}首。"
+            }
+        }
         return when (persona) {
             PetPersona.TOXIC -> if (track.isBlank()) "下一首给你接上，别催。" else "下一首接$track，别打断。"
             PetPersona.FRIENDLY -> if (track.isBlank()) "下一首给你接上，不打断现在这首。" else "下一首接$track，不打断现在这首。"

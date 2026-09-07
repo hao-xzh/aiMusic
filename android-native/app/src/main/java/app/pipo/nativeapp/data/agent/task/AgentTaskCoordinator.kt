@@ -35,8 +35,24 @@ class AgentTaskCoordinator(private val context: Context) {
     fun unregisterGateway(value: AgentTaskGateway) { if (gateway === value) gateway = null }
 
     fun submit(userText: String, contextJson: String = "", onFinished: (Result<TurnOutcome>) -> Unit = {}): AgentTask {
-        val task = store.enqueue(userText, contextJson)
-        DiagnosticsLogStore.record("ai_agent_task", "enqueued", mapOf("taskId" to task.id, "contextBytes" to contextJson.length))
+        val retriedTask = if (isRetryOnlyRequest(userText)) store.retryLatestFailed() else null
+        val task = retriedTask ?: store.enqueue(userText, contextJson)
+        if (retriedTask?.error == AgentTaskStore.INTERRUPTED_EXECUTION_RESULT_UNKNOWN) {
+            DiagnosticsLogStore.record(
+                "ai_agent_task",
+                "manual_retry_blocked_unknown_result",
+                mapOf("taskId" to task.id),
+            )
+            scope.launch {
+                onFinished(Result.failure(AgentTurnExecutionException(false, task.error)))
+            }
+            return task
+        }
+        DiagnosticsLogStore.record(
+            "ai_agent_task",
+            if (retriedTask == null) "enqueued" else "manual_retry_enqueued",
+            mapOf("taskId" to task.id, "contextBytes" to task.contextJson.length),
+        )
         scope.launch {
             // Persist the user's side as soon as the durable task exists. taskId makes
             // this idempotent with process-recovery / retry execution below.
