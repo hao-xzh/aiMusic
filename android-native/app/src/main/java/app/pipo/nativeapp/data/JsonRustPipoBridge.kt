@@ -86,6 +86,26 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         return parseTracks(tracks)
     }
 
+    override suspend fun neteaseSearchPage(query: String, limit: Int, offset: Int): List<NativeTrack> {
+        val tracks = callArray(
+            "netease_search",
+            jsonObject("query" to query, "limit" to limit, "offset" to offset),
+        )
+        return parseTracks(tracks)
+    }
+
+    override suspend fun neteaseDailyRecommendedTracks(): List<NativeTrack> {
+        return parseTracks(callArray("netease_daily_recommended_tracks"))
+    }
+
+    override suspend fun neteasePersonalFmTracks(): List<NativeTrack> {
+        return parseTracks(callArray("netease_personal_fm_tracks"))
+    }
+
+    override suspend fun neteaseSimilarTracks(trackId: Long): List<NativeTrack> {
+        return parseTracks(callArray("netease_similar_tracks", jsonObject("trackId" to trackId)))
+    }
+
     override suspend fun neteaseUserCloudTracks(): List<NativeTrack> {
         val tracks = callArray("netease_user_cloud_tracks")
         return parseTracks(tracks)
@@ -477,7 +497,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
 
 class RustBridgeException(command: String, message: String) : RuntimeException("$command: $message")
 
-private object LrcParser {
+internal object LrcParser {
     private val stamp = Regex("""\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?]""")
     private val offsetTag = Regex("""\[(?:offset|offsetMs)\s*:\s*([+-]?\d+)]""", RegexOption.IGNORE_CASE)
 

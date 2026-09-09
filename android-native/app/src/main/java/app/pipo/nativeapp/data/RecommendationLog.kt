@@ -11,7 +11,8 @@ import org.json.JSONObject
  * 每次 AI 出了 batch 都 log 一次（source=pet）；自动播放推荐用 source=auto；电台 radio。
  */
 class RecommendationLog(context: Context) {
-    enum class Source(val key: String) { Pet("pet"), Auto("auto"), Radio("radio"), Search("search") }
+    enum class Source(val key: String) { Pet("pet"), Auto("auto"), Radio("radio"), Search("search"), Home("home") }
+    enum class HomeGroup { FamiliarTrack, FamiliarArtist, NewArtist }
 
     data class Event(
         val trackId: Long,
@@ -19,6 +20,18 @@ class RecommendationLog(context: Context) {
         val source: Source,
         /** 主艺人名 —— v2 新增,做 artist-level fatigue;老事件没这字段当 null */
         val artist: String? = null,
+        /** Classification when this batch was generated; null for older/non-home records. */
+        val isDiscovery: Boolean? = null,
+        val userId: Long? = null,
+        val songKey: String? = null,
+        val homeGroup: HomeGroup? = null,
+    )
+
+    data class FavoriteEvent(
+        val trackId: Long,
+        val tsMs: Long,
+        val userId: Long,
+        val liked: Boolean,
     )
 
     data class RecentContext(
@@ -36,6 +49,9 @@ class RecommendationLog(context: Context) {
     @Volatile
     private var buffer: MutableList<Event>? = null
 
+    @Volatile
+    private var favoriteBuffer: MutableList<FavoriteEvent>? = null
+
     @Synchronized
     private fun ensureBuffer(): MutableList<Event> {
         buffer?.let { return it }
@@ -50,7 +66,14 @@ class RecommendationLog(context: Context) {
                     val src = Source.entries.firstOrNull { it.key == srcKey } ?: Source.Pet
                     val artistField = o.optString("artist", "")
                     val artist = if (artistField.isBlank()) null else artistField
-                    out.add(Event(o.optLong("trackId"), o.optLong("ts"), src, artist))
+                    val homeGroup = o.optString("homeGroup", "")
+                        .takeIf { it.isNotBlank() }
+                        ?.let { key -> HomeGroup.entries.firstOrNull { it.name == key } }
+                    out.add(Event(o.optLong("trackId"), o.optLong("ts"), src, artist,
+                        isDiscovery = if (o.has("discovery") && !o.isNull("discovery")) o.optBoolean("discovery") else null,
+                        userId = if (o.has("userId") && !o.isNull("userId")) o.optLong("userId") else null,
+                        songKey = o.optString("songKey", "").takeIf { it.isNotBlank() },
+                        homeGroup = homeGroup))
                 }
             }
         }
@@ -76,7 +99,11 @@ class RecommendationLog(context: Context) {
      * 新代码请尽量用这个;老的 log(List<Long>) 保留兼容。
      */
     @Synchronized
-    fun logTracks(tracks: List<NativeTrack>, source: Source = Source.Pet) {
+    fun logTracks(
+        tracks: List<NativeTrack>, source: Source = Source.Pet,
+        discoveryIds: Set<Long>? = null, userId: Long? = null,
+        homeGroups: Map<Long, HomeGroup>? = null,
+    ) {
         if (tracks.isEmpty()) return
         val buf = ensureBuffer()
         val now = System.currentTimeMillis() / 1000
@@ -85,10 +112,51 @@ class RecommendationLog(context: Context) {
             val id = t.neteaseId ?: continue
             if (!seen.add(id)) continue
             val artist = t.artist.split('/', '&', ',', '、').firstOrNull()?.trim()
-            buf.add(Event(id, now, source, artist))
+            buf.add(Event(id, now, source, artist,
+                isDiscovery = discoveryIds?.contains(id), userId = userId,
+                songKey = if (discoveryIds != null) TrackDedupe.songKey(t) else null,
+                homeGroup = homeGroups?.get(id)))
         }
         flush()
     }
+
+    @Synchronized
+    private fun ensureFavoriteBuffer(): MutableList<FavoriteEvent> {
+        favoriteBuffer?.let { return it }
+        val raw = prefs.getString(FAVORITES_KEY, null)
+        val out = mutableListOf<FavoriteEvent>()
+        if (raw != null) {
+            runCatching {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (!o.has("tsMs") || o.isNull("tsMs")) continue
+                    out.add(
+                        FavoriteEvent(
+                            trackId = o.optLong("trackId"),
+                            tsMs = o.optLong("tsMs"),
+                            userId = o.optLong("userId"),
+                            liked = o.optBoolean("liked"),
+                        ),
+                    )
+                }
+            }
+        }
+        val trimmed = if (out.size > MAX_EVENTS) out.takeLast(MAX_EVENTS).toMutableList() else out
+        favoriteBuffer = trimmed
+        return trimmed
+    }
+
+    @Synchronized
+    fun logFavorite(trackId: Long, userId: Long, liked: Boolean) {
+        ensureFavoriteBuffer().add(
+            FavoriteEvent(trackId, System.currentTimeMillis(), userId, liked),
+        )
+        flushFavorites()
+    }
+
+    @Synchronized
+    fun readFavorites(): List<FavoriteEvent> = ensureFavoriteBuffer().toList()
 
     @Synchronized
     private fun flush() {
@@ -100,9 +168,30 @@ class RecommendationLog(context: Context) {
             arr.put(JSONObject().apply {
                 put("trackId", it.trackId); put("ts", it.tsSec); put("source", it.source.key)
                 if (!it.artist.isNullOrBlank()) put("artist", it.artist)
+                it.isDiscovery?.let { discovery -> put("discovery", discovery) }
+                it.userId?.let { userId -> put("userId", userId) }
+                it.songKey?.let { songKey -> put("songKey", songKey) }
+                it.homeGroup?.let { homeGroup -> put("homeGroup", homeGroup.name) }
             })
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
+    }
+
+    @Synchronized
+    private fun flushFavorites() {
+        val buf = favoriteBuffer ?: return
+        val trimmed = if (buf.size > MAX_EVENTS) buf.takeLast(MAX_EVENTS).toMutableList() else buf
+        favoriteBuffer = trimmed
+        val arr = JSONArray()
+        trimmed.forEach {
+            arr.put(JSONObject().apply {
+                put("trackId", it.trackId)
+                put("tsMs", it.tsMs)
+                put("userId", it.userId)
+                put("liked", it.liked)
+            })
+        }
+        prefs.edit().putString(FAVORITES_KEY, arr.toString()).apply()
     }
 
     fun readAll(): List<Event> = ensureBuffer().toList()
@@ -135,6 +224,7 @@ class RecommendationLog(context: Context) {
     companion object {
         private const val PREFS_NAME = "claudio_recommendation_log"
         private const val KEY = "v1"
+        private const val FAVORITES_KEY = "favorites_v1"
         private const val MAX_EVENTS = 800
         private const val DAY_S = 24 * 3600L
     }

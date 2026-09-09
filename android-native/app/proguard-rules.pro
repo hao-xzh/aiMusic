@@ -1,50 +1,16 @@
-# ===== Pipo Release ProGuard / R8 规则 =====
-# 目标：体积最小的同时不破坏 Compose / Coil / Media3 / Kotlin 协程 / JNI bridge
+# Android 组件由 Manifest 生成的规则保留；Media3、Compose、Coil 和协程
+# 使用各依赖附带的 consumer rules，不再整包禁止裁剪和优化。
 
-# Media3 / ExoPlayer —— UnstableApi 注解 + 内部反射
--keep class androidx.media3.** { *; }
--keep interface androidx.media3.** { *; }
--dontwarn androidx.media3.**
-
-# Compose 运行时
--keep class androidx.compose.runtime.** { *; }
--keep class androidx.compose.ui.tooling.** { *; }
-
-# Kotlin 协程 / Flow
--keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
--keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
--keep class kotlin.coroutines.Continuation { *; }
--keepclassmembers class kotlin.coroutines.jvm.internal.SuspendLambda {
-    private final java.lang.Object L$0;
+# Rust 导出函数按类名和 native 方法名绑定，只保留实际 JNI 边界。
+-keep,allowoptimization class app.pipo.nativeapp.data.JsonRustPipoBridge {
+    native <methods>;
 }
-
-# JNI Native Bridge —— invokeNative 是 native 方法，必须保留签名
--keep class app.pipo.nativeapp.data.JsonRustPipoBridge { *; }
 -keepclasseswithmembernames class * {
     native <methods>;
 }
 
-# Coil —— 反射加载 Decoder / Fetcher
--keep class coil.** { *; }
--keep interface coil.** { *; }
--dontwarn coil.**
+# 播放通知通过 Class.forName 创建 Activity Intent。
+-keepnames class app.pipo.nativeapp.MainActivity
 
-# OkHttp / Okio —— Coil 依赖
--dontwarn okhttp3.**
--dontwarn okio.**
-
-# ZXing —— QR 码生成
--keep class com.google.zxing.** { *; }
--dontwarn com.google.zxing.**
-
-# Pipo 应用自身的 data class
--keep class app.pipo.nativeapp.data.** { *; }
--keep class app.pipo.nativeapp.runtime.** { *; }
-
-# 诊断日志（B 阶段 AMLL 调试需要从设置导出，禁止 R8 删除写日志路径）
--keep class app.pipo.nativeapp.DiagnosticsLogStore { *; }
--keep class app.pipo.nativeapp.DiagnosticsLogStore$* { *; }
--keep class app.pipo.nativeapp.CrashLogStore { *; }
-
-# 保留泛型 / 注解 / 内部类签名
+# 保留诊断堆栈和运行时注解所需信息，业务方法仍可优化。
 -keepattributes Signature, *Annotation*, InnerClasses, EnclosingMethod, SourceFile, LineNumberTable

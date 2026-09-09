@@ -1,6 +1,8 @@
 package app.pipo.nativeapp.ui
 
 import android.app.Activity
+import android.content.pm.ActivityInfo
+import android.view.OrientationEventListener
 import android.content.res.Configuration
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
@@ -13,15 +15,15 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -40,7 +42,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -76,15 +80,16 @@ import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
 import app.pipo.nativeapp.runtime.AppForeground
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 应用根 —— 镜像 src/app/layout.tsx + page.tsx 的根组合。
  *
  * 关键：immersive 进出动画用 coverProgress (0=compact, 1=immersive) 同时驱动：
- *   - TransitioningCover 形变（compact rect → 顶部全宽方块）
- *   - ImmersiveLyrics 的 backdrop / 标题 / 歌词 fade
+ *   - ImmersiveLyrics 的标题 / 歌词 fade
  *   - PlayerScreen 的 compact 封面 / nav 图标 hide
  */
 @Composable
@@ -113,10 +118,41 @@ fun PipoNativeApp(
             )
             return@MaterialTheme
         }
-        var route by remember { mutableStateOf<Route>(Route.Player) }
+        var route by remember { mutableStateOf<Route>(Route.Browse) }
         var immersive by remember { mutableStateOf(false) }
         val viewModel: PlayerViewModel = viewModel()
         val playerState = viewModel.state
+        val browseModel: BrowseViewModel = viewModel()
+        val browseContext = LocalContext.current.applicationContext
+        val browseSession = remember(browseContext) { BrowseSession(browseContext) }
+        var queueOpen by remember { mutableStateOf(false) }
+        var createOpen by remember { mutableStateOf(false) }
+        var backStack by remember { mutableStateOf<List<Route>>(emptyList()) }
+        var playerOrigin by remember { mutableStateOf(Route.Browse) }
+        var miniPlayerBounds by remember { mutableStateOf(Rect.Zero) }
+        var miniDockHeight by remember { mutableStateOf(0.dp) }
+        val browseDensity = androidx.compose.ui.platform.LocalDensity.current
+        val navigate: (Route) -> Unit = { destination ->
+            if (destination != route) { backStack = backStack + route; route = destination }
+        }
+        val openSettings: () -> Unit = { navigate(Route.Settings) }
+        val openLogin: () -> Unit = { navigate(Route.Login) }
+        val openPlayer: () -> Unit = {
+            if (route != Route.Player) {
+                val existingPlayer = backStack.indexOfLast { it == Route.Player }
+                if (existingPlayer >= 0) {
+                    backStack = backStack.take(existingPlayer)
+                    route = Route.Player
+                } else {
+                    playerOrigin = route
+                    navigate(Route.Player)
+                }
+            }
+        }
+        val goBack: () -> Unit = {
+            route = backStack.lastOrNull() ?: Route.Browse
+            backStack = backStack.dropLast(1)
+        }
         val settings by PipoGraph.repository.settings.collectAsState(initial = NativeSettings())
         val scope = rememberCoroutineScope()
         val showLyricTranslation = settings.lyricTranslation
@@ -135,6 +171,34 @@ fun PipoNativeApp(
         val configuration = LocalConfiguration.current
         val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
             configuration.screenWidthDp > configuration.screenHeightDp
+        val orientationActivity = LocalContext.current as? Activity
+        var returnToPortrait by remember { mutableStateOf(false) }
+        val exitLandscape: () -> Unit = {
+            immersive = false
+            returnToPortrait = true
+        }
+        LaunchedEffect(route) {
+            if (route != Route.Player) returnToPortrait = false
+        }
+        DisposableEffect(orientationActivity, returnToPortrait, route) {
+            if (orientationActivity == null || !returnToPortrait || route != Route.Player) {
+                onDispose { }
+            } else {
+                val previousOrientation = orientationActivity.requestedOrientation
+                orientationActivity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                // Once held upright again, restore normal rotation instead of locking the app.
+                val listener = object : OrientationEventListener(orientationActivity) {
+                    override fun onOrientationChanged(orientation: Int) {
+                        if (orientation in 0..20 || orientation in 340..359) returnToPortrait = false
+                    }
+                }
+                if (listener.canDetectOrientation()) listener.enable()
+                onDispose {
+                    listener.disable()
+                    orientationActivity.requestedOrientation = previousOrientation
+                }
+            }
+        }
         val hasLyricTranslation by remember(playerState.lyrics) {
             derivedStateOf {
                 playerState.lyrics.any { line ->
@@ -245,9 +309,11 @@ fun PipoNativeApp(
 
         // 横屏 Player 全程隐藏；竖屏只有沉浸式歌词页隐藏（让 cover 真正贴到屏幕顶）。
         val hideSystemBars = route == Route.Player && (isLandscape || immersive)
-        DisposableEffect(hideSystemBars) {
+        DisposableEffect(hideSystemBars, route) {
             val window = (view.context as? Activity)?.window
             val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+            controller?.isAppearanceLightStatusBars = false
+            controller?.isAppearanceLightNavigationBars = false
             if (hideSystemBars) {
                 controller?.systemBarsBehavior =
                     WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -278,155 +344,164 @@ fun PipoNativeApp(
 
         CompositionLocalProvider(LocalCoverAnchor provides coverAnchor) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // 主页 + 独立封面 FLIP 层一起作为 AI 背景。
-                // TransitioningCover 不在 PlayerScreen 里面；所以 blur 必须包住这整个播放组，
-                // 否则 compact cover 会清晰地浮在 AI 覆盖层上方。
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .blur(aiPlayerBlur),
-                ) {
-                    PlayerScreen(
-                        onOpenLyrics = {
-                            viewModel.refreshPosition()
-                            immersive = true
-                        },
-                        onOpenDistill = { route = Route.Distill },
-                        onOpenSettings = { route = Route.Settings },
-                        immersiveProgress = contentProgress,
-                        showTranslation = showLyricTranslation && hasLyricTranslation,
-                        hasTranslation = hasLyricTranslation,
-                        onToggleTranslation = toggleLyricTranslation,
-                        viewModel = viewModel,
-                    )
-                    AnimatedVisibility(
-                        visible = !isLandscape,
-                        enter = fadeIn(tween(240, easing = PipoMotion.FlipEase)),
-                        exit = fadeOut(tween(180, easing = PipoMotion.CloseEase)),
-                    ) {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            // 播放页本身已经绘制 Apple Music 式清晰封面 + 同源毛玻璃背景。
-                            // 歌词页共享这层底图，只让播放控件淡出、歌词列表淡入，避免两套封面层叠出分界。
-                            val lyricPositionProvider = remember(viewModel) { { viewModel.positionMs } }
-                            ImmersiveLyricsOverlay(
-                                progress = coverProgress,
-                                contentProgress = contentProgress,
-                                coverUrl = viewModel.state.artworkUrl,
-                                title = viewModel.state.title,
-                                artist = viewModel.state.artist,
-                                trackId = viewModel.state.currentTrackId,
-                                lyrics = viewModel.state.lyrics,
-                                positionProvider = lyricPositionProvider,
-                                isPlaying = viewModel.state.isPlaying,
-                                showTranslation = showLyricTranslation && hasLyricTranslation,
-                                hasTranslation = hasLyricTranslation,
-                                onClose = { immersive = false },
-                                onToggle = viewModel::toggle,
-                                onNext = viewModel::next,
-                                onToggleTranslation = toggleLyricTranslation,
-                                onSeekToMs = { targetMs ->
-                                    viewModel.seekToMs(targetMs)
-                                },
-                            )
+                // 播放页与沉浸式歌词一起作为 AI 覆盖层的背景。
+                PlayerExpansionSurface(
+                    expanded = route == Route.Player || backStack.contains(Route.Player),
+                    miniBounds = miniPlayerBounds,
+                    canCollapse = route == Route.Player && !isLandscape && !immersive && !aiOverlayOpen && !queueOpen,
+                    isLandscape = isLandscape,
+                    onReturnPortrait = if (route == Route.Player && isLandscape && !aiOverlayOpen && !queueOpen) exitLandscape else null,
+                    onCollapse = goBack,
+                    onOpenSettings = openSettings,
+                    onOpenAi = if (route == Route.Player && !immersive && !isLandscape && !aiOverlayOpen && !queueOpen) {
+                        {
+                            AiPetCommandBus.openChat()
+                            DiagnosticsLogStore.record(area = "ai_pet", event = "open_from_player_double_tap")
                         }
-                    }
-                }
-
-                // 子页面 push 动画（distill / settings / taste / login）
-                AnimatedVisibility(
-                    visible = route != Route.Player,
-                    enter = slideInVertically(tween(240)) { it } + fadeIn(tween(240)),
-                    exit = slideOutVertically(tween(240)) { it } + fadeOut(tween(240)),
+                    } else null,
+                    compactContent = { MiniPlayerSurface(viewModel.state.artworkUrl) { BrowseMiniPlayerContents(viewModel) { queueOpen = true } } },
                 ) {
-                    CompositionLocalProvider(
-                        LocalOnBack provides { route = Route.Player },
-                        LocalNav provides PipoNav(
-                            openTaste = { route = Route.Taste },
-                            openSettings = { route = Route.Settings },
-                            openDistill = { route = Route.Distill },
-                            openLogin = { route = Route.Login },
-                        ),
-                    ) {
-                        when (route) {
-                            Route.Distill -> DistillScreen()
-                            Route.Settings -> SettingsScreen()
-                            Route.Taste -> TasteScreen(
-                                onPlayTracks = { tracks ->
-                                    if (tracks.isNotEmpty()) {
-                                        route = Route.Player
-                                        scope.launch {
-                                            viewModel.applyAgentQueueRequest(
-                                                AgentQueueRequest(
-                                                    requestId = "taste_${System.currentTimeMillis()}",
-                                                    sourceUserText = "taste_screen_play",
-                                                    operation = QueueOperation.ReplaceQueue,
-                                                    tracks = tracks,
-                                                    desiredCount = tracks.size,
-                                                ),
-                                            )
-                                        }
-                                    }
-                                },
-                            )
-                            Route.Login -> LoginScreen(onBack = { route = Route.Player })
-                            Route.Player -> Unit
-                        }
-                    }
-                }
-
-                // 后台蒸馏的浮条 —— 跨所有 route 都可见，不阻碍交互
-                DistillStatusChip()
-
-                // 全局 AiPet（仅在 Player root + 非沉浸式 + 竖屏时显示）
-                if (route == Route.Player && !immersive && !isLandscape) {
-                    val currentTrack = playerState.queue.getOrNull(playerState.currentIndex)
-                    NativeAiPet(
-                        isPlaying = playerState.isPlaying,
-                        currentTrack = currentTrack,
-                        currentQueue = playerState.queue,
-                        currentTrackKey = currentTrack?.id,
-                        currentTitle = playerState.title,
-                        currentArtist = playerState.artist,
-                        coverUrl = playerState.artworkUrl,
-                        onApplyAgentQueueRequest = { request -> viewModel.applyAgentQueueRequest(request) },
-                        onSkipFromAgent = { viewModel.next() },
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
-
-                if (route == Route.Player && !immersive && !isLandscape && settings.hideAiPetOrb) {
                     Box(
                         modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .height(104.dp)
-                            .navigationBarsPadding()
-                            .pointerInput(Unit) {
-                                detectTapGestures(
-                                    onDoubleTap = {
-                                        AiPetCommandBus.openChat()
-                                        DiagnosticsLogStore.record(
-                                            area = "ai_pet",
-                                            event = "open_from_bottom_double_tap",
-                                        )
+                            .fillMaxSize()
+                            .blur(aiPlayerBlur),
+                    ) {
+                        PlayerScreen(
+                            onOpenLyrics = {
+                                viewModel.refreshPosition()
+                                immersive = true
+                            },
+                            onOpenDistill = { queueOpen = true },
+                            onOpenTaste = { navigate(Route.Taste) },
+                            immersiveProgress = contentProgress,
+                            showTranslation = showLyricTranslation && hasLyricTranslation,
+                            hasTranslation = hasLyricTranslation,
+                            onToggleTranslation = toggleLyricTranslation,
+                            isVisible = route == Route.Player,
+                            viewModel = viewModel,
+                        )
+                        AnimatedVisibility(
+                            visible = !isLandscape,
+                            enter = fadeIn(tween(240, easing = PipoMotion.FlipEase)),
+                            exit = fadeOut(tween(180, easing = PipoMotion.CloseEase)),
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                // 播放页本身已经绘制 Apple Music 式清晰封面 + 同源毛玻璃背景。
+                                // 歌词页共享这层底图，只让播放控件淡出、歌词列表淡入，避免两套封面层叠出分界。
+                                val lyricPositionProvider = remember(viewModel) { { viewModel.positionMs } }
+                                ImmersiveLyricsOverlay(
+                                    progress = coverProgress,
+                                    contentProgress = contentProgress,
+                                    coverUrl = viewModel.state.artworkUrl,
+                                    title = viewModel.state.title,
+                                    artist = viewModel.state.artist,
+                                    trackId = viewModel.state.currentTrackId,
+                                    lyrics = viewModel.state.lyrics,
+                                    positionProvider = lyricPositionProvider,
+                                    isPlaying = viewModel.state.isPlaying,
+                                    showTranslation = showLyricTranslation && hasLyricTranslation,
+                                    hasTranslation = hasLyricTranslation,
+                                    onClose = { immersive = false },
+                                    onToggle = viewModel::toggle,
+                                    onNext = viewModel::next,
+                                    onToggleTranslation = toggleLyricTranslation,
+                                    onSeekToMs = { targetMs ->
+                                        viewModel.seekToMs(targetMs)
                                     },
                                 )
-                            },
-                    )
+                            }
+                        }
+                    }
                 }
+
+                // The origin stays mounted underneath the player, preserving scroll and page state.
+                val pageRoute = if (route == Route.Player) playerOrigin else route
+                Box(Modifier.fillMaxSize().zIndex(if (route != Route.Player && backStack.contains(Route.Player)) 2f else 0f)) {
+                    CompositionLocalProvider(
+                        LocalOnBack provides goBack,
+                        LocalNav provides PipoNav(
+                            openTaste = { navigate(Route.Taste) },
+                            openSettings = openSettings,
+                            openLogin = openLogin,
+                            openAiSettings = { navigate(Route.AiSettings) },
+                        ),
+                    ) {
+                        Column(Modifier.fillMaxSize().background(BrowseBackground).imePadding()) {
+                            Box(Modifier.weight(1f)) {
+                                when (pageRoute) {
+                                    Route.Browse -> CompositionLocalProvider(
+                                        LocalBrowseBottomInset provides if (playerState.currentTrackId != null && !createOpen) miniDockHeight else 0.dp,
+                                    ) {
+                                        BrowseHost(
+                                            browseSession, browseModel, viewModel, openSettings,
+                                            openLogin,
+                                            openPlayer,
+                                            { openPlayer(); AiPetCommandBus.recommendMusic() },
+                                            { createOpen = it },
+                                        )
+                                    }
+                                    Route.AiSettings -> SettingsScreen(aiOnly = true)
+                                    Route.Settings -> SettingsScreen()
+                                    Route.Taste -> TasteScreen()
+                                    Route.Login -> LoginScreen(onBack = goBack)
+                                    Route.Player -> Unit
+                                }
+                                if (pageRoute == Route.Browse && !createOpen) {
+                                    BrowseMiniPlayerDock(viewModel, openPlayer, { queueOpen = true }, { miniPlayerBounds = it },
+                                        Modifier.align(Alignment.BottomCenter).onGloballyPositioned {
+                                            miniDockHeight = with(browseDensity) { it.size.height.toDp() }
+                                        },
+                                    )
+                                }
+                            }
+                        if (pageRoute != Route.Login && pageRoute != Route.AiSettings && !createOpen) {
+                            BrowseChrome(browseSession.tab, viewModel,
+                                { browseSession.select(it); backStack = emptyList(); route = Route.Browse },
+                                openPlayer, { queueOpen = true }, { miniPlayerBounds = it }, showMiniPlayer = pageRoute != Route.Browse)
+                        }
+                        }
+                    }
+                }
+                if (queueOpen) BrowseQueueSheet(viewModel) { queueOpen = false }
+
+                // 后台蒸馏的浮条 —— 跨所有 route 都可见，不阻碍交互
+                Box(Modifier.fillMaxSize().zIndex(3f)) { DistillStatusChip() }
+
+                // One persistent assistant overlay for every app page.
+                val currentTrack = playerState.queue.getOrNull(playerState.currentIndex)
+                NativeAiPet(
+                    isPlaying = playerState.isPlaying,
+                    currentTrack = currentTrack,
+                    currentQueue = playerState.queue,
+                    currentTrackKey = currentTrack?.id,
+                    currentTitle = playerState.title,
+                    currentArtist = playerState.artist,
+                    coverUrl = playerState.artworkUrl,
+                    onApplyAgentQueueRequest = { request -> viewModel.applyAgentQueueRequest(request) },
+                    onSkipFromAgent = { viewModel.next() },
+                    onOpenAiSettings = { navigate(Route.AiSettings) },
+                    modifier = Modifier.fillMaxSize().zIndex(4f),
+                    showPlayerDecorations = route == Route.Player && !immersive && !isLandscape,
+                )
+
+
             }
 
-            BackHandler(enabled = immersive || route != Route.Player) {
+            BackHandler(enabled = !aiOverlayOpen && (queueOpen || immersive || route != Route.Browse || browseSession.playlist != null || browseSession.cloud || browseSession.searchOpen)) {
                 when {
+                    queueOpen -> queueOpen = false
+                    route == Route.Player && isLandscape -> exitLandscape()
                     immersive -> immersive = false
-                    else -> route = Route.Player
+                    route == Route.Browse && (browseSession.playlist != null || browseSession.cloud) -> browseSession.closeDetail()
+                    route == Route.Browse && browseSession.searchOpen -> { browseSession.closeSearch(); browseModel.editQuery("") }
+                    else -> goBack()
                 }
             }
         }
     }
 }
 
-private enum class Route { Player, Distill, Settings, Taste, Login }
+private enum class Route { Browse, Player, Settings, AiSettings, Taste, Login }
 
 /**
  * Skip-Correction —— 用户连跳 3 首 / 15 分钟内 → 主动换队列。
@@ -454,13 +529,11 @@ private fun SkipCorrectionEffect(
             ledger = AgentLedgerStore(context),
         )
     }
-    val appInForeground by AppForeground.isForeground.collectAsState()
     val queueSignature = remember(playerState.queue) { skipCorrectionQueueSignature(playerState.queue) }
     var lastTriggerTs by remember { mutableStateOf(0L) }
     var queueStartedAtMs by remember { mutableStateOf(System.currentTimeMillis()) }
     val latestSettings by rememberUpdatedState(settings)
     val latestPlayerState by rememberUpdatedState(playerState)
-    val latestAppInForeground by rememberUpdatedState(appInForeground)
     val latestQueueStartedAtMs by rememberUpdatedState(queueStartedAtMs)
 
     LaunchedEffect(queueSignature) {
@@ -470,28 +543,22 @@ private fun SkipCorrectionEffect(
     LaunchedEffect(route, immersive, isLandscape) {
         while (route == Route.Player && !immersive && !isLandscape) {
             delay(20_000)
+            if (!AppForeground.isForeground.value) continue
             val activeQueueStartedAtMs = latestQueueStartedAtMs
-            val events = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
-            val skipped = events
-                .filter { it.type == BehaviorType.Skipped && it.tsMs >= activeQueueStartedAtMs }
-                .sortedBy { it.tsMs }
-                .takeLast(3)
+            val skipped = withContext(Dispatchers.IO) {
+                runCatching { PipoGraph.behaviorLog.readAll() }
+                    .getOrDefault(emptyList())
+                    .filter { it.type == BehaviorType.Skipped && it.tsMs >= activeQueueStartedAtMs }
+                    .sortedBy { it.tsMs }
+                    .takeLast(3)
+            }
+            if (!AppForeground.isForeground.value) continue
+            if (activeQueueStartedAtMs != latestQueueStartedAtMs) continue
             if (skipped.size < 3) continue
             val newest = skipped.last()
             val oldest = skipped.first()
             // 15 分钟窗口内连跳 3 首
             if (newest.tsMs - oldest.tsMs > SKIP_CORRECTION_WINDOW_MS) continue
-            if (!latestAppInForeground) {
-                DiagnosticsLogStore.record(
-                    area = "skip_correction",
-                    event = "suppressed",
-                    fields = mapOf(
-                        "reason" to "background",
-                        "skipCount" to skipped.size,
-                    ),
-                )
-                continue
-            }
             if (System.currentTimeMillis() - activeQueueStartedAtMs < SKIP_CORRECTION_FRESH_QUEUE_GRACE_MS) {
                 DiagnosticsLogStore.record(
                     area = "skip_correction",
@@ -537,6 +604,7 @@ private fun SkipCorrectionEffect(
                         primaryGoal: MusicGoal,
                         target: TrackRequirement?,
                         similar: Boolean,
+                        preserveCurrent: Boolean,
                     ): ActionExecutionResult {
                         if (tracks.isEmpty()) {
                             return ActionExecutionResult(actionId, "play_queue", success = false, message = "这次没排出能播的歌。")
@@ -551,6 +619,7 @@ private fun SkipCorrectionEffect(
                             },
                             tracks = tracks,
                             continuous = continuous,
+                            preserveCurrent = preserveCurrent,
                             desiredCount = tracks.size,
                         )
                         return when (val commit = onApplyAgentQueueRequest(request)) {

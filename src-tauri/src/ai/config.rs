@@ -291,9 +291,9 @@ struct LegacyConfig {
     model: Option<String>,
 }
 
-/// V4 上线后 deepseek-chat / deepseek-reasoner 在 API 端是 v4-flash 的兼容别名，
-/// 但前端 dropdown 里已经看不到了，会显示成"（自定义）"。统一推到 v4-flash，
-/// 让设置页里看着干净；这俩别名 V4 API 仍然接受，所以即使没被本地迁移，测试也不会挂。
+/// deepseek-chat / deepseek-reasoner 已于 2026-07-24 从官方 API 退役。
+/// 旧配置加载时统一迁移到稳定调用名 deepseek-v4-flash，该调用名会自动跟随
+/// DeepSeek 官方发布的最新 Flash 版本。
 fn migrate_legacy_models(cfg: &mut AiConfig) {
     if matches!(
         cfg.deepseek.model.as_str(),

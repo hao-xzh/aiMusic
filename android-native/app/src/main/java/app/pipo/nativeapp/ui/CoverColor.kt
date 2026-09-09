@@ -15,8 +15,16 @@ import androidx.core.graphics.scale
 import coil.Coil
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
@@ -41,6 +49,10 @@ data class EdgeColors(
     // 全图稳定底色：用于沉浸页背景/封面融合。它偏向大面积、低噪声颜色，
     // 避免黑字、贴纸、局部高饱和块把背景揉脏。
     val ambient: IntArray? = null,
+    // 横屏溶解区域按高度分区，避免整条右边缘的一个暗色簇覆盖上、下不同底色。
+    val rightUpper: IntArray? = null,
+    val rightMiddle: IntArray? = null,
+    val rightLower: IntArray? = null,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -48,7 +60,16 @@ data class EdgeColors(
 
 enum class Tone { Light, Dark }
 
-private val coverEdgeColorsCache = ConcurrentHashMap<String, EdgeColors>()
+private const val COVER_EDGE_COLORS_CACHE_SIZE = 128
+private const val COVER_EDGE_COLORS_TIMEOUT_MS = 10_000L
+private val coverEdgeColorsCache = Collections.synchronizedMap(
+    object : LinkedHashMap<String, EdgeColors>(COVER_EDGE_COLORS_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, EdgeColors>?): Boolean =
+            size > COVER_EDGE_COLORS_CACHE_SIZE
+    },
+)
+private val coverEdgeColorsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+private val coverEdgeColorsInFlight = ConcurrentHashMap<String, Deferred<EdgeColors?>>()
 
 @Composable
 fun useCoverEdgeColors(url: String?): EdgeColors {
@@ -70,42 +91,65 @@ fun useCoverEdgeColors(url: String?): EdgeColors {
             colors = cached
             return@LaunchedEffect
         }
-        val bitmap = withContext(Dispatchers.IO) {
-            runCatching {
-                // 之前每次切歌都 ImageLoader.Builder(context).build() 新建一个 loader,
-                // Coil ImageLoader 内部带线程池 + 内存/磁盘缓存,是重对象。频繁切歌时
-                // 旧 loader 持有 native bitmap 不释放 → 长时间听歌内存稳定上涨。
-                // 用 Coil 的全局单例 —— ImageLoader 全 app 共享一份,缓存命中率也更高。
-                val loader = Coil.imageLoader(context)
-                val request = ImageRequest.Builder(context)
-                    .data(url)
-                    .allowHardware(false)
-                    .build()
-                val res = loader.execute(request)
-                (res as? SuccessResult)?.drawable?.let { drawable ->
-                    (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
-                        ?: drawable.toBitmap(
-                            width = drawable.intrinsicWidth.coerceAtLeast(64),
-                            height = drawable.intrinsicHeight.coerceAtLeast(64),
-                            config = Config.ARGB_8888,
-                        )
-                }
-            }.getOrNull()
-        }
-        if (bitmap == null) {
+        val sampled = loadCoverEdgeColors(context, url)
+        if (sampled == null) {
             // 新封面获取失败时不能整首沿用上一首的颜色；回到中性 palette 也通过
             // backdrop 的 1100ms 色彩动画过渡，不会出现一帧硬闪。
             colors = EdgeColors(null, null, null)
             return@LaunchedEffect
         }
-
-        val sampled = withContext(Dispatchers.Default) {
-            sampleEdges(bitmap)
-        }
-        coverEdgeColorsCache[url] = sampled
         colors = sampled
     }
     return colors
+}
+
+private suspend fun loadCoverEdgeColors(context: android.content.Context, url: String): EdgeColors? {
+    coverEdgeColorsCache[url]?.let { return it }
+    val deferred = coverEdgeColorsInFlight.computeIfAbsent(url) {
+        // 外层 cache miss 后前一个任务可能刚好已经完成；这里再查一次，
+        // 避免在 map 插入竞态下为同一 URL 重复加载和采样。
+        coverEdgeColorsCache[url]?.let { return@computeIfAbsent CompletableDeferred<EdgeColors?>(it) }
+        val appContext = context.applicationContext
+        coverEdgeColorsScope.async {
+            try {
+                withTimeoutOrNull(COVER_EDGE_COLORS_TIMEOUT_MS) {
+                    val bitmap = try {
+                        // Coil 全局单例共享线程池与内存/磁盘缓存；相同 URL 的采样任务也只保留一份。
+                        val loader = Coil.imageLoader(appContext)
+                        val request = ImageRequest.Builder(appContext)
+                            .data(url)
+                            .allowHardware(false)
+                            .build()
+                        val res = loader.execute(request)
+                        (res as? SuccessResult)?.drawable?.let { drawable ->
+                            (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                                ?: drawable.toBitmap(
+                                    width = drawable.intrinsicWidth.coerceAtLeast(64),
+                                    height = drawable.intrinsicHeight.coerceAtLeast(64),
+                                    config = Config.ARGB_8888,
+                                )
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        null
+                    } ?: return@withTimeoutOrNull null
+
+                    withContext(Dispatchers.Default) { sampleEdges(bitmap) }
+                }?.also { sampled ->
+                    coverEdgeColorsCache[url] = sampled
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+    // 即使任务在 computeIfAbsent 返回前完成，回调注册也会立即移除刚写入的同一实例。
+    // 已完成（含失败）的任务不留在 in-flight 表；成功结果由有界 LRU 保留。
+    deferred.invokeOnCompletion { coverEdgeColorsInFlight.remove(url, deferred) }
+    return deferred.await()
 }
 
 private fun sampleEdges(bitmap: Bitmap): EdgeColors {
@@ -220,8 +264,16 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
     )
     val accent = extractVibrant(pixels)
     val ambient = dominant(0, h)
+    val dissolveStart = (w * 0.56f).roundToInt()
+    val rightUpper = dominant(0, (h * 0.40f).roundToInt(), dissolveStart, w, EdgeSide.Right)
+    val rightMiddle = dominant((h * 0.30f).roundToInt(), (h * 0.70f).roundToInt(), dissolveStart, w, EdgeSide.Right)
+    val rightLower = dominant((h * 0.60f).roundToInt(), h, dissolveStart, w, EdgeSide.Right)
     if (small !== bitmap) small.recycle()
-    return EdgeColors(top, bottom, right, left, lower, seam, accent, ambient)
+    return EdgeColors(
+        top = top, bottom = bottom, right = right, left = left,
+        lower = lower, seam = seam, accent = accent, ambient = ambient,
+        rightUpper = rightUpper, rightMiddle = rightMiddle, rightLower = rightLower,
+    )
 }
 
 private enum class EdgeSide { Top, Bottom, Left, Right, Lower, Seam }
@@ -337,8 +389,7 @@ fun appleMusicLandscapeSurfaceColor(edges: EdgeColors, fallback: Color = PipoCol
 }
 
 fun appleMusicLandscapeCoverColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
-    val base = blendRgb(edges.right ?: edges.ambient ?: edges.top, edges.ambient, 0.10f)
-    return normalizeAppleMusicLandscapeSurface(base, fallback)
+    return rgbToColor(edges.right ?: edges.ambient ?: edges.top, fallback)
 }
 
 fun toneForColor(color: Color): Tone {
@@ -414,18 +465,17 @@ private fun normalizeAppleMusicLandscapeSurface(rgb: IntArray?, fallback: Color)
     val luma = rgbLumaValue(rgb)
     when {
         luma > 180f -> {
-            hsv[1] = (hsv[1] * 0.92f).coerceIn(0.04f, 0.36f)
+            hsv[1] = (hsv[1] * 0.92f).coerceIn(0f, 0.36f)
             hsv[2] = hsv[2].coerceIn(0.82f, 0.97f)
         }
         luma > 120f -> {
-            hsv[1] = (hsv[1] * 0.98f).coerceIn(0.08f, 0.50f)
+            hsv[1] = (hsv[1] * 0.98f).coerceIn(0f, 0.50f)
             hsv[2] = hsv[2].coerceIn(0.56f, 0.84f)
         }
         else -> {
-            // 横屏右侧本来就是大面积背景，不应为了文字对比再压黑。
-            // 保留封面右侧颜色的明度，只把过暗值抬到可见的深色区。
-            hsv[1] = (hsv[1] * 0.96f).coerceIn(0.14f, 0.74f)
-            hsv[2] = hsv[2].coerceIn(0.20f, 0.48f)
+            // 保留深色边缘的明度和灰度，避免黑白封面被抬成带色的灰底。
+            hsv[1] = (hsv[1] * 0.96f).coerceIn(0f, 0.74f)
+            hsv[2] = hsv[2].coerceIn(0.04f, 0.48f)
         }
     }
     return Color(android.graphics.Color.HSVToColor(hsv))

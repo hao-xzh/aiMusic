@@ -67,7 +67,7 @@ class RecommendationFeedbackLog(context: Context) {
 
     /** Manual removal is a durable, context-independent dislike. */
     @Synchronized
-    fun reject(track: NativeTrack) {
+    fun reject(track: NativeTrack, sourceText: String = "manual_queue_remove") {
         val now = System.currentTimeMillis() / 1000
         val event = Event(
             contextKey = GLOBAL_CONTEXT,
@@ -75,7 +75,7 @@ class RecommendationFeedbackLog(context: Context) {
             trackRef = TrackDedupe.idKey(track) ?: track.id,
             songKey = TrackDedupe.songKey(track),
             tsSec = now,
-            sourceText = "manual_queue_remove",
+            sourceText = sourceText,
         )
         val buf = ensureBuffer()
             .filterNot { it.contextKey == GLOBAL_CONTEXT &&
@@ -84,6 +84,14 @@ class RecommendationFeedbackLog(context: Context) {
             .toMutableList()
         buf.add(event)
         buffer = trimFresh(buf, now)
+        flush()
+    }
+
+    @Synchronized
+    fun restoreHomeDismissal(track: NativeTrack) {
+        val songKey = TrackDedupe.songKey(track)
+        buffer = ensureBuffer().filterNot { it.contextKey == GLOBAL_CONTEXT &&
+            it.sourceText == "home_not_interested" && it.songKey == songKey }.toMutableList()
         flush()
     }
 

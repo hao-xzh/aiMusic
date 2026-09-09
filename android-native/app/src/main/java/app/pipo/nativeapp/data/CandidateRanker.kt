@@ -20,6 +20,7 @@ object CandidateRanker {
         val recentPlay: BehaviorLog.RecentPlay? = null,
         val recentRecommendation: RecommendationLog.RecentContext? = null,
         val behaviorPreference: BehaviorPreferenceSnapshot = BehaviorPreferenceSnapshot.Empty,
+        val userTaste: UserTasteSnapshot? = null,
     )
 
     // 权重 v2(2026-05) —— 跟 Web 端 candidate-ranker.ts 对齐。
@@ -44,7 +45,14 @@ object CandidateRanker {
             .map(::normalizeArtistKey)
             .filter { it.isNotBlank() }
         val ranked = ArrayList<Ranked>()
-        val rnd = java.util.Random()
+        val requestedDimensions = buildSet {
+            if (intent.hardArtists.isNotEmpty() || intent.textArtists.isNotEmpty()) add("artist")
+            if (intent.hardGenres.isNotEmpty() || intent.musicHintsGenres.isNotEmpty() || intent.aiMainStyles.isNotEmpty()) add("genre")
+            if (intent.hardLanguages.isNotEmpty()) add("language")
+            if (intent.hardVocalTypes.isNotEmpty()) add("vocal")
+            // Category is governed by this request's result guard, never by profile overrides.
+            add("category")
+        }
 
         for (c in candidates) {
             if (avoidKeys.isNotEmpty() && hitsAvoid(c, avoidKeys)) continue
@@ -95,12 +103,13 @@ object CandidateRanker {
             )
 
             val w = rankWeights(intent)
-            // 扰动 0.025 → 0.08(跟 Web 对齐),配合 bucket 洗牌共破"同 query 总同结果"
+            val explicitTaste = if (explicitlyMentioned) 0.0 else
+                options.userTaste?.explicitScore(c.track, c.semanticProfile, requestedDimensions) ?: 0.0
+            // Preferences are secondary within the current request, with no random promotion.
             val baseScore = intentScore * W_INTENT +
                 tagScore * w.tag + semanticScore * w.semantic +
                 tasteScore * w.taste + behaviorAffinityScore * w.behavior +
-                transitionScore * W_TRANSITION + freshnessScore * W_FRESHNESS +
-                rnd.nextDouble() * 0.08
+                transitionScore * W_TRANSITION + freshnessScore * W_FRESHNESS + explicitTaste * 0.10
 
             val recentPlayPenalty = if (explicitlyMentioned) 0.0
                 else recentPenalty(neteaseId, options.recentPlay?.last24hTrackIds, options.recentPlay?.last7dTrackIds, 0.5, 0.25)
@@ -126,19 +135,13 @@ object CandidateRanker {
             ranked.add(Ranked(c, finalScore))
         }
 
-        ranked.sortByDescending { it.finalScore }
+        ranked.sortWith(compareByDescending<Ranked> { it.finalScore }.thenBy { TrackDedupe.songKey(it.candidate.track) })
         val asksVersion = TrackDedupe.queryAsksForSpecificVersion(
             intent.musicHintsGenres + intent.musicHintsMoods + intent.textTracks + intent.textArtists + intent.textAlbums
         )
         val deduped = if (asksVersion) ranked else dedupeByCandidate(ranked)
 
-        // 分位 bucket 洗牌(同 query 重复触发时让顺序在每段内变化,跨段保持优先级)
-        val withBuckets = if (!asksVersion && deduped.size > 8) {
-            shuffleByBuckets(deduped)
-        } else {
-            // 至少打 bucket 标签
-            deduped.mapIndexed { idx, r -> r.copy(bucket = pickBucket(idx, deduped.size)) }
-        }
+        val withBuckets = deduped.mapIndexed { idx, r -> r.copy(bucket = pickBucket(idx, deduped.size)) }
         return withBuckets.take(options.topN)
     }
 
@@ -150,16 +153,6 @@ object CandidateRanker {
             ratio < 0.75 -> 2
             else -> 3
         }
-    }
-
-    private fun shuffleByBuckets(items: List<Ranked>): List<Ranked> {
-        val withBucket = items.mapIndexed { idx, r -> r.copy(bucket = pickBucket(idx, items.size)) }
-        val groups = Array(4) { ArrayList<Ranked>() }
-        for (r in withBucket) groups[r.bucket].add(r)
-        for (g in groups) g.shuffle()
-        val out = ArrayList<Ranked>(items.size)
-        for (g in groups) out.addAll(g)
-        return out
     }
 
     /**

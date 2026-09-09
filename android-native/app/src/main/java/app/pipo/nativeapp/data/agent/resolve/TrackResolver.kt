@@ -14,13 +14,25 @@ class TrackResolver(
         allowOnline: Boolean = true,
     ): ResolvedTrack {
         val local = resolveLocal(requirement, library)
-        if (local != null) {
+        val localPick = pickMatchingVersion(local, requirement)
+        if (localPick != null) {
+            val track = localPick
             return ResolvedTrack(
                 requirement = requirement,
-                track = local,
-                candidates = listOf(local),
+                track = track,
+                candidates = local,
                 confidence = if (requirement.artist.isNullOrBlank()) 0.9 else 0.98,
                 source = ResolveSource.Local,
+            )
+        }
+        if (local.size > 1) {
+            return ResolvedTrack(
+                requirement = requirement,
+                track = null,
+                candidates = local,
+                confidence = 0.0,
+                source = ResolveSource.None,
+                error = ResolveError.Ambiguous,
             )
         }
         if (!allowOnline) {
@@ -34,55 +46,54 @@ class TrackResolver(
             )
         }
         val query = listOfNotNull(requirement.artist, requirement.title).joinToString(" ")
-        val online = runCatching { repository.searchTracks(query, limit = 8) }.getOrDefault(emptyList())
-        val picked = online
-            .filter { requirement.artist.isNullOrBlank() || artistMatches(it.artist, requirement.artist) }
-            .minByOrNull { variantWeight(it.title) }
-            ?: online.minByOrNull { variantWeight(it.title) }
+        val online = repository.searchTracks(query, limit = 8)
+        val matches = online.filter { requirementMatches(it, requirement) }
+        val distinctMatches = matches.distinctBy { it.id }
+        val picked = pickMatchingVersion(distinctMatches, requirement)
         return ResolvedTrack(
             requirement = requirement,
             track = picked,
-            candidates = online,
+            candidates = matches,
             confidence = if (picked == null) 0.0 else if (requirement.artist.isNullOrBlank()) 0.72 else 0.82,
             source = if (picked == null) ResolveSource.None else ResolveSource.Online,
-            error = if (picked == null) ResolveError.NotFound else null,
+            error = when {
+                distinctMatches.isEmpty() -> ResolveError.NotFound
+                picked == null -> ResolveError.Ambiguous
+                else -> null
+            },
         )
     }
 
-    private fun resolveLocal(requirement: TrackRequirement, library: List<NativeTrack>): NativeTrack? {
+    private fun resolveLocal(requirement: TrackRequirement, library: List<NativeTrack>): List<NativeTrack> {
         val titleKey = CommandTextSignals.normalizeForMatch(requirement.title)
-        if (titleKey.isBlank()) return null
-        val exact = library.filter {
-            CommandTextSignals.normalizeForMatch(it.title) == titleKey &&
-                (requirement.artist.isNullOrBlank() || artistMatches(it.artist, requirement.artist))
+        if (titleKey.isBlank()) return emptyList()
+        return library.filter { requirementMatches(it, requirement) }.distinctBy { it.id }
+    }
+
+    private fun requirementMatches(track: NativeTrack, requirement: TrackRequirement): Boolean =
+        CommandTextSignals.trackTitleMatches(track.title, requirement.title) &&
+            (requirement.artist.isNullOrBlank() || artistMatches(track.artist, requirement.artist))
+
+    private fun pickMatchingVersion(matches: List<NativeTrack>, requirement: TrackRequirement): NativeTrack? {
+        if (matches.size <= 1) return matches.singleOrNull()
+        val exact = matches.filter {
+            CommandTextSignals.normalizeForMatch(it.title) == CommandTextSignals.normalizeForMatch(requirement.title)
         }
-        if (exact.isNotEmpty()) return exact.minByOrNull { variantWeight(it.title) }
-        val partial = library.filter {
-            val key = CommandTextSignals.normalizeForMatch(it.title)
-            key.isNotBlank() && (titleKey in key || key in titleKey) &&
-                (requirement.artist.isNullOrBlank() || artistMatches(it.artist, requirement.artist))
+        val preferred = exact.ifEmpty { matches }
+        if (preferred.size == 1) return preferred.single()
+        // Do not resolve a genuinely ambiguous performer by arbitrary search order.
+        return preferred.firstOrNull().takeIf {
+            !requirement.artist.isNullOrBlank() || preferred.map { CommandTextSignals.normalizeForMatch(it.artist) }.distinct().size == 1
         }
-        return partial.minByOrNull { variantWeight(it.title) }
     }
 
     private fun artistMatches(leftRaw: String, rightRaw: String?): Boolean {
         if (rightRaw.isNullOrBlank()) return true
-        val left = CommandTextSignals.normalizeForMatch(leftRaw)
         val right = CommandTextSignals.normalizeForMatch(rightRaw)
-        return right.isNotBlank() && (left == right || left.contains(right) || right.contains(left))
+        return right.isNotBlank() && leftRaw.split("/", "&", ",", "、")
+            .any { CommandTextSignals.normalizeForMatch(it) == right }
     }
 
-    private fun variantWeight(title: String): Int {
-        val lower = title.lowercase()
-        var weight = title.length
-        if ("live" in lower || "现场" in lower || "演唱会" in lower) weight += 1000
-        if ("伴奏" in lower || "instrumental" in lower || "karaoke" in lower) weight += 1000
-        if ("cover" in lower || "翻唱" in lower) weight += 800
-        if ("remix" in lower || "混音" in lower) weight += 700
-        if ("acoustic" in lower || "unplugged" in lower) weight += 600
-        if ("demo" in lower) weight += 500
-        return weight
-    }
 }
 
 data class ResolvedTrack(
@@ -96,4 +107,4 @@ data class ResolvedTrack(
 
 enum class ResolveSource { Local, Online, None }
 
-enum class ResolveError { NotFound }
+enum class ResolveError { NotFound, Ambiguous }

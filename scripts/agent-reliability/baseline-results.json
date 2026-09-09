@@ -1,0 +1,2125 @@
+[
+  {
+    "input": "播放晴天",
+    "actual": "PlayNow",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "PlayNow",
+    "realPlayerTested": false,
+    "id": "mode_plain",
+    "passed": true
+  },
+  {
+    "input": "下一首放晴天",
+    "actual": "InsertNext",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "InsertNext",
+    "realPlayerTested": false,
+    "id": "mode_next",
+    "passed": true
+  },
+  {
+    "input": "先播放晴天，然后下一首放稻香",
+    "actual": "InsertNext",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "PlayNow",
+    "realPlayerTested": false,
+    "id": "mode_now_then_next",
+    "passed": false
+  },
+  {
+    "input": "替换队列为周杰伦的歌，再插播红豆",
+    "actual": "PlayNow",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "InsertNext",
+    "realPlayerTested": false,
+    "id": "mode_replace_then_insert",
+    "passed": false
+  },
+  {
+    "input": "Play 晴天 next, keep this song playing",
+    "actual": "PlayNow",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "InsertNext",
+    "realPlayerTested": false,
+    "id": "mode_english_next",
+    "passed": false
+  },
+  {
+    "input": "播放晴天，不要跳到下一首",
+    "actual": "InsertNext",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "PlayNow",
+    "realPlayerTested": false,
+    "id": "mode_no_skip",
+    "passed": false
+  },
+  {
+    "input": "这首听完再放晴天",
+    "actual": "InsertNext",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "InsertNext",
+    "realPlayerTested": false,
+    "id": "mode_after_current",
+    "passed": true
+  },
+  {
+    "input": "周杰伦和风格接近的歌手混着放",
+    "actual": "Similar",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "similar",
+    "realPlayerTested": false,
+    "id": "scope_similar",
+    "passed": true
+  },
+  {
+    "input": "周杰伦为主，掺一点其他人的歌",
+    "actual": "Focus",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "focus",
+    "realPlayerTested": false,
+    "id": "scope_focus",
+    "passed": true
+  },
+  {
+    "input": "只放周杰伦",
+    "actual": "Strict",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "strict",
+    "realPlayerTested": false,
+    "id": "scope_strict",
+    "passed": true
+  },
+  {
+    "input": "我要听周杰伦和陈奕迅的歌",
+    "actual": [
+      "周杰伦",
+      "陈奕迅"
+    ],
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "retain both artists",
+    "realPlayerTested": false,
+    "id": "two_artist_slots",
+    "passed": true
+  },
+  {
+    "input": "再加点王菲进去，原来的也保留",
+    "actual": [
+      "周杰伦",
+      "陈奕迅",
+      "王菲"
+    ],
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "retain all three if model supplies union",
+    "realPlayerTested": false,
+    "id": "followup_explicit_union",
+    "passed": true
+  },
+  {
+    "input": "先放周杰伦和陈奕迅的歌，中途加王菲的《红豆》",
+    "actual": "ArtistFocus",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "first action remains artist_focus",
+    "realPlayerTested": false,
+    "id": "mixed_sentence_intent",
+    "passed": true
+  },
+  {
+    "input": "改成夜间开车的R&B，女声，别说唱",
+    "actual": "MusicStyleProfile(semanticQuery=夜间开车的R&B, energy=any, moods=[relaxed], scenes=[driving], genres=[rnb], textures=[], qualityWords=[], languages=[zh, en], vocalTypes=[female], refStyles=[], avoidTags=[rap], transitionStyle=soft, exploration=balanced)",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "retain style, scene and exclusions",
+    "realPlayerTested": false,
+    "id": "style_slots",
+    "passed": true
+  },
+  {
+    "input": "来10首不要电音的摇滚",
+    "actual": "genres=[rock, electronic]; avoid=[electronic]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "electronic excluded from positive genres",
+    "realPlayerTested": false,
+    "id": "negated_style",
+    "passed": false
+  },
+  {
+    "input": "来几首夜晚开车听的安静歌曲",
+    "actual": "energy=low; scenes=[night, sleep, focus, driving, commute]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "scene signals exist",
+    "realPlayerTested": false,
+    "id": "scene_signals",
+    "passed": true
+  },
+  {
+    "input": "播放周杰伦的晴天",
+    "actual": "晴天",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "correct local match",
+    "realPlayerTested": false,
+    "id": "exact_local_track",
+    "passed": true
+  },
+  {
+    "input": "播放不存在的歌手的晴天",
+    "actual": "周杰伦-晴天",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "no substitution with another artist",
+    "realPlayerTested": false,
+    "id": "online_wrong_artist",
+    "passed": false
+  },
+  {
+    "input": "播放周杰伦的不存在的歌曲",
+    "actual": "周杰伦-晴天",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "no substitution with another title",
+    "realPlayerTested": false,
+    "id": "online_wrong_title",
+    "passed": false
+  },
+  {
+    "input": "周杰伦和陈奕迅都要有",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "accept when both present",
+    "realPlayerTested": false,
+    "id": "two_artist_both_present",
+    "passed": true
+  },
+  {
+    "input": "周杰伦和陈奕迅都要有",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "reject missing 陈奕迅",
+    "realPlayerTested": false,
+    "id": "two_artist_one_missing",
+    "passed": false
+  },
+  {
+    "input": "再加点王菲进去，原来的也保留",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "reject missing 王菲",
+    "realPlayerTested": false,
+    "id": "added_artist_missing",
+    "passed": false
+  },
+  {
+    "input": "只放周杰伦",
+    "actual": "passed=false; messages=[strict_artist_scope_violated:十年-陈奕迅]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "reject wrong artist",
+    "realPlayerTested": false,
+    "id": "strict_artist_violation",
+    "passed": true
+  },
+  {
+    "input": "下一首开始只放周杰伦",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "insert must retain artist scope",
+    "realPlayerTested": false,
+    "id": "insert_artist_violation",
+    "passed": false
+  },
+  {
+    "input": "必须包含王菲的红豆",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "reject wrong singer for must include",
+    "realPlayerTested": false,
+    "id": "wrong_version_required",
+    "passed": false
+  },
+  {
+    "input": "最后一首一定是晴天",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "closer must be last",
+    "realPlayerTested": false,
+    "id": "closer_not_last",
+    "passed": false
+  },
+  {
+    "input": "必须有红豆",
+    "actual": "passed=false; messages=[must_include_missed]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "reject missing required track",
+    "realPlayerTested": false,
+    "id": "missing_required_track",
+    "passed": true
+  },
+  {
+    "input": "换成全英文歌",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "reject all-Chinese queue against required language",
+    "realPlayerTested": false,
+    "id": "english_only_wrong_queue",
+    "passed": false
+  },
+  {
+    "input": "换成爵士，不要流行歌",
+    "actual": "passed=true; messages=[]",
+    "realModelTested": false,
+    "kind": "local_semantics_or_queue_validation",
+    "expected": "require evidence for hard genre or reject unverified tracks",
+    "realPlayerTested": false,
+    "id": "genre_not_validated",
+    "passed": false
+  },
+  {
+    "input": "收藏这首",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "好，《晴天》收藏好了。",
+      "actions": [{
+        "currentBefore": "晴天",
+        "method": "likeCurrent",
+        "tracks": []
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "97968ba1-7957-4295-a280-0a2be4efd463",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59995,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "97968ba1-7957-4295-a280-0a2be4efd463",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 2
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "97968ba1-7957-4295-a280-0a2be4efd463",
+          "trace": "6ms:commit_simple:like:true|7ms:turn_complete_declared:like_current",
+          "success": true,
+          "resultTypes": "like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "exactly one like action",
+    "realPlayerTested": false,
+    "id": "simple_like",
+    "passed": true
+  },
+  {
+    "input": "收藏这首",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "ok": false,
+        "error": "arguments_json_malformed",
+        "message": "这次的 arguments 不是完整 JSON（可能被截断）。请精简参数后重新调用 like_current：列表类参数只留必要项，长文案缩短。",
+        "tool": "like_current"
+      }],
+      "reply": "参数错误，未执行。",
+      "actions": [],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "e186814f-5ab3-4006-85d7-7084b4be90af",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "e186814f-5ab3-4006-85d7-7084b4be90af",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "e186814f-5ab3-4006-85d7-7084b4be90af",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "final_response",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "e186814f-5ab3-4006-85d7-7084b4be90af",
+          "trace": "1ms:tool_args_malformed:like_current|1ms:commit_simple:say:true",
+          "success": true,
+          "resultTypes": "say",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current,final_response"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "malformed arguments cannot execute",
+    "realPlayerTested": false,
+    "id": "malformed_string",
+    "passed": true
+  },
+  {
+    "input": "不要收藏这首",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "trackCount": 0,
+        "warnings": [],
+        "acceptedByPlayer": true,
+        "actuallyStarted": false,
+        "ok": true,
+        "type": "like",
+        "message": "动作完成",
+        "error": null,
+        "playlistName": null
+      }],
+      "reply": "好，《晴天》收藏好了。",
+      "actions": [{
+        "currentBefore": "晴天",
+        "method": "likeCurrent",
+        "tracks": []
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "65c8bef4-dcd6-4d39-acc0-cc271525ebf3",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "65c8bef4-dcd6-4d39-acc0-cc271525ebf3",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "65c8bef4-dcd6-4d39-acc0-cc271525ebf3",
+          "stage": "tools",
+          "success": false,
+          "remainingMs": 59998,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 1,
+          "providerError": "IllegalStateException:401:auth"
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "65c8bef4-dcd6-4d39-acc0-cc271525ebf3",
+          "reason": "aiChatTools_failed",
+          "committed": 1,
+          "event": "tool_loop_salvaged",
+          "toolCalls": "like_current"
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "65c8bef4-dcd6-4d39-acc0-cc271525ebf3",
+          "trace": "1ms:commit_simple:like:true|2ms:aiChatTools_attempt1_failed:IllegalStateException:401:auth",
+          "success": true,
+          "resultTypes": "like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "non-object arguments cannot execute",
+    "realPlayerTested": false,
+    "id": "malformed_array",
+    "passed": false
+  },
+  {
+    "input": "不要收藏这首",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "trackCount": 0,
+        "warnings": [],
+        "acceptedByPlayer": true,
+        "actuallyStarted": false,
+        "ok": true,
+        "type": "like",
+        "message": "动作完成",
+        "error": null,
+        "playlistName": null
+      }],
+      "reply": "好，《晴天》收藏好了。",
+      "actions": [{
+        "currentBefore": "晴天",
+        "method": "likeCurrent",
+        "tracks": []
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "c9ea7047-ad93-4d32-abee-28856e00a363",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "c9ea7047-ad93-4d32-abee-28856e00a363",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "c9ea7047-ad93-4d32-abee-28856e00a363",
+          "stage": "tools",
+          "success": false,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0,
+          "providerError": "IllegalStateException:401:auth"
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "c9ea7047-ad93-4d32-abee-28856e00a363",
+          "reason": "aiChatTools_failed",
+          "committed": 1,
+          "event": "tool_loop_salvaged",
+          "toolCalls": "like_current"
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "c9ea7047-ad93-4d32-abee-28856e00a363",
+          "trace": "0ms:commit_simple:like:true|1ms:aiChatTools_attempt1_failed:IllegalStateException:401:auth",
+          "success": true,
+          "resultTypes": "like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "null arguments cannot execute",
+    "realPlayerTested": false,
+    "id": "malformed_null",
+    "passed": false
+  },
+  {
+    "input": "播放晴天",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "播放成功，正在为你播放晴天。",
+      "actions": [],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "e097a8e9-c70d-4d44-bb87-a72d744673d9",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "e097a8e9-c70d-4d44-bb87-a72d744673d9",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "final_response",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "e097a8e9-c70d-4d44-bb87-a72d744673d9",
+          "trace": "0ms:commit_simple:say:true",
+          "success": true,
+          "resultTypes": "say",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "final_response"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "cannot report success without execution",
+    "realPlayerTested": false,
+    "id": "false_success",
+    "passed": false
+  },
+  {
+    "input": "能帮我排个周杰伦专场吗",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "ok": false,
+        "error": "unverified_success_claim",
+        "message": "你在 final_response 里说了已放/切了/收藏了/排好了，但本轮没有任何执行工具成功提交。要么先真正调用对应的播放 / 收藏 / 跳过 / 建歌单工具完成动作，要么改成\u2018还没执行 / 没找到\u2019的诚实说明再 final_response。"
+      }],
+      "error": "AgentTurnExecutionException",
+      "actions": [],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "ee487713-1f53-47f0-a2ca-20c1c9c7cc7b",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "ee487713-1f53-47f0-a2ca-20c1c9c7cc7b",
+          "success": false,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "final_response",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "ee487713-1f53-47f0-a2ca-20c1c9c7cc7b",
+          "stage": "tools",
+          "success": false,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0,
+          "providerError": "IllegalStateException:401:auth"
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "ee487713-1f53-47f0-a2ca-20c1c9c7cc7b",
+          "reason": "aiChatTools_failed",
+          "committed": 0,
+          "event": "tool_loop_salvage_failed",
+          "toolCalls": "final_response"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "honest explanation accepted",
+    "realPlayerTested": false,
+    "id": "honest_negation",
+    "passed": false
+  },
+  {
+    "input": "收藏这首，再跳过",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "这步没接上，我不硬说完成。 好，先从《晴天》-周杰伦来。",
+      "actions": [
+        {
+          "currentBefore": "晴天",
+          "method": "likeCurrent",
+          "tracks": []
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "skip",
+          "tracks": []
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "a4ad20f1-a631-42ab-af89-60dac0cdb7c4",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "a4ad20f1-a631-42ab-af89-60dac0cdb7c4",
+          "success": false,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "a4ad20f1-a631-42ab-af89-60dac0cdb7c4",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "skip_current",
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": false,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "这步没接上，我不硬说完成。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "skip",
+          "persona": "friendly",
+          "success": true,
+          "verified": false,
+          "event": "persona_reply",
+          "reply": "好，先从《晴天》-周杰伦来。",
+          "usedCopywriter": false
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "a4ad20f1-a631-42ab-af89-60dac0cdb7c4",
+          "trace": "0ms:commit_simple:like:false|1ms:commit_simple:skip:true|1ms:turn_complete_declared:skip_current",
+          "success": false,
+          "resultTypes": "like+skip",
+          "validationPassed": false,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current,skip_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "both actions attempted and failed like reported",
+    "realPlayerTested": false,
+    "id": "failure_then_success",
+    "passed": true
+  },
+  {
+    "input": "收藏这首",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "ok": false,
+        "error": "fixture cancelled",
+        "tool": "like_current"
+      }],
+      "reply": "无法执行。",
+      "actions": [],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "68f4960f-315d-4739-98ad-587aac2a7422",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "68f4960f-315d-4739-98ad-587aac2a7422",
+          "success": false,
+          "errorType": "CancellationException",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "68f4960f-315d-4739-98ad-587aac2a7422",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "68f4960f-315d-4739-98ad-587aac2a7422",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "final_response",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "68f4960f-315d-4739-98ad-587aac2a7422",
+          "trace": "1ms:commit_simple:say:true",
+          "success": true,
+          "resultTypes": "say",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current,final_response"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "CancellationException must propagate; no subsequent provider call",
+    "realPlayerTested": false,
+    "id": "cancel_propagation",
+    "passed": false
+  },
+  {
+    "input": "收藏这首，再播放红豆",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "trackCount": 0,
+        "warnings": [],
+        "acceptedByPlayer": true,
+        "actuallyStarted": false,
+        "ok": true,
+        "type": "like",
+        "message": "动作完成",
+        "error": null,
+        "playlistName": null
+      }],
+      "reply": "好，《晴天》收藏好了。",
+      "actions": [{
+        "currentBefore": "晴天",
+        "method": "likeCurrent",
+        "tracks": []
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "d3b172ba-1752-42f4-94d8-11f323d67215",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d3b172ba-1752-42f4-94d8-11f323d67215",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d3b172ba-1752-42f4-94d8-11f323d67215",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d3b172ba-1752-42f4-94d8-11f323d67215",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "final_response",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d3b172ba-1752-42f4-94d8-11f323d67215",
+          "trace": "0ms:commit_simple:like:true|0ms:final_response_after_action_ignored",
+          "success": true,
+          "resultTypes": "like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current,final_response"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "partial failure message retained",
+    "realPlayerTested": false,
+    "id": "partial_omission",
+    "passed": false
+  },
+  {
+    "input": "跳过这首",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "trackCount": 0,
+        "warnings": [],
+        "acceptedByPlayer": true,
+        "actuallyStarted": false,
+        "ok": true,
+        "type": "skip",
+        "message": "动作完成",
+        "error": null,
+        "playlistName": null
+      }],
+      "reply": "好，先从《晴天》-周杰伦来。 好，先从《晴天》-周杰伦来。",
+      "actions": [
+        {
+          "currentBefore": "晴天",
+          "method": "skip",
+          "tracks": []
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "skip",
+          "tracks": []
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "dec9e4c0-c174-4e82-821c-a063ec7ad982",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "dec9e4c0-c174-4e82-821c-a063ec7ad982",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "skip_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "dec9e4c0-c174-4e82-821c-a063ec7ad982",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "dec9e4c0-c174-4e82-821c-a063ec7ad982",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "skip_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "skip",
+          "persona": "friendly",
+          "success": true,
+          "verified": false,
+          "event": "persona_reply",
+          "reply": "好，先从《晴天》-周杰伦来。",
+          "usedCopywriter": false
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "skip",
+          "persona": "friendly",
+          "success": true,
+          "verified": false,
+          "event": "persona_reply",
+          "reply": "好，先从《晴天》-周杰伦来。",
+          "usedCopywriter": false
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "dec9e4c0-c174-4e82-821c-a063ec7ad982",
+          "trace": "0ms:commit_simple:skip:true|0ms:commit_simple:skip:true|0ms:turn_complete_declared:skip_current",
+          "success": true,
+          "resultTypes": "skip+skip",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "skip_current,skip_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "same request does not skip twice",
+    "realPlayerTested": false,
+    "id": "duplicate_skip",
+    "passed": false
+  },
+  {
+    "input": "现在播放稻香",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "好，队列接上，先从《稻香》-周杰伦来。",
+      "actions": [{
+        "mode": "PlayNow",
+        "currentBefore": "晴天",
+        "method": "playQueue",
+        "artists": [],
+        "tracks": ["稻香"]
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "782b7b39-ed07-439d-973c-7caf7fa47a80",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59997,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "782b7b39-ed07-439d-973c-7caf7fa47a80",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "782b7b39-ed07-439d-973c-7caf7fa47a80",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 2
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "play_queue",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，队列接上，先从《稻香》-周杰伦来。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "782b7b39-ed07-439d-973c-7caf7fa47a80",
+          "trace": "5ms:commit_queue:true:|5ms:turn_complete_declared:commit_queue",
+          "success": true,
+          "resultTypes": "play_queue",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "commit_queue"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "execute playQueue for 稻香",
+    "realPlayerTested": false,
+    "id": "direct_play",
+    "passed": true
+  },
+  {
+    "input": "这首别打断，下一首放稻香",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "下一首从《稻香》-周杰伦开始，共接4首，不打断现在这首。",
+      "actions": [{
+        "currentBefore": "晴天",
+        "method": "insertNext",
+        "tracks": ["稻香"],
+        "jump": false
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "b6f9e107-f694-489a-9e66-56c4d086bca9",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "b6f9e107-f694-489a-9e66-56c4d086bca9",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "b6f9e107-f694-489a-9e66-56c4d086bca9",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "insert_next",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "下一首从《稻香》-周杰伦开始，共接4首，不打断现在这首。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "b6f9e107-f694-489a-9e66-56c4d086bca9",
+          "trace": "0ms:commit_queue:true:|0ms:turn_complete_declared:commit_queue",
+          "success": true,
+          "resultTypes": "insert_next",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "commit_queue"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "insert without changing current",
+    "realPlayerTested": false,
+    "id": "direct_insert",
+    "passed": true
+  },
+  {
+    "input": "先播放稻香，然后下一首放夜曲",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "下一首从《稻香》-周杰伦开始，共接4首，不打断现在这首。 下一首从《夜曲》-周杰伦开始，共接5首，不打断现在这首。",
+      "actions": [
+        {
+          "currentBefore": "晴天",
+          "method": "insertNext",
+          "tracks": ["稻香"],
+          "jump": false
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "insertNext",
+          "tracks": ["夜曲"],
+          "jump": false
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "effective": "InsertNext",
+          "requested": "PlayNow",
+          "event": "operation_guard",
+          "selectionMode": "ExactTrack"
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "insert_next",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "下一首从《稻香》-周杰伦开始，共接4首，不打断现在这首。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "insert_next",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "下一首从《夜曲》-周杰伦开始，共接5首，不打断现在这首。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d44861e3-5930-4c24-a9e5-406396c4f24c",
+          "trace": "0ms:operation_guard:PlayNow->InsertNext:ExactTrack|0ms:commit_queue:true:|1ms:commit_queue:true:|1ms:turn_complete_declared:commit_queue",
+          "success": true,
+          "resultTypes": "insert_next+insert_next",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "commit_queue,commit_queue"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "playQueue 稻香 then insertNext 夜曲",
+    "realPlayerTested": false,
+    "id": "mixed_two_commits",
+    "passed": false
+  },
+  {
+    "input": "现在播放王菲的红豆",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "query": "王菲 红豆",
+        "ok": true,
+        "error": null,
+        "tracks": [{
+          "artist": "王菲",
+          "album": "测试专辑",
+          "title": "红豆",
+          "key": "t4"
+        }]
+      }],
+      "reply": "好，给你排一组王菲，先从《红豆》-王菲来。",
+      "actions": [{
+        "mode": "PlayNow",
+        "currentBefore": "晴天",
+        "method": "playQueue",
+        "artists": [],
+        "tracks": ["红豆"]
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "905a4a69-c7c6-4abb-a3ba-e7197b792f38",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "905a4a69-c7c6-4abb-a3ba-e7197b792f38",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "search_tracks",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "905a4a69-c7c6-4abb-a3ba-e7197b792f38",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "905a4a69-c7c6-4abb-a3ba-e7197b792f38",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "905a4a69-c7c6-4abb-a3ba-e7197b792f38",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "play_queue",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，给你排一组王菲，先从《红豆》-王菲来。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "905a4a69-c7c6-4abb-a3ba-e7197b792f38",
+          "trace": "1ms:search_tracks:王菲 红豆:1|1ms:commit_queue:true:|1ms:turn_complete_declared:commit_queue",
+          "success": true,
+          "resultTypes": "play_queue",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "search_tracks,commit_queue"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "real search observation binds returned key to 红豆",
+    "realPlayerTested": false,
+    "id": "search_then_play",
+    "passed": true
+  },
+  {
+    "input": "音量调到30%",
+    "actual": {
+      "providerCalls": 2,
+      "observations": [{
+        "ok": false,
+        "error": "unknown_tool:set_volume"
+      }],
+      "reply": "暂不支持调整音量。",
+      "actions": [],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "8300c8ed-46b6-41d4-8300-bf3e9bc836aa",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "8300c8ed-46b6-41d4-8300-bf3e9bc836aa",
+          "success": false,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "set_volume",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "8300c8ed-46b6-41d4-8300-bf3e9bc836aa",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "8300c8ed-46b6-41d4-8300-bf3e9bc836aa",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "final_response",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "8300c8ed-46b6-41d4-8300-bf3e9bc836aa",
+          "trace": "0ms:commit_simple:say:true",
+          "success": true,
+          "resultTypes": "say",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "set_volume,final_response"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "unknown tool must not execute",
+    "realPlayerTested": false,
+    "id": "unknown_tool",
+    "passed": true
+  },
+  {
+    "input": "收藏这首，加入通勤歌单，然后跳过",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "好，《晴天》收藏好了。 好，歌单 处理好了。 好，先从《晴天》-周杰伦来。",
+      "actions": [
+        {
+          "currentBefore": "晴天",
+          "method": "likeCurrent",
+          "tracks": []
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "modifyPlaylist",
+          "tracks": []
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "skip",
+          "tracks": []
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "55c9cad6-9166-47a6-a804-533e8c4b13f2",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59999,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "55c9cad6-9166-47a6-a804-533e8c4b13f2",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "55c9cad6-9166-47a6-a804-533e8c4b13f2",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "modify_playlist_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "55c9cad6-9166-47a6-a804-533e8c4b13f2",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "skip_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "playlist",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，歌单 处理好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "skip",
+          "persona": "friendly",
+          "success": true,
+          "verified": false,
+          "event": "persona_reply",
+          "reply": "好，先从《晴天》-周杰伦来。",
+          "usedCopywriter": false
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "55c9cad6-9166-47a6-a804-533e8c4b13f2",
+          "trace": "1ms:commit_simple:like:true|1ms:commit_simple:playlist:true|1ms:commit_simple:skip:true|1ms:turn_complete_declared:skip_current",
+          "success": true,
+          "resultTypes": "like+playlist+skip",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current,modify_playlist_current,skip_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "three side effects in requested order",
+    "realPlayerTested": false,
+    "id": "like_playlist_skip",
+    "passed": true
+  },
+  {
+    "input": "新建歌单通勤，加入周杰伦的晴天和稻香，再播放稻香并收藏",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "动作完成 好，队列接上，先从《稻香》-周杰伦来。 好，《稻香》收藏好了。",
+      "actions": [
+        {
+          "currentBefore": "晴天",
+          "method": "createPlaylist",
+          "tracks": []
+        },
+        {
+          "mode": "PlayNow",
+          "currentBefore": "晴天",
+          "method": "playQueue",
+          "artists": [],
+          "tracks": ["稻香"]
+        },
+        {
+          "currentBefore": "稻香",
+          "method": "likeCurrent",
+          "tracks": []
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "5f869a76-5f98-47fa-90a9-005a3a6889d2",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "5f869a76-5f98-47fa-90a9-005a3a6889d2",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "create_playlist_from_tracks",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "5f869a76-5f98-47fa-90a9-005a3a6889d2",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "5f869a76-5f98-47fa-90a9-005a3a6889d2",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "5f869a76-5f98-47fa-90a9-005a3a6889d2",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "playlist_create",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "动作完成",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "play_queue",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，队列接上，先从《稻香》-周杰伦来。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《稻香》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "5f869a76-5f98-47fa-90a9-005a3a6889d2",
+          "trace": "0ms:commit_simple:playlist_create:true|1ms:commit_queue:true:|1ms:commit_simple:like:true|1ms:turn_complete_declared:like_current",
+          "success": true,
+          "resultTypes": "playlist_create+play_queue+like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "create_playlist_from_tracks,commit_queue,like_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "create playlist, play 稻香, like new current 稻香",
+    "realPlayerTested": false,
+    "id": "create_play_like",
+    "passed": true
+  },
+  {
+    "input": "打开通勤歌单播放，然后收藏第一首",
+    "actual": {
+      "providerCalls": 3,
+      "observations": [
+        {
+          "playlists": [
+            {
+              "trackCount": 5,
+              "kind": "cloud",
+              "name": "我的网盘",
+              "id": -1
+            },
+            {
+              "trackCount": 5,
+              "kind": "playlist",
+              "name": "通勤",
+              "id": 10
+            }
+          ],
+          "ok": true
+        },
+        {
+          "trackCount": 5,
+          "ok": true,
+          "error": null,
+          "tracks": [
+            {
+              "artist": "周杰伦",
+              "album": "测试专辑",
+              "title": "晴天",
+              "key": "t1"
+            },
+            {
+              "artist": "周杰伦",
+              "album": "测试专辑",
+              "title": "稻香",
+              "key": "t2"
+            },
+            {
+              "artist": "周杰伦",
+              "album": "测试专辑",
+              "title": "夜曲",
+              "key": "t3"
+            },
+            {
+              "artist": "陈奕迅",
+              "album": "测试专辑",
+              "title": "十年",
+              "key": "t4"
+            },
+            {
+              "artist": "王菲",
+              "album": "测试专辑",
+              "title": "红豆",
+              "key": "t5"
+            }
+          ]
+        }
+      ],
+      "reply": "好，队列接上，先从《晴天》-周杰伦来。 好，《晴天》收藏好了。",
+      "actions": [
+        {
+          "mode": "ReplaceQueue",
+          "currentBefore": "晴天",
+          "method": "playQueue",
+          "artists": [],
+          "tracks": [
+            "晴天",
+            "稻香",
+            "夜曲"
+          ]
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "likeCurrent",
+          "tracks": []
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "list_playlists",
+          "elapsedMs": 489
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59510,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "get_playlist_tracks",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 59510,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "actionCount": 1,
+          "validationPassed": true,
+          "event": "queue_plan",
+          "validation": ""
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "commit_queue",
+          "elapsedMs": 2276
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "play_queue",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，队列接上，先从《晴天》-周杰伦来。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "d0f1716f-c97e-408b-bbf1-af0d90b9d89a",
+          "trace": "489ms:list_playlists:2|490ms:get_playlist_tracks:通勤:5|2766ms:commit_queue:true:|2767ms:commit_simple:like:true|2767ms:turn_complete_declared:like_current",
+          "success": true,
+          "resultTypes": "play_queue+like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "list_playlists,get_playlist_tracks,commit_queue,like_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "list/read observations followed by playback and like",
+    "realPlayerTested": false,
+    "id": "list_read_play_like",
+    "passed": true
+  },
+  {
+    "input": "收藏这首，然后加入通勤歌单，再跳过",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "好，《晴天》收藏好了。",
+      "actions": [{
+        "currentBefore": "晴天",
+        "method": "likeCurrent",
+        "tracks": []
+      }],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "b38f746e-9de9-4a6e-8894-c126f1a72a54",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "b38f746e-9de9-4a6e-8894-c126f1a72a54",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，《晴天》收藏好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "b38f746e-9de9-4a6e-8894-c126f1a72a54",
+          "trace": "0ms:commit_simple:like:true|0ms:turn_complete_declared:like_current",
+          "success": true,
+          "resultTypes": "like",
+          "validationPassed": true,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "incomplete compound request must not silently close after first tool",
+    "realPlayerTested": false,
+    "id": "multi_early_finish",
+    "passed": false
+  },
+  {
+    "input": "收藏这首，加入通勤歌单，然后跳过",
+    "actual": {
+      "providerCalls": 1,
+      "observations": [],
+      "reply": "这步没接上，我不硬说完成。 好，歌单 处理好了。 好，先从《晴天》-周杰伦来。",
+      "actions": [
+        {
+          "currentBefore": "晴天",
+          "method": "likeCurrent",
+          "tracks": []
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "modifyPlaylist",
+          "tracks": []
+        },
+        {
+          "currentBefore": "晴天",
+          "method": "skip",
+          "tracks": []
+        }
+      ],
+      "events": [
+        {
+          "area": "ai_agent",
+          "turnId": "eb3471fd-8d37-418b-a555-891d52919779",
+          "stage": "tools",
+          "success": true,
+          "remainingMs": 60000,
+          "event": "tool_llm_stage",
+          "attempt": 1,
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "eb3471fd-8d37-418b-a555-891d52919779",
+          "success": false,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "like_current",
+          "elapsedMs": 1
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "eb3471fd-8d37-418b-a555-891d52919779",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "modify_playlist_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "eb3471fd-8d37-418b-a555-891d52919779",
+          "success": true,
+          "errorType": "",
+          "event": "tool_stage",
+          "tool": "skip_current",
+          "elapsedMs": 0
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "like",
+          "persona": "friendly",
+          "success": false,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "这步没接上，我不硬说完成。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "playlist",
+          "persona": "friendly",
+          "success": true,
+          "verified": true,
+          "event": "persona_reply",
+          "reply": "好，歌单 处理好了。",
+          "usedCopywriter": true
+        },
+        {
+          "area": "ai_agent",
+          "actionType": "skip",
+          "persona": "friendly",
+          "success": true,
+          "verified": false,
+          "event": "persona_reply",
+          "reply": "好，先从《晴天》-周杰伦来。",
+          "usedCopywriter": false
+        },
+        {
+          "area": "ai_agent",
+          "turnId": "eb3471fd-8d37-418b-a555-891d52919779",
+          "trace": "1ms:commit_simple:like:false|1ms:commit_simple:playlist:true|1ms:commit_simple:skip:true|1ms:turn_complete_declared:skip_current",
+          "success": false,
+          "resultTypes": "like+playlist+skip",
+          "validationPassed": false,
+          "event": "agent_tool_loop_finish",
+          "toolCalls": "like_current,modify_playlist_current,skip_current"
+        }
+      ]
+    },
+    "realModelTested": false,
+    "kind": "fault_injection",
+    "expected": "failed first step does not prevent independent remaining actions",
+    "realPlayerTested": false,
+    "id": "failed_like_continue_playlist_skip",
+    "passed": true
+  },
+  {
+    "input": "第1轮：我要听周杰伦和陈奕迅的歌",
+    "actual": [
+      "周杰伦-晴天",
+      "陈奕迅-十年"
+    ],
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "dispatch requested two-artist queue",
+    "realPlayerTested": false,
+    "id": "conversation_initial",
+    "passed": true
+  },
+  {
+    "input": "第2轮：这首不要打断，再加点王菲进去",
+    "actual": [
+      "周杰伦-晴天",
+      "王菲-红豆",
+      "陈奕迅-十年"
+    ],
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "insert 王菲 without interrupting current song; continuation source not covered",
+    "realPlayerTested": false,
+    "id": "conversation_add",
+    "passed": true
+  },
+  {
+    "input": "第2轮是否收到上一轮事实和当前队列",
+    "actual": "用户原文：这首不要打断，再加点王菲进去\n当前播放：周杰伦 - 晴天\n当前队列（共 2 首，列出前 2 首；[key] 可直接填进 commit_queue 的 track_keys）：\n1. [t1] 周杰伦 - 晴天 ←正在放\n2. [t2] 陈奕迅 - 十年\n其它最近真实执行：\n- 用户=我要听周杰伦和陈奕迅的歌; 成功; tracks=晴天/十年; \n必须先调用工具观察真实候选；需要播放/收藏/改歌单/创建歌单时必须以 commit/动作工具结束。\n",
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "prior execution and current queue reach provider prompt",
+    "realPlayerTested": false,
+    "id": "conversation_context",
+    "passed": true
+  },
+  {
+    "input": "第3轮：替换成这三个人的歌，后续也只放他们",
+    "actual": {
+      "mode": "ReplaceQueue",
+      "currentBefore": "晴天",
+      "method": "playQueue",
+      "artists": [
+        "周杰伦",
+        "陈奕迅",
+        "王菲"
+      ],
+      "tracks": [
+        "晴天",
+        "红豆",
+        "十年"
+      ]
+    },
+    "realModelTested": false,
+    "kind": "scripted_tool_loop",
+    "expected": "correct explicit model union reaches executor; real auto-radio not covered",
+    "realPlayerTested": false,
+    "id": "conversation_replace_union",
+    "passed": true
+  }
+]

@@ -1,166 +1,233 @@
 package app.pipo.nativeapp.data
 
+import app.pipo.nativeapp.data.RecommendationLog.HomeGroup
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
-import kotlin.math.abs
 import kotlin.math.exp
-import kotlin.math.ln
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-/**
- * 业界主流 mini 实现 —— "多路召回 → 多因子打分 → 多样性 rerank → 在线兜底"。
- *
- * 形态参考 Spotify Discover Weekly / YouTube Music Recommended for You 的最小可行版：
- *
- *   召回 (recall, ~80 candidates)
- *     ch1 audio similarity   —— anchor 的 BPM/能量/谱心 cosine
- *     ch2 co-listen / Item-CF —— 跟 anchor 在最近 30 天同 session 共现的歌
- *     ch3 taste affinity     —— TasteProfile.topArtists / genres 命中加权
- *     ch4 love revival       —— 完成 ≥2 次但 7 天没听的"老朋友"
- *
- *   排序 (rank)：score = 0.30·rel + 0.25·taste + 0.20·love + recencyPen + diversityPen
- *
- *   多样性 (rerank)：贪心选 —— 同 artist 上限 2、同 songKey 不入、与已选歌相似度去抖
- *
- *   兜底 (fallback)：本地池太薄时走 AI seeds，但有护栏（不允许只用 anchor.artist 当 seed，
- *   强制混入 mood/era/genre），并对结果走同一套 rank + diversity
- *
- * 不依赖任何在线 ML 服务；BehaviorLog / TasteProfile 越丰富，结果越准。冷启动（无历史）
- * 也能给出合理推荐 —— 退化为"同音色 + 同口味标签"。
- */
+internal fun recommendationArtistKeys(artist: String): Set<String> =
+    artist.split('/', '&', ',', '、').map {
+        it.lowercase().replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？]+"), "")
+    }.filter { it.isNotBlank() }.toSet()
+
+/** A ranked feed snapshot. Reasons describe observed signals, never fabricated song attributes. */
+data class RecommendationFeed(
+    val tracks: List<NativeTrack> = emptyList(),
+    val reasons: Map<String, String> = emptyMap(),
+    val message: String = "",
+    val hasSignal: Boolean = false,
+)
+
 class RecommendEngine(
     private val library: LibraryLoader,
     private val featuresStore: AudioFeaturesStore,
     private val behaviorLog: BehaviorLog,
-    private val tasteProfileStore: TasteProfileStore,
     private val recommendationLog: RecommendationLog,
     private val repository: PipoRepository,
     private val behaviorPreference: BehaviorPreferenceEngine,
+    private val semanticStore: TrackSemanticStore? = null,
 ) {
 
     suspend fun fetchMore(
         anchor: NativeTrack?,
         excludeIds: Set<Long>,
         wantCount: Int = 8,
-    ): List<NativeTrack> = withContext(Dispatchers.Default) {
-        // 整段在 Default 上跑 —— 召回 + 排序 + 多样性都是 CPU 活，调用方多在 main，
-        // 不切走会偶发让主线程卡几十 ms（库一大就明显）
-        val lib = runCatching { library.library() }.getOrDefault(emptyList())
-        val taste = tasteProfileStore.flow.value
-        val events = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
-        val recentPlay = runCatching { behaviorLog.recentPlay() }
-            .getOrDefault(BehaviorLog.RecentPlay(emptySet(), emptySet()))
-        val recentRec = runCatching { recommendationLog.recentContext() }
-            .getOrDefault(RecommendationLog.RecentContext(emptySet(), emptySet()))
-        val behaviorDelta = runCatching { behaviorPreference.current() }
-            .getOrDefault(BehaviorPreferenceSnapshot.Empty)
-        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
-            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
+        reportSearchFailure: Boolean = false,
+    ): List<NativeTrack> = recommend(anchor, excludeIds, wantCount, reportSearchFailure, home = false).tracks
 
-        val anchorKey = anchor?.let { TrackDedupe.songKey(it) }
-        val anchorArtistKey = anchor?.firstArtistKey()
+    suspend fun homeFeed(
+        excludeIds: Set<Long>, wantCount: Int = 24,
+        anchor: NativeTrack? = null, useAi: Boolean = true,
+        excludeSongKeys: Set<String> = emptySet(),
+    ): RecommendationFeed =
+        recommend(anchor, excludeIds, wantCount, reportSearchFailure = true, home = true,
+            useAi = useAi, excludeSongKeys = excludeSongKeys)
 
-        // 硬排除：anchor 自己 + excludeIds 里的 neteaseId + 24h 内推荐过的 neteaseId
-        // —— 之前 24h 推荐过的只走 -0.25 软扣分，多 channel 加起来仍能浮上来，导致
-        // "怎么又给我推这首"。改成硬排除，跨多次 fetchMore 调用都不会重复
-        val hardExclude: (NativeTrack) -> Boolean = { t ->
-            val ne = t.neteaseId
-            val sk = TrackDedupe.songKey(t)
-            (ne != null && ne in excludeIds) || sk == anchorKey ||
-                (ne != null && ne in recentRec.last24hTrackIds) ||
-                hardRejected.contains(t)
+    private suspend fun recommend(
+        anchor: NativeTrack?, excludeIds: Set<Long>, wantCount: Int,
+        reportSearchFailure: Boolean, home: Boolean, useAi: Boolean = home,
+        excludeSongKeys: Set<String> = emptySet(),
+    ): RecommendationFeed = withContext(Dispatchers.Default) {
+        if (wantCount <= 0) return@withContext RecommendationFeed()
+        val lib = library.library()
+        val unified = PipoGraph.userTaste.snapshot(lib)
+        val taste = unified.profile
+        val events = behaviorLog.readAll()
+        val recentPlay = behaviorLog.recentPlay()
+        val recentRec = recommendationLog.recentContext()
+        val delta = unified.behavior
+        val rejected = PipoGraph.recommendationFeedbackLog.globallyRejected()
+        val now = System.currentTimeMillis()
+        val userId = if (home) repository.account.first()?.userId else null
+        // Older AUTO transitions were not proof of listening. Home learning uses measured outcomes.
+        val learningEvents = if (home) events.filter { it.verifiedListeningRatio() != null } else events
+        val lastWeek = learningEvents.filter { it.tsMs in (now - 7L * 86_400_000)..now }
+        val skipEvents = lastWeek.filter { it.type == BehaviorType.Skipped &&
+            (!home || ((it.verifiedListeningRatio() ?: 1.0) < 0.35 && (it.listenedMs ?: 0) >= 1_500)) }
+        val repeatedSkips = skipEvents
+            .groupingBy { it.trackId }.eachCount().filterValues { it >= 2 }.keys
+        val completed = learningEvents.filter { it.type == BehaviorType.Completed }
+            .groupingBy { it.trackId }.eachCount()
+        val savedKeys = lib.flatMapTo(HashSet()) { TrackDedupe.compatibleKeys(it) }
+        val familiarKeys = learningEvents.filter { it.type != BehaviorType.PlayStarted &&
+            (it.verifiedListeningRatio() ?: 0.0) >= 0.5 }
+            .groupBy { it.trackId }.values.filter { it.size >= 2 }.flatMapTo(HashSet()) { listens ->
+                val event = listens.last()
+                TrackDedupe.compatibleKeys(NativeTrack(event.trackId, event.neteaseId,
+                    event.title, event.artist, "", ""))
+            }
+        val familiarArtists = buildSet {
+            lib.forEach { addAll(recommendationArtistKeys(it.artist)) }
+            taste?.topArtists.orEmpty().filter { it.affinity > 0 }.forEach { addAll(recommendationArtistKeys(it.name)) }
+            unified.explicit.filter { it.liked && it.dimension == "artist" }
+                .forEach { addAll(recommendationArtistKeys(it.value)) }
+            learningEvents.filter { it.type != BehaviorType.PlayStarted && (it.verifiedListeningRatio() ?: 0.0) >= 0.5 }
+                .flatMap { recommendationArtistKeys(it.artist) }.groupingBy { it }.eachCount()
+                .filterValues { it >= 2 }.keys.let(::addAll)
         }
+        val homeMix = if (home) homeGroupShares(learningEvents, userId, now) else null
+        val anchorKey = anchor?.let(TrackDedupe::songKey)
+        val hardExclude: (NativeTrack) -> Boolean = { track ->
+            val id = track.neteaseId
+            (id != null && id in excludeIds) || (!home && TrackDedupe.songKey(track) == anchorKey) ||
+                TrackDedupe.songKey(track) in excludeSongKeys ||
+                (!home && id != null && id in recentRec.last24hTrackIds) || rejected.contains(track) ||
+                (home && excludedHomeCategory(track)) ||
+                track.id in repeatedSkips ||
+                (home && unified.explicitScore(track, semanticStore?.get(track.id)) < 0.0) ||
+                !FunctionalMusicFilter.acceptsCategory(track, if (home) unified.explicit.filter { it.liked }.joinToString("；") { it.evidence } else anchor?.let { "${it.title} ${it.artist}" }.orEmpty()) ||
+                (anchor?.let { FunctionalMusicFilter.isFunctional(it.title, it.artist) } != true &&
+                    FunctionalMusicFilter.isFunctional(track.title, track.artist))
+        }
+        val references = if (anchor != null && (!home || !excludedHomeCategory(anchor))) listOf(anchor)
+            else listeningReferences(lib, learningEvents, taste, delta) {
+                rejected.contains(it) || it.id in repeatedSkips || (home && excludedHomeCategory(it))
+            }
+        val hasSignal = unified.explicit.any { it.liked } || lib.isNotEmpty() || references.isNotEmpty() || delta.hasSignal ||
+            taste?.let { it.topArtists.isNotEmpty() || it.genres.isNotEmpty() } == true
+        if (!hasSignal) return@withContext RecommendationFeed(
+            message = "先听几首喜欢的歌，或登录导入收藏，PIPO 才能开始了解你的口味。",
+        )
 
-        // ---- 召回 ----
-        val pool = HashMap<String, Candidate>()  // songKey -> Candidate
-        recallAudio(anchor, lib, hardExclude).forEach { pool.merge(it) }
-        recallCoListen(anchor, lib, events, hardExclude).forEach { pool.merge(it) }
+        val pool = HashMap<String, Candidate>()
+        val coListenEvents = if (home) learningEvents.filter { (it.verifiedListeningRatio() ?: 0.0) >= 0.5 }
+            else learningEvents
+        references.take(4).forEach { reference ->
+            recallAudio(reference, lib, hardExclude).forEach { pool.merge(it) }
+            recallCoListen(reference, lib, coListenEvents, hardExclude).forEach { pool.merge(it) }
+        }
         recallTaste(taste, lib, hardExclude).forEach { pool.merge(it) }
-        recallLove(events, lib, recentPlay, hardExclude).forEach { pool.merge(it) }
-        recallBehaviorDelta(behaviorDelta, lib, hardExclude).forEach { pool.merge(it) }
+        recallLove(learningEvents, lib, recentPlay, hardExclude).forEach { pool.merge(it) }
+        recallBehaviorDelta(delta, lib, hardExclude).forEach { pool.merge(it) }
+        // A saved library is already positive evidence, even before AI taste analysis exists.
+        lib.filterNot(hardExclude).forEach { pool.merge(Candidate(it, savedScore = 0.45, source = SOURCE_LIBRARY)) }
 
-        if (pool.isEmpty()) {
-            // 本地空 → 走 AI / 在线兜底,但**也要过多样性筛选**。之前直接 return online,
-            // 冷启动用户(无听历)拿到的可能全是同一艺人的 hot songs("怎么推都是周杰伦")。
-            // 多取一倍 wantCount,然后按"每艺人 ≤ 2 首"去重。
-            val online = fetchFromOnline(anchor, taste, behaviorDelta, excludeIds, wantCount * 2)
-            val seenArtist = HashMap<String, Int>()
-            val diverse = ArrayList<NativeTrack>(wantCount)
-            for (t in online) {
-                val ak = t.firstArtistKey()
-                val cnt = seenArtist[ak] ?: 0
-                if (cnt >= 2) continue
-                seenArtist[ak] = cnt + 1
-                diverse.add(t)
-                if (diverse.size >= wantCount) break
-            }
-            // 如果艺人去重后还不够 wantCount,把剩下的(可能同艺人)按原顺序补上,
-            // 不让"多样性"完全 starve 掉数量
-            if (diverse.size < wantCount) {
-                val have = diverse.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-                for (t in online) {
-                    if (TrackDedupe.songKey(t) in have) continue
-                    diverse.add(t)
-                    if (diverse.size >= wantCount) break
-                }
-            }
-            logRecommendationTracks(diverse)
-            return@withContext diverse
-        }
-
-        // ---- 打分 ----
-        // 权重和约 = 1.0：rel 0.25 + co-listen 0.25 + taste 0.25 + love 0.15 + serendipity 0.10
-        // 之前少了 co-listen 那项 → 共听信号在 ranker 阶段不起作用，等于浪费了一路召回
-        val ranked = pool.values.map { c ->
-            val rel = c.audioSim
-            val co = c.coListenScore
-            val taste0 = c.tasteScore
-            val love = c.loveScore
-            val deltaScore = if (c.behaviorDeltaScore != 0.0) c.behaviorDeltaScore
-                else behaviorPreference.scoreTrack(behaviorDelta, c.track)
-            val ne = c.track.neteaseId
-            val recencyPen = when {
-                // recentRec.last24h 已经在 hardExclude 里硬筛掉，这里不再列
-                ne != null && ne in recentPlay.last24hTrackIds -> -0.6
-                ne != null && ne in recentPlay.last7dTrackIds -> -0.10
+        val recentStarted = events.filter { it.type == BehaviorType.PlayStarted && it.tsMs in (now - 86_400_000)..now }
+            .mapTo(HashSet()) { it.trackId }
+        fun rankCandidates(candidates: Collection<Candidate>): List<Candidate> = candidates.map { candidate ->
+            val track = candidate.track
+            val behavior = behaviorPreference.scoreTrack(delta, track)
+            val affinity = if (home) maxOf(candidate.tasteScore, artistAffinity(track, taste, references))
+                else artistAffinity(track, taste, references)
+            val semantic = semanticAffinity(track, taste)
+            val listens = completed[track.id] ?: 0
+            val love = maxOf(candidate.loveScore, (1.0 - exp(-listens / 3.0)) * 0.75)
+            val recentPenalty = when {
+                track.id in recentStarted -> 0.42
+                track.neteaseId in recentPlay.last7dTrackIds -> 0.08
                 else -> 0.0
             }
-            val behaviorDeltaBoost = if (deltaScore >= 0.0) deltaScore * 0.22 else deltaScore * 0.16
-            val score = 0.23 * rel + 0.23 * co + 0.22 * taste0 + 0.14 * love +
-                behaviorDeltaBoost + recencyPen +
-                // 微噪声 ±0.05 给重排提供 serendipity，避免每次永远同一组
-                (kotlin.random.Random.nextDouble(-0.05, 0.05))
-            c.copy(finalScore = score)
-        }.sortedByDescending { it.finalScore }
-
-        // ---- 多样性 rerank ----
-        val picks = pickDiverse(ranked, wantCount, anchorArtistKey)
-        if (picks.size >= wantCount) {
-            logRecommendations(picks)
-            return@withContext picks.map { it.track }
-        }
-
-        // ---- 在线兜底 ----
-        val haveKeys = picks.mapTo(HashSet()) { TrackDedupe.songKey(it.track) }
-        val haveTitleFamilies = picks.mapTo(HashSet()) { TrackDedupe.recommendationTitleKey(it.track.title) }
-        val online = fetchFromOnline(anchor, taste, behaviorDelta, excludeIds, wantCount - picks.size)
-            .filter {
-                val family = TrackDedupe.recommendationTitleKey(it.title)
-                TrackDedupe.songKey(it) !in haveKeys && !hardExclude(it) &&
-                    (family.isBlank() || family !in haveTitleFamilies)
+            val savedScore = if (TrackDedupe.compatibleKeys(track).any { it in savedKeys })
+                maxOf(candidate.savedScore, 0.45) else 0.0
+            val familiarTrack = savedScore > 0 || TrackDedupe.compatibleKeys(track).any { it in familiarKeys }
+            val group = when {
+                familiarTrack -> HomeGroup.FamiliarTrack
+                recommendationArtistKeys(track.artist).any { it in familiarArtists } -> HomeGroup.FamiliarArtist
+                else -> HomeGroup.NewArtist
             }
-        val final = picks.map { it.track } + online
-        val result = final.take(wantCount)
-        logRecommendationTracks(result)
-        return@withContext result
+            val exposurePenalty = if (home && track.neteaseId in recentRec.last24hTrackIds) 0.20 else 0.0
+            val skipped = skipEvents.count { it.trackId == track.id }
+            val explicit = if (home) unified.explicitScore(track, semanticStore?.get(track.id)) else 0.0
+            val score = explicit * 0.4 + candidate.audioSim * 0.16 + candidate.coListenScore * 0.12 +
+                affinity * 0.20 + semantic * 0.14 + love * 0.12 + (if (home) savedScore else candidate.savedScore) * 0.12 +
+                behavior * 0.30 + candidate.discoveryScore * 0.16 - recentPenalty - exposurePenalty - skipped * 0.22
+            candidate.copy(tasteScore = affinity, semanticScore = semantic, loveScore = love,
+                behaviorDeltaScore = behavior, explicitScore = explicit, finalScore = score,
+                savedScore = savedScore,
+                isDiscovery = !familiarTrack, homeGroup = if (home) group else null)
+        }.filter { it.behaviorDeltaScore > -0.32 && it.finalScore > -0.05 &&
+            // Personalized service / reference-song / taste-conditioned AI recall supplies relevance
+            // for first-time artists with no local history. Ordinary keyword hits (0.10) do not.
+            (it.homeGroup != HomeGroup.NewArtist || (it.finalScore >= 0.08 &&
+                recommendationArtistKeys(it.track.artist).isNotEmpty() &&
+                (it.explicitScore > 0 || it.semanticScore >= 0.2 || it.behaviorDeltaScore >= 0.12 ||
+                    it.discoveryScore >= 0.6 || it.audioSim >= 0.7))) &&
+            (it.explicitScore > 0 || it.savedScore > 0 || it.tasteScore >= 0.25 || it.semanticScore >= 0.2 ||
+                it.behaviorDeltaScore >= 0.12 || it.discoveryScore >= 0.6 || it.audioSim >= 0.7) }
+            .sortedWith(compareByDescending<Candidate> { it.finalScore }.thenBy { TrackDedupe.songKey(it.track) })
+        // Refill against the final ranked/diverse mixture, not the size of the raw search pool.
+        var onlineUnavailable = false
+        if (home || pool.size < wantCount * 3) {
+            try {
+                fetchOnlineCandidates(references, unified, hardExclude, excludeIds,
+                    useAi = useAi, savedTracks = lib, home = home, familiarArtists = familiarArtists, hasEnough = { online ->
+                        val combined = HashMap(pool)
+                        online.forEach { combined.merge(it) }
+                        val ranked = rankCandidates(combined.values)
+                        val selected = pickDiverse(ranked, wantCount, anchor?.firstArtistKey(), homeMix)
+                        selected.size >= wantCount && (!home ||
+                            selected.count { it.homeGroup == HomeGroup.NewArtist } >=
+                                newArtistTarget(wantCount, requireNotNull(homeMix)))
+                    }).forEach { pool.merge(it) }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) {
+                onlineUnavailable = true
+                if (pool.isEmpty() && reportSearchFailure) throw e
+            }
+        }
+        val picks = pickDiverse(rankCandidates(pool.values), wantCount, anchor?.firstArtistKey(), homeMix)
+        val tracks = picks.map { it.track }
+        if (tracks.isNotEmpty()) recommendationLog.logTracks(tracks,
+            if (home) RecommendationLog.Source.Home else RecommendationLog.Source.Radio,
+            discoveryIds = if (home) picks.filter { it.isDiscovery }.mapNotNullTo(HashSet()) { it.track.neteaseId } else null,
+            userId = userId,
+            homeGroups = if (home) picks.mapNotNull { candidate ->
+                candidate.track.neteaseId?.let { it to requireNotNull(candidate.homeGroup) }
+            }.toMap() else null)
+        RecommendationFeed(
+            tracks = tracks,
+            reasons = picks.associate { it.track.id to recommendationReason(it) },
+            hasSignal = true,
+            message = when {
+                home && onlineUnavailable -> "新歌发现暂时不可用，请稍后重试。"
+                home && tracks.isEmpty() -> "暂时没有找到合适的未收藏歌曲，稍后再换一批。"
+                home -> "结合你的口味，重温熟悉的喜欢，也听见新的发现。"
+                tracks.isEmpty() -> "这一批暂时没有合适的新歌。再听几首喜欢的，稍后回来看看。"
+                onlineUnavailable -> "发现新歌暂时不可用，先为你挑选资料库中合适的音乐。"
+                delta.hasSignal && taste != null -> "结合你的长期口味与最近聆听，为你挑选。"
+                delta.hasSignal -> "根据你最近听完、重听和跳过的歌曲，持续调整。"
+                else -> "从你的收藏和口味出发，兼顾熟悉与新发现。"
+            },
+        )
     }
 
     // ============== 召回 ==============
 
-    /** ch1: 跟 anchor 音色近似 —— BPM / RMS / spectral centroid 的归一化 cosine */
+    private fun excludedHomeCategory(track: NativeTrack): Boolean {
+        if (FunctionalMusicFilter.isReligious(track)) return true
+        val semantic = semanticStore?.get(track.id) ?: return false
+        return semantic.sourceLlm && semantic.confidence >= 0.55 &&
+            (semantic.genres + semantic.subGenres + semantic.styleAnchors).any { FunctionalMusicFilter.isReligious(it, "") }
+    }
+
+    /** ch1: Use feature distance, not the nearly-always-positive cosine of unsigned audio features. */
     private fun recallAudio(
         anchor: NativeTrack?,
         lib: List<NativeTrack>,
@@ -174,8 +241,9 @@ class RecommendEngine(
             if (t.id == anchor.id || hardExclude(t)) continue
             val f = featuresStore.get(t.id) ?: continue
             val v = f.toVector() ?: continue
-            val sim = cosine(anchorVec, v)
-            if (sim < 0.55) continue   // 太低就别召
+            val distance = sqrt(anchorVec.indices.sumOf { i -> (anchorVec[i] - v[i]) * (anchorVec[i] - v[i]) } / anchorVec.size)
+            val sim = exp(-distance * 3.0)
+            if (sim < 0.65) continue   // 太低就别召
             out.add(Candidate(track = t, audioSim = sim, source = SOURCE_AUDIO))
         }
         out.sortByDescending { it.audioSim }
@@ -198,7 +266,8 @@ class RecommendEngine(
         val anchorTrackId = anchor.id
         // 按 ts 排序后切 session
         val sorted = events
-            .filter { it.type == BehaviorType.PlayStarted || it.type == BehaviorType.Completed }
+            .filter { it.type == BehaviorType.PlayStarted || it.type == BehaviorType.Completed ||
+                (it.type == BehaviorType.ManualCut && (it.verifiedListeningRatio() ?: 0.0) >= 0.5) }
             .sortedBy { it.tsMs }
         if (sorted.isEmpty()) return emptyList()
         val sessions = ArrayList<MutableSet<String>>()
@@ -321,118 +390,377 @@ class RecommendEngine(
 
     /**
      * 贪心选择，不破坏多样性硬约束：
-     *   - 同 artist 上限 2
+     *   - 按批次大小限制同 artist，保持专辑与同名版本去重
      *   - 同 songKey 已选 → 跳
      *   - anchor 的 artist 优先级降低（前 3 个里只允许 1 首跟 anchor 同 artist）
      */
     private fun pickDiverse(
-        ranked: List<Candidate>,
-        wantCount: Int,
-        anchorArtistKey: String?,
+        ranked: List<Candidate>, wantCount: Int, anchorArtistKey: String?, homeMix: Map<HomeGroup, Double>? = null,
     ): List<Candidate> {
         val picked = ArrayList<Candidate>()
         val artistCount = HashMap<String, Int>()
-        val seenSongKeys = HashSet<String>()
-        val seenTitleFamilies = HashSet<String>()
-        var anchorArtistTaken = 0
-
-        for (c in ranked) {
-            if (picked.size >= wantCount) break
-            val sk = TrackDedupe.songKey(c.track)
-            if (sk in seenSongKeys) continue
-            val titleFamily = TrackDedupe.recommendationTitleKey(c.track.title)
-            if (titleFamily.isNotBlank() && titleFamily in seenTitleFamilies) continue
-            val ak = c.track.firstArtistKey()
-            val artistN = artistCount[ak] ?: 0
-            if (artistN >= 2) continue
-            // 前 3 首里只允许 1 首跟 anchor 同 artist —— 否则一上来全推同 artist
-            if (anchorArtistKey != null && ak == anchorArtistKey && picked.size < 3 && anchorArtistTaken >= 1) continue
-
-            picked.add(c)
-            seenSongKeys.add(sk)
-            if (titleFamily.isNotBlank()) seenTitleFamilies.add(titleFamily)
-            artistCount[ak] = artistN + 1
-            if (anchorArtistKey != null && ak == anchorArtistKey) anchorArtistTaken++
+        val albumCount = HashMap<String, Int>()
+        val titleFamilies = HashSet<String>()
+        val remaining = ranked.toMutableList()
+        val artistLimit = maxOf(2, kotlin.math.ceil(wantCount * 0.12).toInt())
+        while (picked.size < wantCount && remaining.isNotEmpty()) {
+            val needsUnsaved = homeMix != null && picked.isEmpty()
+            val eligible = remaining.filter { candidate ->
+                val artist = candidate.track.firstArtistKey()
+                val family = TrackDedupe.recommendationTitleKey(candidate.track.title)
+                val album = normalizeKey(candidate.track.album)
+                (!needsUnsaved || candidate.savedScore == 0.0) &&
+                    (artistCount[artist] ?: 0) < (if (candidate.homeGroup == HomeGroup.NewArtist) minOf(2, artistLimit) else artistLimit) &&
+                    (family.isBlank() || family !in titleFamilies) &&
+                    (album.isBlank() || (albumCount["$artist:$album"] ?: 0) < 2) &&
+                    !(artist == anchorArtistKey && picked.size < 4 && (artistCount[artist] ?: 0) >= 1)
+            }
+            if (eligible.isEmpty()) break
+            fun diverseScore(candidate: Candidate): Double {
+                val artist = candidate.track.firstArtistKey()
+                val sameArtist = (artistCount[artist] ?: 0) * 0.12
+                val adjacent = if (picked.lastOrNull()?.track?.firstArtistKey() == artist) 0.25 else 0.0
+                val radioDiscovery = if (homeMix == null && candidate.savedScore == 0.0 &&
+                    picked.count { it.savedScore == 0.0 }.toDouble() / picked.size.coerceAtLeast(1) < 0.40) 0.10 else 0.0
+                return candidate.finalScore - sameArtist - adjacent + radioDiscovery
+            }
+            val best = eligible.maxBy(::diverseScore)
+            val preferred = homeMix?.let { mix ->
+                val counts = picked.groupingBy { it.homeGroup }.eachCount()
+                val newCount = counts[HomeGroup.NewArtist] ?: 0
+                val missingNew = newArtistTarget(wantCount, mix) - newCount
+                val newArtistDue = missingNew > 0 &&
+                    ((picked.size >= 3 && newCount == 0) || wantCount - picked.size <= missingNew)
+                val available = eligible.groupBy { it.homeGroup }
+                val group = if (newArtistDue && !available[HomeGroup.NewArtist].isNullOrEmpty()) HomeGroup.NewArtist
+                else mix.keys.filter { !available[it].isNullOrEmpty() }.maxByOrNull {
+                    (picked.size + 1) * mix.getValue(it) - (counts[it] ?: 0)
+                }
+                available[group]?.maxByOrNull(::diverseScore)
+            }
+            // Each group has already passed taste/negative-feedback filters. Reserve real opportunities
+            // for new artists instead of requiring them to outscore a familiar artist's history bonus.
+            val selected = preferred ?: best
+            picked.add(selected)
+            remaining.remove(selected)
+            val artist = selected.track.firstArtistKey()
+            artistCount[artist] = (artistCount[artist] ?: 0) + 1
+            val album = normalizeKey(selected.track.album)
+            if (album.isNotBlank()) albumCount["$artist:$album"] = (albumCount["$artist:$album"] ?: 0) + 1
+            val family = TrackDedupe.recommendationTitleKey(selected.track.title)
+            if (family.isNotBlank()) titleFamilies.add(family)
         }
         return picked
     }
 
-    // ============== 在线兜底 ==============
-
-    /**
-     * 本地召回不够时走 netease 搜索。但 seed 有护栏 —— 不允许"光放 anchor.artist 名"
-     * 这种容易回流同曲多版本的 seed。混入 mood / genre / era 让搜索面更宽。
-     */
-    private suspend fun fetchFromOnline(
-        anchor: NativeTrack?,
-        taste: TasteProfile?,
-        behaviorDelta: BehaviorPreferenceSnapshot,
-        excludeIds: Set<Long>,
-        wantCount: Int,
-    ): List<NativeTrack> {
-        if (wantCount <= 0) return emptyList()
-        val seeds = buildOnlineSeeds(anchor, taste, behaviorDelta)
-        if (seeds.isEmpty()) return emptyList()
-        val out = LinkedHashMap<String, NativeTrack>()  // songKey -> track
-        val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
-            .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
-        val anchorArtistKey = anchor?.firstArtistKey()
-        // mood/genre seed 在网易搜索里会捞回助眠/养生流水线内容；除非用户正在听的
-        // 锚点本身就是功能性音乐（那继续推同类才对），一律挡掉。
-        val anchorFunctional = anchor != null && FunctionalMusicFilter.isFunctional(anchor.title, anchor.artist)
-        for (batch in seeds.chunked(3)) {
-            if (out.size >= wantCount * 4) break
-            val hitsPerSeed = coroutineScope {
-                batch.map { seed ->
-                    async { runCatching { repository.searchTracks(seed, limit = 12) }.getOrDefault(emptyList()) }
-                }.awaitAll()
-            }
-            for (hits in hitsPerSeed) {
-                for (t in hits) {
-                    val ne = t.neteaseId ?: continue
-                    if (ne in excludeIds) continue
-                    if (hardRejected.contains(t)) continue
-                    if (!anchorFunctional && FunctionalMusicFilter.isFunctional(t.title, t.artist)) continue
-                    val sk = TrackDedupe.songKey(t)
-                    if (sk in out) continue
-                    out[sk] = t
-                    if (out.size >= wantCount * 4) break
-                }
-                if (out.size >= wantCount * 4) break
-            }
-        }
-        val recalled = out.values.toList()
-        val tasteArtists = taste?.topArtists.orEmpty().associate { normalizeKey(it.name) to it.affinity.toDouble() }
-        // 搜索次序只代表召回热度。最终顺序再叠加长期口味、近期正负行为；
-        // 用户反复跳过/删掉某类歌后，即使它仍是搜索热榜，也会自然沉底。
-        val ranked = recalled.mapIndexed { index, track ->
-            val searchPrior = 1.0 - index.toDouble() / maxOf(1, recalled.size)
-            val behaviorScore = behaviorPreference.scoreTrack(behaviorDelta, track)
-            val artistTaste = track.artist
-                .split('/', '&', ',', '、')
-                .maxOfOrNull { tasteArtists[normalizeKey(it)] ?: 0.0 }
-                ?: 0.0
-            track to (searchPrior * 0.45 + behaviorScore * 0.40 + artistTaste * 0.15)
-        }
-            .sortedByDescending { it.second }
-            .map { it.first }
-        val artistCount = HashMap<String, Int>()
-        val titleFamilies = HashSet<String>()
-        val result = ArrayList<NativeTrack>(wantCount)
-        for (track in ranked) {
-            val family = TrackDedupe.recommendationTitleKey(track.title)
-            if (family.isNotBlank() && family in titleFamilies) continue
-            val artist = track.firstArtistKey()
-            val count = artistCount[artist] ?: 0
-            if (count >= 2) continue
-            if (anchorArtistKey != null && artist == anchorArtistKey && count >= 1) continue
-            result.add(track)
-            artistCount[artist] = count + 1
-            if (family.isNotBlank()) titleFamilies.add(family)
-            if (result.size >= wantCount) break
-        }
-        return result
+    private fun BehaviorEvent.verifiedListeningRatio(): Double? {
+        val duration = durationMs?.takeIf { it > 0 } ?: return null
+        val listened = listenedMs?.takeIf { it >= 0 } ?: return null
+        return (listened.toDouble() / duration).coerceIn(0.0, 1.0)
     }
+
+    private fun newArtistTarget(count: Int, mix: Map<HomeGroup, Double>): Int =
+        (count * mix.getValue(HomeGroup.NewArtist)).roundToInt().coerceIn(1, count.coerceAtLeast(1))
+
+    /** Local, conservative outcome association; an impression alone is never success or failure. */
+    private fun homeGroupShares(events: List<BehaviorEvent>, userId: Long?, now: Long): Map<HomeGroup, Double> {
+        val since = now - 28L * 86_400_000
+        val recommended = recommendationLog.readAll().filter { it.source == RecommendationLog.Source.Home &&
+            it.homeGroup != null && it.userId == userId && it.tsSec * 1_000 in since..now }
+            .groupBy { it.trackId }
+        data class Sample(val group: HomeGroup, val value: Double, val strength: Double, val atMs: Long)
+        val samples = HashMap<String, Sample>()
+        fun addSample(trackId: Long?, atMs: Long, value: Double, strength: Double) {
+            if (atMs !in since..now) return
+            val prior = recommended[trackId]?.filter { it.tsSec * 1_000 <= atMs &&
+                atMs - it.tsSec * 1_000 <= 86_400_000 }?.maxByOrNull { it.tsSec } ?: return
+            val key = "${prior.songKey ?: prior.trackId}:${atMs / 86_400_000}"
+            val previous = samples[key]
+            // Saving is stronger evidence than a play. Repeated plays/taps cannot multiply one song/day.
+            if (previous == null || strength > previous.strength ||
+                (strength == previous.strength && atMs > previous.atMs)) {
+                samples[key] = Sample(requireNotNull(prior.homeGroup), value, strength, atMs)
+            }
+        }
+        for (event in events) {
+            if (event.type == BehaviorType.PlayStarted) continue
+            val ratio = event.verifiedListeningRatio() ?: continue
+            val outcome = when {
+                ratio >= 0.8 -> 1.0
+                event.type == BehaviorType.Skipped && ratio < 0.35 && (event.listenedMs ?: 0) >= 1_500 -> 0.0
+                else -> continue
+            }
+            addSample(event.neteaseId, event.tsMs, outcome, 1.0)
+        }
+        recommendationLog.readFavorites().filter { it.userId == userId && it.tsMs in since..now }
+            .groupBy { it.trackId }.values.mapNotNull { it.maxByOrNull { event -> event.tsMs } }
+            .filter { it.liked }.forEach { addSample(it.trackId, it.tsMs, 1.0, 1.5) }
+        val weights = DoubleArray(HomeGroup.entries.size)
+        val positives = DoubleArray(HomeGroup.entries.size)
+        samples.values.forEach {
+            val weight = it.strength * exp(-(now - it.atMs).coerceAtLeast(0) / (14.0 * 86_400_000))
+            weights[it.group.ordinal] += weight
+            positives[it.group.ordinal] += it.value * weight
+        }
+        val base = mapOf(HomeGroup.FamiliarTrack to 0.45, HomeGroup.FamiliarArtist to 0.25, HomeGroup.NewArtist to 0.30)
+        val adjusted = base.mapValues { (group, prior) ->
+            val rate = (positives[group.ordinal] + 4.0) / (weights[group.ordinal] + 8.0)
+            prior * exp(1.8 * (rate - 0.5))
+        }
+        val newShare = (adjusted.getValue(HomeGroup.NewArtist) / adjusted.values.sum()).coerceIn(0.20, 0.45)
+        val familiarTotal = adjusted.getValue(HomeGroup.FamiliarTrack) + adjusted.getValue(HomeGroup.FamiliarArtist)
+        return adjusted.mapValues { (group, value) ->
+            if (group == HomeGroup.NewArtist) newShare else (1 - newShare) * value / familiarTotal
+        }
+    }
+
+    // ============== Library and catalog discovery ==============
+
+    private fun listeningReferences(
+        lib: List<NativeTrack>, events: List<BehaviorEvent>, taste: TasteProfile?,
+        delta: BehaviorPreferenceSnapshot, excluded: (NativeTrack) -> Boolean,
+    ): List<NativeTrack> {
+        val byId = lib.associateBy { it.id }.toMutableMap()
+        val weights = HashMap<String, Double>()
+        val now = System.currentTimeMillis()
+        for (event in events) {
+            val listenedRatio = event.verifiedListeningRatio()
+            val signal = when (event.type) {
+                BehaviorType.Completed -> 1.0
+                BehaviorType.ManualCut -> if (listenedRatio != null) {
+                    if (listenedRatio >= 0.8) 0.35 else 0.0
+                } else if (event.completionPct >= 0.82f) 0.35 else -0.2
+                BehaviorType.Skipped -> if (listenedRatio != null) {
+                    when {
+                        listenedRatio >= 0.8 -> 0.35
+                        listenedRatio < 0.35 && (event.listenedMs ?: 0) >= 1_500 -> -1.2
+                        else -> 0.0
+                    }
+                } else -1.2
+                BehaviorType.PlayStarted -> 0.0
+            }
+            val ageDays = ((now - event.tsMs).coerceAtLeast(0) / 86_400_000.0)
+            weights[event.trackId] = (weights[event.trackId] ?: 0.0) + signal * exp(-ageDays / 21.0)
+            if (signal > 0) byId.putIfAbsent(event.trackId, NativeTrack(event.trackId, event.neteaseId,
+                event.title, event.artist, "", ""))
+        }
+        val savedIds = lib.mapTo(HashSet()) { it.id }
+        val savedArtistCounts = lib.groupingBy { it.firstArtistKey() }.eachCount()
+        val ranked = byId.values.filterNot(excluded).map { track ->
+            val saved = if (track.id in savedIds) 0.3 else 0.0
+            val artist = taste?.topArtists?.firstOrNull { normalizeKey(it.name) == track.firstArtistKey() }?.affinity ?: 0f
+            track to ((weights[track.id] ?: 0.0) + artist * 0.8 +
+                behaviorPreference.scoreTrack(delta, track) * 0.8 + saved +
+                (1 - exp(-(savedArtistCounts[track.firstArtistKey()] ?: 0) / 8.0)) * 0.3)
+        }.filter { it.second > 0.1 }.sortedWith(compareByDescending<Pair<NativeTrack, Double>> { it.second }.thenBy { it.first.id })
+        val seen = HashSet<String>()
+        return ranked.map { it.first }.filter { seen.add(it.firstArtistKey()) }.take(4)
+    }
+
+    private fun artistAffinity(track: NativeTrack, taste: TasteProfile?, references: List<NativeTrack>): Double {
+        val keys = track.artist.split('/', '&', ',', '、').map(::normalizeKey)
+        val longTerm = taste?.topArtists.orEmpty().filter { normalizeKey(it.name) in keys }
+            .maxOfOrNull { it.affinity.toDouble() } ?: 0.0
+        val reference = if (references.any { it.firstArtistKey() in keys }) 0.65 else 0.0
+        return maxOf(longTerm, reference).coerceIn(0.0, 1.0)
+    }
+
+    private fun semanticAffinity(track: NativeTrack, taste: TasteProfile?): Double {
+        if (taste == null) return 0.0
+        val profile = semanticStore?.get(track.id) ?: return 0.0
+        // A title containing “pop” or “happy” is not evidence of musical style.
+        if (!profile.sourceLlm || profile.confidence < 0.55) return 0.0
+        val genres = (profile.genres + profile.subGenres + profile.styleAnchors).map(::normalizeKey).toSet()
+        val genre = taste.genres.filter { normalizeKey(it.tag) in genres }.maxOfOrNull { it.weight.toDouble() } ?: 0.0
+        val moods = profile.moods.map(::normalizeKey).toSet()
+        val mood = if (taste.moods.any { normalizeKey(it) in moods }) 0.5 else 0.0
+        return (genre * 0.75 + mood * 0.25) * profile.confidence
+    }
+
+    private fun recommendationReason(candidate: Candidate): String = when {
+        candidate.homeGroup == HomeGroup.NewArtist -> "按你的口味，探索不常听的音乐人"
+        candidate.homeGroup == HomeGroup.FamiliarArtist -> "熟悉的音乐人，换一首少听的作品"
+        candidate.explicitScore > 0 -> "符合你明确表达的音乐偏好"
+        candidate.loveScore >= 0.45 -> "你曾反复听完，值得再听一次"
+        candidate.behaviorDeltaScore >= 0.18 -> "贴近你最近更常听完的音乐"
+        candidate.audioSim >= 0.70 -> "音色与节奏接近你常听的歌曲"
+        candidate.coListenScore >= 0.35 -> "与你常听的歌曲一起出现过"
+        candidate.semanticScore >= 0.25 -> "贴近你的长期音乐风格"
+        candidate.tasteScore >= 0.55 && candidate.savedScore == 0.0 -> "来自你常听或偏爱的音乐人"
+        candidate.discoveryScore >= 0.6 -> "根据你的口味，探索新的作品"
+        candidate.savedScore > 0 -> "从你的资料库中重新发现"
+        else -> "贴近你音乐口味的新发现"
+    }
+
+    private suspend fun fetchOnlineCandidates(
+        references: List<NativeTrack>, unified: UserTasteSnapshot,
+        excluded: (NativeTrack) -> Boolean, exclusions: Set<Long>, useAi: Boolean,
+        savedTracks: List<NativeTrack>, home: Boolean, familiarArtists: Set<String>,
+        hasEnough: (List<Candidate>) -> Boolean,
+    ): List<Candidate> {
+        val taste = unified.profile
+        val delta = unified.behavior
+        val artistSeeds = buildList {
+            unified.explicit.filter { it.liked && it.dimension == "artist" }.takeLast(4).forEach { add(it.value) }
+            references.forEach { add(it.artist) }
+            taste?.topArtists.orEmpty().take(12).forEach { add(it.name) }
+            if (home) addAll(unified.libraryArtists)
+        }.map { it.split('/', '&', ',', '、').first().trim() }
+            .filter { it.isNotBlank() && (!home || !FunctionalMusicFilter.isReligious(it, "")) }
+            .distinctBy(::normalizeKey).take(if (home) 16 else 4)
+            .map { CatalogSeed(it, artist = it, artistScore = 0.50) }
+        val tagSeeds = buildOnlineSeeds(references.firstOrNull(), taste, delta)
+            .filter { !home || !FunctionalMusicFilter.isReligious(it, "") }.take(3).map { CatalogSeed(it) }
+        var successCount = 0
+        var failure: Throwable? = null
+        val pool = HashMap<String, Candidate>()
+
+        suspend fun searchBatch(batch: List<CatalogSeed>) {
+            val results = coroutineScope {
+                batch.map { seed -> async {
+                    try {
+                        val limit = if (seed.suggestion != null) 8 else if (home) 60 else 20
+                        val paged = home && seed.suggestion == null
+                        val offset = if (paged) synchronized(catalogOffsets) { catalogOffsets[seed.query] ?: 0 } else 0
+                        val tracks = if (home) withTimeoutOrNull(5_000L) {
+                            if (paged) repository.searchTracksPage(seed.query, limit, offset)
+                            else repository.searchTracks(seed.query, limit)
+                        } ?: throw IllegalStateException("歌曲搜索响应超时")
+                        else repository.searchTracks(seed.query, limit)
+                        if (paged) synchronized(catalogOffsets) {
+                            // Rotate through the catalog on each batch; end-of-catalog returns to page one.
+                            catalogOffsets[seed.query] = if (tracks.size >= limit && offset + limit <= 10_000) offset + limit else 0
+                            while (catalogOffsets.size > 80) catalogOffsets.remove(catalogOffsets.keys.first())
+                        }
+                        seed to Result.success(tracks)
+                    }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { seed to Result.failure<List<NativeTrack>>(e) }
+                } }.awaitAll()
+            }
+            for ((seed, result) in results) {
+                if (result.isSuccess) successCount++ else if (failure == null) failure = result.exceptionOrNull()
+                val candidates = result.getOrDefault(emptyList()).filter { it.neteaseId != null && !excluded(it) &&
+                    (!seed.newArtistsOnly || recommendationArtistKeys(it.artist).let { keys ->
+                        keys.isNotEmpty() && keys.none { key -> key in familiarArtists }
+                    }) }
+                val hits = if (seed.suggestion != null) candidates.filter {
+                    TrackDedupe.normalizeTitle(it.title) == TrackDedupe.normalizeTitle(seed.suggestion.title) &&
+                        it.artist.split('/', '&', ',', '、').any { artist -> normalizeKey(artist) == normalizeKey(seed.suggestion.artist) }
+                }.take(1) else if (seed.artist != null) candidates.filter { track ->
+                    track.artist.split('/', '&', ',', '、').any { normalizeKey(it) == normalizeKey(seed.artist) }
+                } else candidates
+                hits.forEach { pool.merge(Candidate(it, tasteScore = seed.artistScore,
+                    discoveryScore = when {
+                        seed.suggestion != null -> 0.85
+                        seed.newArtistsOnly -> 0.65
+                        else -> 0.10
+                    },
+                    source = if (seed.newArtistsOnly) SOURCE_NEW_ARTIST else SOURCE_DISCOVERY)) }
+            }
+        }
+
+        val completed = withTimeoutOrNull(30_000L) {
+            coroutineScope {
+                if (!home) {
+                    val seeds = buildList {
+                        unified.explicit.filter { it.liked && it.dimension == "artist" }.takeLast(3).forEach { add(CatalogSeed(it.value)) }
+                        references.take(3).forEach { add(CatalogSeed(it.artist.split('/', '&', ',').first().trim())) }
+                        addAll(tagSeeds)
+                    }.distinctBy { it.query }.take(12)
+                    for (batch in seeds.chunked(3)) searchBatch(batch)
+                    return@coroutineScope
+                }
+                // This source runs even when familiar-artist candidates already fill the batch.
+                val suggestionsJob = async {
+                    if (useAi) discoveryRecall.suggestions(unified, references, exclusions, savedTracks, familiarArtists)
+                    else emptyList()
+                }
+                // Service recommendations remain the independent, non-AI taste-matched source.
+                val platformRequests = buildList<suspend () -> List<NativeTrack>> {
+                    if (repository.account.first() != null) {
+                        add { repository.dailyRecommendedTracks() }
+                        add { repository.personalFmTracks() }
+                    }
+                    references.mapNotNull { it.neteaseId }.distinct().take(3).forEach { id ->
+                        add { repository.similarTracks(id) }
+                    }
+                }
+                for (batch in platformRequests.chunked(3)) {
+                    val results = batch.map { request -> async {
+                        try {
+                            Result.success(withTimeoutOrNull(5_000L) { request() }
+                                ?: throw IllegalStateException("网易云推荐响应超时"))
+                        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Exception) { Result.failure<List<NativeTrack>>(e) }
+                    } }.awaitAll()
+                    results.forEach { result ->
+                        if (result.isSuccess) successCount++ else if (failure == null) failure = result.exceptionOrNull()
+                        result.getOrDefault(emptyList()).filter { it.neteaseId != null && !excluded(it) }.forEach {
+                            pool.merge(Candidate(it, discoveryScore = 0.75, source = SOURCE_PLATFORM))
+                        }
+                    }
+                }
+                val suggestions = suggestionsJob.await()
+                for (batch in suggestions.map {
+                    CatalogSeed("${it.title} ${it.artist}", suggestion = it, newArtistsOnly = true)
+                }.chunked(4)) {
+                    searchBatch(batch)
+                }
+                if (hasEnough(pool.values.toList())) return@coroutineScope
+
+                // Expand through taste-matched unfamiliar artists before returning to known artists.
+                // This lane also works when AI is unavailable. Identity and all home filters still apply.
+                val newArtistAnchors = pool.values.filter { candidate ->
+                    candidate.discoveryScore >= 0.6 && recommendationArtistKeys(candidate.track.artist).let { keys ->
+                        keys.isNotEmpty() && keys.none { it in familiarArtists }
+                    }
+                }.sortedWith(compareByDescending<Candidate> { it.discoveryScore }.thenBy { it.track.id })
+                    .distinctBy { it.track.firstArtistKey() }.mapNotNull { it.track.neteaseId }.take(3)
+                val expanded = newArtistAnchors.map { id -> async {
+                    try { withTimeoutOrNull(5_000L) { repository.similarTracks(id) }.orEmpty() }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (_: Exception) { emptyList() }
+                } }.awaitAll().flatten()
+                expanded.filter { it.neteaseId != null && !excluded(it) && recommendationArtistKeys(it.artist).let { keys ->
+                    keys.isNotEmpty() && keys.none { key -> key in familiarArtists }
+                } }.forEach { pool.merge(Candidate(it, discoveryScore = 0.65, source = SOURCE_NEW_ARTIST)) }
+                if (hasEnough(pool.values.toList())) return@coroutineScope
+                for (batch in artistSeeds.take(6).chunked(3)) searchBatch(batch)
+
+                // A catalog-verified AI suggestion also opens that musician's other works for exploration.
+                val relatedArtists = pool.values.filter { it.discoveryScore >= 0.85 }.map { it.track.firstArtistKey() }.toSet()
+                val relatedSeeds = suggestions.filter { normalizeKey(it.artist) in relatedArtists }
+                    .map { CatalogSeed(it.artist, artist = it.artist, artistScore = 0.30, newArtistsOnly = true) }
+                val extraSeeds = (artistSeeds.drop(6) + relatedSeeds + tagSeeds).distinctBy { normalizeKey(it.query) }
+                for (batch in extraSeeds.chunked(3)) {
+                    searchBatch(batch)
+                    if (hasEnough(pool.values.toList())) return@coroutineScope
+                }
+                if (home) repeat(2) {
+                    for (batch in (artistSeeds + relatedSeeds).distinctBy { normalizeKey(it.query) }.chunked(3)) {
+                        searchBatch(batch)
+                        if (hasEnough(pool.values.toList())) return@coroutineScope
+                    }
+                }
+            }
+            true
+        } ?: false
+        // Preserve completed search batches when one later request reaches the deadline.
+        if (pool.isEmpty()) {
+            if (successCount == 0) failure?.let { throw it }
+            if (!completed) throw IllegalStateException("推荐服务响应超时，请稍后重试。")
+        }
+        return pool.values.toList()
+    }
+
+    private data class CatalogSeed(
+        val query: String, val suggestion: DiscoverySuggestion? = null,
+        val artist: String? = null, val artistScore: Double = 0.0,
+        val newArtistsOnly: Boolean = false,
+    )
+    private val discoveryRecall by lazy { AiDiscoveryRecall(repository) }
+    private val catalogOffsets = LinkedHashMap<String, Int>()
 
     private fun buildOnlineSeeds(
         anchor: NativeTrack?,
@@ -440,49 +768,15 @@ class RecommendEngine(
         behaviorDelta: BehaviorPreferenceSnapshot,
     ): List<String> {
         val seeds = LinkedHashSet<String>()
-        // 先放最近行为 seed：这正是"越听越懂我"对库外搜索最直接的低成本入口。
-        behaviorDelta.onlineSeeds(maxItems = 4).forEach { seeds.add(it) }
-        // 不能光放 anchor.artist —— 会回流同 artist 热曲。改成
-        // "anchor.artist + mood" / "anchor.artist + genre" 这种组合 seed
         val anchorArtist = anchor?.artist?.split('/', '&', ',')?.firstOrNull()?.trim().orEmpty()
-        val moods = taste?.moods?.take(3).orEmpty()
-        val genres = taste?.genres?.map { it.tag }?.take(3).orEmpty()
-        val eras = taste?.eras?.map { it.label }?.take(2).orEmpty()
-        val cultural = taste?.culturalContext?.take(2).orEmpty()
-
-        // 优先组合 seed
-        for (g in genres) {
-            if (anchorArtist.isNotBlank()) seeds.add("$anchorArtist $g")
-            else seeds.add(g)
-        }
-        for (m in moods) {
-            if (genres.isNotEmpty()) seeds.add("${genres.first()} $m")
-            else seeds.add(m)
-        }
-        for (e in eras) seeds.add(e)
-        for (c in cultural) seeds.add(c)
-
-        // 冷启动不再注入裸 pop/city-pop 固定种子。没有可靠语义时宁可不搜，
-        // 避免把搜索服务的默认热榜误当成用户口味。
-        if (seeds.isEmpty() && anchorArtist.isNotBlank()) {
-            seeds.add("$anchorArtist 同类")
-        }
-
-        // 单独 anchor.artist 放最后兜底（且只放 1 个），不让它霸占 seeds
-        if (anchorArtist.isNotBlank() && seeds.size < 3) seeds.add(anchorArtist)
+        val genres = (taste?.genres.orEmpty().map { it.tag } + behaviorDelta.genreScores.entries
+            .filter { it.value > 0.32 }.sortedByDescending { it.value }.map { it.key }).distinct().take(3)
+        genres.forEach { genre -> seeds.add(if (anchorArtist.isNotBlank()) "$anchorArtist $genre" else genre) }
+        if (anchorArtist.isNotBlank()) seeds.add(anchorArtist)
         return seeds.toList().take(6)
     }
 
-    // ============== utility ==============
-
-    private fun logRecommendations(picks: List<Candidate>) {
-        logRecommendationTracks(picks.map { it.track })
-    }
-
-    private fun logRecommendationTracks(tracks: List<NativeTrack>) {
-        if (tracks.isEmpty()) return
-        runCatching { recommendationLog.logTracks(tracks, RecommendationLog.Source.Pet) }
-    }
+    // ============== Candidate signal merge ==============
 
     private data class Candidate(
         val track: NativeTrack,
@@ -491,8 +785,14 @@ class RecommendEngine(
         val tasteScore: Double = 0.0,
         val loveScore: Double = 0.0,
         val behaviorDeltaScore: Double = 0.0,
+        val savedScore: Double = 0.0,
+        val semanticScore: Double = 0.0,
+        val discoveryScore: Double = 0.0,
         val source: Int = 0,
+        val explicitScore: Double = 0.0,
         val finalScore: Double = 0.0,
+        val isDiscovery: Boolean = false,
+        val homeGroup: HomeGroup? = null,
     )
 
     /** 同一首歌从多个 channel 召回 → 各 channel 信号取 max 合并 */
@@ -508,6 +808,8 @@ class RecommendEngine(
                 tasteScore = maxOf(existing.tasteScore, c.tasteScore),
                 loveScore = maxOf(existing.loveScore, c.loveScore),
                 behaviorDeltaScore = maxOf(existing.behaviorDeltaScore, c.behaviorDeltaScore),
+                savedScore = maxOf(existing.savedScore, c.savedScore),
+                discoveryScore = maxOf(existing.discoveryScore, c.discoveryScore),
                 source = existing.source or c.source,
             )
         }
@@ -525,6 +827,7 @@ class RecommendEngine(
      */
     private fun AudioFeatures.toVector(): DoubleArray? {
         val bpm = bpm ?: return null
+        if (bpmConfidence < 0.35) return null
         // BPM 60-180 映到 0..1
         val bpmN = ((bpm - 60.0) / 120.0).coerceIn(0.0, 1.0)
         // rmsDb 一般 -30 .. 0 → 越接近 0 越响 → 映到 0..1
@@ -536,22 +839,15 @@ class RecommendEngine(
         return doubleArrayOf(bpmN, energyN, centroidN, drN)
     }
 
-    private fun cosine(a: DoubleArray, b: DoubleArray): Double {
-        var dot = 0.0; var na = 0.0; var nb = 0.0
-        for (i in a.indices) {
-            dot += a[i] * b[i]
-            na += a[i] * a[i]
-            nb += b[i] * b[i]
-        }
-        if (na == 0.0 || nb == 0.0) return 0.0
-        return dot / (sqrt(na) * sqrt(nb))
-    }
-
     companion object {
         private const val SOURCE_AUDIO = 1
         private const val SOURCE_COLISTEN = 2
         private const val SOURCE_TASTE = 4
         private const val SOURCE_LOVE = 8
         private const val SOURCE_BEHAVIOR_DELTA = 16
+        private const val SOURCE_LIBRARY = 32
+        private const val SOURCE_DISCOVERY = 64
+        private const val SOURCE_PLATFORM = 128
+        private const val SOURCE_NEW_ARTIST = 256
     }
 }

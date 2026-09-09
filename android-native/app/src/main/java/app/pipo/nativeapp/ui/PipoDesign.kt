@@ -29,8 +29,8 @@ object PipoColors {
     val Gold = Color(0xFFF3C46A)
 
     // glass 卡（沉浸式控件容器）
-    val GlassFill = Color(0x8C0C1018)       // rgba(12,16,24,0.55)
-    val GlassStroke = Color(0x14E9EFFF)     // rgba(233,239,255,0.08)
+    val GlassFill = Color(0x8A172029)
+    val GlassStroke = Color(0x24FFFFFF)
 
     // 进度条 / 控件背景层
     val ProgressTrack = Color(0x33E9EFFF)
@@ -78,6 +78,9 @@ object PipoMotion {
 }
 
 object PipoDimens {
+    val SurfaceCornerDp = 14.dp
+    val ThumbnailCornerDp = 7.dp
+    val GlassBlurDp = 24.dp
     // PlayerCard compact
     val CompactCoverMaxDp = 400.dp
     val CompactCoverMinDp = 220.dp

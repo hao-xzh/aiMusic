@@ -20,7 +20,7 @@ class AgentQueuePlanner(
             }
         }
         val validation = if (llmStructured) {
-            validator.validateStructured(actions)
+            validator.validateStructured(actions, turnPlan.userText)
         } else {
             validator.validate(turnPlan.userText, actions)
         }

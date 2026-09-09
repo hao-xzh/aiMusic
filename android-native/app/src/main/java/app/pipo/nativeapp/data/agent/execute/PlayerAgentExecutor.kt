@@ -17,7 +17,12 @@ import app.pipo.nativeapp.playback.orchestrator.QueueHardConstraints
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
 import app.pipo.nativeapp.playback.PlaybackUrlResolver
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class PlayerAgentExecutor(
     private val repository: PipoRepository,
@@ -27,13 +32,20 @@ class PlayerAgentExecutor(
     private val onSkip: () -> Unit,
     /** Durable task id; makes playback request ids stable across Worker retries. */
     private val taskId: String = "",
+    private val playerDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    resolvePlayableTrack: (suspend (NativeTrack) -> NativeTrack?)? = null,
+    private val currentQueueProvider: () -> List<NativeTrack> = { emptyList() },
 ) : AgentActionExecutor {
     private val playbackUrlResolver = PlaybackUrlResolver(
         repository = repository,
         streamLevelFallbacks = STREAM_LEVEL_FALLBACKS,
         streamUrlTimeoutMs = STREAM_URL_TIMEOUT_MS,
     )
+    private val resolvePlayableTrack = resolvePlayableTrack ?: playbackUrlResolver::resolveSinglePlayable
     private val playlistImportService = PlaylistImportService(repository)
+    private var committedCurrentTrack: NativeTrack? = null
+    private var committedQueue: List<NativeTrack>? = null
+    private var currentCursorUnconfirmed = false
 
     override suspend fun playQueue(
         actionId: String,
@@ -43,6 +55,7 @@ class PlayerAgentExecutor(
         primaryGoal: MusicGoal,
         target: TrackRequirement?,
         similar: Boolean,
+        preserveCurrent: Boolean,
     ): ActionExecutionResult {
         val operation = when {
             similar -> QueueOperation.PlaySimilar
@@ -61,15 +74,24 @@ class PlayerAgentExecutor(
             else -> tracks
         }
         val request = AgentQueueRequest(
-            requestId = stableId("play", tracks.joinToString(",") { it.id }, mode.name, similar.toString()),
+            requestId = stableId(
+                "play",
+                tracks.joinToString(",") { it.id },
+                mode.name,
+                similar.toString(),
+                preserveCurrent.toString(),
+            ),
             sourceUserText = sourceUserText,
             operation = operation,
             tracks = requestTracks,
             continuous = continuous,
+            preserveCurrent = preserveCurrent,
             desiredCount = requestTracks.size,
             hardConstraints = hardConstraintsFor(primaryGoal, target, operation),
         )
-        return resultForCommit(request.requestId, "play_queue", request, onApplyAgentQueueRequest(request), similar)
+        val currentBeforeCommit = actionCurrentTrack()
+        val commit = withContext(playerDispatcher) { onApplyAgentQueueRequest(request) }
+        return resultForCommit(request.requestId, "play_queue", request, commit, similar, currentBeforeCommit)
     }
 
     override suspend fun insertNext(
@@ -94,18 +116,55 @@ class PlayerAgentExecutor(
                 nextTrack = TrackRequirement(title = resolvedFirst.title, artist = resolvedFirst.artist, placement = TrackPlacement.Next),
             ),
         )
-        return resultForCommit(request.requestId, "insert_next", request, onApplyAgentQueueRequest(request), similar = false)
+        val currentBeforeCommit = actionCurrentTrack()
+        val commit = withContext(playerDispatcher) { onApplyAgentQueueRequest(request) }
+        return resultForCommit(
+            request.requestId,
+            "insert_next",
+            request,
+            commit,
+            similar = false,
+            currentBeforeCommit = currentBeforeCommit,
+        )
     }
 
     override suspend fun skip(actionId: String): ActionExecutionResult {
         val stableActionId = stableId("skip")
-        onSkip()
-        return ActionExecutionResult(stableActionId, "skip", success = true, message = "换一首")
+        val previousIds = withContext(playerDispatcher) {
+            listOfNotNull(currentTrackProvider()?.id, committedCurrentTrack?.id).toSet()
+        }
+        withContext(playerDispatcher) { onSkip() }
+        val currentAfterSkip = awaitCurrentAfterSkip(previousIds)
+        if (currentAfterSkip == null) {
+            currentCursorUnconfirmed = true
+            committedCurrentTrack = null
+            committedQueue = null
+            return ActionExecutionResult(
+                stableActionId,
+                "skip",
+                success = false,
+                message = "切歌后未确认新的当前歌曲，不能继续按旧歌曲操作。",
+                acceptedByPlayer = false,
+            )
+        }
+        currentCursorUnconfirmed = false
+        committedCurrentTrack = currentAfterSkip
+        if (committedQueue?.any { it.id == currentAfterSkip.id } != true) {
+            committedQueue = null
+        }
+        return ActionExecutionResult(
+            stableActionId,
+            "skip",
+            success = true,
+            message = "换一首",
+            currentTrack = currentAfterSkip,
+            queueSnapshot = executionQueue(),
+        )
     }
 
     override suspend fun likeCurrent(actionId: String, like: Boolean): ActionExecutionResult {
         val stableActionId = stableId("like_current", like.toString())
-        val currentTrack = currentTrackProvider()
+        val currentTrack = actionCurrentTrack()
         val tid = currentTrack?.neteaseId
         if (currentTrack == null || tid == null) {
             return ActionExecutionResult(stableActionId, "like", success = false, message = "现在没在放歌，没法${if (like) "收藏" else "取消收藏"}。")
@@ -125,6 +184,7 @@ class PlayerAgentExecutor(
                         message = if (like) "收藏好了：${currentTrack.title}" else "取消收藏了：${currentTrack.title}",
                         tracks = listOf(currentTrack),
                         currentTrack = currentTrack,
+                        queueSnapshot = executionQueue(),
                         likedTrack = currentTrack,
                     )
                 },
@@ -134,6 +194,7 @@ class PlayerAgentExecutor(
                         type = "like",
                         success = false,
                         message = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
+                        tracks = listOf(currentTrack),
                     )
                 },
             )
@@ -187,9 +248,31 @@ class PlayerAgentExecutor(
                         type = "like",
                         success = false,
                         message = "${if (like) "收藏" else "取消收藏"}失败：${err.message ?: err::class.java.simpleName}",
+                        tracks = listOf(track),
                     )
                 },
             )
+    }
+
+    override suspend fun retryFavorite(
+        actionId: String, track: NativeTrack, like: Boolean, accountUserId: Long,
+    ): ActionExecutionResult {
+        val tid = track.neteaseId
+        if (tid == null || repository.account.first()?.userId != accountUserId) {
+            return ActionExecutionResult(actionId, "like", false, "账号或歌曲已变化，请明确要收藏的歌曲。", acceptedByPlayer = false)
+        }
+        return runCatching { repository.likeSong(tid, like) }.fold(
+            onSuccess = {
+                ActionExecutionResult(actionId, "like", true,
+                    if (like) "收藏好了：${trackLabel(track)}" else "取消收藏了：${trackLabel(track)}",
+                    tracks = listOf(track), likedTrack = track)
+            },
+            onFailure = { error ->
+                ActionExecutionResult(actionId, "like", false,
+                    "${if (like) "收藏" else "取消收藏"}失败：${error.message ?: error::class.java.simpleName}",
+                    tracks = listOf(track), acceptedByPlayer = false)
+            },
+        )
     }
 
     override suspend fun modifyPlaylist(
@@ -198,7 +281,7 @@ class PlayerAgentExecutor(
         playlistName: String,
     ): ActionExecutionResult {
         val stableActionId = stableId("playlist", add.toString(), playlistName)
-        val currentTrack = currentTrackProvider()
+        val currentTrack = actionCurrentTrack()
         val tid = currentTrack?.neteaseId
         if (currentTrack == null || tid == null) {
             return ActionExecutionResult(stableActionId, "playlist", success = false, message = "现在没在放歌，没法操作歌单。")
@@ -216,6 +299,8 @@ class PlayerAgentExecutor(
                         success = true,
                         message = "${if (add) "已加入" else "已移出"}「${target.name}」",
                         tracks = listOf(currentTrack),
+                        currentTrack = currentTrack,
+                        queueSnapshot = executionQueue(),
                         playlistName = target.name,
                     )
                 },
@@ -252,7 +337,7 @@ class PlayerAgentExecutor(
     }
 
     private suspend fun resolveTrackForLike(target: TrackRequirement): NativeTrack? {
-        currentTrackProvider()?.takeIf { matchesTarget(it, target) }?.let { return it }
+        actionCurrentTrack()?.takeIf { matchesTarget(it, target) }?.let { return it }
         val query = listOfNotNull(target.artist, target.title).joinToString(" ").trim()
         if (query.isBlank()) return null
         val candidates = runCatching { repository.searchTracks(query, limit = 10) }.getOrDefault(emptyList())
@@ -308,7 +393,7 @@ class PlayerAgentExecutor(
         operation: QueueOperation,
         track: NativeTrack,
     ): NativeTrack? {
-        val resolved = playbackUrlResolver.resolveSinglePlayable(track)
+        val resolved = resolvePlayableTrack(track)
         if (resolved == null) {
             DiagnosticsLogStore.record(
                 area = "ai_agent",
@@ -405,11 +490,13 @@ class PlayerAgentExecutor(
         request: AgentQueueRequest,
         commit: QueueCommitResult,
         similar: Boolean,
+        currentBeforeCommit: NativeTrack?,
     ): ActionExecutionResult {
         return when (commit) {
             is QueueCommitResult.Success -> {
                 val plan = commit.plan
                 val tracks = plan.tracks
+                updateCommittedPlayback(plan, currentBeforeCommit)
                 val summary = plan.toSummary(accepted = true)
                 ActionExecutionResult(
                     actionId = actionId,
@@ -429,8 +516,8 @@ class PlayerAgentExecutor(
                     tracks = tracks,
                     acceptedByPlayer = true,
                     actuallyStarted = false,
-                    currentTrack = null,
-                    queueSnapshot = tracks,
+                    currentTrack = executionCurrentTrack(),
+                    queueSnapshot = executionQueue(),
                     insertedTrack = tracks.firstOrNull().takeIf { plan.operation == QueueOperation.InsertNext },
                     insert = plan.operation == QueueOperation.InsertNext,
                     similar = similar,
@@ -452,6 +539,65 @@ class PlayerAgentExecutor(
         }
     }
 
+    private suspend fun actionCurrentTrack(): NativeTrack? {
+        if (currentCursorUnconfirmed) return null
+        return committedCurrentTrack ?: withContext(playerDispatcher) {
+            if (committedQueue == null) {
+                committedQueue = currentQueueProvider().takeIf { it.isNotEmpty() }?.toList()
+            }
+            currentTrackProvider()
+        }
+    }
+
+    private suspend fun awaitCurrentAfterSkip(previousIds: Set<String>): NativeTrack? {
+        if (previousIds.isEmpty()) return null
+        return withTimeoutOrNull(SKIP_CURRENT_CONFIRM_TIMEOUT_MS) {
+            var candidate = withContext(playerDispatcher) { currentTrackProvider() }
+            while (candidate == null || candidate.id in previousIds) {
+                delay(SKIP_CURRENT_CONFIRM_POLL_MS)
+                candidate = withContext(playerDispatcher) { currentTrackProvider() }
+            }
+            candidate
+        }
+    }
+
+    private fun executionCurrentTrack(): NativeTrack? =
+        if (currentCursorUnconfirmed) null else committedCurrentTrack
+
+    private fun executionQueue(): List<NativeTrack> =
+        committedQueue ?: listOfNotNull(executionCurrentTrack())
+
+    private fun updateCommittedPlayback(
+        plan: app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlan,
+        currentBeforeCommit: NativeTrack?,
+    ) {
+        val tracks = plan.tracks
+        if (tracks.isEmpty()) return
+        currentCursorUnconfirmed = false
+        if (plan.operation == QueueOperation.InsertNext) {
+            val base = committedQueue ?: listOfNotNull(currentBeforeCommit)
+            val currentIndex = base.indexOfFirst { it.id == currentBeforeCommit?.id }
+            val insertIndex = (currentIndex + 1).coerceIn(0, base.size)
+            committedQueue = buildList {
+                addAll(base.take(insertIndex))
+                addAll(tracks)
+                addAll(base.drop(insertIndex))
+            }
+            committedCurrentTrack = if (plan.jumpToInserted) tracks.first() else currentBeforeCommit
+            return
+        }
+        if (plan.preserveCurrent && currentBeforeCommit != null) {
+            val base = committedQueue ?: listOf(currentBeforeCommit)
+            val currentIndex = base.indexOfFirst { it.id == currentBeforeCommit.id }
+            val prefix = if (currentIndex >= 0) base.take(currentIndex + 1) else listOf(currentBeforeCommit)
+            committedCurrentTrack = currentBeforeCommit
+            committedQueue = prefix + tracks
+            return
+        }
+        committedCurrentTrack = tracks.first()
+        committedQueue = tracks
+    }
+
     private fun stableId(operation: String, vararg parts: String): String {
         val seed = listOf(taskId, sourceUserText, operation, *parts).joinToString("|")
         return "agent-${seed.hashCode().toUInt().toString(16)}-$operation"
@@ -459,6 +605,8 @@ class PlayerAgentExecutor(
 
     private companion object {
         private const val STREAM_URL_TIMEOUT_MS = 15_000L
+        private const val SKIP_CURRENT_CONFIRM_TIMEOUT_MS = 1_000L
+        private const val SKIP_CURRENT_CONFIRM_POLL_MS = 20L
         private const val NO_PLAYABLE_SOURCE_MESSAGE = "很抱歉，没有找到可播放的音源。"
         private val STREAM_LEVEL_FALLBACKS = listOf("lossless", "exhigh", "higher", "standard")
     }

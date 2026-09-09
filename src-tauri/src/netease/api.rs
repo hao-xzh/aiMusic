@@ -17,8 +17,6 @@ use serde_json::json;
 use super::client::NeteaseClient;
 use super::models::*;
 
-const PHONE_LOGIN_COOKIE_OVERRIDES: &[(&str, &str)] = &[("os", "ios"), ("appver", "8.7.01")];
-
 #[derive(Default)]
 struct CloudHydrationResult {
     tracks: Vec<TrackInfo>,
@@ -61,16 +59,19 @@ impl NeteaseClient {
     /// 后端常见返回码：200 = 已发送 / 400 = 参数错误 / 503 = 频繁触发风控。
     pub async fn captcha_sent(&self, phone: &str, ctcode: i32) -> Result<CaptchaResp> {
         let resp: CaptchaResp = self
-            .weapi_api(
+            .weapi_login(
                 "sms/captcha/sent",
-                json!({ "ctcode": ctcode, "cellphone": phone }),
+                json!({
+                    "ctcode": ctcode.to_string(),
+                    "cellphone": phone,
+                    "secrete": "music_middleuser_pclogin",
+                }),
             )
             .await?;
         Ok(resp)
     }
 
-    /// 校验短信验证码。先 verify 再 login/cellphone，比直接拿验证码登录更接近官方流程，
-    /// 能减少一部分“存在风险，请稍后再试”这类误判。
+    /// 显式校验短信验证码；验证码登录由 w/login/cellphone 自行校验，不重复请求。
     pub async fn captcha_verify(
         &self,
         phone: &str,
@@ -78,9 +79,9 @@ impl NeteaseClient {
         ctcode: i32,
     ) -> Result<CaptchaResp> {
         let resp: CaptchaResp = self
-            .weapi(
+            .weapi_login(
                 "sms/captcha/verify",
-                json!({ "ctcode": ctcode, "cellphone": phone, "captcha": captcha }),
+                json!({ "ctcode": ctcode.to_string(), "cellphone": phone, "captcha": captcha }),
             )
             .await?;
         Ok(resp)
@@ -94,24 +95,20 @@ impl NeteaseClient {
         captcha: &str,
         ctcode: i32,
     ) -> Result<CellphoneLoginResp> {
-        let verify = self.captcha_verify(phone, captcha, ctcode).await?;
-        if verify.code != 200 {
-            return Ok(CellphoneLoginResp {
-                code: verify.code,
-                message: verify.message,
-                profile: None,
-            });
-        }
+        // Follow api-enhanced's current web SMS flow, using the same cookie jar as captcha_sent.
+        // https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/blob/main/module/login_cellphone.js
         let resp: CellphoneLoginResp = self
-            .weapi_with_cookie_overrides(
-                "login/cellphone",
+            .weapi_login(
+                "w/login/cellphone",
                 json!({
+                    "type": "1",
+                    "https": "true",
                     "phone": phone,
-                    "countrycode": ctcode,
+                    "countrycode": ctcode.to_string(),
                     "captcha": captcha,
-                    "rememberLogin": true,
+                    "remember": "true",
+                    "secureCaptcha": "",
                 }),
-                PHONE_LOGIN_COOKIE_OVERRIDES,
             )
             .await?;
         if resp.code == 200 {

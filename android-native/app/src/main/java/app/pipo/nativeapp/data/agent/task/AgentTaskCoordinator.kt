@@ -10,6 +10,7 @@ import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.PetMemory
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.agent.domain.TurnOutcome
+import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.runtime.AgentTurnExecutionException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -26,6 +27,7 @@ interface AgentTaskGateway {
 /** Process-level owner: UI composition may disappear, but this scope and durable queue do not. */
 class AgentTaskCoordinator(private val context: Context) {
     val store = AgentTaskStore(context)
+    private val ledger = AgentLedgerStore(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
     @Volatile private var gateway: AgentTaskGateway? = null
@@ -35,8 +37,27 @@ class AgentTaskCoordinator(private val context: Context) {
     fun unregisterGateway(value: AgentTaskGateway) { if (gateway === value) gateway = null }
 
     fun submit(userText: String, contextJson: String = "", onFinished: (Result<TurnOutcome>) -> Unit = {}): AgentTask {
-        val task = store.enqueue(userText, contextJson)
-        DiagnosticsLogStore.record("ai_agent_task", "enqueued", mapOf("taskId" to task.id, "contextBytes" to contextJson.length))
+        // A favorite failure has an exact song/account target. Give the new retry request to
+        // the tool loop instead of replaying a whole old task against today's current song.
+        val retriedTask = if (isRetryOnlyRequest(userText) && ledger.pendingFavorite() == null)
+            store.retryLatestFailed() else null
+        val task = retriedTask ?: store.enqueue(userText, contextJson)
+        if (retriedTask?.error == AgentTaskStore.INTERRUPTED_EXECUTION_RESULT_UNKNOWN) {
+            DiagnosticsLogStore.record(
+                "ai_agent_task",
+                "manual_retry_blocked_unknown_result",
+                mapOf("taskId" to task.id),
+            )
+            scope.launch {
+                onFinished(Result.failure(AgentTurnExecutionException(false, task.error)))
+            }
+            return task
+        }
+        DiagnosticsLogStore.record(
+            "ai_agent_task",
+            if (retriedTask == null) "enqueued" else "manual_retry_enqueued",
+            mapOf("taskId" to task.id, "contextBytes" to task.contextJson.length),
+        )
         scope.launch {
             // Persist the user's side as soon as the durable task exists. taskId makes
             // this idempotent with process-recovery / retry execution below.
@@ -61,6 +82,7 @@ class AgentTaskCoordinator(private val context: Context) {
         if (task.status == AgentTaskStatus.FAILED) return@withLock false
         val activeGateway = gateway ?: detachedGateway
         val startedAt = System.currentTimeMillis()
+        scope.launch { PipoGraph.userTaste.learnConversation(task.userText, task.id) }
         // WorkManager may win the race with submit's IO coroutine, or recreate the
         // process entirely. Ensure the question is durable before doing expensive work.
         runCatching {
@@ -103,7 +125,10 @@ class AgentTaskCoordinator(private val context: Context) {
             val terminal = task.attempts >= MAX_ATTEMPTS ||
                 (error is AgentTurnExecutionException && !error.retryable)
             if (terminal) {
-                store.fail(task.id, error.message ?: error::class.java.simpleName)
+                val reply = if (error is AgentTurnExecutionException && error.message.orEmpty().endsWith(":auth")) {
+                    "AI 服务鉴权失败，请到设置中的 AI 设置检查 API Key 后重试。"
+                } else "这次请求没能完成，请重试。"
+                store.fail(task.id, error.message ?: error::class.java.simpleName, reply)
                 onFinished(Result.failure(error))
             } else {
                 // A recoverable failure remains pending. Do not tell the page that the

@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.playback.orchestrator
 
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.data.AudioFeatures
 import app.pipo.nativeapp.data.AudioFeaturesStore
 import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.NativeTrack
@@ -25,6 +26,7 @@ data class AgentQueueRequest(
     val operation: QueueOperation,
     val tracks: List<NativeTrack>,
     val continuous: ContinuousQueueSource? = null,
+    val preserveCurrent: Boolean = false,
     val jumpToInserted: Boolean = true,
     val desiredCount: Int = tracks.size,
     val mixPolicy: MixPolicy = MixPolicy.fromUserText(sourceUserText),
@@ -269,6 +271,7 @@ data class TransitionPlan(
     val toTrackId: String,
     val mode: TransitionMode,
     val risk: TransitionRisk,
+    val analysisPending: Boolean = false,
 )
 
 enum class TransitionMode {
@@ -316,6 +319,7 @@ data class CommittedQueuePlan(
     val hardConstraints: QueueHardConstraints,
     val softPreferences: QueueSoftPreferences,
     val continuous: ContinuousQueueSource?,
+    val preserveCurrent: Boolean,
     val jumpToInserted: Boolean,
 ) {
     val tracks: List<NativeTrack> get() = slots.map { it.track }
@@ -330,6 +334,7 @@ data class CommittedQueuePlan(
             tracks: List<NativeTrack>,
             mixPolicy: MixPolicy = MixPolicy.fromUserText(sourceUserText),
             continuous: ContinuousQueueSource? = null,
+            preserveCurrent: Boolean = false,
         ): CommittedQueuePlan {
             val slots = tracks.mapIndexed { index, track ->
                 QueueSlot(
@@ -374,6 +379,7 @@ data class CommittedQueuePlan(
                 hardConstraints = QueueHardConstraints.fromUserText(sourceUserText),
                 softPreferences = QueueSoftPreferences.fromUserText(sourceUserText),
                 continuous = continuous,
+                preserveCurrent = preserveCurrent,
                 jumpToInserted = false,
             )
         }
@@ -462,6 +468,7 @@ class PlaybackSessionManager(
             operation = operation,
             tracks = tracks,
             continuous = continuous,
+            preserveCurrent = preserveCurrent,
             jumpToInserted = jumpToInserted,
             desiredCount = tracks.size,
             mixPolicy = mixPolicy,
@@ -531,6 +538,7 @@ class PlaybackOrchestrator(
             hardConstraints = request.hardConstraints,
             softPreferences = request.softPreferences,
             continuous = request.continuous,
+            preserveCurrent = request.preserveCurrent,
             jumpToInserted = request.jumpToInserted,
         )
         return sessionManager.commitQueue(plan)
@@ -627,7 +635,10 @@ class PlaybackOrchestrator(
     ): List<TransitionPlan> {
         if (!mixPolicy.enabled || mixPolicy.mode == MixMode.Off) return emptyList()
         return optimized.slots.zipWithNext().mapIndexed { index, (from, to) ->
-            val score = pairScore(from.track, to.track)
+            val fromFeatures = featuresStore.get(from.track.id)
+            val toFeatures = featuresStore.get(to.track.id)
+            val analysisPending = fromFeatures == null || toFeatures == null
+            val score = pairScore(from.track, to.track, fromFeatures, toFeatures)
             val risk = when {
                 score >= 0.78 -> TransitionRisk.Low
                 score >= 0.52 -> TransitionRisk.Medium
@@ -647,14 +658,20 @@ class PlaybackOrchestrator(
                     else -> TransitionMode.NoMix
                 },
                 risk = risk,
+                analysisPending = analysisPending,
             )
         }
     }
 
-    private fun pairScore(from: NativeTrack, to: NativeTrack): Double {
+    private fun pairScore(
+        from: NativeTrack,
+        to: NativeTrack,
+        fromFeatures: AudioFeatures?,
+        toFeatures: AudioFeatures?,
+    ): Double {
         val fit = TransitionScore.fitScore(
-            TransitionScore.Scored(from, featuresStore.get(from.id)),
-            TransitionScore.Scored(to, featuresStore.get(to.id)),
+            TransitionScore.Scored(from, fromFeatures),
+            TransitionScore.Scored(to, toFeatures),
         )
         return fit.score
     }

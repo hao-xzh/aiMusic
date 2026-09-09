@@ -36,10 +36,17 @@ internal fun PlaylistDetailBackdrop(
     showTopCover: Boolean,
     topCoverHeight: Dp,
     topCoverOffsetPx: Float,
+    darkSurface: Boolean = false,
+    fallbackCoverUrl: String? = null,
 ) {
-    val surfaceColor = appleMusicPureSurfaceColor(edges)
-    val bridgeColor = appleMusicDissolveBridgeColor(edges, fallback = surfaceColor)
-    val topColor = appleMusicPureTopColor(edges, fallback = bridgeColor)
+    // Browsing keeps readable dark surfaces even for white/bright album covers.
+    // The existing full player and legacy library retain their adaptive palette.
+    val originalSurface = appleMusicPureSurfaceColor(edges)
+    val surfaceColor = if (darkSurface) lerp(originalSurface, Color(0xFF070B12), 0.88f) else originalSurface
+    val originalBridge = appleMusicDissolveBridgeColor(edges, fallback = surfaceColor)
+    val bridgeColor = if (darkSurface) lerp(originalBridge, Color(0xFF070B12), 0.80f) else originalBridge
+    val originalTop = appleMusicPureTopColor(edges, fallback = bridgeColor)
+    val topColor = if (darkSurface) lerp(originalTop, Color(0xFF070B12), 0.66f) else originalTop
 
     Box(
         modifier = Modifier
@@ -56,12 +63,13 @@ internal fun PlaylistDetailBackdrop(
                 ),
             ),
     ) {
-        PlaylistDetailLowerGlassWash(coverUrl = coverUrl)
+        PlaylistDetailLowerGlassWash(coverUrl = coverUrl, fallbackCoverUrl = fallbackCoverUrl)
         PlaylistDetailTopCover(
             coverUrl = coverUrl,
             height = topCoverHeight,
             offsetPx = topCoverOffsetPx,
             visible = showTopCover,
+            fallbackCoverUrl = fallbackCoverUrl,
         )
         Box(
             modifier = Modifier
@@ -81,7 +89,7 @@ internal fun PlaylistDetailBackdrop(
 }
 
 @Composable
-private fun PlaylistDetailLowerGlassWash(coverUrl: String?) {
+private fun PlaylistDetailLowerGlassWash(coverUrl: String?, fallbackCoverUrl: String?) {
     if (coverUrl == null) return
     Box(modifier = Modifier.fillMaxSize()) {
         InstantBackdropCoverImage(
@@ -96,6 +104,7 @@ private fun PlaylistDetailLowerGlassWash(coverUrl: String?) {
                 .blur(64.dp),
             contentScale = ContentScale.Crop,
             maxDecodeSizePx = 960,
+            fallbackUrl = fallbackCoverUrl,
         )
     }
 }
@@ -106,6 +115,7 @@ private fun InstantBackdropCoverImage(
     modifier: Modifier,
     contentScale: ContentScale,
     maxDecodeSizePx: Int,
+    fallbackUrl: String? = null,
 ) {
     val context = LocalContext.current
     val model = remember(context, url, maxDecodeSizePx) {
@@ -117,12 +127,23 @@ private fun InstantBackdropCoverImage(
             .crossfade(false)
             .build()
     }
-    AsyncImage(
-        model = model,
-        contentDescription = null,
-        contentScale = contentScale,
-        modifier = modifier,
-    )
+    Box(modifier) {
+        // Keep the local artwork visible until the remote cover has loaded, including on failure.
+        if (fallbackUrl != null && fallbackUrl != url) {
+            InstantBackdropCoverImage(
+                url = fallbackUrl,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale,
+                maxDecodeSizePx = maxDecodeSizePx,
+            )
+        }
+        AsyncImage(
+            model = model,
+            contentDescription = null,
+            contentScale = contentScale,
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
 }
 
 @Composable
@@ -131,6 +152,7 @@ private fun PlaylistDetailTopCover(
     height: Dp,
     offsetPx: Float,
     visible: Boolean,
+    fallbackCoverUrl: String?,
 ) {
     Box(
         modifier = Modifier
@@ -170,6 +192,7 @@ private fun PlaylistDetailTopCover(
                     .background(Color(0xFF11151D)),
                 contentScale = ContentScale.Crop,
                 maxDecodeSizePx = 960,
+                fallbackUrl = fallbackCoverUrl,
             )
         } else {
             Box(

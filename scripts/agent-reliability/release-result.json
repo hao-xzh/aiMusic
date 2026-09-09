@@ -1,0 +1,21 @@
+{
+  "apkPath": "/Volumes/soft/Claudio/android-native/release-apks/Claudio-PIPO-v0.4.3-32-release-20260906-003217.apk",
+  "applicationId": "app.pipo.nativeapp",
+  "versionName": "0.4.3",
+  "versionCode": 32,
+  "abi": "arm64-v8a",
+  "sizeBytes": 10719754,
+  "sha256": "7480639e15e1174b3f0e66b78d96d794c5a04a1ed3dcf0534d782da09eff49f3",
+  "certificateSha256": "c18626989d71387e0232da98aef662bd144b68ef1009f26b7d2ab7a0e72c4d1f",
+  "v2SignatureVerified": true,
+  "zipAlignment16KiBVerified": true,
+  "archiveIntegrityVerified": true,
+  "packagedNativeMatchesReleaseIntermediate": true,
+  "newSearchEndpointAndFailureMarkersPresent": true,
+  "deliveryCopyMatchesBuiltApk": true,
+  "deviceTested": false,
+  "build": "assembleRelease succeeded in 1m 45s; Android ARM64 native bridge rebuilt",
+  "scope": "Android online search EAPI fix, explicit search-service failure propagation, reviewed multi-song opening request, original-version correction; includes existing group/retry and current animation/playback workspace changes",
+  "credentialScanPassed": true,
+  "credentialScanFiles": 99
+}

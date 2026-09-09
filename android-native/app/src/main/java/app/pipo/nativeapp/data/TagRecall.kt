@@ -88,9 +88,13 @@ object TagRecall {
 
     private fun matchArray(needles: List<String>, haystack: List<String>): Double {
         if (needles.isEmpty()) return 0.0
-        var hit = 0
-        for (n in needles) if (includesAny(listOf(n), haystack)) hit++
-        return hit.toDouble() / needles.size
+        val wanted = needles.map(::normalize).filter(String::isNotBlank).distinct()
+        if (wanted.isEmpty()) return 0.0
+        val available = haystack.map(::normalize).filter(String::isNotBlank)
+        val hit = wanted.count { needle ->
+            available.any { value -> value == needle || value.contains(needle) || needle.contains(value) }
+        }
+        return hit.toDouble() / wanted.size
     }
 
     private fun matchLanguages(needles: List<String>, actual: String): Double {
@@ -130,8 +134,15 @@ object TagRecall {
     }
 
     private fun normalize(value: String): String {
-        return value.lowercase().replace(Regex("\\s+"), "")
+        val compact = value.lowercase().replace(Regex("\\s+"), "")
             .replace("节奏布鲁斯", "r&b").replace("rnb", "r&b")
+        return when (compact) {
+            "忧郁", "伤感", "emo", "难过", "失恋", "心碎", "丧",
+            "melancholic", "melancholy", "sad", "heartbreak", "heartbroken" -> "melancholic"
+            "孤独", "寂寞", "lonely" -> "lonely"
+            "深夜", "凌晨", "latenight", "late-night", "night" -> "night"
+            else -> compact
+        }
     }
 }
 

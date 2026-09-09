@@ -1,48 +1,19 @@
 package app.pipo.nativeapp.ui
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.RectangleShape
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.DiagnosticsLogStore
-import app.pipo.nativeapp.data.CaptchaSentStatus
-import app.pipo.nativeapp.data.PhoneLoginStatus
-import app.pipo.nativeapp.data.PipoGraph
-import app.pipo.nativeapp.data.PipoRepository
+import app.pipo.nativeapp.data.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -51,178 +22,87 @@ fun LoginScreen(onBack: () -> Unit) {
     val repository = PipoGraph.repository
     val account by repository.account.collectAsState(initial = null)
     val scope = rememberCoroutineScope()
-
     var mode by remember { mutableStateOf(LoginMode.Phone) }
     var phone by remember { mutableStateOf("") }
     var captcha by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf("输入手机号，先拿短信验证码。") }
+    var status by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var loggingIn by remember { mutableStateOf(false) }
     var cooldown by remember { mutableIntStateOf(0) }
-
+    var loginCooldown by remember { mutableIntStateOf(0) }
     var qrContent by remember { mutableStateOf<String?>(null) }
     var qrRefreshNonce by remember { mutableIntStateOf(0) }
     var qrStatus by remember { mutableStateOf("用网易云 App 扫码确认登录。") }
-
-    val cleanPhone = phone.filter(Char::isDigit).take(11)
-    val cleanCaptcha = captcha.filter(Char::isDigit).take(6)
-    val phoneOk = Regex("^1\\d{10}$").matches(cleanPhone)
-    val captchaOk = cleanCaptcha.length in 4..6
-
-    LaunchedEffect(account) {
-        if (account != null) onBack()
-    }
-
-    LaunchedEffect(cooldown) {
-        if (cooldown > 0) {
-            delay(1_000)
-            cooldown -= 1
-        }
-    }
-
+    val phoneOk = Regex("^1[0-9]{10}$").matches(phone)
+    val captchaOk = captcha.length in 4..6
+    LaunchedEffect(account) { if (account != null) onBack() }
+    LaunchedEffect(cooldown) { if (cooldown > 0) { delay(1_000); cooldown-- } }
+    LaunchedEffect(loginCooldown) { if (loginCooldown > 0) { delay(1_000); loginCooldown-- } }
     LaunchedEffect(mode, qrRefreshNonce) {
-        if (mode != LoginMode.Qr) {
-            qrContent = null
-            return@LaunchedEffect
-        }
+        if (mode != LoginMode.Qr) { qrContent = null; return@LaunchedEffect }
         runQrFlow(repository, onContent = { qrContent = it }, onStatus = { qrStatus = it })
     }
-
-    ScreenScaffold(title = "LOGIN") {
-        Text(
-            "登录网易云，把歌单和云盘接进 Pipo。",
-            color = PipoColors.TextDim,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(bottom = 12.dp),
-        )
-
-        LoginSectionHeader("01", "PHONE")
-        LoginRow(title = "手机号", subtitle = "大陆手机号，默认 +86。") {
-            LoginInput(
-                value = cleanPhone,
-                onValueChange = { phone = it.filter(Char::isDigit).take(11) },
-                placeholder = "11 位手机号",
-                modifier = Modifier.widthIn(min = 156.dp, max = 210.dp),
-                keyboardType = KeyboardType.Phone,
-                imeAction = ImeAction.Next,
-            )
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = BrowseMuted, unfocusedBorderColor = Color.White.copy(alpha = 0.12f),
+        focusedContainerColor = Color.White.copy(alpha = 0.025f), unfocusedContainerColor = Color.White.copy(alpha = 0.025f),
+        focusedTextColor = BrowseInk, unfocusedTextColor = BrowseInk,
+        focusedPlaceholderColor = BrowseMuted, unfocusedPlaceholderColor = BrowseMuted,
+        focusedPrefixColor = BrowseInk, unfocusedPrefixColor = BrowseInk, cursorColor = PipoColors.Mint
+    )
+    BrowsePageScaffold("", coverUrl = "file:///android_asset/artwork/login-music-classics.png", artistic = true, onBack = onBack) {
+        Text("旧日有声，\n此刻重逢。", color = BrowseInk, fontSize = 36.sp, lineHeight = 48.sp)
+        Text("让网易云里的珍藏，继续陪你往前走。", color = BrowseMuted, fontSize = 16.sp, modifier = Modifier.padding(top = 16.dp, bottom = 72.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+            TextButton(enabled = !sending && !loggingIn, onClick = { mode = LoginMode.Phone }) { Text("手机号登录", color = if (mode == LoginMode.Phone) BrowseInk else BrowseMuted) }
+            TextButton(enabled = !sending && !loggingIn, onClick = { mode = LoginMode.Qr }) { Text("扫码登录", color = if (mode == LoginMode.Qr) BrowseInk else BrowseMuted) }
         }
-        LoginRow(title = "短信验证码", subtitle = "验证码通过后会自动写入本机 cookie。") {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                LoginInput(
-                    value = cleanCaptcha,
-                    onValueChange = { captcha = it.filter(Char::isDigit).take(6) },
-                    placeholder = "验证码",
-                    modifier = Modifier.width(104.dp),
-                    keyboardType = KeyboardType.Number,
-                    imeAction = ImeAction.Done,
-                )
-                LoginButton(
-                    text = when {
-                        sending -> "发送中"
-                        cooldown > 0 -> "${cooldown}s"
-                        else -> "发送"
-                    },
-                    enabled = phoneOk && !sending && cooldown == 0,
-                    onClick = {
-                        scope.launch {
-                            sending = true
-                            status = "正在请求验证码…"
-                            val result = runCatching { repository.sendPhoneCaptcha(cleanPhone) }
-                            val sent = result.getOrNull()
-                            if (sent?.code == 200) {
-                                cooldown = 60
-                                status = "验证码已发送。"
-                                DiagnosticsLogStore.record("login", "phone_captcha_sent")
-                            } else {
-                                status = phoneStatus(sent, result.exceptionOrNull())
-                                DiagnosticsLogStore.record(
-                                    area = "login",
-                                    event = "phone_captcha_failed",
-                                    fields = mapOf(
-                                        "code" to sent?.code,
-                                        "message" to sent?.message.orEmpty().take(120),
-                                        "errorType" to result.exceptionOrNull()?.javaClass?.simpleName.orEmpty(),
-                                    ),
-                                )
-                            }
-                            sending = false
-                        }
-                    },
-                )
-            }
-        }
-        LoginRow(title = "登录状态", subtitle = status, showDivider = false) {
-            LoginButton(
-                text = if (loggingIn) "登录中" else "登录",
-                isPrimary = true,
-                enabled = phoneOk && captchaOk && !loggingIn,
-                onClick = {
+        if (mode == LoginMode.Phone) {
+            OutlinedTextField(phone, { phone = it.filter { c -> c in '0'..'9' }.take(11) }, Modifier.fillMaxWidth().padding(top = 18.dp), colors = fieldColors, textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp), prefix = { Text("+86  ") }, placeholder = { Text("11 位手机号") }, singleLine = true, readOnly = sending || loggingIn, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp))
+            OutlinedTextField(captcha, { captcha = it.filter { c -> c in '0'..'9' }.take(6) }, Modifier.fillMaxWidth().padding(top = 18.dp), colors = fieldColors, textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp), placeholder = { Text("短信验证码") }, singleLine = true, readOnly = sending || loggingIn, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp), trailingIcon = {
+                TextButton(enabled = phoneOk && !sending && !loggingIn && cooldown == 0 && loginCooldown == 0, onClick = {
+                    if (sending || loggingIn || cooldown > 0 || loginCooldown > 0) return@TextButton
+                    val requestedPhone = phone
+                    sending = true
+                    cooldown = 60
+                    status = "正在发送验证码…"
                     scope.launch {
-                        loggingIn = true
-                        status = "正在校验验证码并登录…"
-                        val result = runCatching { repository.loginWithPhone(cleanPhone, cleanCaptcha) }
-                        val login = result.getOrNull()
-                        if (login?.code == 200) {
-                            DiagnosticsLogStore.record(
-                                area = "login",
-                                event = "phone_login_success",
-                                fields = mapOf("hasNickname" to !login.nickname.isNullOrBlank()),
-                            )
-                            status = login.nickname?.let { "已登录 · $it" } ?: "登录成功"
-                            runCatching { repository.refreshAccount() }
-                        } else {
-                            status = phoneLoginStatus(login, result.exceptionOrNull())
-                            DiagnosticsLogStore.record(
-                                area = "login",
-                                event = "phone_login_failed",
-                                fields = mapOf(
-                                    "code" to login?.code,
-                                    "message" to login?.message.orEmpty().take(120),
-                                    "errorType" to result.exceptionOrNull()?.javaClass?.simpleName.orEmpty(),
-                                ),
-                            )
-                        }
-                        loggingIn = false
+                        try {
+                            val sent = repository.sendPhoneCaptcha(requestedPhone)
+                            status = phoneStatus(sent, null)
+                            if (sent.code == 200) DiagnosticsLogStore.record("login", "phone_captcha_sent")
+                            else DiagnosticsLogStore.record("login", "phone_captcha_failed", mapOf("code" to sent.code))
+                        } catch (e: CancellationException) { throw e }
+                        catch (e: Exception) { status = phoneStatus(null, e) }
+                        finally { sending = false }
                     }
-                },
-            )
-        }
-
-        LoginSectionHeader("02", "FALLBACK")
-        LoginRow(
-            title = "扫码登录",
-            subtitle = "如果网易云提示风险，扫码通常更稳。",
-            showDivider = mode != LoginMode.Qr,
-        ) {
-            LoginButton(
-                text = if (mode == LoginMode.Qr && qrContent != null) "刷新二维码" else "打开扫码",
-                isPrimary = mode == LoginMode.Qr,
-                onClick = {
-                    mode = LoginMode.Qr
-                    qrRefreshNonce += 1
-                },
-            )
-        }
-
-        if (mode == LoginMode.Qr) {
-            Box(
-                modifier = Modifier
-                    .padding(vertical = 10.dp)
-                    .border(1.dp, PipoColors.GlassStroke, RectangleShape)
-                    .padding(8.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                qrContent?.let { content ->
-                    QrCode(content = content, modifier = Modifier.size(184.dp))
-                } ?: Box(modifier = Modifier.size(184.dp), contentAlignment = Alignment.Center) {
-                    Text(qrStatus, color = PipoColors.TextDim, style = TextStyle(fontSize = 12.sp))
+                }) { Text(if (sending) "发送中" else if (cooldown > 0) "${cooldown}s" else "发送验证码", fontSize = 12.sp) }
+            })
+            Button(enabled = phoneOk && captchaOk && !sending && !loggingIn && loginCooldown == 0, onClick = {
+                if (sending || loggingIn || loginCooldown > 0) return@Button
+                val requestedPhone = phone
+                val requestedCaptcha = captcha
+                loggingIn = true
+                status = "正在登录…"
+                scope.launch {
+                    try {
+                        val result = repository.loginWithPhone(requestedPhone, requestedCaptcha)
+                        status = phoneLoginStatus(result, null)
+                        if (isPhoneLoginRestricted(result.code, result.message)) loginCooldown = 60
+                        if (result.code == 200) { DiagnosticsLogStore.record("login", "phone_login_success"); repository.refreshAccount() }
+                        else DiagnosticsLogStore.record("login", "phone_login_failed", mapOf("code" to result.code))
+                    } catch (e: CancellationException) { throw e }
+                    catch (e: Exception) { loginCooldown = 60; status = phoneLoginStatus(null, e) }
+                    finally { loggingIn = false }
                 }
+            }, modifier = Modifier.fillMaxWidth().padding(top = 22.dp).heightIn(min = 52.dp), colors = ButtonDefaults.buttonColors(containerColor = BrowseInk, contentColor = Color.Black), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp)) { Text(if (loggingIn) "登录中…" else if (loginCooldown > 0) "${loginCooldown}s 后重试" else "登录") }
+            if (status.isNotEmpty()) BrowseNotice(status)
+            Text("使用已注册的网易云账号登录", color = BrowseMuted, fontSize = 13.sp, modifier = Modifier.padding(top = 14.dp))
+        } else {
+            Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+                qrContent?.let { QrCode(content = it, modifier = Modifier.size(200.dp)) } ?: Text(qrStatus, color = BrowseMuted)
             }
-            LoginRow(title = "扫码状态", subtitle = qrStatus, showDivider = false)
+            Text(qrStatus, color = BrowseMuted)
+            TextButton(onClick = { qrRefreshNonce++ }) { Text("刷新二维码") }
         }
     }
 }
@@ -280,12 +160,18 @@ private suspend fun runQrFlow(
     onContent(null)
 }
 
+private fun isPhoneLoginRestricted(code: Int?, message: String?): Boolean =
+    code in setOf(-462, 503, 8821) || message?.let {
+        it.contains("风险") || it.contains("风控") || it.contains("频繁") || it.contains("行为验证")
+    } == true
+
 private fun phoneStatus(sent: CaptchaSentStatus?, error: Throwable?): String {
     val msg = sent?.message?.takeIf { it.isNotBlank() }
     return when {
         error != null -> "请求失败：${error.message ?: error.javaClass.simpleName}"
-        msg?.contains("风险") == true -> "网易云提示风险，等一会儿再试，或改用扫码登录。"
-        sent?.code == 503 -> msg ?: "发送太频繁，稍后再试。"
+        sent?.code == 200 -> "验证码已发送，请查收短信。"
+        sent?.code == 8821 -> "网易云要求额外安全验证，请暂停重试，并在网易云官方客户端检查账号状态。"
+        isPhoneLoginRestricted(sent?.code, msg) -> "${msg ?: "网易云暂时限制此请求"}。请稍后再试，勿连续发送验证码。"
         sent?.code != null -> msg ?: "发送失败，状态码 ${sent.code}。"
         else -> "发送失败，检查网络后重试。"
     }
@@ -295,158 +181,11 @@ private fun phoneLoginStatus(login: PhoneLoginStatus?, error: Throwable?): Strin
     val msg = login?.message?.takeIf { it.isNotBlank() }
     return when {
         error != null -> "登录失败：${error.message ?: error.javaClass.simpleName}"
-        msg?.contains("风险") == true -> "网易云提示风险，改用扫码登录更稳。"
+        login?.code == 200 -> login.nickname?.let { "登录成功 · $it" } ?: "登录成功。"
+        login?.code == 8821 -> "网易云要求额外安全验证，请暂停重试，并在网易云官方客户端检查账号状态。"
+        isPhoneLoginRestricted(login?.code, msg) -> "${msg ?: "网易云暂时限制此登录"}。请稍后再试，勿连续提交验证码。"
         login?.code == 502 -> msg ?: "验证码不对，重新输入。"
         login?.code != null -> msg ?: "登录失败，状态码 ${login.code}。"
         else -> "登录失败，检查网络后重试。"
-    }
-}
-
-@Composable
-private fun LoginSectionHeader(index: String, title: String) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 28.dp, bottom = 12.dp),
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = index,
-                color = PipoColors.TextDim,
-                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp),
-            )
-            Text(
-                text = "/",
-                color = PipoColors.TextDim.copy(alpha = 0.5f),
-                style = TextStyle(fontSize = 11.sp),
-            )
-            Text(
-                text = title.uppercase(),
-                color = PipoColors.Ink,
-                style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 3.sp),
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        LoginDivider()
-    }
-}
-
-@Composable
-private fun LoginRow(
-    title: String,
-    subtitle: String? = null,
-    showDivider: Boolean = true,
-    content: @Composable (() -> Unit)? = null,
-) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = title,
-                    color = PipoColors.Ink,
-                    style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Medium),
-                )
-                subtitle?.let {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = it,
-                        color = PipoColors.TextDim,
-                        style = TextStyle(fontSize = 11.sp, lineHeight = 15.sp),
-                    )
-                }
-            }
-            content?.let {
-                Spacer(modifier = Modifier.width(16.dp))
-                it()
-            }
-        }
-        if (showDivider) LoginDivider()
-    }
-}
-
-@Composable
-private fun LoginDivider() {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(1.dp)
-            .background(PipoColors.GlassStroke),
-    )
-}
-
-@Composable
-private fun LoginButton(
-    text: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    isPrimary: Boolean = false,
-    enabled: Boolean = true,
-) {
-    val backgroundColor = if (isPrimary && enabled) PipoColors.Ink else Color.Transparent
-    val textColor = when {
-        !enabled -> PipoColors.TextDim.copy(alpha = 0.55f)
-        isPrimary -> PipoColors.Bg0
-        else -> PipoColors.Ink
-    }
-    val borderColor = if (enabled) PipoColors.GlassStroke else PipoColors.GlassStroke.copy(alpha = 0.45f)
-    val borderModifier = if (isPrimary && enabled) Modifier else Modifier.border(1.dp, borderColor, RectangleShape)
-
-    Box(
-        modifier = modifier
-            .background(backgroundColor, RectangleShape)
-            .then(borderModifier)
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 8.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = text,
-            color = textColor,
-            style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp),
-        )
-    }
-}
-
-@Composable
-private fun LoginInput(
-    value: String,
-    onValueChange: (String) -> Unit,
-    placeholder: String,
-    modifier: Modifier = Modifier,
-    keyboardType: KeyboardType,
-    imeAction: ImeAction,
-) {
-    Box(
-        modifier = modifier
-            .height(38.dp)
-            .border(1.dp, PipoColors.GlassStroke, RectangleShape)
-            .padding(horizontal = 10.dp),
-        contentAlignment = Alignment.CenterStart,
-    ) {
-        if (value.isBlank()) {
-            Text(
-                text = placeholder,
-                color = PipoColors.TextDim.copy(alpha = 0.72f),
-                style = TextStyle(fontSize = 12.sp),
-            )
-        }
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            singleLine = true,
-            cursorBrush = SolidColor(PipoColors.Mint),
-            keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = imeAction),
-            textStyle = TextStyle(color = PipoColors.Ink, fontSize = 13.sp),
-            modifier = Modifier.fillMaxWidth(),
-        )
     }
 }

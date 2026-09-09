@@ -1,0 +1,75 @@
+{
+  "manifest_version": 3,
+  "manifest_kind": "execution_control",
+  "scope_id": "android-dark-v3",
+  "objective": "完成concept-03已批准12页Android改版；旧版远端备份c3e993c位于origin/codex/android-dark-v3",
+  "canonical_execution_manifest": "docs/development/execution-manifest.json",
+  "work_queue_status": "blocked",
+  "items": [
+    {
+      "item_id": "BROWSE",
+      "title": "首页、搜索、资料库与共享导航",
+      "source_ref": "/Users/shengpeng/.codex/visualizations/2026/09/07/01a07af1-41c2-7381-8cee-197d3c707bdb/design.md",
+      "contract_ref": null,
+      "depends_on": [],
+      "phase": "verification",
+      "status": "blocked",
+      "blocker": "首页已改为统一口味推荐列表，最终 release 构建通过，模拟器已核对无账号空状态；真实推荐列表和登录歌单仍缺用户数据验收，未声明逐像素完成。",
+      "next_action": "登录并配置有效 AI 后复核真实推荐列表、负反馈及发现质量；复用当前 release 与模拟器。",
+      "result_ref": null,
+      "audit_ref": null,
+      "updated_at": "2026-09-08"
+    },
+    {
+      "item_id": "SHEETS",
+      "title": "歌单详情、歌曲菜单、新建歌单与队列",
+      "source_ref": "/Users/shengpeng/.codex/visualizations/2026/09/07/01a07af1-41c2-7381-8cee-197d3c707bdb/design.md",
+      "contract_ref": null,
+      "depends_on": [
+        "BROWSE"
+      ],
+      "phase": "verification",
+      "status": "blocked",
+      "blocker": "队列与歌曲菜单已在模拟器复核；歌单详情、新建歌单需要真实登录账号。",
+      "next_action": "登录后从资料库进入真实歌单并核对详情、新建及拥有者操作。",
+      "result_ref": null,
+      "audit_ref": null,
+      "updated_at": "2026-09-08"
+    },
+    {
+      "item_id": "ACCOUNT",
+      "title": "登录、口味、设置与AI设置",
+      "source_ref": "/Users/shengpeng/.codex/visualizations/2026/09/07/01a07af1-41c2-7381-8cee-197d3c707bdb/design.md",
+      "contract_ref": null,
+      "depends_on": [
+        "BROWSE"
+      ],
+      "phase": "verification",
+      "status": "blocked",
+      "blocker": "设置直达口味库、未登录口味空状态已在模拟器复核；对话提取及画像实数据仍需有效 AI Key 和真实聆听数据。",
+      "next_action": "在音乐口味页核对真实对话偏好来源、忘记操作、近期倾向；本次请求覆盖长期偏好与宗教类别边界需真实模型联调。",
+      "result_ref": null,
+      "audit_ref": null,
+      "updated_at": "2026-09-08"
+    },
+    {
+      "item_id": "INTEGRATION",
+      "title": "路由整合及Android编译检查",
+      "source_ref": "/Users/shengpeng/.codex/visualizations/2026/09/07/01a07af1-41c2-7381-8cee-197d3c707bdb/design.md",
+      "contract_ref": null,
+      "depends_on": [
+        "BROWSE",
+        "SHEETS",
+        "ACCOUNT"
+      ],
+      "phase": "verification",
+      "status": "blocked",
+      "blocker": "最终 assembleRelease、APK v2 签名、16 KB 对齐和压缩完整性通过；依赖页面的真实账号及 AI 业务验收仍未完成。",
+      "next_action": "交付 android-native/release-apks/Claudio-PIPO-v0.4.3-32-unified-taste-20260908.apk；源码构建日志 /tmp/claudio-unified-taste-release-final.log，无新源码时复用产物。",
+      "result_ref": null,
+      "audit_ref": null,
+      "updated_at": "2026-09-08"
+    }
+  ],
+  "updated_at": "2026-09-08"
+}

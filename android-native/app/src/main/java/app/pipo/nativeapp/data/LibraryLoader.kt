@@ -59,6 +59,8 @@ class LibraryLoader(private val repository: PipoRepository) {
         return tracks
     }
 
+    fun peek(): List<NativeTrack> = cached.orEmpty()
+
     fun invalidate() { cached = null }
 
     companion object {

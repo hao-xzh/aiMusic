@@ -43,6 +43,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
@@ -72,7 +74,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import app.pipo.nativeapp.playback.LyricPlaybackPositionProvider
 import app.pipo.nativeapp.playback.PlayerViewModel
 import app.pipo.nativeapp.runtime.Amp
 import kotlinx.coroutines.delay
@@ -84,16 +89,18 @@ import kotlinx.coroutines.delay
 fun PlayerScreen(
     onOpenLyrics: () -> Unit,
     onOpenDistill: () -> Unit,
-    onOpenSettings: () -> Unit,
+    onOpenTaste: () -> Unit,
     immersiveProgress: Float,
     showTranslation: Boolean,
     hasTranslation: Boolean,
     onToggleTranslation: () -> Unit,
+    isVisible: Boolean = true,
     viewModel: PlayerViewModel = viewModel(),
 ) {
     val state = viewModel.state
+    val lifecycleOwner = LocalLifecycleOwner.current
 
-    LaunchedEffect(state.isPlaying) {
+    LaunchedEffect(state.isPlaying, isVisible) {
         // 不在播 → 单次 reset Amp,然后退出。之前 while(true) 在暂停态也每 420ms tick
         // 一次 refreshPosition,viewmodel 走 syncFrom + 歌词比对 + 续杯检查,待机也耗电。
         // isPlaying 变 true 时 LaunchedEffect 自动 relaunch,重新进入 30Hz tick 循环。
@@ -106,7 +113,16 @@ fun PlayerScreen(
             viewModel.refreshPosition()
             // 33ms ≈ 30Hz —— 之前 80ms 让歌词的 per-letter 颜色 sweep 显得分级不连续
             // （短词 200ms 内只有 2~3 帧）。30Hz 让 sweep 视觉连贯。
-            delay(33L)
+            // 子页覆盖或 Activity 不在前台时仍低频刷新，保留续杯、预热与快照逻辑。
+            // 每轮直接读取 lifecycle，避免后台后 Compose 未重组而继续 30Hz 刷新。
+            val tickDelayMs = if (
+                isVisible && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            ) {
+                33L
+            } else {
+                1_000L
+            }
+            delay(tickDelayMs)
         }
     }
 
@@ -116,7 +132,17 @@ fun PlayerScreen(
     val progressProvider: () -> Float = {
         if (durationMs > 0) (viewModel.positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
     }
-    val positionProvider = remember(viewModel) { { viewModel.positionMs } }
+    val positionProvider = remember(viewModel) {
+        object : LyricPlaybackPositionProvider {
+            override fun invoke(): Long = viewModel.currentPlaybackPositionMs()
+
+            override val playbackSpeed: Float
+                get() = viewModel.lyricPlaybackSpeed
+
+            override val discontinuitySequence: Long
+                get() = viewModel.lyricPlaybackDiscontinuitySequence
+        }
+    }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
         configuration.screenWidthDp > configuration.screenHeightDp
@@ -179,7 +205,7 @@ fun PlayerScreen(
                 transitionProgress = immersiveProgress,
                 onOpenLyrics = onOpenLyrics,
                 onOpenDistill = onOpenDistill,
-                onOpenSettings = onOpenSettings,
+                onOpenTaste = onOpenTaste,
                 onPrevious = viewModel::previous,
                 onToggle = viewModel::toggle,
                 onNext = viewModel::next,
@@ -205,7 +231,7 @@ private fun PortraitPlayerContent(
     transitionProgress: Float,
     onOpenLyrics: () -> Unit,
     onOpenDistill: () -> Unit,
-    onOpenSettings: () -> Unit,
+    onOpenTaste: () -> Unit,
     onPrevious: () -> Unit,
     onToggle: () -> Unit,
     onNext: () -> Unit,
@@ -412,8 +438,8 @@ private fun PortraitPlayerContent(
                                 }
                             },
                             c = {
-                                NavIconBtn(onClick = onOpenSettings) {
-                                    GearIcon(color = fg, modifier = Modifier.size(24.dp))
+                                NavIconBtn(onClick = onOpenTaste) {
+                                    ProfileIcon(color = fg, modifier = Modifier.size(24.dp).semantics { contentDescription = "音乐口味" })
                                 }
                             },
                         )

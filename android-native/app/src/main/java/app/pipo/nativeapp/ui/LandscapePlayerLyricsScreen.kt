@@ -26,15 +26,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -46,7 +45,7 @@ import app.pipo.nativeapp.data.PipoLyricLine
 
 /**
  * 横屏播放/歌词共用布局：
- * 左侧封面占满可用高度，右侧承载歌词列表和播放控制。封面右边缘用同源色彩云衔接，
+ * 左侧封面占满可用高度，右侧承载歌词列表和播放控制。封面右边缘按高度分区取色并渐变衔接，
  * 保持竖屏沉浸歌词页那种“封面融进背景”的感觉。
  */
 @Composable
@@ -76,6 +75,21 @@ internal fun LandscapePlayerLyricsScreen(
     val ambientColor = rgbToColor(ambientRgb, fallback = PipoColors.Bg1)
     val seamColor = appleMusicLandscapeSurfaceColor(edges, fallback = ambientColor)
     val coverEdgeColor = appleMusicLandscapeCoverColor(edges, fallback = seamColor)
+    val upperColor = animateColorAsState(
+        targetValue = rgbToColor(edges.rightUpper, fallback = coverEdgeColor),
+        animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
+        label = "landscapeUpperColor",
+    )
+    val middleColor = animateColorAsState(
+        targetValue = rgbToColor(edges.rightMiddle, fallback = coverEdgeColor),
+        animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
+        label = "landscapeMiddleColor",
+    )
+    val lowerColor = animateColorAsState(
+        targetValue = rgbToColor(edges.rightLower, fallback = coverEdgeColor),
+        animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
+        label = "landscapeLowerColor",
+    )
     // 只有真正提取到高色度 accent 才给歌词染色；灰度封面保持透明。
     val accentRgb = edges.accent?.let { blendRgb(it, ambientRgb, 0.22f) }
     val tone = toneForColor(seamColor)
@@ -89,22 +103,24 @@ internal fun LandscapePlayerLyricsScreen(
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
-        LandscapeBackdrop(
-            coverUrl = coverUrl,
-            baseColor = seamColor,
-            coverEdgeColor = coverEdgeColor,
-        )
-
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize(),
         ) {
-            val coverSide = maxHeight
+            // 高度驱动的封面在平板/窄横屏会挤空右栏，给歌词至少保留半屏宽度。
+            val coverPaneWidth = minOf(maxHeight + 42.dp, maxWidth * 0.5f)
+            LandscapeBackdrop(
+                baseColor = seamColor,
+                upperColor = { upperColor.value },
+                middleColor = { middleColor.value },
+                lowerColor = { lowerColor.value },
+                coverFraction = coverPaneWidth / maxWidth.coerceAtLeast(1.dp),
+            )
             Row(modifier = Modifier.fillMaxSize()) {
                 LandscapeCoverPane(
                     coverUrl = coverUrl,
                     seamColor = coverEdgeColor,
                     modifier = Modifier
-                        .width(coverSide + 42.dp)
+                        .width(coverPaneWidth)
                         .fillMaxHeight(),
                 )
 
@@ -128,39 +144,45 @@ internal fun LandscapePlayerLyricsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
 
                     androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides landscapeAccentState) {
-                        AppleMusicLyricColumn(
-                            lines = lyrics,
-                            sessionId = trackId,
-                            isPlaying = isPlaying,
-                            positionProvider = positionProvider,
-                            fg = fg,
-                            fgDim = fgDim,
-                            fgUnsung = fgUnsung,
-                            showTranslation = showTranslation,
-                            onSeekToMs = onSeekToMs,
-                            horizontalPadding = 0.dp,
-                            rowMinHeight = 52.dp,
-                            rowVerticalPadding = 6.dp,
-                            lyricFontSize = 25.sp,
-                            lyricLineHeight = 30.sp,
-                            lyricFontWeight = FontWeight.Bold,
-                            bottomFadeStart = 0.90f,
-                            bottomFadeSoftEnd = 0.98f,
-                            // 锚点改到顶部后同步收窄渐隐区；否则高横屏按百分比计算的
-                            // 20% mask 会把已经贴近标题的当前句也压暗。
-                            topFadeTransparentEnd = 0f,
-                            topFadePartialEnd = 0.02f,
-                            topFadeSolidEnd = 0.05f,
-                            // 90dp 只保护极短横屏/分屏不把当前句裁到 viewport 外；常规与
-                            // 平板横屏均由 8dp 上限决定，锚点不会随可用高度越长越远离标题。
-                            anchorBiasDp = 90.dp,
-                            anchorTopCapDp = 8.dp,
-                            // 横屏也按真实可用宽度排满再换行，不为“两行等长”提前折行。
-                            naturalSyllableWrap = true,
+                        BoxWithConstraints(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth(),
-                        )
+                        ) {
+                            val typography = nativeLyricTypography(maxWidth, maxHeight)
+                            val lyricTextScale = 0.88f
+                            AppleMusicLyricColumn(
+                                lines = lyrics,
+                                sessionId = trackId,
+                                isPlaying = isPlaying,
+                                positionProvider = positionProvider,
+                                fg = fg,
+                                fgDim = fgDim,
+                                fgUnsung = fgUnsung,
+                                showTranslation = showTranslation,
+                                onSeekToMs = onSeekToMs,
+                                horizontalPadding = 0.dp,
+                                rowMinHeight = 52.dp,
+                                rowVerticalPadding = 6.dp,
+                                lyricFontSize = typography.fontSize * lyricTextScale,
+                                lyricLineHeight = typography.lineHeight * lyricTextScale,
+                                lyricFontWeight = FontWeight.Bold,
+                                bottomFadeStart = 0.90f,
+                                bottomFadeSoftEnd = 0.98f,
+                                // 锚点改到顶部后同步收窄渐隐区；否则高横屏按百分比计算的
+                                // 20% mask 会把已经贴近标题的当前句也压暗。
+                                topFadeTransparentEnd = 0f,
+                                topFadePartialEnd = 0.02f,
+                                topFadeSolidEnd = 0.05f,
+                                // 90dp 只保护极短横屏/分屏不把当前句裁到 viewport 外；常规与
+                                // 平板横屏均由 8dp 上限决定，锚点不会随可用高度越长越远离标题。
+                                anchorBiasDp = 90.dp,
+                                anchorTopCapDp = 8.dp,
+                                // 横屏也按真实可用宽度排满再换行，不为“两行等长”提前折行。
+                                naturalSyllableWrap = true,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
                     }
 
                     LandscapeBottomControls(
@@ -184,57 +206,40 @@ internal fun LandscapePlayerLyricsScreen(
 
 @Composable
 private fun LandscapeBackdrop(
-    coverUrl: String?,
     baseColor: Color,
-    coverEdgeColor: Color,
+    upperColor: () -> Color,
+    middleColor: () -> Color,
+    lowerColor: () -> Color,
+    coverFraction: Float,
 ) {
-    val seamAccent = lerp(coverEdgeColor, baseColor, 0.26f)
-    val panelAccent = lerp(coverEdgeColor, baseColor, 0.72f)
+    // 保留上、中、下各区原色，只在歌词区远端轻收底色；不能把整条边缘
+    // 压成单一颜色，也不再用放大的整张封面把人物高光带进接缝。
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.horizontalGradient(
+            .drawWithCache {
+                val edgeField = Brush.verticalGradient(
                     colorStops = arrayOf(
-                        0.0f to seamAccent,
-                        0.34f to seamAccent,
-                        0.68f to panelAccent,
-                        1.0f to baseColor,
+                        0.0f to upperColor(),
+                        0.20f to upperColor(),
+                        0.50f to middleColor(),
+                        0.80f to lowerColor(),
+                        1.0f to lowerColor(),
                     ),
-                ),
-            ),
-    ) {
-        if (coverUrl != null) {
-            CrossfadeCoverImage(
-                url = coverUrl,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        alpha = 0.30f
-                        scaleX = 1.74f
-                        scaleY = 1.74f
-                    }
-                    .blur(64.dp),
-                contentScale = ContentScale.Crop,
-                durationMs = PipoMotion.CoverFadeMs,
-                maxDecodeSizePx = 448,
-            )
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
-                        colorStops = arrayOf(
-                            0.00f to Color.Transparent,
-                            0.36f to Color.Transparent,
-                            0.62f to baseColor.copy(alpha = 0.18f),
-                            1.00f to baseColor.copy(alpha = 0.46f),
-                        ),
+                )
+                val panelWash = Brush.horizontalGradient(
+                    colorStops = arrayOf(
+                        0.0f to baseColor.copy(alpha = 0f),
+                        coverFraction to baseColor.copy(alpha = 0f),
+                        1.0f to baseColor.copy(alpha = 0.22f),
                     ),
-                ),
-        )
-    }
+                )
+                onDrawBehind {
+                    drawRect(edgeField)
+                    drawRect(panelWash)
+                }
+            },
+    )
 }
 
 @Composable
@@ -253,9 +258,9 @@ private fun LandscapeCoverPane(
                     brush = Brush.horizontalGradient(
                         colorStops = arrayOf(
                             0.0f to Color.Black,
-                            0.54f to Color.Black,
-                            0.72f to Color.Black.copy(alpha = 0.84f),
-                            0.90f to Color.Black.copy(alpha = 0.28f),
+                            0.68f to Color.Black,
+                            0.82f to Color.Black.copy(alpha = 0.88f),
+                            0.94f to Color.Black.copy(alpha = 0.28f),
                             1.0f to Color.Transparent,
                         ),
                     ),
@@ -268,7 +273,7 @@ private fun LandscapeCoverPane(
                 url = coverUrl,
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color(0xFF11151D)),
+                    .background(seamColor),
                 contentScale = ContentScale.Crop,
                 durationMs = 520,
             )
@@ -276,23 +281,9 @@ private fun LandscapeCoverPane(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(PipoColors.Bg1),
+                    .background(seamColor),
             )
         }
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
-                        colorStops = arrayOf(
-                            0.0f to Color.Transparent,
-                            0.58f to Color.Transparent,
-                            0.82f to seamColor.copy(alpha = 0.08f),
-                            1.0f to seamColor.copy(alpha = 0.18f),
-                        ),
-                    ),
-                ),
-        )
     }
 }
 

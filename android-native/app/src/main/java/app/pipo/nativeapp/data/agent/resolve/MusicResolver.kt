@@ -1,13 +1,13 @@
 package app.pipo.nativeapp.data.agent.resolve
 
 import app.pipo.nativeapp.DiagnosticsLogStore
-import app.pipo.nativeapp.data.BehaviorPreferenceSnapshot
 import app.pipo.nativeapp.data.CandidateRanker
 import app.pipo.nativeapp.data.CandidateRecall
 import app.pipo.nativeapp.data.ContinuousQueueSource
 import app.pipo.nativeapp.data.FunctionalMusicFilter
 import app.pipo.nativeapp.data.GuardedContinuousQueueSource
 import app.pipo.nativeapp.data.NativeTrack
+import app.pipo.nativeapp.data.MusicSearchException
 import app.pipo.nativeapp.data.PetIntent
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoPlaylist
@@ -23,6 +23,9 @@ import app.pipo.nativeapp.data.agent.domain.TrackRequirement
 import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CatalogLexicon
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
+import app.pipo.nativeapp.data.agent.queue.ConstraintEvidence
+import app.pipo.nativeapp.data.agent.queue.ConstraintScorer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -30,6 +33,10 @@ import kotlinx.coroutines.flow.first
 
 class MusicResolver(
     private val repository: PipoRepository,
+    private val loadLocalTracks: suspend () -> List<NativeTrack> = {
+        runCatching { PipoGraph.library.library() }.getOrDefault(emptyList())
+    },
+    private val recallCandidates: ((PetIntent, List<NativeTrack>, NativeTrack?, Int) -> List<CandidateRecall.Candidate>)? = null,
 ) {
     private companion object {
         const val CONTINUATION_WANT_COUNT = 12
@@ -42,12 +49,49 @@ class MusicResolver(
 
     private val trackResolver = TrackResolver(repository)
     private val playlistResolver = PlaylistResolver()
+    private val constraintScorer = ConstraintScorer()
 
-    suspend fun resolve(plan: MusicTurnPlan, input: AgentTurnInput): ResolutionResult {
-        val localTracks = runCatching { PipoGraph.library.library() }.getOrDefault(emptyList())
+    private data class SearchAttempt(
+        val tracks: List<NativeTrack>?,
+        val failure: MusicSearchException?,
+    )
+
+    private suspend fun searchBatch(queries: List<String>, limit: Int): List<List<NativeTrack>> {
+        val attempts = coroutineScope {
+            queries.map { query ->
+                async {
+                    try {
+                        SearchAttempt(repository.searchTracks(query, limit), failure = null)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: MusicSearchException) {
+                        SearchAttempt(tracks = null, failure = error)
+                    }
+                }
+            }.awaitAll()
+        }
+        val successes = attempts.mapNotNull { it.tracks }
+        if (successes.isEmpty()) {
+            throw requireNotNull(attempts.mapNotNull { it.failure }.firstOrNull())
+        }
+        return successes
+    }
+
+    suspend fun resolve(
+        plan: MusicTurnPlan,
+        input: AgentTurnInput,
+        allowOnlineSearch: Boolean = true,
+    ): ResolutionResult {
+        val localTracks = loadLocalTracks()
         val resolvedActions = plan.actions.map { action ->
             when (action) {
-                is PlannedAction.PlayRequest -> resolvePlayRequest(action, plan, input, localTracks)
+                is PlannedAction.PlayRequest -> resolvePlayRequest(
+                    action,
+                    plan,
+                    input,
+                    localTracks,
+                    allowOnlineSearch,
+                )
                 is PlannedAction.PlayPlaylist -> resolvePlaylist(action)
                 else -> action
             }
@@ -92,6 +136,7 @@ class MusicResolver(
         plan: MusicTurnPlan,
         input: AgentTurnInput,
         localTracks: List<NativeTrack>,
+        allowOnlineSearch: Boolean,
     ): PlannedAction.PlayTracks {
         val catalogConstraint = action.primaryGoal.catalogConstraint
         val unfilteredScopedTracks = scopedTracksFor(action.primaryGoal.playlistName, localTracks)
@@ -115,12 +160,13 @@ class MusicResolver(
                 ),
             )
         }
-        val allowOnline = action.primaryGoal.playlistName.isBlank()
+        val allowOnline = action.primaryGoal.playlistName.isBlank() && allowOnlineSearch
         val tracks = when (action.mode) {
             PlayMode.PlayNow -> {
                 val target = action.target
                 val head = target?.let { trackResolver.resolve(it, scopedTracks, allowOnline = allowOnline).track }
                 if (head == null) emptyList()
+                else if (action.desiredCount <= 1) listOf(head)
                 else mergeUnique(
                     listOf(head),
                     rankForIntent(
@@ -131,7 +177,7 @@ class MusicResolver(
                         action.primaryGoal.artistScope,
                         allowOnline = allowOnline,
                     ),
-                )
+                ).take(action.desiredCount)
             }
             PlayMode.InsertNext -> {
                 // desiredCount=1 仍是“下一首插某首”；>1 是批量插播（这首听完放 X 的歌/
@@ -210,7 +256,7 @@ class MusicResolver(
             mode = action.mode,
             tracks = tracks,
             continuous = if (action.mode != PlayMode.InsertNext && tracks.size > 1) {
-                continuousSourceFor(action, plan, input, scopedTracks)
+                continuousSourceFor(action, plan, input, scopedTracks, allowOnline)
             } else {
                 null
             },
@@ -218,6 +264,7 @@ class MusicResolver(
             target = action.target,
             similar = action.similar,
             jumpToInserted = action.jumpToInserted,
+            preserveCurrent = action.preserveCurrent,
         )
     }
 
@@ -253,15 +300,20 @@ class MusicResolver(
         val lexicon = CatalogLexicon(localTracks)
         val trackMentions = if (useTextSignals) lexicon.findTrackMentions(plan.userText).take(4) else emptyList()
         val artistMentions = if (useTextSignals) lexicon.findArtistMentions(plan.userText).take(4) else emptyList()
+        // Opening/must-include/closing tracks are resolved and inserted separately.
+        // Their singer/title must not become the recommendation pool for the rest.
+        val standaloneRequirements = if (action.mode == PlayMode.ReplaceQueue) emptyList()
+            else listOfNotNull(target) + primaryTracks + mustInclude + listOfNotNull(closer)
         val trackHints = mergeTextHints(
-            (listOfNotNull(target) + primaryTracks + mustInclude + listOfNotNull(closer)).map { it.title },
+            standaloneRequirements.map { it.title },
             trackMentions.map { it.title },
         )
         val rawPrimaryArtists = action.primaryGoal.primaryArtists
         val includeArtists = action.primaryGoal.includeArtists
         val rawArtistHints = mergeTextHints(
-            rawPrimaryArtists + includeArtists + listOfNotNull(target?.artist) +
-                primaryTracks.mapNotNull { it.artist } + mustInclude.mapNotNull { it.artist } + listOfNotNull(closer?.artist),
+            rawPrimaryArtists +
+                (if (action.mode == PlayMode.ReplaceQueue) emptyList() else includeArtists) +
+                standaloneRequirements.mapNotNull { it.artist },
             artistMentions.map { it.name } + trackMentions.map { it.artist },
         )
         val artistResolver = ArtistResolver(localTracks)
@@ -351,23 +403,24 @@ class MusicResolver(
     ): List<NativeTrack> {
         if (localTracks.isEmpty()) return if (allowOnline) onlineBackfill(intent, desired, artistScope) else emptyList()
         val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
-        val behaviorPreference = runCatching { PipoGraph.behaviorPreference.current() }
-            .getOrDefault(BehaviorPreferenceSnapshot.Empty)
+        val unifiedTaste = PipoGraph.userTaste.snapshot(PipoGraph.library.peek())
+        val behaviorPreference = unifiedTaste.behavior
         val queryVector = queryVectorFor(intent)
         val embeddingStore = queryVector?.let {
             runCatching { PipoGraph.embeddingStore.takeIf { store -> store.count() > 0 } }.getOrNull()
         }
-        val candidates = CandidateRecall.recall(
+        val recallLimit = maxOf(220, desired * 8).coerceAtMost(900)
+        val candidates = recallCandidates?.invoke(intent, localTracks, input.currentTrack, recallLimit) ?: CandidateRecall.recall(
             intent = intent,
             library = localTracks,
             featuresStore = PipoGraph.audioFeaturesStore,
             semanticStore = PipoGraph.trackSemanticStore,
             indexer = PipoGraph.semanticIndexer,
-            tasteProfile = PipoGraph.tasteProfileStore.current(),
+            tasteProfile = unifiedTaste.profile,
             behaviorEvents = behaviorEvents,
             behaviorPreference = behaviorPreference,
             currentTrack = input.currentTrack,
-            limit = maxOf(220, desired * 8).coerceAtMost(900),
+            limit = recallLimit,
             queryVector = queryVector,
             embeddingStore = embeddingStore,
         )
@@ -382,6 +435,7 @@ class MusicResolver(
                 recentPlay = runCatching { PipoGraph.behaviorLog.recentPlay() }.getOrNull(),
                 recentRecommendation = runCatching { PipoGraph.recommendationLog.recentContext() }.getOrNull(),
                 behaviorPreference = behaviorPreference,
+                userTaste = unifiedTaste,
             ),
         )
         val ranked = rankedRaw
@@ -434,11 +488,8 @@ class MusicResolver(
         }
         return when {
             localResult.size >= desired -> localResult
-            // 具名作品和明确艺人范围都不能因为本地只碰巧有一两首就停止联网召回；
-            // 保留本地命中，再从同一硬边界下补齐，仍不允许画像候选越界凑数。
-            localResult.isNotEmpty() && allowOnline &&
-                (intent.catalogAnchors.isNotEmpty() ||
-                    artistKeys.isNotEmpty() && artistScope != ArtistScope.Similar) ->
+            // 本地有少量命中仍需联网补齐；保留相同硬约束和艺人范围。
+            localResult.isNotEmpty() && allowOnline ->
                 takeWithinArtistScope(
                     tracks = mergeUnique(localResult, onlineBackfill(intent, desired, artistScope)),
                     artistKeys = artistKeys,
@@ -491,13 +542,16 @@ class MusicResolver(
             listOf(intent.queryText) + intent.hardGenres + intent.musicHintsGenres +
                 intent.refStyles + intent.aiMainStyles,
         )
+        var searchedSuccessfully = false
         for (batch in queries.chunked(3)) {
             if (out.size >= poolTarget) break
-            val hitsPerQuery = coroutineScope {
-                batch.map { query ->
-                    async { runCatching { repository.searchTracks(query, limit = 20) }.getOrDefault(emptyList()) }
-                }.awaitAll()
+            val hitsPerQuery = try {
+                searchBatch(batch, limit = 20)
+            } catch (error: MusicSearchException) {
+                if (!searchedSuccessfully) throw error
+                break
             }
+            searchedSuccessfully = true
             for (hits in hitsPerQuery) {
                 if (out.size >= poolTarget) break
                 val scopedHits = when {
@@ -515,6 +569,7 @@ class MusicResolver(
                         continue
                     }
                     if (hardRejected.contains(track)) continue
+                    if (!FunctionalMusicFilter.acceptsCategory(track, intent.queryText)) continue
                     // 情绪词搜索的助眠/养生流水线内容不进候选（明确要纯音乐/点名歌手除外）。
                     if (!allowFunctional &&
                         FunctionalMusicFilter.isFunctional(track.title, track.artist) &&
@@ -567,19 +622,20 @@ class MusicResolver(
     ): List<NativeTrack> {
         if (tracks.size <= 1) return tracks
         val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
-        val behaviorPreference = runCatching { PipoGraph.behaviorPreference.current() }
-            .getOrDefault(BehaviorPreferenceSnapshot.Empty)
-        val candidates = CandidateRecall.recall(
+        val unifiedTaste = PipoGraph.userTaste.snapshot(PipoGraph.library.peek())
+        val behaviorPreference = unifiedTaste.behavior
+        val recallLimit = maxOf(limit, tracks.size)
+        val candidates = recallCandidates?.invoke(intent, tracks, null, recallLimit) ?: CandidateRecall.recall(
             intent = intent,
             library = tracks,
             featuresStore = PipoGraph.audioFeaturesStore,
             semanticStore = PipoGraph.trackSemanticStore,
             indexer = PipoGraph.semanticIndexer,
-            tasteProfile = PipoGraph.tasteProfileStore.current(),
+            tasteProfile = unifiedTaste.profile,
             behaviorEvents = behaviorEvents,
             behaviorPreference = behaviorPreference,
             currentTrack = null,
-            limit = maxOf(limit, tracks.size),
+            limit = recallLimit,
         )
         val ranked = CandidateRanker.rank(
             candidates = candidates,
@@ -589,6 +645,7 @@ class MusicResolver(
                 recentPlay = runCatching { PipoGraph.behaviorLog.recentPlay() }.getOrNull(),
                 recentRecommendation = runCatching { PipoGraph.recommendationLog.recentContext() }.getOrNull(),
                 behaviorPreference = behaviorPreference,
+                userTaste = unifiedTaste,
             ),
         ).map { it.candidate.track }
         val seen = ranked.mapTo(HashSet()) { TrackDedupe.songKey(it) }
@@ -634,6 +691,7 @@ class MusicResolver(
         plan: MusicTurnPlan,
         input: AgentTurnInput,
         localTracks: List<NativeTrack>,
+        allowOnline: Boolean,
     ): ContinuousQueueSource {
         val intent = intentFor(action, plan, localTracks)
         val artistKeys = intent.hardArtists
@@ -641,7 +699,7 @@ class MusicResolver(
             .filter { it.isNotBlank() }
         val artistScope = action.primaryGoal.artistScope
         if (action.primaryGoal.playlistName.isNotBlank()) {
-            return ContinuousQueueSource { excludeIds ->
+            val fetcher: suspend (Set<Long>) -> List<NativeTrack> = { excludeIds ->
                 val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
                     .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
                 val scoped = applyArtistScope(
@@ -655,6 +713,7 @@ class MusicResolver(
                     }
                     .take(12)
             }
+            return guardedContinuousSource(action, intent, artistKeys, plan.userText, fetcher)
         }
         val seedQueries = buildContinuationSearchQueries(intent).ifEmpty { listOf(plan.userText) }
         val allowFunctional = FunctionalMusicFilter.mentionsFunctional(
@@ -666,7 +725,7 @@ class MusicResolver(
         }
         val fetcher: suspend (Set<Long>) -> List<NativeTrack> = { excludeIds ->
             val local = localContinuation(intent, input, localTracks, artistScope, excludeIds)
-            if (local.size >= CONTINUATION_WANT_COUNT) {
+            if (local.size >= CONTINUATION_WANT_COUNT || !allowOnline) {
                 local
             } else {
                 val haveKeys = local.mapTo(HashSet()) { TrackDedupe.songKey(it) }
@@ -689,15 +748,44 @@ class MusicResolver(
                 )
             }
         }
-        return if (intent.catalogAnchors.isNotEmpty()) {
-            GuardedContinuousQueueSource(
-                allowDefaultFallback = false,
-                acceptsTrack = { track -> CatalogConstraintMatcher.matches(track, intent.catalogAnchors) },
-                fetcher = fetcher,
-            )
-        } else {
-            ContinuousQueueSource { excludeIds -> fetcher(excludeIds) }
+        return guardedContinuousSource(action, intent, artistKeys, plan.userText, fetcher)
+    }
+
+    private fun guardedContinuousSource(
+        action: PlannedAction.PlayRequest,
+        intent: PetIntent,
+        artistKeys: List<String>,
+        userRequest: String,
+        fetcher: suspend (Set<Long>) -> List<NativeTrack>,
+    ): ContinuousQueueSource {
+        val goal = action.primaryGoal
+        val strictArtists = goal.artistScope == ArtistScope.Strict && artistKeys.isNotEmpty()
+        val excludedTerms = mergeTextHints(intent.avoidWords, intent.excludeTags, intent.aiAvoidStyles)
+
+        fun accepts(track: NativeTrack): Boolean {
+            if (!FunctionalMusicFilter.acceptsCategory(track, userRequest)) return false
+            if (strictArtists && !exactArtistMatchesAny(track.artist, artistKeys)) return false
+            if (goal.hardLanguages.isNotEmpty() &&
+                constraintScorer.hardLanguageEvidence(track, goal.hardLanguages) != ConstraintEvidence.Match
+            ) return false
+            if (goal.hardGenres.isNotEmpty() &&
+                constraintScorer.hardGenreEvidence(track, goal.hardGenres) != ConstraintEvidence.Match
+            ) return false
+            if (intent.excludeLanguages.isNotEmpty() &&
+                constraintScorer.excludedLanguageEvidence(track, intent.excludeLanguages) != ConstraintEvidence.Mismatch
+            ) return false
+            if (excludedTerms.isNotEmpty() &&
+                constraintScorer.avoidEvidence(track, excludedTerms) != ConstraintEvidence.Mismatch
+            ) return false
+            if (goal.catalogConstraint.isActive && !CatalogConstraintMatcher.matches(track, goal.catalogConstraint)) return false
+            return true
         }
+
+        return GuardedContinuousQueueSource(
+            allowDefaultFallback = false,
+            acceptsTrack = ::accepts,
+            fetcher = { excludeIds -> fetcher(excludeIds).filter(::accepts) },
+        )
     }
 
     /** 标题+歌手以拉丁字母为主（粗粒度语言判定，仅用于排序偏好，不做硬过滤）。 */
@@ -820,16 +908,16 @@ class MusicResolver(
         val seen = HashSet<String>()
         val hardRejected = runCatching { PipoGraph.recommendationFeedbackLog.globallyRejected() }
             .getOrDefault(RecommendationFeedbackLog.RejectedContext(emptySet(), emptySet()))
+        var searchedSuccessfully = false
         for (batch in seedQueries.chunked(3)) {
             if (out.size >= CONTINUATION_WANT_COUNT * 2) break
-            val hitsPerQuery = coroutineScope {
-                batch.map { query ->
-                    async {
-                        runCatching { repository.searchTracks(query, limit = CONTINUATION_SEARCH_LIMIT) }
-                            .getOrDefault(emptyList())
-                    }
-                }.awaitAll()
+            val hitsPerQuery = try {
+                searchBatch(batch, limit = CONTINUATION_SEARCH_LIMIT)
+            } catch (error: MusicSearchException) {
+                if (!searchedSuccessfully) throw error
+                break
             }
+            searchedSuccessfully = true
             for (hits in hitsPerQuery) {
                 val scopedHits = when {
                     artistScope == ArtistScope.Strict && artistKeys.isNotEmpty() ->
@@ -952,16 +1040,23 @@ class MusicResolver(
         val out = ArrayList<NativeTrack>()
         val seen = HashSet<String>()
         val localPool = ranked + scopedTracks
+        var searchedSuccessfully = false
+        var searchUnavailable = false
         for (artist in canonical) {
             val key = CommandTextSignals.normalizeForMatch(artist)
             if (key.isBlank()) continue
             val local = localPool.firstOrNull { track ->
                 TrackDedupe.songKey(track) !in seen && artistMatchesAny(track.artist, listOf(key))
             }
-            val picked = local ?: if (allowOnline) {
-                runCatching { repository.searchTracks(artist, limit = 12) }
-                    .getOrDefault(emptyList())
-                    .firstOrNull { track -> artistMatchesAny(track.artist, listOf(key)) && TrackDedupe.songKey(track) !in seen }
+            val picked = local ?: if (allowOnline && !searchUnavailable) {
+                try {
+                    repository.searchTracks(artist, limit = 12).also { searchedSuccessfully = true }
+                        .firstOrNull { track -> artistMatchesAny(track.artist, listOf(key)) && TrackDedupe.songKey(track) !in seen }
+                } catch (error: MusicSearchException) {
+                    if (!searchedSuccessfully && out.isEmpty()) throw error
+                    searchUnavailable = true
+                    null
+                }
             } else {
                 null
             }
@@ -1065,6 +1160,13 @@ class MusicResolver(
         val tracks = actions.filterIsInstance<PlannedAction.PlayTracks>().flatMap { it.tracks }
         val play = actions.filterIsInstance<PlannedAction.PlayTracks>().firstOrNull()
         val missing = mutableListOf<String>()
+        play?.primaryGoal?.primaryTracks.orEmpty().forEach { requirement ->
+            if (tracks.none { CommandTextSignals.normalizeForMatch(it.title) == CommandTextSignals.normalizeForMatch(requirement.title) &&
+                    (requirement.artist.isNullOrBlank() || artistMatchesAny(it.artist,
+                        listOf(CommandTextSignals.normalizeForMatch(requirement.artist)))) }) {
+                missing.add("primaryTrack:" + listOfNotNull(requirement.artist, requirement.title).joinToString(" - "))
+            }
+        }
         val structured = plan.plannerRaw.startsWith("tool_loop")
         val includeTitle = if (structured) {
             play?.primaryGoal?.mustInclude?.firstOrNull()?.title
@@ -1190,6 +1292,12 @@ class MusicResolver(
                     actual == expected || actual.contains(expected) || expected.contains(actual)
                 }
             }
+
+    private fun exactArtistMatchesAny(actualRaw: String, artistKeys: List<String>): Boolean =
+        actualRaw.split("/", "&", ",", "、")
+            .map(CommandTextSignals::normalizeForMatch)
+            .filter { it.isNotBlank() }
+            .any { actual -> actual in artistKeys }
 
     private fun titleMatches(leftRaw: String, rightRaw: String): Boolean {
         val left = CommandTextSignals.normalizeForMatch(leftRaw)

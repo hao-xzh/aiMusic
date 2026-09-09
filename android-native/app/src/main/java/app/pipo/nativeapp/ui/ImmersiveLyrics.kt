@@ -9,6 +9,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -29,12 +30,8 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.blur
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -44,106 +41,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import app.pipo.nativeapp.data.PipoLyricLine
-
-/**
- * 仅渲染沉浸式的"底"：黑兜底 + 同源模糊封面 + 顶/底采样色渐变。
- * 在 PipoNativeApp 里被 TransitioningCover 叠在上面，再叠上标题 / 歌词。
- */
-@Composable
-fun ImmersiveBackdrop(
-    progress: Float,
-    coverUrl: String?,
-) {
-    if (progress <= 0.001f) return
-    val edges = useCoverEdgeColors(coverUrl)
-    val ambientRgb = edges.ambient ?: edges.bottom ?: edges.top ?: edges.right ?: edges.left
-    val ambientColor = rgbToColor(ambientRgb, fallback = PipoColors.Bg1)
-    val topColor = rgbToColor(blendRgb(edges.top, ambientRgb, 0.40f), fallback = ambientColor)
-    val rightColor = rgbToColor(blendRgb(edges.right, ambientRgb, 0.48f), fallback = ambientColor)
-    val seamColor = rgbToColor(blendRgb(edges.bottom, ambientRgb, 0.34f), fallback = ambientColor)
-    val accentColor = rgbToColor(blendRgb(edges.accent, ambientRgb, 0.28f), fallback = seamColor)
-    // Apple Music 的"封面就是页"做法：同源重模糊只提供纹理连续性，稳定底色云决定大面积色调。
-    // 这样不会被黑字/emoji/局部强色揉脏，同时 sharp 封面底部仍能自然溶进同一张图的模糊层。
-    //
-    //   底层：bg color cloud —— 多个 radialGradient 叠出 mesh-like 效果
-    //     · 屏幕左上：topColor 半径 70% → 淡掉
-    //     · 屏幕右上：rightColor 半径 65% → 淡掉
-    //     · 屏幕底中：seamColor 半径 80% → 淡掉
-    //   这三个 radial 叠加 + 互相填补，结果是封面色调温柔铺满整屏，没有可见的图样。
-    //
-    // 用 drawBehind 直接画圆（中心 = 屏幕分数坐标 × 尺寸），避免 Brush.radialGradient
-    // 的 center 必须是 px 坐标的繁琐
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .graphicsLayer { alpha = progress }
-            .background(ambientColor)
-            .drawWithContent {
-                drawContent()
-                val w = size.width
-                val h = size.height
-                val maxDim = kotlin.math.max(w, h) * 1.4f
-                // 三个色块叠合形成 mesh-like 色彩云
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(topColor.copy(alpha = 0.62f), Color.Transparent),
-                        center = androidx.compose.ui.geometry.Offset(w * 0.20f, h * 0.18f),
-                        radius = maxDim * 0.85f,
-                    ),
-                    radius = maxDim,
-                    center = androidx.compose.ui.geometry.Offset(w * 0.20f, h * 0.18f),
-                )
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(rightColor.copy(alpha = 0.46f), Color.Transparent),
-                        center = androidx.compose.ui.geometry.Offset(w * 0.85f, h * 0.30f),
-                        radius = maxDim * 0.80f,
-                    ),
-                    radius = maxDim,
-                    center = androidx.compose.ui.geometry.Offset(w * 0.85f, h * 0.30f),
-                )
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(seamColor.copy(alpha = 0.72f), Color.Transparent),
-                        center = androidx.compose.ui.geometry.Offset(w * 0.50f, h * 0.95f),
-                        radius = maxDim * 0.95f,
-                    ),
-                    radius = maxDim,
-                    center = androidx.compose.ui.geometry.Offset(w * 0.50f, h * 0.95f),
-                )
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(accentColor.copy(alpha = 0.16f), Color.Transparent),
-                        center = androidx.compose.ui.geometry.Offset(w * 0.58f, h * 0.22f),
-                        radius = maxDim * 0.58f,
-                    ),
-                    radius = maxDim,
-                    center = androidx.compose.ui.geometry.Offset(w * 0.58f, h * 0.22f),
-                )
-            },
-    ) {
-        if (coverUrl != null) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        alpha = 0.34f
-                        scaleX = 1.16f
-                        scaleY = 1.16f
-                    }
-                    .blur(26.dp),
-            ) {
-                CrossfadeCoverImage(
-                    url = coverUrl,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop,
-                    durationMs = PipoMotion.CoverFadeMs,
-                    maxDecodeSizePx = 720,
-                )
-            }
-        }
-    }
-}
 
 // 歌词扫描交界处的"封面色微光"。Local 传递稳定的 State，而不是逐帧变化的 Color；
 // 歌词在 draw 阶段读取 value，切歌颜色动画只触发重绘，不让整棵歌词子树逐帧重组。
@@ -350,42 +247,45 @@ private fun ImmersiveLyricsColumnLayer(
     lyricsRiseDp: Dp,
 ) {
     androidx.compose.runtime.CompositionLocalProvider(LocalLyricAccent provides lyricAccentState) {
-        AppleMusicLyricColumn(
-            lines = lyrics,
-            sessionId = trackId,
-            isPlaying = isPlaying,
-            positionProvider = positionProvider,
-            fg = fg,
-            fgDim = fgDim,
-            fgUnsung = fgUnsung,
-            showTranslation = showTranslation,
-            onSeekToMs = onSeekToMs,
-            enterProgress = enterProgress,
-            lyricFontSize = 34.sp,
-            lyricLineHeight = 41.sp,
-            lyricFontWeight = FontWeight.Bold,
-            rowVerticalPadding = 7.75.dp,
-            useMobileAppleProfile = true,
-            // 当前页面的歌词 viewport 只有封面/标题下方半屏，不能继续按整屏 25%
-            // 下压锚点。14dp + 行内约 31dp 顶部间距后，字形从约 45dp 开始，刚好
-            // 越过 40dp 顶部渐隐区；相比上一版再上移一整行，同时保持当前句完整。
-            anchorTopCapDp = 14.dp,
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
-                // 这个页面上方仍保留正方形封面与曲名 controls；Apple 的歌词排版 token
-                // 只应用在剩余歌词 viewport 内。绘制、裁剪和 pointerInput 都位于 padding
-                // 之后，保证旧句不会穿进封面/标题，歌词命中区也不会盖住标题 controls。
                 .padding(top = lyricsTopPadding, bottom = 20.dp)
                 .navigationBarsPadding()
                 .graphicsLayer {
                     translationY = (1f - enterProgress) * lyricsRiseDp.toPx()
                 },
-        )
+        ) {
+            val typography = nativeLyricTypography(
+                contentWidth = (maxWidth - 48.dp).coerceAtLeast(0.dp),
+                viewportHeight = maxHeight,
+            )
+            AppleMusicLyricColumn(
+                lines = lyrics,
+                sessionId = trackId,
+                isPlaying = isPlaying,
+                positionProvider = positionProvider,
+                fg = fg,
+                fgDim = fgDim,
+                fgUnsung = fgUnsung,
+                showTranslation = showTranslation,
+                onSeekToMs = onSeekToMs,
+                enterProgress = enterProgress,
+                lyricFontSize = typography.fontSize,
+                lyricLineHeight = typography.lineHeight,
+                lyricFontWeight = FontWeight.Bold,
+                rowVerticalPadding = 7.75.dp,
+                useMobileAppleProfile = true,
+                // 当前页面的歌词 viewport 只有封面/标题下方半屏，不能继续按整屏 25%
+                // 下压锚点。14dp + 行内约 31dp 顶部间距后，字形从约 45dp 开始，刚好
+                // 越过 40dp 顶部渐隐区；相比上一版再上移一整行，同时保持当前句完整。
+                anchorTopCapDp = 14.dp,
+                // 父容器已经扣掉封面/标题和导航栏，只使用真实歌词 viewport。
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
     }
 }
-
-// BackdropBlurredCover 独立组件已删除：ImmersiveBackdrop 内联同源模糊层 + 柔和色彩云，
-// 让清晰封面底部 fade 时仍接到同一张图的氛围纹理。
 
 @Composable
 private fun ImmersiveIconButton(

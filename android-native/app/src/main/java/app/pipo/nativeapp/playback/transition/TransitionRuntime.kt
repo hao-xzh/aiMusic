@@ -6,10 +6,11 @@ import app.pipo.nativeapp.playback.orchestrator.TransitionResult
 
 data class TransitionVerification(
     val passed: Boolean,
-    val gapOk: Boolean,
-    val driftOk: Boolean,
-    val overlapOk: Boolean,
+    val gapOk: Boolean?,
+    val driftOk: Boolean?,
+    val overlapOk: Boolean?,
     val failureReason: String? = null,
+    val missingEvidence: List<String> = emptyList(),
 )
 
 class TransitionVerifier(
@@ -18,31 +19,29 @@ class TransitionVerifier(
     private val minOverlapMs: Long = 1_350L,
 ) {
     fun verify(result: TransitionResult): TransitionVerification {
-        if (!result.success) {
-            return TransitionVerification(
-                passed = false,
-                gapOk = false,
-                driftOk = false,
-                overlapOk = false,
-                failureReason = result.failureReason ?: "transition_failed",
-            )
-        }
-        val gapOk = result.handoffGapMs?.let { it <= maxHandoffGapMs } ?: true
-        val driftOk = result.resumeDriftMs?.let { it <= maxResumeDriftMs } ?: true
+        val gapOk = result.handoffGapMs?.let { it <= maxHandoffGapMs }
+        val driftOk = result.resumeDriftMs?.let { it <= maxResumeDriftMs }
         val overlapOk = if (result.mode == TransitionMode.RealtimeCrossfade) {
-            result.actualOverlapMs?.let { it >= minOverlapMs } ?: false
+            result.actualOverlapMs?.let { it >= minOverlapMs }
         } else {
             true
         }
+        val missingEvidence = buildList {
+            if (gapOk == null) add("handoff_gap_ms")
+            if (driftOk == null) add("resume_drift_ms")
+            if (overlapOk == null) add("actual_overlap_ms")
+        }
         return TransitionVerification(
-            passed = gapOk && driftOk && overlapOk,
+            passed = result.success && missingEvidence.isEmpty() &&
+                gapOk == true && driftOk == true && overlapOk == true,
             gapOk = gapOk,
             driftOk = driftOk,
             overlapOk = overlapOk,
             failureReason = when {
-                !gapOk -> "handoff_gap_over_threshold"
-                !driftOk -> "resume_drift_over_threshold"
-                !overlapOk -> "overlap_under_threshold"
+                !result.success -> result.failureReason ?: "transition_failed"
+                gapOk == false -> "handoff_gap_over_threshold"
+                driftOk == false -> "resume_drift_over_threshold"
+                overlapOk == false -> "overlap_under_threshold"
                 else -> null
             },
         )
@@ -66,6 +65,7 @@ object TransitionMetrics {
                 "gapOk" to verification.gapOk,
                 "driftOk" to verification.driftOk,
                 "overlapOk" to verification.overlapOk,
+                "missingEvidence" to verification.missingEvidence.joinToString(","),
                 "completedReason" to result.completedReason,
                 "failureReason" to (result.failureReason ?: verification.failureReason),
                 "auxReadyDelayMs" to result.auxReadyDelayMs,

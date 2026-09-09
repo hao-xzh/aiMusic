@@ -8,6 +8,9 @@ import app.pipo.nativeapp.data.agent.task.AgentTaskCoordinator
  * TasteProfileStore / DistillEngine 在 installContext 时装配（需要 Application Context）。
  */
 object PipoGraph {
+    lateinit var homeRecommendationStore: HomeRecommendationStore
+        private set
+
     @Volatile
     private var overrideRepository: PipoRepository? = null
 
@@ -64,6 +67,10 @@ object PipoGraph {
 
     @Volatile
     private var agentTaskCoordinator: AgentTaskCoordinator? = null
+
+    private var unifiedTaste: UserTasteStore? = null
+    val userTaste: UserTasteStore
+        get() = unifiedTaste ?: error("PipoGraph.installContext() must be called before userTaste")
 
     val agentTasks: AgentTaskCoordinator
         get() = agentTaskCoordinator ?: error("PipoGraph.installContext() must be called before agentTasks")
@@ -136,10 +143,10 @@ object PipoGraph {
             library = library,
             featuresStore = audioFeaturesStore,
             behaviorLog = behaviorLog,
-            tasteProfileStore = tasteProfileStore,
             recommendationLog = recommendationLog,
             repository = repository,
             behaviorPreference = behaviorPreference,
+            semanticStore = trackSemanticStore,
         ).also { recEngine = it }
 
     /** Bridge 还没装配前的空仓库——所有页面走 React 端的"空状态"分支。 */
@@ -158,6 +165,7 @@ object PipoGraph {
 
     fun installContext(context: Context) {
         val app = context.applicationContext
+        if (!::homeRecommendationStore.isInitialized) homeRecommendationStore = HomeRecommendationStore(app)
         if (agentTaskCoordinator == null) agentTaskCoordinator = AgentTaskCoordinator(app)
         if (profileStore == null) profileStore = TasteProfileStore(app)
         if (featuresStore == null) featuresStore = AudioFeaturesStore(app)
@@ -165,6 +173,7 @@ object PipoGraph {
         if (lastPlaybackStore == null) lastPlaybackStore = LastPlaybackStore(app)
         if (semanticStore == null) semanticStore = TrackSemanticStore(app)
         if (memory == null) memory = PetMemory(app)
+        if (unifiedTaste == null) unifiedTaste = UserTasteStore(app)
         if (recLog == null) recLog = RecommendationLog(app)
         if (recFeedbackLog == null) recFeedbackLog = RecommendationFeedbackLog(app)
         if (embedStore == null) embedStore = EmbeddingStore(app)

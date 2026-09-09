@@ -14,7 +14,7 @@ import org.json.JSONObject
  *
  * 事件类型：
  *   - PlayStarted：进入新曲（自动接 / 主动跳到 都算）
- *   - Completed：曲尾自然结束（auto 转场触发，且离 duration 末端不远）
+ *   - Completed：曲尾自动转场，且实际聆听时长达到完成阈值
  *   - Skipped：用户主动 next 且当前进度 < 50%
  *   - ManualCut：用户主动 next/prev 且当前进度 ≥ 50%
  */
@@ -28,6 +28,10 @@ data class BehaviorEvent(
     val artist: String,
     val tsMs: Long,
     val completionPct: Float = 0f,
+    /** 由播放器真实处于 isPlaying 时累计；旧日志没有该值。 */
+    val listenedMs: Long? = null,
+    /** 与 listenedMs 同一首曲目开始播放时确定的时长；旧日志没有该值。 */
+    val durationMs: Long? = null,
 )
 
 data class BehaviorSummary(
@@ -144,6 +148,8 @@ class BehaviorLog(context: Context) {
         put("artist", e.artist)
         put("ts", e.tsMs)
         put("pct", e.completionPct.toDouble())
+        e.listenedMs?.let { put("listenedMs", it) }
+        e.durationMs?.let { put("durationMs", it) }
     }
 
     private fun jsonToEvent(o: JSONObject?): BehaviorEvent? {
@@ -157,6 +163,8 @@ class BehaviorLog(context: Context) {
                 artist = o.optString("artist"),
                 tsMs = o.optLong("ts"),
                 completionPct = o.optDouble("pct", 0.0).toFloat(),
+                listenedMs = if (o.has("listenedMs")) o.optLong("listenedMs") else null,
+                durationMs = if (o.has("durationMs")) o.optLong("durationMs") else null,
             )
         } catch (_: Exception) { null }
     }

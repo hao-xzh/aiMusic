@@ -5,37 +5,20 @@ import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Request
 import java.io.File
-import java.util.concurrent.TimeUnit
 
 /**
  * 从 AMLL TTML 数据库（amll-dev/amll-ttml-db）拉网易云逐字歌词，按需缓存到本地。
  *
- * 接入策略：
- *   1. trackId 必须是纯网易云数字 ID（非数字直接放弃，落回原 yrc/lrc）
- *   2. 命中本地 .ttml 缓存 → 解析返回
- *   3. 命中本地 .404 哨兵 → 直接返回 null（不重复打网络）
- *   4. 无缓存 → HTTP GET raw.githubusercontent.com
- *      · 200：写 .ttml 缓存，解析返回
- *      · 404：写 .404 哨兵，返回 null
- *      · 其他错误（网络断 / 超时 / 5xx）：不写缓存，返回 null，下次再试
- *
- * 缓存目录用 `Context.cacheDir/amll-lyrics/`，OS 在空间紧张时可清理；
- * 单文件 ~10KB，重度用户播 1000 首也才 ~10MB，不需要主动 evict。
+ * 成功缓存七天，未收录记录一天；网络失败尝试作者镜像并保留已验证缓存。
+ * 旧版无期限的空 .404 哨兵会失效，避免数据库补录后仍永久使用回退歌词。
  */
 class AmllLyricsSource(private val context: Context) {
 
     private val cacheDir: File by lazy {
         File(context.cacheDir, CACHE_SUBDIR).apply { mkdirs() }
-    }
-
-    // 复用全 app 共享连接池,叠加本数据源自己的超时(连接 4s / 读 6s,与旧值一致)。
-    private val http by lazy {
-        PipoHttp.client.newBuilder()
-            .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
-            .readTimeout(READ_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
-            .build()
     }
 
     /**
@@ -44,7 +27,7 @@ class AmllLyricsSource(private val context: Context) {
      *   · 返回 null = 没命中（404 / 非数字 ID / 网络失败 / 解析失败），调用方应回落到原源
      */
     suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine>? {
-        if (trackId.isBlank() || trackId.any { !it.isDigit() }) {
+        if (trackId.length !in 1..24 || trackId.any { !it.isDigit() }) {
             log(trackId, "skip_non_numeric", lineCount = null)
             return null
         }
@@ -52,49 +35,42 @@ class AmllLyricsSource(private val context: Context) {
             val cacheFile = File(cacheDir, "$trackId$TTML_SUFFIX")
             val missFile = File(cacheDir, "$trackId$MISS_SUFFIX")
 
-            // 1. 之前已经确认 404 过 → 直接放弃
-            if (missFile.exists()) {
+            val now = System.currentTimeMillis()
+            val cached = if (cacheFile.length() in 1..MAX_CACHE_FILE_BYTES) {
+                runCatching { AmllTtmlParser.parse(cacheFile.readText(Charsets.UTF_8)) }
+                    .getOrNull()?.takeIf { OnlineLyricSupport.validTimings(it, 0L) }
+            } else null
+            if (cached != null && now - cacheFile.lastModified() in 0 until CACHE_TTL_MS) {
+                log(trackId, "hit_cache", cached.size)
+                return@withContext cached
+            }
+            val missUntil = runCatching { missFile.readText().toLongOrNull() }.getOrNull()
+            if (cached == null && missUntil != null && missUntil > now && missUntil - now <= MISS_TTL_MS) {
                 log(trackId, "miss_cached_404", lineCount = null)
                 return@withContext null
             }
-
-            // 2. 本地缓存命中
-            if (cacheFile.exists() && cacheFile.length() > 0L) {
-                val cached = runCatching { cacheFile.readText(Charsets.UTF_8) }.getOrNull()
-                if (!cached.isNullOrBlank()) {
-                    val parsed = runCatching { AmllTtmlParser.parse(cached) }.getOrNull()
-                    if (!parsed.isNullOrEmpty()) {
-                        log(trackId, "hit_cache", lineCount = parsed.size)
-                        return@withContext parsed
-                    }
-                    // 文件存在但解析空 → 当作脏缓存删了，下次重拉
-                    cacheFile.delete()
-                }
-            }
-
-            // 3. 走网拉
+            missFile.delete()
             val result = fetchOnce(trackId)
             if (result == null) {
-                log(trackId, "miss_network_error", lineCount = null)
-                return@withContext null
+                log(trackId, if (cached != null) "hit_stale_cache" else "miss_network_error", cached?.size)
+                return@withContext cached
             }
             when (result) {
                 FetchResult.NotFound -> {
-                    runCatching { missFile.writeBytes(ByteArray(0)) }
+                    cacheFile.delete()
+                    runCatching { missFile.writeText((now + MISS_TTL_MS).toString()) }
+                    trimCache()
                     log(trackId, "miss_404", lineCount = null)
                     null
                 }
                 is FetchResult.Ok -> {
                     val parsed = runCatching { AmllTtmlParser.parse(result.body) }.getOrNull()
-                    if (parsed.isNullOrEmpty()) {
-                        // 拿到了但解析失败 —— 不写 404 哨兵（数据有效，是我们的 parser 有问题，
-                        // 留着 .ttml 给开发可见，但本次返回 null）
-                        runCatching { cacheFile.writeText(result.body, Charsets.UTF_8) }
+                    if (parsed.isNullOrEmpty() || !OnlineLyricSupport.validTimings(parsed, 0L)) {
                         log(trackId, "parse_failed", lineCount = null)
-                        null
+                        cached
                     } else {
-                        runCatching { cacheFile.writeText(result.body, Charsets.UTF_8) }
-                        log(trackId, "hit_network", lineCount = parsed.size)
+                        writeCache(cacheFile, result.body)
+                        log(trackId, "hit_${result.origin}", lineCount = parsed.size)
                         parsed
                     }
                 }
@@ -105,8 +81,6 @@ class AmllLyricsSource(private val context: Context) {
     private fun log(trackId: String, result: String, lineCount: Int?) {
         // 走 area="lyrics" / event="amll_resolve" —— 用户从设置里分享诊断日志时，
         // 一眼能看出每首歌走的是 AMLL（字级）还是 yrc/lrc（回落）。
-        // result 取值：hit_cache / hit_network / miss_cached_404 / miss_404 /
-        //             miss_network_error / parse_failed / skip_non_numeric
         val fields = mutableMapOf<String, Any?>(
             "trackId" to trackId,
             "result" to result,
@@ -119,48 +93,62 @@ class AmllLyricsSource(private val context: Context) {
         )
     }
 
-    private suspend fun fetchOnce(trackId: String): FetchResult? = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url("$BASE_URL$trackId$TTML_SUFFIX")
-            .header("User-Agent", USER_AGENT)
-            .header("Accept", "application/ttml+xml,application/xml,text/xml,*/*")
-            .get()
-            .build()
-        try {
-            // response.use{} 无论 2xx / 404 / 其他都会正确关闭 body 并把连接归还连接池(或关闭),
-            // 不像旧 disconnect() 那样强关 socket —— 重复抓歌词时复用 keep-alive 连接。
-            http.newCall(request).execute().use { resp ->
-                when {
-                    resp.isSuccessful -> {
-                        val body = resp.body?.string()
-                        if (body.isNullOrBlank()) null else FetchResult.Ok(body)
-                    }
-                    resp.code == 404 -> FetchResult.NotFound
-                    else -> null
+    private suspend fun fetchOnce(trackId: String): FetchResult? {
+        val urls = listOf("$BASE_URL$trackId$TTML_SUFFIX", "$MIRROR_URL$trackId")
+        for ((index, url) in urls.withIndex()) {
+            try {
+                val body = withTimeoutOrNull(4_000L) {
+                    OnlineLyricSupport.requestText(
+                        Request.Builder().url(url).header("User-Agent", USER_AGENT)
+                            .header("Accept", "application/ttml+xml,application/xml,text/xml,*/*").build(),
+                    )
                 }
+                if (!body.isNullOrBlank()) return FetchResult.Ok(body, if (index == 0) "network" else "mirror")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: LyricHttpException) {
+                // Only the canonical repository can establish that the song is not indexed.
+                if (index == 0 && e.statusCode == 404) return FetchResult.NotFound
+            } catch (_: Exception) {
+                // The mirror is a fallback for transport failure, never a reason to cache a miss.
             }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Throwable) {
-            null
         }
+        return null
+    }
+
+    private fun writeCache(target: File, body: String) {
+        runCatching {
+            val temporary = File.createTempFile("amll-", ".tmp", cacheDir)
+            try {
+                temporary.writeText(body, Charsets.UTF_8)
+                temporary.renameTo(target)
+            } finally {
+                temporary.delete()
+            }
+            trimCache()
+        }
+    }
+
+    private fun trimCache() {
+        cacheDir.listFiles()?.filter { it.extension == "ttml" || it.extension == "404" }
+            ?.sortedByDescending { it.lastModified() }?.drop(MAX_CACHE_FILES)?.forEach { it.delete() }
     }
 
     private sealed class FetchResult {
         object NotFound : FetchResult()
-        data class Ok(val body: String) : FetchResult()
+        data class Ok(val body: String, val origin: String) : FetchResult()
     }
 
     companion object {
-        // raw.githubusercontent.com 在国内访问偶尔不稳；如果将来想换镜像就只改这里。
-        // amll-ttml-db.stevexmh.net 是作者镜像，URL 形如 https://amll-ttml-db.stevexmh.net/ncm/<id>
-        // 但本地无法直接拿到 .ttml 文件名，得改抓接口；先走 raw + 缓存兜底，命中率足够。
         private const val BASE_URL = "https://raw.githubusercontent.com/amll-dev/amll-ttml-db/main/ncm-lyrics/"
+        private const val MIRROR_URL = "https://amll-ttml-db.stevexmh.net/ncm/"
         private const val TTML_SUFFIX = ".ttml"
         private const val MISS_SUFFIX = ".404"
         private const val CACHE_SUBDIR = "amll-lyrics"
-        private const val CONNECT_TIMEOUT_MS = 4_000
-        private const val READ_TIMEOUT_MS = 6_000
+        private const val CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000L
+        private const val MISS_TTL_MS = 24 * 60 * 60 * 1000L
+        private const val MAX_CACHE_FILE_BYTES = 2 * 1024 * 1024L
+        private const val MAX_CACHE_FILES = 256
         private const val USER_AGENT = "Pipo-Android/AMLL-fetch"
     }
 }

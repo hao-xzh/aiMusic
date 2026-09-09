@@ -3,133 +3,95 @@ package app.pipo.nativeapp.ui
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import app.pipo.nativeapp.data.coverImageRequest
 import coil.compose.AsyncImage
-import coil.request.ImageRequest
+import kotlinx.coroutines.flow.collect
 
-/**
- * 双层 cross-fade 封面 —— 镜像 src/components/PlayerCard.tsx CoverImageLayer。
- *
- * 切 url 时：
- *   - 旧 url 在 prev 层从 alpha 1 淡到 0
- *   - 新 url 在 cur 层从 alpha 0 淡到 1（同时 scale 1.018→1）
- *   - 720ms cubic-bezier(0.22, 1, 0.36, 1)
- *
- * 关键：每次 url 变化用 `key(url)` 强制 Animatable 重新创建，避免之前那一版用
- * phaseKey + floor() 算 frac 在动画结束瞬间归 0 导致新封面消失的 bug。
- */
-private val SoftEase = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)
+private val SoftEase = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)
 
+private data class LoadedCover(val url: String?, val painter: Painter?)
+
+/** 新图解码完成后才过渡；命中缓存也执行动画，加载期间保留已显示的封面。 */
 @Composable
 fun CrossfadeCoverImage(
     url: String?,
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     durationMs: Int = 720,
-    maxDecodeSizePx: Int? = null,
-) {
-    var currentUrl by remember { mutableStateOf<String?>(null) }
-    var previousUrl by remember { mutableStateOf<String?>(null) }
-
-    if (url != currentUrl) {
-        previousUrl = currentUrl
-        currentUrl = url
-    }
-
-    Box(modifier = modifier) {
-        // 旧封面 alpha 1 → 0（同时 scale 不动）
-        previousUrl?.let { prev ->
-            key(prev) {
-                FadingImage(
-                    url = prev,
-                    contentScale = contentScale,
-                    durationMs = durationMs,
-                    initialAlpha = 1f,
-                    targetAlpha = 0f,
-                    initialScale = 1f,
-                    targetScale = 1f,
-                    maxDecodeSizePx = maxDecodeSizePx,
-                    onFinished = {
-                        if (previousUrl == prev) previousUrl = null
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-        }
-        // 新封面 alpha 0 → 1，scale 1.018 → 1
-        currentUrl?.let { cur ->
-            key(cur) {
-                FadingImage(
-                    url = cur,
-                    contentScale = contentScale,
-                    durationMs = durationMs,
-                    initialAlpha = 0f,
-                    targetAlpha = 1f,
-                    initialScale = 1.018f,
-                    targetScale = 1f,
-                    maxDecodeSizePx = maxDecodeSizePx,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun FadingImage(
-    url: String,
-    contentScale: ContentScale,
-    durationMs: Int,
-    initialAlpha: Float,
-    targetAlpha: Float,
-    initialScale: Float,
-    targetScale: Float,
-    maxDecodeSizePx: Int?,
-    onFinished: (() -> Unit)? = null,
-    modifier: Modifier = Modifier,
+    maxDecodeSizePx: Int? = 960,
 ) {
     val context = LocalContext.current
-    val alpha = remember { Animatable(initialAlpha) }
-    val scale = remember { Animatable(initialScale) }
+    val latestUrl by rememberUpdatedState(url)
+    val latestDuration by rememberUpdatedState(durationMs)
+    var loaded by remember { mutableStateOf(LoadedCover(null, null)) }
+    var current by remember { mutableStateOf(LoadedCover(null, null)) }
+    var previous by remember { mutableStateOf<Painter?>(null) }
+    val progress = remember { Animatable(1f) }
     val model = remember(context, url, maxDecodeSizePx) {
-        if (maxDecodeSizePx == null) {
-            url
-        } else {
-            ImageRequest.Builder(context)
-                .data(url)
-                .size(maxDecodeSizePx, maxDecodeSizePx)
-                .memoryCacheKey("cover:$maxDecodeSizePx:$url")
-                .diskCacheKey(url)
-                .build()
+        coverImageRequest(context, url, maxDecodeSizePx)
+    }
+    LaunchedEffect(url) {
+        if (url == null) loaded = LoadedCover(null, null)
+    }
+    LaunchedEffect(Unit) {
+        // 完成正在显示的两层混合，再接最新结果；连续切歌不重置到半途消失的旧图。
+        snapshotFlow { loaded }.collect { next ->
+            if (next.url != latestUrl || next == current) return@collect
+            previous = current.painter
+            current = next
+            progress.snapTo(0f)
+            progress.animateTo(1f, tween(latestDuration.coerceAtLeast(0), easing = SoftEase))
+            previous = null
         }
     }
-    LaunchedEffect(Unit) {
-        alpha.animateTo(targetAlpha, animationSpec = tween(durationMs, easing = SoftEase))
-        onFinished?.invoke()
+    Box(modifier = modifier) {
+        // 收到成功回调前不让新请求覆盖可见层，并核对结果所属 URL。
+        AsyncImage(
+            model = model,
+            contentDescription = null,
+            contentScale = contentScale,
+            modifier = Modifier.fillMaxSize().graphicsLayer { alpha = 0f },
+            onSuccess = { state ->
+                if (state.result.request.data == latestUrl) loaded = LoadedCover(latestUrl, state.painter)
+            },
+            onError = { state ->
+                if (state.result.request.data == latestUrl) loaded = LoadedCover(latestUrl, null)
+            },
+        )
+        previous?.let { painter ->
+            Image(
+                painter = painter,
+                contentDescription = null,
+                contentScale = contentScale,
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    // 不同时降低两层透明度，避免混合中途露底、发暗。
+                    alpha = if (current.painter == null) 1f - progress.value else 1f
+                },
+            )
+        }
+        current.painter?.let { painter ->
+            Image(
+                painter = painter,
+                contentDescription = null,
+                contentScale = contentScale,
+                modifier = Modifier.fillMaxSize().graphicsLayer { alpha = progress.value },
+            )
+        }
     }
-    LaunchedEffect(Unit) {
-        scale.animateTo(targetScale, animationSpec = tween(durationMs, easing = SoftEase))
-    }
-    AsyncImage(
-        model = model,
-        contentDescription = null,
-        contentScale = contentScale,
-        modifier = modifier.graphicsLayer {
-            this.alpha = alpha.value
-            scaleX = scale.value
-            scaleY = scale.value
-        },
-    )
 }

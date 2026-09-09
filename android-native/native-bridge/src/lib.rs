@@ -115,8 +115,25 @@ fn dispatch(command: &str, args: Value) -> String {
                 .unwrap_or_default()
                 .to_string();
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(30);
+            let offset = args.get("offset").and_then(Value::as_i64).unwrap_or(0);
             run_json(async move {
-                let tracks = netease_client().search_tracks(&query, limit).await?;
+                let tracks =
+                    netease::search_tracks_page(netease_client(), &query, limit, offset).await?;
+                Ok(serde_json::to_value(tracks)?)
+            })
+        }
+        "netease_daily_recommended_tracks" => run_json(async {
+            let tracks = netease::daily_recommended_tracks(netease_client()).await?;
+            Ok(serde_json::to_value(tracks)?)
+        }),
+        "netease_personal_fm_tracks" => run_json(async {
+            let tracks = netease::personal_fm_tracks(netease_client()).await?;
+            Ok(serde_json::to_value(tracks)?)
+        }),
+        "netease_similar_tracks" => {
+            let track_id = args.get("trackId").and_then(Value::as_i64).unwrap_or(0);
+            run_json(async move {
+                let tracks = netease::similar_tracks(netease_client(), track_id).await?;
                 Ok(serde_json::to_value(tracks)?)
             })
         }

@@ -19,6 +19,29 @@ object CommandTextSignals {
             .any { it in key }
     }
 
+    /** Keeping an existing queue requires timing/addition language in this turn. */
+    fun hasDeferredPlaybackIntent(text: String): Boolean {
+        // A song title containing “下一首” is not a playback timing instruction.
+        val unquoted = text.replace(Regex("[《「“\"][^》」”\"]*[》」”\"]"), "")
+        val key = normalizeCommandText(unquoted).replace(
+            Regex("(?:不要|别|无需|不用|不想|不是)(?:再)?(?:跳到|切到|跳过|放到|排到|接到|放在|排在)?" +
+                "(?:下一首|插播|追加|后面|后续|稍后|队尾|末尾|保留当前|保留这首)"), "",
+        )
+        if (noInterrupt(key)) return true
+        return listOf(
+            "下一首", "插播", "后面", "后续", "稍后", "听完", "播完", "放完",
+            "再加", "加点", "加一些", "加几首", "追加", "接着加", "接在", "排在",
+            "中途加", "中间加", "剩下的", "剩下改", "保留当前", "保留这首", "队尾", "末尾",
+        ).any { it in key } || Regex("先.{1,60}(?:然后|再)(?:听|放|播)").containsMatchIn(key) || Regex(
+            "\\bnext\\b|\\blater\\b|\\b(?:append|enqueue)\\b|\\badd\\b.{0,40}\\b(?:queue|more)\\b|" +
+                "\\bafter\\b.{0,20}\\b(?:song|track|this)\\b|\\bkeep\\b.{0,30}\\bplaying\\b|\\bdon't interrupt\\b",
+            RegexOption.IGNORE_CASE,
+        ).containsMatchIn(unquoted.replace(Regex(
+            "\\b(?:don't|do not|not|never)\\s+(?:(?:play|put|queue|add)\\s+.{0,30}?\\s+)?(?:next|later|append|enqueue)\\b",
+            RegexOption.IGNORE_CASE,
+        ), ""))
+    }
+
     fun isRepair(text: String): Boolean {
         val key = normalizeCommandText(text)
         return listOf("呢", "怎么没有", "怎么没", "只有", "不是说", "刚才", "上一轮", "没放")
@@ -212,8 +235,25 @@ object CommandTextSignals {
         return null
     }
 
+    /** An opening-song constraint belongs to a queue; it is not a single-song request. */
+    private val openingTrackClause = Regex("(?:第一首|首曲)\\s*(?:要放|要听|播放|先放|放|要|是|用)?\\s*([^，。；,;！!？?]+)")
+
+    fun textWithoutOpeningTrack(text: String): String = openingTrackClause.replaceFirst(text, "").trim(' ', '，', ',')
+
+    fun openingTrackRequirement(text: String): TrackRequirement? {
+        val clause = openingTrackClause
+            .find(text)?.groupValues?.getOrNull(1)?.trim() ?: return null
+        val parts = if (clause.firstOrNull() in listOf('《', '「', '“', '"')) listOf(clause) else clause.split("的", limit = 2)
+        val artist = parts.firstOrNull()?.trim()?.takeIf { parts.size == 2 && it.isNotBlank() }
+        val title = sanitizeTitle(parts.last().trim())
+        return title.takeIf { it.isNotBlank() && !isGenericMusicNoun(it) && !isCatalogDescriptor(it) }
+            ?.let { TrackRequirement(it, artist, TrackPlacement.Now) }
+    }
+
     fun closerTrackTitle(text: String): String? {
         val patterns = listOf(
+            Regex("(?:最后|末尾|结尾)(?:用|放)?\\s*([^，。,.!！?？]{1,28}?)(?:收尾|收一下|收住|结束)"),
+            Regex("(?:最后|末尾|结尾)(?:还是|依然是|仍然是)\\s*([^，。,.!！?？]{1,28})"),
             Regex("(?:最后|末尾|结尾)[^《「“\"]{0,16}[《「“\"]([^》」”\"]{1,32})[》」”\"]"),
             Regex("(?:最后|末尾|结尾)\\s*([^，。,.!！?？]{1,28})(?:收一下|收住|压住|结束|结尾)?"),
             Regex("([^，。,.!！?？]{1,28})(?:收一下|收住)$"),
@@ -475,6 +515,23 @@ object CommandTextSignals {
         value.lowercase()
             .replace(Regex("[\\s'\"`·・\\-－—_,，。.、!?！？()（）\\[\\]【】《》<>&/]+"), "")
             .trim()
+
+    /** A bare song name may match its labelled live/remaster, while a named
+     * edition and cover/instrumental/remix requirements retain exact identity. */
+    fun trackTitleMatches(actual: String, requested: String): Boolean {
+        val expected = normalizeForMatch(requested)
+        if (expected.isBlank()) return false
+        if (normalizeForMatch(actual) == expected) return true
+        var base = actual.trim()
+        repeat(2) {
+            val suffix = Regex("\\s*[（(\\[]([^()（）\\[\\]]{1,180})[）)\\]]\\s*$").find(base) ?: return@repeat
+            val label = suffix.groupValues[1]
+            if (Regex("cover|翻唱|伴奏|karaoke|instrumental|remix|混音", RegexOption.IGNORE_CASE).containsMatchIn(label)) return false
+            if (!Regex("live|现场|演唱会|remaster|重制|重混母带", RegexOption.IGNORE_CASE).containsMatchIn(label)) return@repeat
+            base = base.substring(0, suffix.range.first).trim()
+        }
+        return normalizeForMatch(base) == expected
+    }
 
     private fun sanitizeTitle(raw: String): String =
         raw.trim()

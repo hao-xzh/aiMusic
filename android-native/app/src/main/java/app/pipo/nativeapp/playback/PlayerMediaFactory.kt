@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.playback
 
 import android.net.Uri
+import android.os.Bundle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -28,12 +29,19 @@ internal class PlayerMediaFactory(
             Uri.parse(secureUrl)
         }
 
-        val metadata = MediaMetadata.Builder()
+        val metadataBuilder = MediaMetadata.Builder()
             .setTitle(track.title)
             .setArtist(track.artist)
             .setAlbumTitle(track.album)
             .setArtworkUri(artworkUri)
-            .build()
+        track.durationMs.takeIf { it > 0L }?.let { durationMs ->
+            metadataBuilder.setExtras(
+                Bundle().apply {
+                    putLong(SOURCE_DURATION_MS_EXTRA, durationMs)
+                },
+            )
+        }
+        val metadata = metadataBuilder.build()
 
 
         val builder = MediaItem.Builder()
@@ -90,7 +98,9 @@ internal class PlayerMediaFactory(
         return builder.build()
     }
 
-    private companion object {
+    companion object {
+        internal const val SOURCE_DURATION_MS_EXTRA = "app.pipo.nativeapp.source_duration_ms"
+
         private const val FEATURE_DURATION_MIN_RATIO = 0.88
         private const val FEATURE_DURATION_MAX_SHORTFALL_MS = 20_000L
 

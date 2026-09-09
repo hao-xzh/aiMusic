@@ -13,7 +13,9 @@ import app.pipo.nativeapp.data.AudioFeatures
 import app.pipo.nativeapp.data.AudioFeaturesStore
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.TransitionScore
+import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlan
 import app.pipo.nativeapp.playback.orchestrator.CommittedQueuePlanStore
+import app.pipo.nativeapp.playback.orchestrator.MixMode
 import app.pipo.nativeapp.playback.orchestrator.TransitionMode
 import app.pipo.nativeapp.playback.orchestrator.TransitionResult
 import app.pipo.nativeapp.playback.orchestrator.TransitionRisk
@@ -43,6 +45,8 @@ internal class SmartAutoMixer(
     private var lastCompletedQueueVersion: Long = 0L
     private var lastCompletedAtMs: Long = 0L
     private var lastArmDiagAtMs: Long = 0L
+    private var cachedPlanInputs: PlanInputs? = null
+    private var cachedPlan: AutoMixPlan? = null
 
     private val tickRunnable = object : Runnable {
         override fun run() {
@@ -73,10 +77,10 @@ internal class SmartAutoMixer(
             } else {
                 updateActiveMix(running)
             }
-            if (shouldKeepTicking()) scheduleTick()
+            if (shouldKeepTicking()) scheduleTick(soon = true)
             return
         }
-        if (shouldKeepTicking()) scheduleTick()
+        if (shouldKeepTicking()) scheduleTick(soon = true)
         if (!mainPlayer.playWhenReady || mainPlayer.playbackState == Player.STATE_IDLE) {
             cancel("main-not-playing", keepMainVolume = true)
         }
@@ -107,6 +111,8 @@ internal class SmartAutoMixer(
     fun release() {
         handler.removeCallbacks(tickRunnable)
         tickPosted = false
+        cachedPlanInputs = null
+        cachedPlan = null
         cancel("release", keepMainVolume = false)
     }
 
@@ -116,10 +122,21 @@ internal class SmartAutoMixer(
             (mainPlayer.playWhenReady && mainPlayer.mediaItemCount > 1)
     }
 
-    private fun scheduleTick() {
-        if (tickPosted) return
+    private fun scheduleTick(soon: Boolean = false) {
+        if (tickPosted && !soon) return
+        if (tickPosted) handler.removeCallbacks(tickRunnable)
         tickPosted = true
-        handler.postDelayed(tickRunnable, TICK_MS)
+        handler.postDelayed(tickRunnable, if (soon) TICK_MS else nextTickDelayMs())
+    }
+
+    private fun nextTickDelayMs(): Long {
+        if (armed != null || active != null) return TICK_MS
+        val plan = cachedPlan ?: return IDLE_TICK_MS
+        val remaining = remainingMs() ?: return IDLE_TICK_MS
+        val untilPrepareMs = remaining - plan.mixMs - prepareLeadMs(plan)
+        val speed = mainPlayer.playbackParameters.speed.coerceAtLeast(0.1f)
+        // 到准备窗口前恢复原有精度；远离曲尾时无需每 80ms 轮询同一对歌曲。
+        return if (untilPrepareMs <= IDLE_TICK_MS * speed) TICK_MS else IDLE_TICK_MS
     }
 
     private fun tick() {
@@ -179,7 +196,7 @@ internal class SmartAutoMixer(
     }
 
     /**
-     * 接歌为什么从不 arm 的探针 —— 限频(≥2s)记录 arming 视角。一次复现就能区分：
+     * 准备窗口内每 2s、平稳播放期间每 30s 记录 arming 视角。
      * hasPlan=false → buildPlan 被某条件挡(缺特征/同专辑 gapless/曲太短)；
      * durationKnown=false → player 不知道时长(流没报 duration)，remainingMs 永远算不出；
      * remainingMs 一直 > armThresholdMs → 时长异常(位置/时长错)，永远进不了 arming 窗口。
@@ -187,7 +204,10 @@ internal class SmartAutoMixer(
      */
     private fun maybeLogArmDiag(plan: AutoMixPlan?, remainingMs: Long?) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastArmDiagAtMs < ARM_DIAG_INTERVAL_MS) return
+        val nearPrepare = plan != null && remainingMs != null &&
+            remainingMs <= plan.mixMs + prepareLeadMs(plan) + IDLE_TICK_MS
+        val intervalMs = if (nearPrepare) ARM_DIAG_INTERVAL_MS else IDLE_ARM_DIAG_INTERVAL_MS
+        if (now - lastArmDiagAtMs < intervalMs) return
         lastArmDiagAtMs = now
         val durationMs = mainPlayer.duration
         DiagnosticsLogStore.record(
@@ -278,10 +298,11 @@ internal class SmartAutoMixer(
         }
         maybeApplyTempoLock(waiting, remainingMs)
 
+        val remainingRealtimeMs = (remainingMs / mainPlayer.playbackParameters.speed.coerceAtLeast(0.1f)).toLong()
         if (plan.realtimeCrossfadeEligible &&
-            remainingMs <= plan.realtimeCrossfadeMs + REALTIME_CROSSFADE_START_TOLERANCE_MS
+            remainingRealtimeMs <= plan.realtimeCrossfadeMs + REALTIME_CROSSFADE_PREPARE_HEADROOM_MS
         ) {
-            if (startRealtimeCrossfade(waiting, remainingMs)) {
+            if (startRealtimeCrossfade(waiting, remainingRealtimeMs)) {
                 return
             }
         }
@@ -320,11 +341,11 @@ internal class SmartAutoMixer(
             nextMediaItem = plan.nextMediaItem,
             nextIndex = plan.nextIndex,
             nextStartMs = plan.nextStartPositionMs,
-            crossfadeMs = remainingMs,
-            beatmatchSpeed = plan.nextTempoScale,
+            crossfadeMs = minOf(remainingMs, plan.realtimeCrossfadeMs),
             nextGainLinear = nextGain,
             queueVersion = plan.queueVersion,
             pairKey = plan.key,
+            beatAlignment = plan.beatAlignment,
         )
         if (!started) return false
         armed = null
@@ -595,33 +616,80 @@ internal class SmartAutoMixer(
     }
 
     private fun buildPlan(): AutoMixPlan? {
-        val currentIndex = mainPlayer.currentMediaItemIndex.takeIf { it >= 0 } ?: return null
-        val nextIndex = nextIndex(currentIndex) ?: return null
+        val currentIndex = mainPlayer.currentMediaItemIndex
+        val nextIndex = currentIndex.takeIf { it >= 0 }?.let(::nextIndex)
+        if (nextIndex == null) {
+            cachedPlanInputs = null
+            cachedPlan = null
+            return null
+        }
         val currentItem = mainPlayer.getMediaItemAt(currentIndex)
         val nextItem = mainPlayer.getMediaItemAt(nextIndex)
-        val currentTrack = currentItem.toNativeTrack() ?: return null
+        val currentFeatures = featuresStore.get(currentItem.mediaId)
+        val nextFeatures = featuresStore.get(nextItem.mediaId)
+        val currentDurationMs = mainPlayer.duration.takeIf { it > 0 && it != C.TIME_UNSET } ?: 0L
+        val queueVersion = PlaybackSessionClock.currentQueueVersion()
+        val committedPlan = CommittedQueuePlanStore.current()
+        val previous = cachedPlanInputs
+        if (previous != null &&
+            previous.currentIndex == currentIndex && previous.nextIndex == nextIndex &&
+            previous.currentItem === currentItem && previous.nextItem === nextItem &&
+            previous.currentFeatures === currentFeatures && previous.nextFeatures === nextFeatures &&
+            previous.currentDurationMs == currentDurationMs && previous.queueVersion == queueVersion &&
+            previous.committedPlan === committedPlan
+        ) return cachedPlan
+
+        val inputs = PlanInputs(
+            currentIndex, nextIndex, currentItem, nextItem, currentFeatures, nextFeatures,
+            currentDurationMs, queueVersion, committedPlan,
+        )
+        val plan = createPlan(inputs)
+        cachedPlanInputs = inputs
+        cachedPlan = plan
+        return plan
+    }
+
+    private fun createPlan(inputs: PlanInputs): AutoMixPlan? {
+        val currentIndex = inputs.currentIndex
+        val nextIndex = inputs.nextIndex
+        val currentItem = inputs.currentItem
+        val nextItem = inputs.nextItem
+        // 没有裁尾时，已解析的播放时长比目录元数据更接近当前实际音源。
+        val measuredSourceDurationMs = inputs.currentDurationMs.takeIf { it > 0L }
+            ?.takeIf { currentItem.clippingConfiguration.endPositionMs == C.TIME_END_OF_SOURCE }
+            ?.let { it + currentItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L) }
+        val currentTrack = currentItem.toNativeTrack(measuredSourceDurationMs) ?: return null
         val nextTrack = nextItem.toNativeTrack() ?: return null
         if (currentTrack.streamUrl.isBlank() || nextTrack.streamUrl.isBlank()) return null
         // 特征时长与元数据不符 = 特征是从截断/不同版本音频上分析的，它描述的
         // outro/intro 根本不是这条音频的真实首尾——在这种特征上做切歌决策，
         // 就是“人声没唱完就切”的来源之一。当缺失处理（走活体幅度兜底）。
-        val currentFeatures = featuresStore.get(currentTrack.id)
+        val currentFeatures = inputs.currentFeatures
             ?.takeIf { featuresDurationAgrees(it, currentTrack, "current") }
-        val nextFeatures = featuresStore.get(nextTrack.id)
+        val nextFeatures = inputs.nextFeatures
             ?.takeIf { featuresDurationAgrees(it, nextTrack, "next") }
-        val currentDurationMs = mainPlayer.duration.takeIf { it > 0 && it != C.TIME_UNSET } ?: 0L
+        val currentDurationMs = inputs.currentDurationMs
         val currentClipSourceDurationMs = currentDurationMs +
             currentItem.clippingConfiguration.startPositionMs.coerceAtLeast(0L)
         if (shouldLeaveAlbumGapless(currentTrack, nextTrack, currentFeatures, nextFeatures)) return null
-        val queueVersion = PlaybackSessionClock.currentQueueVersion()
-        val committedTransitionPlan = CommittedQueuePlanStore.transitionFor(
-            queueVersion = queueVersion,
-            fromTrackId = currentTrack.id,
-            toTrackId = nextTrack.id,
-        )
-        if (committedTransitionPlan?.risk == TransitionRisk.High ||
-            committedTransitionPlan?.mode == TransitionMode.NoMix ||
-            committedTransitionPlan?.mode == TransitionMode.NativeGapless
+        val queueVersion = inputs.queueVersion
+        val committedQueuePlan = inputs.committedPlan
+            ?.takeIf { it.queueVersion == queueVersion }
+        if (committedQueuePlan != null &&
+            (!committedQueuePlan.mixPolicy.enabled ||
+                committedQueuePlan.mixPolicy.mode == MixMode.Off ||
+                committedQueuePlan.mixPolicy.mode == MixMode.NativeGaplessOnly)
+        ) return null
+        val committedTransitionPlan = committedQueuePlan
+            ?.transitionPlans?.firstOrNull {
+                it.queueVersion == queueVersion &&
+                    it.fromTrackId == currentTrack.id && it.toTrackId == nextTrack.id
+            }
+        // 缺分析只是暂时未知；特征就绪后由实时规划重新判断，显式禁止混音仍保留。
+        val committedDecision = committedTransitionPlan?.takeUnless { it.analysisPending }
+        if (committedDecision?.risk == TransitionRisk.High ||
+            committedDecision?.mode == TransitionMode.NoMix ||
+            committedDecision?.mode == TransitionMode.NativeGapless
         ) {
             DiagnosticsLogStore.record(
                 area = "automix",
@@ -629,8 +697,8 @@ internal class SmartAutoMixer(
                 fields = mapOf(
                     "queueVersion" to queueVersion,
                     "pairKey" to "${currentTrack.id}->${nextTrack.id}",
-                    "committedMode" to committedTransitionPlan.mode.name,
-                    "committedRisk" to committedTransitionPlan.risk.name,
+                    "committedMode" to committedDecision.mode.name,
+                    "committedRisk" to committedDecision.risk.name,
                     "reason" to "committed_no_mix_or_high_risk",
                 ),
             )
@@ -643,14 +711,18 @@ internal class SmartAutoMixer(
             nextFeatures = nextFeatures,
             currentDurationMs = currentDurationMs,
         ) ?: return null
-        val targetTransitionMode = when (committedTransitionPlan?.mode) {
+        val targetTransitionMode = when (committedDecision?.mode) {
             TransitionMode.RealtimeCrossfade ->
                 if (mix.realtimeCrossfadeEligible) TransitionMode.RealtimeCrossfade else TransitionMode.SafeCut
             TransitionMode.SafeCut -> TransitionMode.SafeCut
             TransitionMode.NativeGapless, TransitionMode.NoMix -> return null
             null -> if (mix.realtimeCrossfadeEligible) TransitionMode.RealtimeCrossfade else TransitionMode.SafeCut
         }
-        val transitionModeSource = if (committedTransitionPlan != null) "committed_plan" else "runtime"
+        val transitionModeSource = when {
+            committedTransitionPlan?.analysisPending == true -> "runtime_pending_analysis"
+            committedDecision != null -> "committed_plan"
+            else -> "runtime"
+        }
         return AutoMixPlan(
             key = "${currentTrack.id}->${nextTrack.id}",
             queueVersion = queueVersion,
@@ -680,16 +752,18 @@ internal class SmartAutoMixer(
             tempoLockSpeed = mix.tempoLockSpeed,
             tempoLockLeadMs = mix.tempoLockLeadMs,
             nextTempoScale = mix.nextTempoScale,
+            beatAlignment = mix.beatAlignment,
             policy = mix.policy,
             reason = mix.reason,
             targetTransitionMode = targetTransitionMode,
             transitionModeSource = transitionModeSource,
-            committedTransitionRisk = committedTransitionPlan?.risk,
+            committedTransitionRisk = committedDecision?.risk,
             diagnostics = mix.diagnostics + mapOf(
                 "targetTransitionMode" to targetTransitionMode.name,
                 "transitionModeSource" to transitionModeSource,
                 "committedTransitionMode" to committedTransitionPlan?.mode?.name,
                 "committedTransitionRisk" to committedTransitionPlan?.risk?.name,
+                "committedAnalysisPending" to committedTransitionPlan?.analysisPending,
             ),
         )
     }
@@ -982,7 +1056,8 @@ internal class SmartAutoMixer(
             vocalEntryTooEarly = vocalEntryTooEarly,
             drumEntryTooEarly = drumEntryTooEarly,
         )
-        val nextTempoScale = realtimeCrossfadeNextTempoScale(tempoLock)
+        val beatAlignment = BeatPhaseAlignment.from(currentFeatures, nextFeatures)
+        val nextTempoScale = beatAlignment?.nextTempoRatio ?: DEFAULT_PLAYBACK_SPEED
         val realtimeCrossfadeEligible = realtimeCrossfadeEligible(
             policy = policy,
             fit = fit,
@@ -1006,7 +1081,7 @@ internal class SmartAutoMixer(
             }
         val realtimeCrossfadeMs = realtimeTargetMs.coerceIn(MIN_REALTIME_CROSSFADE_MS, MAX_REALTIME_CROSSFADE_MS)
         val realtimeCrossfadeMode = if (realtimeCrossfadeEligible) {
-            if (policy == "breath-cut") "short-breath-handoff" else "beatmatched-handoff"
+            if (beatAlignment != null) "beat-phase-planned" else "equal-power-handoff"
         } else {
             "none"
         }
@@ -1015,6 +1090,7 @@ internal class SmartAutoMixer(
             realtimeCrossfadeMs = realtimeCrossfadeMs,
             realtimeCrossfadeEligible = realtimeCrossfadeEligible,
             realtimeCrossfadeMode = realtimeCrossfadeMode,
+            beatAlignment = beatAlignment,
             nextStartPositionMs = entryCue.positionMs,
             requiresTailDip = requiredDipTicks > 0,
             tailAmpThreshold = tailAmpThreshold(currentFeatures, melodicTailRisk || clashRisk),
@@ -1203,12 +1279,6 @@ internal class SmartAutoMixer(
         return true
     }
 
-    private fun realtimeCrossfadeNextTempoScale(tempoLock: TempoLock): Float {
-        if (tempoLock.speed == DEFAULT_PLAYBACK_SPEED) return DEFAULT_PLAYBACK_SPEED
-        return (DEFAULT_PLAYBACK_SPEED / tempoLock.speed)
-            .coerceIn(MIN_REALTIME_NEXT_TEMPO_SCALE, MAX_REALTIME_NEXT_TEMPO_SCALE)
-    }
-
     private fun nextEntryCue(features: AudioFeatures?, policy: String): EntryCue {
         if (features == null) return EntryCue(0L, "no-features")
         val headSilenceMs = (features.headSilenceS * 1000.0).roundToLong()
@@ -1358,6 +1428,8 @@ internal class SmartAutoMixer(
     private fun maybeApplyTempoLock(waiting: ArmedMix, remainingMs: Long) {
         if (waiting.tempoLockApplied) return
         val plan = waiting.plan
+        // 实时对拍由辅助播放器匹配当前真实速度，不能先改 A 再反向改 B。
+        if (plan.realtimeCrossfadeEligible) return
         val speed = plan.tempoLockSpeed
         if (speed == DEFAULT_PLAYBACK_SPEED || plan.tempoLockLeadMs <= 0L) return
         if (remainingMs > plan.tempoLockLeadMs) return
@@ -1507,9 +1579,12 @@ internal class SmartAutoMixer(
         track: NativeTrack,
         side: String,
     ): Boolean {
-        val metaMs = track.durationMs.takeIf { it > 0L } ?: return true
-        val featureMs = (features.durationS * 1000).toLong()
-        val agrees = abs(metaMs - featureMs) <= FEATURE_DURATION_AGREEMENT_MS
+        val metaMs = track.durationMs
+        val featureMs = features.durationS.takeIf { it.isFinite() && it > 0.0 }
+            ?.let { (it * 1000).toLong() }
+        val agrees = metaMs > 0L && featureMs != null &&
+            abs(metaMs - featureMs) <= FEATURE_DURATION_AGREEMENT_MS &&
+            (track.neteaseId == null || track.neteaseId == features.trackId)
         if (!agrees) {
             DiagnosticsLogStore.record(
                 area = "automix",
@@ -1549,9 +1624,13 @@ internal class SmartAutoMixer(
         val leftLocal = left.localConfiguration ?: return false
         val rightLocal = right.localConfiguration ?: return false
         if (leftLocal.uri.toString().isBlank() || rightLocal.uri.toString().isBlank()) return false
+        val sameSource = if (leftLocal.customCacheKey != null && rightLocal.customCacheKey != null) {
+            leftLocal.customCacheKey == rightLocal.customCacheKey
+        } else {
+            leftLocal.uri == rightLocal.uri
+        }
         return left.mediaId == right.mediaId &&
-            leftLocal.uri == rightLocal.uri &&
-            leftLocal.customCacheKey == rightLocal.customCacheKey &&
+            sameSource &&
             left.clippingConfiguration.startPositionMs == right.clippingConfiguration.startPositionMs &&
             left.clippingConfiguration.endPositionMs == right.clippingConfiguration.endPositionMs
     }
@@ -1625,15 +1704,20 @@ internal class SmartAutoMixer(
         )
     }
 
-    private fun MediaItem.toNativeTrack(): NativeTrack? {
+    private fun MediaItem.toNativeTrack(measuredSourceDurationMs: Long? = null): NativeTrack? {
         val mediaId = mediaId.takeIf { it.isNotBlank() } ?: return null
         return NativeTrack(
             id = mediaId,
+            neteaseId = mediaId.toLongOrNull(),
             title = mediaMetadata.title?.toString().orEmpty(),
             artist = mediaMetadata.artist?.toString().orEmpty(),
             album = mediaMetadata.albumTitle?.toString().orEmpty(),
             streamUrl = localConfiguration?.uri?.toString().orEmpty(),
             artworkUrl = mediaMetadata.artworkUri?.toString(),
+            streamCacheKey = localConfiguration?.customCacheKey,
+            durationMs = measuredSourceDurationMs
+                ?: mediaMetadata.extras?.getLong(PlayerMediaFactory.SOURCE_DURATION_MS_EXTRA, 0L)
+                ?: 0L,
         )
     }
 
@@ -1662,6 +1746,7 @@ internal class SmartAutoMixer(
         val policy: String,
         val reason: String,
         val diagnostics: Map<String, Any?>,
+        val beatAlignment: BeatPhaseAlignment? = null,
     )
 
     private data class AutoMixPlan(
@@ -1693,12 +1778,25 @@ internal class SmartAutoMixer(
         val tempoLockSpeed: Float,
         val tempoLockLeadMs: Long,
         val nextTempoScale: Float,
+        val beatAlignment: BeatPhaseAlignment?,
         val policy: String,
         val reason: String,
         val targetTransitionMode: TransitionMode,
         val transitionModeSource: String,
         val committedTransitionRisk: TransitionRisk?,
         val diagnostics: Map<String, Any?>,
+    )
+
+    private class PlanInputs(
+        val currentIndex: Int,
+        val nextIndex: Int,
+        val currentItem: MediaItem,
+        val nextItem: MediaItem,
+        val currentFeatures: AudioFeatures?,
+        val nextFeatures: AudioFeatures?,
+        val currentDurationMs: Long,
+        val queueVersion: Long,
+        val committedPlan: CommittedQueuePlan?,
     )
 
     private data class ArmedMix(
@@ -1744,7 +1842,9 @@ internal class SmartAutoMixer(
 
     private companion object {
         private const val TICK_MS = 80L
+        private const val IDLE_TICK_MS = 1_000L
         private const val ARM_DIAG_INTERVAL_MS = 2_000L
+        private const val IDLE_ARM_DIAG_INTERVAL_MS = 30_000L
         private const val FADE_OUT_JUMP_THRESHOLD = 0.92f
         private const val SHORT_MIX_PREPARE_THRESHOLD_MS = 1_500L
         private const val TIGHT_MIX_PREPARE_THRESHOLD_MS = 2_300L
@@ -1754,7 +1854,7 @@ internal class SmartAutoMixer(
         private const val SOFT_MIX_PREPARE_LEAD_MS = 9_500L
         private const val TAIL_DIP_PREPARE_LEAD_MS = 11_000L
         private const val MAX_PREPARE_LEAD_MS = 13_000L
-        private const val REALTIME_CROSSFADE_PREPARE_HEADROOM_MS = 700L
+        private const val REALTIME_CROSSFADE_PREPARE_HEADROOM_MS = 2_000L
         private const val MIN_REMAINING_TO_ARM_MS = 1_200L
         private const val MIN_REMAINING_TO_START_MS = 500L
         private const val MAIN_ONLY_TRANSITION_MODE = "main-only-next"
@@ -1796,7 +1896,6 @@ internal class SmartAutoMixer(
         private const val MAX_REALTIME_CROSSFADE_MS = 5_500L
         // 实时双 player crossfade 总开关。改 false 后回到 main-only SafeCut。
         private const val REALTIME_CROSSFADE_ENABLED = true
-        private const val REALTIME_CROSSFADE_START_TOLERANCE_MS = 160L
         private const val MIN_REALTIME_CROSSFADE_SCORE = 0.82
         private const val MIN_BREATH_REALTIME_CROSSFADE_SCORE = 0.88
         private const val HIGH_CONFIDENCE_CROSSFADE_WITHOUT_BPM_SCORE = 0.88
@@ -1811,8 +1910,6 @@ internal class SmartAutoMixer(
         private const val MAX_BREATH_REALTIME_CROSSFADE_LOW_ENERGY_DELTA = 0.11
         private const val MAX_REALTIME_CROSSFADE_TONAL_DISTANCE = 4
         private const val MIN_TAIL_SILENCE_FOR_OPEN_VOCAL = 1.20
-        private const val MIN_REALTIME_NEXT_TEMPO_SCALE = 0.965f
-        private const val MAX_REALTIME_NEXT_TEMPO_SCALE = 1.035f
         private const val FALLBACK_LIVE_TAIL_MIX_MS = 1_450L
         private const val FALLBACK_FADE_OUT_MS = 170L
         private const val FALLBACK_FADE_IN_MS = 430L

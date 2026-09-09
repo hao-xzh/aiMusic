@@ -151,33 +151,17 @@ impl NeteaseClient {
         self.weapi_at_path(
             format!("weapi/{}", endpoint.trim_start_matches('/')),
             params,
-            &[],
+            false,
         )
         .await
     }
 
-    /// 发到 `/api/...` 路径，但仍使用 weapi 加密体。
-    pub async fn weapi_api<T: DeserializeOwned>(&self, endpoint: &str, params: Value) -> Result<T> {
-        self.weapi_at_path(
-            format!("api/{}", endpoint.trim_start_matches('/')),
-            params,
-            &[],
-        )
-        .await
-    }
-
-    /// 发 weapi 请求时临时覆盖 Cookie header。用于手机号登录这种对客户端身份
-    /// 比较敏感的端点，避免把 iOS 身份永久写进全局 cookie jar。
-    pub async fn weapi_with_cookie_overrides<T: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        params: Value,
-        cookie_overrides: &[(&str, &str)],
-    ) -> Result<T> {
+    /// 短信认证沿用同一个浏览器会话，不注入虚构的来源 IP，也不切换客户端身份。
+    pub async fn weapi_login<T: DeserializeOwned>(&self, endpoint: &str, params: Value) -> Result<T> {
         self.weapi_at_path(
             format!("weapi/{}", endpoint.trim_start_matches('/')),
             params,
-            cookie_overrides,
+            true,
         )
         .await
     }
@@ -239,17 +223,15 @@ impl NeteaseClient {
         &self,
         path: String,
         mut params: Value,
-        cookie_overrides: &[(&str, &str)],
+        authentication: bool,
     ) -> Result<T> {
-        // 注入两个"身份"参数：
-        //   - csrf_token: 未登录时空串，登录后从 cookie 里拿
-        //   - realIP:     告诉风控这是大陆来源，否则 -462
+        // 登录请求只补充当前会话的 csrf_token；其它业务维持现有 realIP 参数行为。
         if let Some(obj) = params.as_object_mut() {
             if !obj.contains_key("csrf_token") {
                 let csrf = self.cookie_value("__csrf").unwrap_or_default();
                 obj.insert("csrf_token".into(), json!(csrf));
             }
-            if !obj.contains_key("realIP") {
+            if !authentication && !obj.contains_key("realIP") {
                 obj.insert("realIP".into(), json!(FAKE_REAL_IP));
             }
         }
@@ -257,21 +239,12 @@ impl NeteaseClient {
         let body = weapi_encrypt(&params);
         let path = path.trim_start_matches('/');
         let url = format!("{HOST}/{path}");
-        let cookie_url = Url::parse(&url).with_context(|| format!("parse url {url}"))?;
-
-        let mut request = self
+        let request = self
             .http
             .post(&url)
             .header("Referer", format!("{HOST}/"))
             .header("Origin", HOST)
             .form(&[("params", body.params), ("encSecKey", body.enc_sec_key)]);
-
-        if !cookie_overrides.is_empty() {
-            request = request.header(
-                reqwest::header::COOKIE,
-                self.cookie_header_with_overrides(&cookie_url, cookie_overrides)?,
-            );
-        }
 
         let resp = request
             .send()
@@ -280,6 +253,13 @@ impl NeteaseClient {
 
         let status = resp.status();
         let text = resp.text().await.context("read body")?;
+        if authentication {
+            // Preserve service error codes even on non-2xx responses. Never expose a login
+            // response body in errors: it can contain the user's session or account details.
+            return serde_json::from_str::<T>(&text).map_err(|_| {
+                anyhow!("网易云认证接口 {path} 返回异常（HTTP {status}），请稍后重试。")
+            });
+        }
         if !status.is_success() {
             return Err(anyhow!(
                 "netease {path} -> {status}: {}",
@@ -404,33 +384,6 @@ impl NeteaseClient {
             header.insert("MUSIC_A".into(), json!(music_a));
         }
         Value::Object(header)
-    }
-
-    fn cookie_header_with_overrides(
-        &self,
-        url: &Url,
-        overrides: &[(&str, &str)],
-    ) -> Result<String> {
-        let store = self
-            .cookies
-            .lock()
-            .map_err(|_| anyhow!("cookie store poisoned"))?;
-        let mut pairs = store
-            .get_request_values(url)
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect::<Vec<_>>();
-        drop(store);
-
-        for (name, value) in overrides {
-            pairs.retain(|(existing, _)| existing.as_str() != *name);
-            pairs.push(((*name).to_string(), (*value).to_string()));
-        }
-
-        Ok(pairs
-            .into_iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; "))
     }
 }
 

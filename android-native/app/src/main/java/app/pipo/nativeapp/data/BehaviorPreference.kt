@@ -30,7 +30,7 @@ class BehaviorPreferenceEngine(
     suspend fun current(): BehaviorPreferenceSnapshot = withContext(Dispatchers.Default) {
         val events = runCatching { behaviorLog.readAll() }.getOrDefault(emptyList())
         val lastTs = events.maxOfOrNull { it.tsMs } ?: 0L
-        val key = "${events.size}:$lastTs"
+        val key = "${events.size}:$lastTs:${System.currentTimeMillis() / 3_600_000}"
         val cached = cachedSnapshot
         if (cachedKey == key) return@withContext cached
 
@@ -43,8 +43,7 @@ class BehaviorPreferenceEngine(
     fun scoreTrack(snapshot: BehaviorPreferenceSnapshot, track: NativeTrack): Double {
         if (!snapshot.hasSignal) return 0.0
         val features = featuresStore.get(track.id)
-        val semantic = semanticStore.get(track.id)
-            ?: indexer.buildRuleBasedProfile(track, features)
+        val semantic = semanticStore.get(track.id)?.takeIf { it.sourceLlm && it.confidence >= 0.55 }
         return snapshot.scoreTrack(track, semantic, features)
     }
 
@@ -96,15 +95,17 @@ class BehaviorPreferenceEngine(
                 ?: indexer.buildRuleBasedProfile(track, features)
 
             addArtistKeys(artist, track, longWeight)
-            addKeys(genre, semantic.genres + semantic.subGenres + semantic.styleAnchors, longWeight, 1.0)
-            addKey(language, semantic.language.key, longWeight, semantic.languageConfidence)
-            addKey(region, semantic.region.key, longWeight, semantic.regionConfidence)
-            addKey(vocal, semantic.vocalType.key, longWeight, 0.65)
-            if (shortWeight != 0.0) {
-                addKeys(mood, semantic.moods + semantic.textures, shortWeight, 0.85)
-                addKeys(scene, semantic.scenes, shortWeight, 0.75)
-                addKey(energy, energyBucket(semantic, features), shortWeight, 0.75)
-                addKey(tempo, tempoBucket(semantic, features), shortWeight, 0.60)
+            if (semantic.sourceLlm && semantic.confidence >= 0.55) {
+                addKeys(genre, semantic.genres + semantic.subGenres + semantic.styleAnchors, longWeight, 1.0)
+                addKey(language, semantic.language.key, longWeight, semantic.languageConfidence)
+                addKey(region, semantic.region.key, longWeight, semantic.regionConfidence)
+                addKey(vocal, semantic.vocalType.key, longWeight, 0.65)
+                if (shortWeight != 0.0) {
+                    addKeys(mood, semantic.moods + semantic.textures, shortWeight, 0.85)
+                    addKeys(scene, semantic.scenes, shortWeight, 0.75)
+                    addKey(energy, energyBucket(semantic, features), shortWeight, 0.75)
+                    addKey(tempo, tempoBucket(semantic, features), shortWeight, 0.60)
+                }
             }
         }
 
@@ -127,17 +128,30 @@ class BehaviorPreferenceEngine(
         )
     }
 
-    private fun eventPreferenceWeight(event: BehaviorEvent): Double =
-        when (event.type) {
-            BehaviorType.Completed -> 1.15
-            BehaviorType.PlayStarted -> 0.12
-            BehaviorType.Skipped -> -1.15
-            BehaviorType.ManualCut -> when {
-                event.completionPct >= 0.82f -> 0.28
-                event.completionPct >= 0.62f -> -0.10
-                else -> -0.45
+    private fun eventPreferenceWeight(event: BehaviorEvent): Double {
+        val listenedRatio = event.listenedMs
+            ?.takeIf { it >= 0L }
+            ?.let { listened ->
+                event.durationMs
+                    ?.takeIf { it > 0L }
+                    ?.let { duration -> (listened.toDouble() / duration).coerceIn(0.0, 1.0) }
             }
+
+        return when (event.type) {
+            // 仅进入一首歌并不能说明喜欢。真实聆听时长在新日志中才是正向依据。
+            BehaviorType.PlayStarted -> 0.0
+            // 旧 AUTO 和进度位置无法证明听完，不继续作为正向证据。
+            BehaviorType.Completed -> if (listenedRatio != null && listenedRatio >= 0.8) 1.15 * listenedRatio else 0.0
+            BehaviorType.Skipped -> when {
+                listenedRatio == null -> -0.55 // 旧日志只保留较弱的明确 next 信号。
+                listenedRatio >= 0.8 -> 0.28
+                listenedRatio >= 0.5 || (event.listenedMs ?: 0) < 1_500 -> 0.0
+                else -> -1.15 * (1.0 - listenedRatio)
+            }
+            // previous 也会产生 ManualCut；低进度重播不表示不喜欢。
+            BehaviorType.ManualCut -> if (listenedRatio != null && listenedRatio >= 0.8) 0.28 else 0.0
         }
+    }
 
     private fun addArtistKeys(bucket: ScoreBucket, track: NativeTrack, weight: Double) {
         track.artist

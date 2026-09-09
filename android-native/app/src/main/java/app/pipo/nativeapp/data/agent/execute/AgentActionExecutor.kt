@@ -16,6 +16,7 @@ interface AgentActionExecutor {
         primaryGoal: MusicGoal,
         target: TrackRequirement?,
         similar: Boolean,
+        preserveCurrent: Boolean = false,
     ): ActionExecutionResult
 
     /** 插到当前歌后面；tracks 支持整批（“这首听完放 X 的歌/下一首开始听 Y”），保持批内顺序。 */
@@ -34,6 +35,13 @@ interface AgentActionExecutor {
         like: Boolean,
         target: TrackRequirement,
     ): ActionExecutionResult
+
+    /** Uses an already resolved song ID and the original account; never resolves the current song again. */
+    suspend fun retryFavorite(
+        actionId: String, track: NativeTrack, like: Boolean, accountUserId: Long,
+    ): ActionExecutionResult = ActionExecutionResult(
+        actionId, "like", false, "当前执行器不支持重试收藏。", acceptedByPlayer = false,
+    )
 
     suspend fun modifyPlaylist(
         actionId: String,

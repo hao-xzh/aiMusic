@@ -185,6 +185,8 @@ interface PipoRepository {
     suspend fun verifyPhoneCaptcha(phone: String, captcha: String, countryCode: Int = 86): CaptchaSentStatus
     suspend fun loginWithPhone(phone: String, captcha: String, countryCode: Int = 86): PhoneLoginStatus
     suspend fun refreshPlaylists()
+    /** Browsing must distinguish an empty library from a failed refresh. */
+    suspend fun refreshPlaylistsForBrowse() = refreshPlaylists()
     suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean = false): List<NativeTrack>
     /**
      * 加载"我的网盘"全部上传歌曲。和 [tracksForPlaylist] 行为对齐：
@@ -192,6 +194,7 @@ interface PipoRepository {
      * 加载完会 emit 到 [cloudTracks] Flow 让 cover-flow tile 跨 UI 重挂载持久。
      */
     suspend fun cloudDiskTracks(forceRefresh: Boolean = false): List<NativeTrack>
+    suspend fun cloudDiskTracksForBrowse(forceRefresh: Boolean = false): List<NativeTrack> = cloudDiskTracks(forceRefresh)
     /**
      * 同步读已加载到内存的歌单 / 网盘曲目（命中时返回，否则 null），用于 DistillLibrary
      * 重新挂载时把 tracks 初始值从 cache 直接灌进去，避免 `loading=true && tracks.isEmpty()`
@@ -199,8 +202,15 @@ interface PipoRepository {
      */
     fun cachedTracksFor(playlistId: Long): List<NativeTrack>?
     suspend fun searchTracks(query: String, limit: Int = 30): List<NativeTrack>
+    suspend fun searchTracksPage(query: String, limit: Int, offset: Int): List<NativeTrack> =
+        if (offset == 0) searchTracks(query, limit) else emptyList()
+    suspend fun dailyRecommendedTracks(): List<NativeTrack> = emptyList()
+    suspend fun personalFmTracks(): List<NativeTrack> = emptyList()
+    suspend fun similarTracks(trackId: Long): List<NativeTrack> = emptyList()
     suspend fun songUrls(ids: List<Long>, level: String = "lossless"): List<NativeSongUrl>
     suspend fun lyricsForTrack(trackId: String): List<PipoLyricLine>
+    /** Recording metadata is required when matching lyrics across music catalogs. */
+    suspend fun lyricsForTrack(track: NativeTrack): List<PipoLyricLine> = lyricsForTrack(track.id)
     /** 收藏 / 取消收藏单曲（写到网易云"我喜欢的音乐"红心歌单） */
     suspend fun likeSong(id: Long, like: Boolean)
     /** 创建普通网易云歌单，返回服务端生成的歌单 id。 */
