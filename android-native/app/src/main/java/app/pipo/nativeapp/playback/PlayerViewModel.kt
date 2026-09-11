@@ -1590,6 +1590,8 @@ class PlayerViewModel(
                 val nextQueue = preservedPrefix + futureQueue
                 val currentMediaIndex = live.currentMediaItemIndex.coerceAtLeast(0)
 
+                // 接管后才能发送播放器事件，避免同步状态时读到旧后台队列的模式。
+                BackgroundAgentContinuation.clear()
                 lastAgentContinuousSource = source
                 val queueMode = modeForNewQueue(source)
                 continuousSource = continuousSourceForMode(queueMode, explicitSource = source)
@@ -1694,6 +1696,7 @@ class PlayerViewModel(
                 }
                 if (gen != playGen) return@launch
                 firstResolvedForAppend = firstResolved
+                BackgroundAgentContinuation.clear()
                 lastAgentContinuousSource = source
                 val queueMode = modeForNewQueue(source)
                 continuousSource = continuousSourceForMode(queueMode, explicitSource = source)
@@ -2423,10 +2426,10 @@ class PlayerViewModel(
 
     @Suppress("UNUSED_PARAMETER")
     private fun modeForNewQueue(explicitSource: ContinuousQueueSource?): PlaybackQueueMode {
-        // Agent 主队列带 continuous source 时，它的语义就是“按这次需求继续推”。
-        // 这里临时进入 AiRadio 以启用 maybeExtendQueue；不写 preferredPlaybackMode，
-        // 所以不会改掉用户在设置里选的默认播放模式。手动歌单/插下一首仍走原偏好。
+        // 本轮单曲循环、播完停止和 AI 续播由 source 决定，不覆盖用户的默认播放偏好。
+        // 手动歌单/插下一首仍走原偏好。
         return when {
+            explicitSource?.repeatsCurrentTrack() == true -> PlaybackQueueMode.SingleLoop
             explicitSource?.startsAutomatically() == false -> PlaybackQueueMode.OrderOnce
             explicitSource != null -> PlaybackQueueMode.AiRadio
             else -> preferredPlaybackMode
@@ -2601,6 +2604,7 @@ class PlayerViewModel(
                 player.playWhenReady &&
                 player.mediaItemCount > 0
         )
+        val newPlaybackMode = BackgroundAgentContinuation.playbackMode() ?: state.playbackMode
         // 仅当元数据真正变化时才替换 state —— 避免 30Hz 进度推进每帧重建 PlayerUiState、
         // 触发顶层 shell 与播放页全树重组。这里只比标量 / 字符串(不碰 queue / lyrics 大列表)。
         if (
@@ -2613,7 +2617,8 @@ class PlayerViewModel(
             state.isPlaying != newIsPlaying ||
             state.durationMs != newDurationMs ||
             !state.isReady ||
-            state.isLoading != newIsLoading
+            state.isLoading != newIsLoading ||
+            state.playbackMode != newPlaybackMode
         ) {
             state = state.copy(
                 currentIndex = index,
@@ -2626,6 +2631,7 @@ class PlayerViewModel(
                 durationMs = newDurationMs,
                 isReady = true,
                 isLoading = newIsLoading,
+                playbackMode = newPlaybackMode,
             )
         }
         // 续杯：current 后剩 < 阈值时调一次 fetchMore

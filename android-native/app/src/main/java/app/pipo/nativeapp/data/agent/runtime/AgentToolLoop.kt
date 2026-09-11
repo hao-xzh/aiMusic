@@ -1156,6 +1156,13 @@ class AgentToolLoop(
         executor: AgentActionExecutor,
         state: LoopState,
     ): JSONObject {
+        if (play.primaryGoal.selectionMode == MusicSelectionMode.ExactTrack &&
+            play.primaryGoal.primaryTracks.isEmpty() && play.primaryGoal.mustInclude.isEmpty() &&
+            play.primaryGoal.closer == null && play.tracks.size > 1
+        ) {
+            return JSONObject().put("ok", false).put("error", "exact_track_requires_single_track")
+                .put("message", "用户点播一首指定歌曲，只提交该歌曲的一个真实 key，不要附加其它推荐或同名版本。需要一组歌时请按用户真实要求使用对应的整组 intent_mode。")
+        }
         val groupRequest = play.primaryGoal.selectionMode in setOf(
             MusicSelectionMode.OpenRecommendation, MusicSelectionMode.ArtistFocus,
             MusicSelectionMode.ContextualContinuation,
@@ -1236,7 +1243,11 @@ class AgentToolLoop(
         })
         .put("artists", JSONArray(goal.primaryArtists))
         .put("artist_scope", goal.artistScope.name)
-        .put("continuation_mode", if (goal.continuationPolicy.mode == ContinuationMode.Disabled) "disabled" else "same_intent")
+        .put("continuation_mode", when (goal.continuationPolicy.mode) {
+            ContinuationMode.Disabled -> "disabled"
+            ContinuationMode.SingleLoop -> "single_loop"
+            else -> "same_intent"
+        })
         .put("genres", JSONArray(goal.hardGenres))
         .put("languages", JSONArray(goal.hardLanguages))
         .put("strict_semantics", goal.hardGenres.isNotEmpty() || goal.hardLanguages.isNotEmpty())
@@ -1591,6 +1602,8 @@ class AgentToolLoop(
                     args.optString("playlist_name").isNotBlank()
                 )
         val desiredCount = when {
+            primaryGoal.selectionMode == MusicSelectionMode.ExactTrack &&
+                primaryGoal.mustInclude.isEmpty() && primaryGoal.closer == null -> 1
             primaryGoal.selectionMode != MusicSelectionMode.ExactTrack && mode != PlayMode.InsertNext &&
                 (explicitCount == null || explicitCount <= 1) ->
                 CommandTextSignals.explicitDesiredCount(input.userText)?.coerceAtLeast(1) ?: 12
@@ -1762,9 +1775,15 @@ class AgentToolLoop(
             styleProfile = style,
             referenceContext = referenceContext(args.optString("reference_context").ifBlank { args.optString("referenceContext") }),
             continuationPolicy = ContinuationPolicy(
-                mode = if (args.optString("continuation_mode").equals("disabled", ignoreCase = true) || closer != null) {
-                    ContinuationMode.Disabled
-                } else ContinuationMode.SameIntent,
+                mode = when {
+                    args.optString("continuation_mode").equals("disabled", ignoreCase = true) || closer != null ->
+                        ContinuationMode.Disabled
+                    // 具名单曲默认循环；包含后续播放安排时让队列继续走到下一首。
+                    mode == MusicSelectionMode.ExactTrack && mustInclude.isEmpty() ->
+                        if (CommandTextSignals.hasDeferredPlaybackIntent(userText)) ContinuationMode.Disabled
+                        else ContinuationMode.SingleLoop
+                    else -> ContinuationMode.SameIntent
+                },
             ),
             includeArtists = stringArray(args, "include_artists").ifEmpty { stringArray(args, "includeArtists") },
         )
@@ -2202,7 +2221,7 @@ class AgentToolLoop(
             )
             .put("count", integerSchema("Desired count. For insert_next: omit/1 = 插单首；>1 = 批量插播（整批排在当前歌后面）"))
             .put("strict_semantics", booleanSchema("True only when the user explicitly requires every track's language/genre to be verified (必须/只听/全部), or preserves that previous explicit requirement. Ordinary style recommendations use false."))
-            .put("continuation_mode", enumSchema("same_intent: continue within this conversation's music constraints, including a single-song first batch. disabled: only when the user explicitly says not to continue / stop after this queue, or specifies a final closing song. count alone limits the first batch, not continuation. insert_next preserves the existing main queue's policy.", listOf("same_intent", "disabled")))
+            .put("continuation_mode", enumSchema("single_loop: default for an exact named song; repeat that song without appending recommendations. same_intent: continue a group recommendation within its music constraints. disabled: stop after the queue when explicitly requested, or when a final closing song is specified. insert_next preserves the existing main queue's policy.", listOf("single_loop", "same_intent", "disabled")))
             .put("target_title", stringSchema("Specific first/next track title. When choosing a returned track key, copy its complete title including version suffixes such as Live/Remaster."))
             .put("target_artist", stringSchema("Specific first/next artist hint"))
             .put("jump_to_inserted", booleanSchema("LLM semantic decision for insert_next: true means jump immediately, false means keep current song playing and only queue next"))
@@ -2522,13 +2541,13 @@ class AgentToolLoop(
 - 必须显式传 intent_mode：exact_track=具名单曲；artist_focus=歌手；playlist=已有歌单；exact_catalog=专辑/原声/音乐剧等具名作品；open_recommendation=风格/场景；contextual_continuation=类似当前。
 - “我想听/我要听/给我放/换成”是新的播放要求：替换整个播放列表并立即从新队列首曲播放，operation=replace_queue（单曲用play_now）、preserve_current=false。即使已有歌曲正在播放、历史有听歌目标，也不能擅自追加、插播或保留旧曲。例：“我想听丁世光、刘思鉴、方大同、陶喆、曹格的歌”必须现在开始播放这些歌手的新队列。
 - 只有本动作明确说“后面想听/听完再放/再加点/不要打断”等时，才接续现有播放；下一首用insert_next，更改整个后续范围用replace_queue和preserve_current=true。混合指令逐动作判断，后半句的“下一首”不能让前半句的“现在播放”保留旧曲。
-- 单曲提供 target_title/target_artist，通常 count=1。立即播用 play_now；下一首或听完当前再播用 insert_next 且 jump_to_inserted=false。只有明确立即跳到插入曲才 true。
+- 单曲提供 target_title/target_artist，count=1。立即播用 play_now、continuation_mode=single_loop，只播放指定歌曲并自动单曲循环，不追加其它推荐。下一首或听完当前再播用 insert_next 且 jump_to_inserted=false，保留原队列模式。只有明确立即跳到插入曲才 true。
 - “来一些安静中文歌，第一首要易烊千玺的粉雾海”是整组推荐加首曲约束：intent_mode=open_recommendation、operation=replace_queue、first_track={title:粉雾海,artist:易烊千玺}、count默认12，并完整传中文/安静条件。首曲歌手不能限定整组；不能只交付这一首。R&B等风格请求也默认是一组，只有用户明确要一首时才count=1。
 - draft_queue 校验后，单动作可自动提交；返回 autoCommitted=true 不要再提交。requiresModelReview=true 的整组首曲草稿尚未播放，需要核对后续曲目的语言、风格、情绪，再用 draft_id commit_queue；不符时重新搜索真实候选选择。多动作草稿带 more_actions_pending=true；不要拿未校验的搜索结果冒充草稿。
 - 单句或多轮要求A和B都要有，artists必须完整，两位必须在队列中出现。默认 Strict，缺一位应继续搜或说明缺口。只有用户明确以某人为主混其他歌手才 Focus，明确类似某人风格才 Similar。
 - “再加C，后续也有/把B去掉/剩下改风格”是在更新持续听歌要求，不是临时插一首。读取 active_listening_request，合并或删除歌手与当前要求，完整传新的 artists、style、排除项，使用 replace_queue；要保留当前歌曲就 preserve_current=true。这会同时替换未来队列并更新自动续播源。不要继承上轮的 operation。
 - 临时“下一首插C”才 insert_next，不改变持续听歌范围。
-- 对话主队列默认 continuation_mode=same_intent，首批只有一首也继续按本轮音乐要求补歌；count只控制首批数量。用户明确“只播这首/这几首、不要续播、播完停止”或指定最后收尾曲时使用 disabled，播完当前队列停止；不能因只指定了一个歌名就擅自关闭续播。后续明确重新要求继续时切回same_intent。
+- 指定一首歌默认 continuation_mode=single_loop；“只播这首”也只循环这首。推荐一组歌使用 same_intent，按本轮音乐要求继续补歌；整组请求的 count 只控制首批数量。用户明确“播一次、播完停止、不要循环、不要续播”或指定最后收尾曲时使用 disabled，播完当前队列停止。单曲之后还安排了下一首时使用 disabled，让后续歌曲正常播放；后续明确要求推荐或继续补歌时切回 same_intent。
 - 风格/情绪/语言/场景放 query/style/genres/languages/moods/scenes，不能当作歌手。明确不要的内容放 exclude_terms/style.avoid_tags，绝不能同时作为正向条件。风格转换仍保留用户明确继续要求的排除条件。
 - 结构化标签优先使用稳定值：R&B=rnb、爵士=jazz；中文=zh、英文=en；女声放 style.vocal_types=[female]，男声=male。不要说唱/现场版用 avoid_tags=[rap,live]。用户给的是偏好时不要额外添加未要求的硬性排除；“安静一点”保留已有风格、人声、语言和排除，只调整 energy=low。
 - 普通“听R&B/中文歌”使用风格与语言偏好召回排序，strict_semantics=false。只有用户明确“必须/只听/全部”等硬要求或延续此前硬要求时才true；若观察到hard_*_unknown，说明歌曲资料不全，不能说成网络或AI配置错误，也不能声称已逐首验证。

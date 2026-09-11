@@ -148,20 +148,6 @@ internal object PetChatStore {
         message.card == null -> 1
         else -> 2
     }
-
-    @Synchronized
-    fun syncLatestPlayCardCount(queueCount: Int) {
-        if (queueCount <= 0 || messages.isEmpty()) return
-        val index = messages.indexOfLast { it.card is PetResultCard.Play }
-        if (index != messages.lastIndex) return
-        val message = messages[index]
-        val card = message.card as? PetResultCard.Play ?: return
-        if (card.insert || card.count == queueCount) return
-        if (System.currentTimeMillis() - message.createdAtMillis > PLAY_CARD_QUEUE_SYNC_WINDOW_MS) return
-        messages[index] = message.copy(card = card.copy(count = queueCount))
-    }
-
-    private const val PLAY_CARD_QUEUE_SYNC_WINDOW_MS = 20_000L
 }
 
 internal val EMPTY_HINTS = listOf("在。说吧。", "醒着呢。", "嗯？", "想听啥。", "随便说。", "说点。", "嗯。")

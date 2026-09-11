@@ -91,6 +91,15 @@ internal object BackgroundAgentContinuation {
     /** source 为空的后台主队列仍归 Service 所有，不能让 VM 的旧 source 接管。 */
     fun isActive(): Boolean = ownsQueue
 
+    /** 前台重连时以后台正在执行的模式更新显示，避免仍显示旧队列的模式。 */
+    fun playbackMode(): PlaybackQueueMode? = when {
+        !ownsQueue -> null
+        player?.repeatMode == Player.REPEAT_MODE_ONE -> PlaybackQueueMode.SingleLoop
+        player?.repeatMode == Player.REPEAT_MODE_OFF -> PlaybackQueueMode.OrderOnce
+        enabled -> PlaybackQueueMode.AiRadio
+        else -> null
+    }
+
     fun onPlayerEvent() {
         requireMainThread()
         maybeExtend()

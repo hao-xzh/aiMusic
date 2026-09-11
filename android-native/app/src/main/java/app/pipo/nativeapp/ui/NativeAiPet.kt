@@ -162,13 +162,6 @@ fun NativeAiPet(
     }
     val activeConversationEpoch = PetChatStore.conversationEpoch
 
-    val currentQueueSignature = remember(currentQueue) {
-        currentQueue.joinToString(separator = "|") { it.id }
-    }
-    LaunchedEffect(currentQueueSignature) {
-        PetChatStore.syncLatestPlayCardCount(currentQueue.size)
-    }
-
     fun submitMessage(text: String) {
         if (text.isBlank() || pending) return
         input = ""

@@ -318,6 +318,7 @@ data class ContinuationPolicy(
 enum class ContinuationMode {
     Default,
     Disabled,
+    SingleLoop,
     SameIntent,
     SameStyle,
     SameQueue,

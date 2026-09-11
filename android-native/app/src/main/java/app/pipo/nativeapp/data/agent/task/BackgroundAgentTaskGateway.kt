@@ -179,7 +179,11 @@ private class BackgroundPlayerAgentExecutor(
             if (!PlaybackSessionClock.isSelectionCurrent(expectedSelectionRevision)) return@withContext null
             BackgroundAgentContinuation.install(continuous, primaryGoal)
             if (continuous != null) {
-                controller.repeatMode = if (continuous.startsAutomatically()) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+                controller.repeatMode = when {
+                    continuous.repeatsCurrentTrack() -> Player.REPEAT_MODE_ONE
+                    continuous.startsAutomatically() -> Player.REPEAT_MODE_ALL
+                    else -> Player.REPEAT_MODE_OFF
+                }
             }
             if (preserveCurrent && controller.currentMediaItem != null) {
                 val start = (controller.currentMediaItemIndex + 1).coerceIn(0, controller.mediaItemCount)

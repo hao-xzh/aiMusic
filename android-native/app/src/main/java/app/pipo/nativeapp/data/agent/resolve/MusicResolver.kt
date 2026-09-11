@@ -834,7 +834,8 @@ class MusicResolver(
             allowDefaultFallback = false,
             acceptsTrack = ::accepts,
             fetcher = { excludeIds -> fetcher(excludeIds).filter(::accepts) },
-            startAutomatically = goal.continuationPolicy.mode != ContinuationMode.Disabled,
+            startAutomatically = goal.continuationPolicy.mode !in setOf(ContinuationMode.Disabled, ContinuationMode.SingleLoop),
+            repeatCurrentTrack = goal.continuationPolicy.mode == ContinuationMode.SingleLoop,
         )
     }
 

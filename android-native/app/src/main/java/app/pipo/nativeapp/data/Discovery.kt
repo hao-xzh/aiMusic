@@ -87,8 +87,11 @@ class Discovery(
 fun interface ContinuousQueueSource {
     suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack>
 
-    /** 明确要求播完停止时保留上下文，但新队列按顺序播一次；用户可手动开启续播。 */
+    /** 是否自动追加推荐；关闭时可单曲循环或播完停止，用户仍可手动开启续播。 */
     fun startsAutomatically(): Boolean = true
+
+    /** 具名单曲点播只循环当前曲，不自动追加其它歌曲。 */
+    fun repeatsCurrentTrack(): Boolean = false
 
     /** 精确目录续播不允许在召回耗尽后降级成画像推荐。 */
     fun permitsDefaultFallback(): Boolean = true
@@ -102,10 +105,13 @@ class GuardedContinuousQueueSource(
     private val acceptsTrack: (NativeTrack) -> Boolean,
     private val fetcher: suspend (Set<Long>) -> List<NativeTrack>,
     private val startAutomatically: Boolean = true,
+    private val repeatCurrentTrack: Boolean = false,
 ) : ContinuousQueueSource {
     override suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack> = fetcher(excludeIds)
 
     override fun startsAutomatically(): Boolean = startAutomatically
+
+    override fun repeatsCurrentTrack(): Boolean = repeatCurrentTrack
 
     override fun permitsDefaultFallback(): Boolean = allowDefaultFallback
 
