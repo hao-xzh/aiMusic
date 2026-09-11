@@ -9,14 +9,16 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -75,6 +77,7 @@ import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
 import app.pipo.nativeapp.playback.PlayerUiState
 import app.pipo.nativeapp.playback.PlayerViewModel
+import app.pipo.nativeapp.playback.PlayerLyricPlaybackPositionProvider
 import app.pipo.nativeapp.playback.orchestrator.AgentQueueRequest
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
@@ -336,10 +339,11 @@ fun PipoNativeApp(
         )
 
         val aiOverlayOpen by AiPetCommandBus.isOpen.collectAsState()
-        val aiPlayerBlur by animateDpAsState(
+        val aiWakeEffect = rememberAssistantWakeEffect(aiOverlayOpen)
+        val aiBackgroundBlur by animateDpAsState(
             targetValue = if (aiOverlayOpen) 6.dp else 0.dp,
-            animationSpec = tween(320, easing = PipoMotion.FlipEase),
-            label = "aiPlayerBlur",
+            animationSpec = tween(if (aiOverlayOpen) 480 else 900, easing = PipoMotion.FlipEase),
+            label = "aiBackgroundBlur",
         )
 
         CompositionLocalProvider(LocalCoverAnchor provides coverAnchor) {
@@ -348,6 +352,7 @@ fun PipoNativeApp(
                 PlayerExpansionSurface(
                     expanded = route == Route.Player || backStack.contains(Route.Player),
                     miniBounds = miniPlayerBounds,
+                    artworkUrl = playerState.artworkUrl,
                     canCollapse = route == Route.Player && !isLandscape && !immersive && !aiOverlayOpen && !queueOpen,
                     isLandscape = isLandscape,
                     onReturnPortrait = if (route == Route.Player && isLandscape && !aiOverlayOpen && !queueOpen) exitLandscape else null,
@@ -364,7 +369,8 @@ fun PipoNativeApp(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .blur(aiPlayerBlur),
+                            .blur(aiBackgroundBlur)
+                            .assistantWaterSurface(aiWakeEffect),
                     ) {
                         PlayerScreen(
                             onOpenLyrics = {
@@ -388,7 +394,9 @@ fun PipoNativeApp(
                             Box(modifier = Modifier.fillMaxSize()) {
                                 // 播放页本身已经绘制 Apple Music 式清晰封面 + 同源毛玻璃背景。
                                 // 歌词页共享这层底图，只让播放控件淡出、歌词列表淡入，避免两套封面层叠出分界。
-                                val lyricPositionProvider = remember(viewModel) { { viewModel.positionMs } }
+                                val lyricPositionProvider = remember(viewModel) {
+                                    PlayerLyricPlaybackPositionProvider(viewModel)
+                                }
                                 ImmersiveLyricsOverlay(
                                     progress = coverProgress,
                                     contentProgress = contentProgress,
@@ -397,6 +405,7 @@ fun PipoNativeApp(
                                     artist = viewModel.state.artist,
                                     trackId = viewModel.state.currentTrackId,
                                     lyrics = viewModel.state.lyrics,
+                                    isLyricsLoading = viewModel.state.isLyricsLoading,
                                     positionProvider = lyricPositionProvider,
                                     isPlaying = viewModel.state.isPlaying,
                                     showTranslation = showLyricTranslation && hasLyricTranslation,
@@ -416,7 +425,12 @@ fun PipoNativeApp(
 
                 // The origin stays mounted underneath the player, preserving scroll and page state.
                 val pageRoute = if (route == Route.Player) playerOrigin else route
-                Box(Modifier.fillMaxSize().zIndex(if (route != Route.Player && backStack.contains(Route.Player)) 2f else 0f)) {
+                val browseKeyboardOpen = pageRoute == Route.Browse && WindowInsets.ime.getBottom(browseDensity) > 0
+                Box(
+                    Modifier.fillMaxSize()
+                        .zIndex(if (route != Route.Player && backStack.contains(Route.Player)) 2f else 0f)
+                        .blur(aiBackgroundBlur),
+                ) {
                     CompositionLocalProvider(
                         LocalOnBack provides goBack,
                         LocalNav provides PipoNav(
@@ -430,7 +444,7 @@ fun PipoNativeApp(
                             Box(Modifier.weight(1f)) {
                                 when (pageRoute) {
                                     Route.Browse -> CompositionLocalProvider(
-                                        LocalBrowseBottomInset provides if (playerState.currentTrackId != null && !createOpen) miniDockHeight else 0.dp,
+                                        LocalBrowseBottomInset provides if (playerState.currentTrackId != null && !createOpen && !browseKeyboardOpen) miniDockHeight else 0.dp,
                                     ) {
                                         BrowseHost(
                                             browseSession, browseModel, viewModel, openSettings,
@@ -446,7 +460,7 @@ fun PipoNativeApp(
                                     Route.Login -> LoginScreen(onBack = goBack)
                                     Route.Player -> Unit
                                 }
-                                if (pageRoute == Route.Browse && !createOpen) {
+                                if (pageRoute == Route.Browse && !createOpen && !browseKeyboardOpen) {
                                     BrowseMiniPlayerDock(viewModel, openPlayer, { queueOpen = true }, { miniPlayerBounds = it },
                                         Modifier.align(Alignment.BottomCenter).onGloballyPositioned {
                                             miniDockHeight = with(browseDensity) { it.size.height.toDp() }
@@ -454,7 +468,7 @@ fun PipoNativeApp(
                                     )
                                 }
                             }
-                        if (pageRoute != Route.Login && pageRoute != Route.AiSettings && !createOpen) {
+                        if (pageRoute != Route.Login && pageRoute != Route.AiSettings && !createOpen && !browseKeyboardOpen) {
                             BrowseChrome(browseSession.tab, viewModel,
                                 { browseSession.select(it); backStack = emptyList(); route = Route.Browse },
                                 openPlayer, { queueOpen = true }, { miniPlayerBounds = it }, showMiniPlayer = pageRoute != Route.Browse)
@@ -470,6 +484,9 @@ fun PipoNativeApp(
                 // One persistent assistant overlay for every app page.
                 val currentTrack = playerState.queue.getOrNull(playerState.currentIndex)
                 NativeAiPet(
+                    wakeProgress = aiWakeEffect.progress,
+                    wakeStrength = aiWakeEffect.strength,
+                    wakeConversationReady = aiWakeEffect.conversationReady,
                     isPlaying = playerState.isPlaying,
                     currentTrack = currentTrack,
                     currentQueue = playerState.queue,

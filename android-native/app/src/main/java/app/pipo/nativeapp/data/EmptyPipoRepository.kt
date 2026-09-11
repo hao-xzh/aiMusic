@@ -2,6 +2,7 @@ package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
@@ -39,7 +40,8 @@ class EmptyPipoRepository : PipoRepository {
 
     private val cloudTracksState = MutableStateFlow<List<NativeTrack>>(emptyList())
 
-    override val account: Flow<PipoAccount?> = accountState.asStateFlow()
+    override val account: StateFlow<PipoAccount?> = accountState.asStateFlow()
+    override val favoriteSongs: StateFlow<FavoriteSongsState> = MutableStateFlow(FavoriteSongsState()).asStateFlow()
     override val playlists: Flow<List<PipoPlaylist>> = playlistState.asStateFlow()
     override val cloudTracks: Flow<List<NativeTrack>> = cloudTracksState.asStateFlow()
     override val distillState: Flow<DistillState> = distillStateValue.asStateFlow()

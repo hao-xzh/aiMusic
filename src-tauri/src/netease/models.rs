@@ -94,6 +94,9 @@ pub struct PlaylistInfo {
     pub cover_img_url: Option<String>,
     #[serde(default, rename = "userId")]
     pub user_id: Option<i64>,
+    /// 网易云特殊歌单类型；5 = 用户的“我喜欢的音乐”红心歌单。
+    #[serde(default, rename = "specialType")]
+    pub special_type: i32,
     /// weapi `updateTime`（ms），增量同步的关键字段。
     /// 对比本地缓存 update_time：没变就跳过 playlist_detail 拉取。
     #[serde(default, rename = "updateTime")]

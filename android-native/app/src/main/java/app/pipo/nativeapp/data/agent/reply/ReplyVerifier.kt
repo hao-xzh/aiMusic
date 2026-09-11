@@ -15,12 +15,18 @@ class ReplyVerifier {
                 }
             if (successWords.any { it in compact }) return false
         }
-        if ("下一首" in compact && results.none { it.type == "insert_next" && it.success }) return false
-        if (facts.actionType == "insert_next" && facts.success && facts.queueCount > 1) {
-            if ("${facts.queueCount}首" !in compact) return false
+        val canReferToNext = results.any { it.type == "insert_next" && it.success } ||
+            (facts.preservedCurrent && facts.success)
+        if ("下一首" in compact && !canReferToNext) return false
+        val claimedCount = Regex("(?:共|新增|本次|这次|加了|接了|排了|插了|放了)(\\d{1,4})首")
+            .findAll(compact)
+            .map { it.groupValues[1].toIntOrNull() }
+            .filterNotNull()
+        if (claimedCount.any { it != facts.changedTrackCount }) {
+            return false
         }
         if (listOf("已经播放", "已播放", "开始播放", "开播", "切过去", "直接切").any { it in compact } &&
-            !facts.actuallyStarted
+            (!facts.actuallyStarted || facts.preservedCurrent)
         ) {
             return false
         }
@@ -48,8 +54,10 @@ class ReplyVerifier {
                         facts.closerTitle,
                     )
                 ).map { it.trim() }.filter { it.isNotBlank() }
+            val actualNamedItems = (actualTitles + facts.playlistName.trim())
+                .filter { it.isNotBlank() }
             val allReal = mentionedQuoted.all { quoted ->
-                actualTitles.any { title -> title == quoted || title.contains(quoted) || quoted.contains(title) }
+                actualNamedItems.any { item -> item == quoted || item.contains(quoted) || quoted.contains(item) }
             }
             if (!allReal) return false
         }

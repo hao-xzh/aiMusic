@@ -17,6 +17,7 @@ import app.pipo.nativeapp.playback.orchestrator.QueueHardConstraints
 import app.pipo.nativeapp.playback.orchestrator.QueueCommitResult
 import app.pipo.nativeapp.playback.orchestrator.QueueOperation
 import app.pipo.nativeapp.playback.PlaybackUrlResolver
+import app.pipo.nativeapp.playback.PlaybackSessionClock
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -35,6 +36,7 @@ class PlayerAgentExecutor(
     private val playerDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
     resolvePlayableTrack: (suspend (NativeTrack) -> NativeTrack?)? = null,
     private val currentQueueProvider: () -> List<NativeTrack> = { emptyList() },
+    private val expectedSelectionRevision: Long? = null,
 ) : AgentActionExecutor {
     private val playbackUrlResolver = PlaybackUrlResolver(
         repository = repository,
@@ -90,7 +92,7 @@ class PlayerAgentExecutor(
             hardConstraints = hardConstraintsFor(primaryGoal, target, operation),
         )
         val currentBeforeCommit = actionCurrentTrack()
-        val commit = withContext(playerDispatcher) { onApplyAgentQueueRequest(request) }
+        val commit = applyQueueRequest(request)
         return resultForCommit(request.requestId, "play_queue", request, commit, similar, currentBeforeCommit)
     }
 
@@ -117,7 +119,7 @@ class PlayerAgentExecutor(
             ),
         )
         val currentBeforeCommit = actionCurrentTrack()
-        val commit = withContext(playerDispatcher) { onApplyAgentQueueRequest(request) }
+        val commit = applyQueueRequest(request)
         return resultForCommit(
             request.requestId,
             "insert_next",
@@ -127,6 +129,16 @@ class PlayerAgentExecutor(
             currentBeforeCommit = currentBeforeCommit,
         )
     }
+
+    private suspend fun applyQueueRequest(request: AgentQueueRequest): QueueCommitResult =
+        withContext(playerDispatcher) {
+            if (!PlaybackSessionClock.isSelectionCurrent(expectedSelectionRevision)) {
+                QueueCommitResult.Rejected(
+                    request, "playback_selection_changed",
+                    listOf("你已经手动选了歌曲，已保留当前播放；想听这次推荐可以重新告诉我。"),
+                )
+            } else onApplyAgentQueueRequest(request)
+        }
 
     override suspend fun skip(actionId: String): ActionExecutionResult {
         val stableActionId = stableId("skip")

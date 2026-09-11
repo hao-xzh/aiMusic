@@ -146,7 +146,7 @@ class GroundedReplyTemplates {
     private fun insert(facts: ReplyFacts, persona: PetPersona): String {
         val track = formatTrack(facts.insertedTitle, facts.insertedArtist)
             .ifBlank { formatTrack(facts.firstTrackTitle, facts.firstTrackArtist) }
-        val count = facts.queueCount
+        val count = facts.changedTrackCount.takeIf { it > 0 } ?: facts.queueCount
         if (count > 1) {
             return when (persona) {
                 PetPersona.TOXIC -> if (track.isBlank()) "下一首开始给你接，别催，共接${count}首。" else "下一首从${track}开始，别打断，共接${count}首。"
@@ -199,7 +199,7 @@ class GroundedReplyTemplates {
     private fun playlistCreated(facts: ReplyFacts, persona: PetPersona): String {
         facts.resultMessage.takeIf(String::isNotBlank)?.let { return it.take(180) }
         val name = facts.playlistName.ifBlank { "歌单" }
-        val count = facts.queueCount.takeIf { it > 0 }?.let { "，添加 $it 首歌" }.orEmpty()
+        val count = facts.changedTrackCount.takeIf { it > 0 }?.let { "，添加 $it 首歌" }.orEmpty()
         return when (persona) {
             PetPersona.TOXIC -> "行，$name 建好了$count。"
             PetPersona.FRIENDLY -> "好，$name 创建好了$count。"

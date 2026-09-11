@@ -141,6 +141,31 @@ impl NeteaseClient {
     }
 
     pub async fn playlist_detail(&self, id: i64) -> Result<PlaylistDetail> {
+        let (playlist, source, fallback_error) = self.playlist_detail_payload(id).await?;
+        self.hydrate_playlist_tracks(playlist, source, fallback_error)
+            .await
+    }
+
+    /// Heart membership only needs the complete ID list, not hydrated song metadata.
+    pub async fn playlist_track_ids(&self, id: i64) -> Result<Vec<i64>> {
+        let (playlist, _, _) = self.playlist_detail_payload(id).await?;
+        let expected = playlist.track_count.max(0) as usize;
+        if !playlist.track_ids.is_empty() && playlist.track_ids.len() >= expected {
+            return Ok(playlist.track_ids);
+        }
+        if playlist.tracks.len() >= expected {
+            return Ok(playlist.tracks.into_iter().map(|track| track.id).collect());
+        }
+        Err(anyhow!(
+            "playlist_track_ids incomplete: expected={expected} actual={}",
+            playlist.track_ids.len()
+        ))
+    }
+
+    async fn playlist_detail_payload(
+        &self,
+        id: i64,
+    ) -> Result<(PlaylistDetail, &'static str, Option<String>)> {
         let mut fallback_error = None;
         let (resp, source): (PlaylistDetailResp, &'static str) = match self
             .linuxapi::<PlaylistDetailResp>(
@@ -171,8 +196,7 @@ impl NeteaseClient {
                 (fallback, "weapi_v6")
             }
         };
-        self.hydrate_playlist_tracks(resp.playlist, source, fallback_error)
-            .await
+        Ok((resp.playlist, source, fallback_error))
     }
 
     async fn hydrate_playlist_tracks(
@@ -273,25 +297,60 @@ impl NeteaseClient {
                 break;
             }
             let mut still_missing = Vec::new();
-            for chunk in pending.chunks(chunk_size) {
-                match self.song_detail(chunk).await {
-                    Ok(tracks) => {
-                        let returned_ids =
-                            tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
-                        out.extend(tracks);
-                        for id in chunk {
-                            if !returned_ids.contains(id) {
-                                still_missing.push(*id);
+            let mut chunks = pending.chunks(chunk_size);
+            while let Some(first) = chunks.next() {
+                let second = if cfg!(target_os = "android") { chunks.next() } else { None };
+                let third = if cfg!(target_os = "android") { chunks.next() } else { None };
+                let fourth = if cfg!(target_os = "android") { chunks.next() } else { None };
+                // Chunks within one retry stage are independent. Keep result handling in input
+                // order so retries and the final playlist order retain their existing semantics.
+                let (first_result, second_result, third_result, fourth_result) = tokio::join!(
+                    self.song_detail(first),
+                    async {
+                        match second {
+                            Some(chunk) => Some(self.song_detail(chunk).await),
+                            None => None,
+                        }
+                    },
+                    async {
+                        match third {
+                            Some(chunk) => Some(self.song_detail(chunk).await),
+                            None => None,
+                        }
+                    },
+                    async {
+                        match fourth {
+                            Some(chunk) => Some(self.song_detail(chunk).await),
+                            None => None,
+                        }
+                    },
+                );
+                for (chunk, result) in [
+                    (Some(first), Some(first_result)),
+                    (second, second_result),
+                    (third, third_result),
+                    (fourth, fourth_result),
+                ] {
+                    let (Some(chunk), Some(result)) = (chunk, result) else { continue };
+                    match result {
+                        Ok(tracks) => {
+                            let returned_ids =
+                                tracks.iter().map(|track| track.id).collect::<HashSet<_>>();
+                            out.extend(tracks);
+                            for id in chunk {
+                                if !returned_ids.contains(id) {
+                                    still_missing.push(*id);
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[netease] song_detail chunk failed: size={} first_id={:?}: {e:#}",
-                            chunk.len(),
-                            chunk.first(),
-                        );
-                        still_missing.extend_from_slice(chunk);
+                        Err(e) => {
+                            eprintln!(
+                                "[netease] song_detail chunk failed: size={} first_id={:?}: {e:#}",
+                                chunk.len(),
+                                chunk.first(),
+                            );
+                            still_missing.extend_from_slice(chunk);
+                        }
                     }
                 }
             }

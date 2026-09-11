@@ -33,9 +33,11 @@ class AgentRuntime(
     private val ledger: AgentLedgerStore,
     private val resolver: MusicResolver = MusicResolver(repository),
     private val queuePlanner: AgentQueuePlanner = AgentQueuePlanner(),
-    // 动作回复必须基于已执行事实；本地模板已经过 ReplyVerifier，不再为“说做完了”额外
-    // 发起第三次 LLM 请求。这样播放成功的常规请求只需一次工具规划调用。
-    private val replyGrounder: ReplyGrounder = ReplyGrounder(),
+    // 动作由工具循环真实执行后，再让当前配置的 AI 按所选人格自然转述；ReplyGrounder
+    // 仍会用事实校验，LLM 不可用或越界时诚实回落到本地模板。
+    private val replyGrounder: ReplyGrounder = ReplyGrounder.withLlmCopywriter { system, user ->
+        repository.aiChat(system = system, user = user, temperature = 0.6f, maxTokens = 220)
+    },
 ) {
     private val toolLoop by lazy {
         AgentToolLoop(

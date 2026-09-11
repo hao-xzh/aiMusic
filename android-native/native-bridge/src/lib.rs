@@ -101,6 +101,13 @@ fn dispatch(command: &str, args: Value) -> String {
                 Ok(serde_json::to_value(playlists)?)
             })
         }
+        "netease_playlist_track_ids" => {
+            let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+            run_json(async move {
+                let ids = netease_client().playlist_track_ids(id).await?;
+                Ok(serde_json::to_value(ids)?)
+            })
+        }
         "netease_playlist_detail" => {
             let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
             run_json(async move {

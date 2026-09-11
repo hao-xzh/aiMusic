@@ -39,6 +39,7 @@ import kotlin.math.roundToInt
 internal fun PlayerExpansionSurface(
     expanded: Boolean,
     miniBounds: Rect,
+    artworkUrl: String?,
     canCollapse: Boolean,
     isLandscape: Boolean,
     onReturnPortrait: (() -> Unit)?,
@@ -117,6 +118,8 @@ internal fun PlayerExpansionSurface(
                     }
                 }
             } else if (!isLandscape && (canCollapse || (!expanded && progress.value > 0.001f))) {
+                val controlEdges = useCoverEdgeColors(artworkUrl)
+                val controlColor = pickFg(toneForColor(appleMusicPureSurfaceColor(controlEdges)))
                 Box(Modifier.fillMaxWidth().statusBarsPadding().height(48.dp)) {
                     IconButton(
                         onClick = latestCollapse,
@@ -129,7 +132,7 @@ internal fun PlayerExpansionSurface(
                                 lineTo(size.width * 0.50f, size.height * 0.66f)
                                 lineTo(size.width * 0.82f, size.height * 0.36f)
                             }
-                            drawPath(chevron, Color.White, style = Stroke(width = 1.7.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+                            drawPath(chevron, controlColor, style = Stroke(width = 1.7.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
                         }
                     }
                     IconButton(
@@ -137,7 +140,7 @@ internal fun PlayerExpansionSurface(
                         modifier = Modifier.align(Alignment.CenterEnd).padding(end = 12.dp)
                             .size(44.dp).semantics { contentDescription = "设置" },
                     ) {
-                        GearIcon(color = Color.White, modifier = Modifier.size(22.dp))
+                        GearIcon(color = controlColor, modifier = Modifier.size(22.dp))
                     }
                 }
             }

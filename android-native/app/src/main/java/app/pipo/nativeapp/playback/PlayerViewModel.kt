@@ -23,7 +23,9 @@ import app.pipo.nativeapp.data.LastPlaybackStore
 import app.pipo.nativeapp.data.LyricTiming
 import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.data.PipoLyricLine
+import app.pipo.nativeapp.data.PipoLyricAlignment
 import app.pipo.nativeapp.data.RecommendationLog
 import app.pipo.nativeapp.data.SmoothQueue
 import app.pipo.nativeapp.data.TrackDedupe
@@ -43,8 +45,12 @@ import coil.Coil
 import coil.request.SuccessResult
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -65,6 +71,7 @@ data class PlayerUiState(
     val isPlaying: Boolean = false,
     val durationMs: Long = 0L,
     val lyrics: List<PipoLyricLine> = emptyList(),
+    val isLyricsLoading: Boolean = false,
     val isReady: Boolean = false,
     val isLoading: Boolean = false,
     val playbackMode: PlaybackQueueMode = PlaybackQueueMode.ShufflePlay,
@@ -98,6 +105,43 @@ class PlayerViewModel(
      *  callRaw 的 30s timeout 槽位。lyricsRequestSeq 已经保证写不进 stale 数据,
      *  这里 cancel 是早释放资源 + 避免 IO 线程堆积。 */
     private var lyricsJob: Job? = null
+    private var currentLyricsRequest: LyricsRequest? = null
+    private var nextLyricsRequest: LyricsRequest? = null
+
+    /** 只保留当前曲和实际下一首；切歌时接管同一请求，不再重复走多来源查询。 */
+    private class LyricsRequest(
+        val trackId: String,
+        val track: NativeTrack?,
+        scope: CoroutineScope,
+        repository: PipoRepository,
+    ) {
+        var result: Result<List<PipoLyricLine>>? = null
+            private set
+
+        val deferred = scope.async {
+            val loaded = try {
+                Result.success(
+                    if (track != null) repository.lyricsForTrack(track)
+                    else repository.lyricsForTrack(trackId),
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+            result = loaded
+            loaded
+        }
+
+        fun matches(id: String, metadata: NativeTrack?): Boolean {
+            if (trackId != id) return false
+            if (track == null || metadata == null) return true
+            return track.neteaseId == metadata.neteaseId &&
+                track.title == metadata.title && track.artist == metadata.artist && track.album == metadata.album &&
+                (track.durationMs <= 0L || metadata.durationMs <= 0L ||
+                    kotlin.math.abs(track.durationMs - metadata.durationMs) <= 1_000L)
+        }
+    }
     /** playFromAgent / playTrack 的 phase generation —— phase-2 完成时跟当前值
      *  对比,不一致说明用户已经启了新的播放,phase-2 的 addMediaItems 不能往
      *  新队列尾部追(否则会污染新歌单)。 */
@@ -637,6 +681,7 @@ class PlayerViewModel(
 
     private fun recoverEndedPlaybackState() {
         val player = controller ?: return
+        if (BackgroundAgentContinuation.isActive()) return
         // 下一首可能已由辅助播放器播出了头段，ENDED 的唯一接管者此时是 Service。
         if (CrossfadeController.ownsTransition || player.playbackState != Player.STATE_ENDED) return
         if (state.queue.isEmpty() || userPausedPlayback) return
@@ -841,13 +886,16 @@ class PlayerViewModel(
 
     init {
         viewModelScope.launch {
-            repository.settings.collect { settings ->
-                val mode = playbackModeFromSettings(settings.playbackMode)
-                preferredPlaybackMode = mode
-                if (state.playbackMode != mode) {
-                    applyPlaybackModePreference(mode, persist = false)
+            // AI 队列临时启用的续播模式不能被音质、画像等其它设置更新覆盖。
+            repository.settings
+                .map { playbackModeFromSettings(it.playbackMode) }
+                .distinctUntilChanged()
+                .collect { mode ->
+                    preferredPlaybackMode = mode
+                    if (state.playbackMode != mode) {
+                        applyPlaybackModePreference(mode, persist = false)
+                    }
                 }
-            }
         }
         controllerFuture.addListener(
             {
@@ -1436,6 +1484,7 @@ class PlayerViewModel(
         val queueSnapshot = state.queue
         val stateIdx = queueSnapshot.indexOfFirst { it.id == trackId }
         if (stateIdx < 0) return
+        PlaybackSessionClock.noteManualSelection()
         val queueVersion = PlaybackSessionClock.bump("play_current_queue_track")
         CommittedQueuePlanStore.clear()
         DiagnosticsLogStore.record(
@@ -1697,6 +1746,16 @@ class PlayerViewModel(
                 alignLoadedQueueOrder(livePlayer)
                 maybePrepareAutoMix(livePlayer)
             }
+            if (gen != playGen) return@launch
+            val livePlayer = controller ?: return@launch
+            // 解析失败的歌未装入播放器，批次结束后按实际时间线收口，避免续播
+            // 永远卡在 mediaItemCount < queue.size 的 timeline_not_ready 门禁。
+            val loadedQueue = queueMatchingPlayerTimeline(livePlayer, state.queue)
+            state = state.copy(
+                queue = loadedQueue,
+                currentIndex = currentQueueIndexFor(livePlayer, loadedQueue),
+            )
+            maybeExtendQueue(trigger = "initial_queue_resolved", logSkips = true)
         }
         return true
     }
@@ -1761,6 +1820,7 @@ class PlayerViewModel(
         BackgroundAgentContinuation.clear()
         if (queueVersion == null) {
             val tracks = manualQueueFromSelection(track, contextQueue)
+            PlaybackSessionClock.noteManualSelection()
             val manualQueueVersion = PlaybackSessionClock.bump("manual_play_track")
             CommittedQueuePlanStore.clear()
             playTrack(track, tracks, smooth, queueVersion = manualQueueVersion)
@@ -1959,10 +2019,12 @@ class PlayerViewModel(
                 val exclusions = queueRecommendationExclusions(queueSnapshot)
                 val more = try {
                     sourceSnapshot.fetchMore(exclusions.trackIds)
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (_: Exception) {
                     emptyList()
                 }
-                if (gen != playGen) return@launch
+                if (gen != playGen || continuousSource !== sourceSnapshot) return@launch
                 if (more.isEmpty()) {
                     recordQueueExtendFailure(
                         trigger = "force_extend",
@@ -1975,11 +2037,13 @@ class PlayerViewModel(
                     return@launch
                 }
                 val resolved = try {
-                    resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() }
+                    resolvePlayableQueue(more).filter { it.streamUrl.isNotBlank() && sourceSnapshot.acceptsResolved(it) }
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (_: Exception) {
                     emptyList()
                 }
-                if (gen != playGen) return@launch
+                if (gen != playGen || continuousSource !== sourceSnapshot) return@launch
                 if (resolved.isEmpty()) {
                     recordQueueExtendFailure(
                         trigger = "force_extend",
@@ -1997,11 +2061,13 @@ class PlayerViewModel(
                 val append = selectQueueRecommendationAppend(
                     candidates = resolved,
                     currentQueue = queueSnapshot,
+                    excludedIdsBeforeFetch = exclusions.trackIds,
                     trigger = "force_extend",
                     queueSnapshot = queueSnapshot,
                     remaining = remaining,
                 )
-                if (append.isEmpty() || gen != playGen) {
+                if (gen != playGen || continuousSource !== sourceSnapshot) return@launch
+                if (append.isEmpty()) {
                     recordQueueExtendFailure(
                         trigger = "force_extend",
                         stage = "append_empty_after_filter",
@@ -2267,7 +2333,10 @@ class PlayerViewModel(
             requestId = "browse_${System.nanoTime()}", sourceUserText = "browse_play 按顺序",
             operation = QueueOperation.ReplaceQueue, tracks = ordered, continuous = source,
         ))
-        if (result is QueueCommitResult.Success) originalQueueOrder = tracks.map { it.id }
+        if (result is QueueCommitResult.Success) {
+            PlaybackSessionClock.noteManualSelection()
+            originalQueueOrder = tracks.map { it.id }
+        }
         return result
     }
 
@@ -2278,6 +2347,13 @@ class PlayerViewModel(
     private fun applyPlaybackModePreference(mode: PlaybackQueueMode, persist: Boolean) {
         val previousMode = state.playbackMode
         preferredPlaybackMode = mode
+        if (persist && BackgroundAgentContinuation.isActive() &&
+            !BackgroundAgentContinuation.setEnabled(mode == PlaybackQueueMode.AiRadio)
+        ) {
+            // 后台普通歌单没有专属来源，用户开启续播时按当前歌曲接通用推荐。
+            BackgroundAgentContinuation.clear()
+            lastAgentContinuousSource = null
+        }
         continuousSource = continuousSourceForMode(mode, explicitSource = lastAgentContinuousSource)
         state = state.copy(playbackMode = mode)
         controller?.let(::applyPlaybackMode)
@@ -2350,7 +2426,11 @@ class PlayerViewModel(
         // Agent 主队列带 continuous source 时，它的语义就是“按这次需求继续推”。
         // 这里临时进入 AiRadio 以启用 maybeExtendQueue；不写 preferredPlaybackMode，
         // 所以不会改掉用户在设置里选的默认播放模式。手动歌单/插下一首仍走原偏好。
-        return if (explicitSource != null) PlaybackQueueMode.AiRadio else preferredPlaybackMode
+        return when {
+            explicitSource?.startsAutomatically() == false -> PlaybackQueueMode.OrderOnce
+            explicitSource != null -> PlaybackQueueMode.AiRadio
+            else -> preferredPlaybackMode
+        }
     }
 
     private fun continuousSourceForMode(
@@ -2369,7 +2449,7 @@ class PlayerViewModel(
         // MediaController 的媒体时间，其内部会使用实际 playbackSpeed 推进。
         val publishedPositionMs = positionMs
         val player = controller
-        return if (player != null && player.isConnected) {
+        return if (player != null && player.isConnected && player.currentMediaItem != null) {
             player.currentPosition.coerceAtLeast(0L)
         } else {
             publishedPositionMs
@@ -2389,11 +2469,14 @@ class PlayerViewModel(
             val q = state.queue
             if (q.isNotEmpty()) {
                 runCatching {
-                    lastPlaybackStore.save(q, currentQueueIndexFor(p, q), p.currentPosition.coerceAtLeast(0))
+                    lastPlaybackStore.save(q, currentQueueIndexFor(p, q), currentPlaybackPositionMs())
                 }
             }
         }
         controller?.removeListener(listener)
+        lyricsJob?.cancel()
+        currentLyricsRequest?.deferred?.cancel()
+        nextLyricsRequest?.deferred?.cancel()
         nextPrewarmJob?.cancel()
         nextArtworkPrefetchJob?.cancel()
         nextTrackPrewarmer.cancelAll()
@@ -2416,11 +2499,6 @@ class PlayerViewModel(
         val authoritativeTrackId = playerMediaId ?: track?.id
         if (authoritativeTrackId != null && loadedLyricsFor != authoritativeTrackId) {
             loadedLyricsFor = authoritativeTrackId
-            // 立刻清空旧歌词 —— 拉新歌词有 100-500ms 网络延迟，期间宁可空白也不要
-            // 把 A 的歌词留在 B 上"对不上"
-            if (state.lyrics.isNotEmpty()) {
-                state = state.copy(lyrics = emptyList())
-            }
             val targetTrackId = authoritativeTrackId
             val lyricTrack = track?.takeIf { it.id == targetTrackId }?.let {
                 it.copy(durationMs = player.duration.takeIf { duration -> duration > 0L } ?: it.durationMs)
@@ -2443,17 +2521,21 @@ class PlayerViewModel(
             lyricsRequestSeq += 1
             val mySeq = lyricsRequestSeq
             lyricsJob?.cancel()
+            currentLyricsRequest?.deferred?.cancel()
+            val prefetched = nextLyricsRequest?.takeIf { it.matches(targetTrackId, lyricTrack) }
+            if (prefetched != null) nextLyricsRequest = null
+            // 预取已失败或没有结果时允许前台重新查询；正处于查询中的预取直接接管。
+            val request = prefetched?.takeIf { pending ->
+                pending.result == null || pending.result?.getOrNull()?.isNotEmpty() == true
+            } ?: LyricsRequest(targetTrackId, lyricTrack, viewModelScope, repository)
+            currentLyricsRequest = request
+            val readyLines = request.result?.getOrNull()
+            state = state.copy(
+                lyrics = readyLines.orEmpty(),
+                isLyricsLoading = request.result == null,
+            )
             lyricsJob = viewModelScope.launch {
-                val lyricResult = try {
-                    Result.success(
-                        if (lyricTrack != null) repository.lyricsForTrack(lyricTrack)
-                        else repository.lyricsForTrack(targetTrackId),
-                    )
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Result.failure(e)
-                }
+                val lyricResult = request.deferred.await()
                 lyricResult.exceptionOrNull()?.let { err ->
                     DiagnosticsLogStore.record(
                         area = "lyrics",
@@ -2474,6 +2556,7 @@ class PlayerViewModel(
                             "trackId" to targetTrackId,
                             "lineCount" to lines.size,
                             "wordLineCount" to lines.count { it.chars.isNotEmpty() },
+                            "rightAlignedLineCount" to lines.count { it.alignment == PipoLyricAlignment.End },
                             "tokenCount" to lines.sumOf { it.chars.size + it.companionLines.sumOf { companion -> companion.chars.size } },
                             "timingPartCount" to lines.sumOf {
                                 it.chars.sumOf { char -> char.timingParts.size.coerceAtLeast(1) } +
@@ -2493,12 +2576,16 @@ class PlayerViewModel(
                             "maxTokenDurationMs" to (lines.flatMap { it.chars }.maxOfOrNull { it.durationMs } ?: 0L),
                         ),
                     )
-                    state = state.copy(lyrics = lines)
+                    state = state.copy(lyrics = lines, isLyricsLoading = false)
                 }
             }
         }
         // 进度是高频字段 —— 每帧只写独立的 positionMs holder,不进 state。
-        positionMs = player.currentPosition.coerceAtLeast(0L)
+        // A connected controller can still have an empty timeline during deferred cold
+        // restore. Its default zero is not the saved song's actual playback position.
+        if (playerMediaId != null || queue.isEmpty()) {
+            positionMs = player.currentPosition.coerceAtLeast(0L)
+        }
         lyricPlaybackSpeed = player.playbackParameters.speed
 
         val newTitle = player.mediaMetadata.title?.toString() ?: track?.title.orEmpty()
@@ -2551,9 +2638,25 @@ class PlayerViewModel(
     }
 
     private fun maybePrepareAutoMix(player: Player) {
+        maybePrefetchNextLyrics(player)
         maybePrefetchNextArtwork(player)
         maybePrewarmNextTrack(player)
         maybePrefetchAutoMixFeatures(player)
+    }
+
+    private fun maybePrefetchNextLyrics(player: Player) {
+        val nextTrack = nextTrackFor(player)
+        val pending = nextLyricsRequest
+        if (pending != null && (nextTrack == null || !pending.matches(nextTrack.id, nextTrack))) {
+            pending.deferred.cancel()
+            nextLyricsRequest = null
+        }
+        if (!player.isPlaying || nextTrack == null || nextLyricsRequest != null ||
+            currentLyricsRequest?.matches(nextTrack.id, nextTrack) == true
+        ) return
+
+        // 与封面一样在开始播放后预取，不等待音频预热的播放进度门槛。
+        nextLyricsRequest = LyricsRequest(nextTrack.id, nextTrack, viewModelScope, repository)
     }
 
     private fun maybePrefetchNextArtwork(player: Player) {
@@ -3062,6 +3165,13 @@ class PlayerViewModel(
                     return@launch
                 }
                 if (more.isEmpty()) {
+                    // 对话/首页的受约束来源暂时耗尽时保留原意图，稍后在同一范围重试。
+                    // 清掉来源会让再次开启 AI 续播时退回通用推荐，丢失本轮对话条件。
+                    if (!sourceSnapshot.permitsDefaultFallback()) {
+                        recordQueueExtendFailure(trigger, "scoped_source_empty", queueSnapshot, remaining)
+                        armQueueExtendBackoff()
+                        return@launch
+                    }
                     // source 跑空：开放推荐可回退到 RecommendEngine 保持电台在线；精确目录 source
                     // 明确禁止降级，宁可停止补歌并循环已核验队列，也不能混入作品外曲目。
                     val fallback = defaultContinuousSource.takeIf {
@@ -3101,12 +3211,6 @@ class PlayerViewModel(
                 }
                 if (resolved.isEmpty()) {
                     if (playable.isNotEmpty() && !sourceSnapshot.permitsDefaultFallback()) {
-                        if (continuousSource === sourceSnapshot) {
-                            continuousSource = null
-                        }
-                        if (lastAgentContinuousSource === sourceSnapshot) {
-                            lastAgentContinuousSource = null
-                        }
                         DiagnosticsLogStore.record(
                             area = "queue",
                             event = "continuous_source_guard_exhausted",
@@ -3116,7 +3220,7 @@ class PlayerViewModel(
                                 "playableCount" to playable.size,
                             ),
                         )
-                        resetQueueExtendBackoff()
+                        armQueueExtendBackoff()
                         return@launch
                     }
                     recordQueueExtendFailure(trigger, "resolved_empty", queueSnapshot, remaining)
@@ -3127,6 +3231,7 @@ class PlayerViewModel(
                 val append = selectQueueRecommendationAppend(
                     candidates = resolved,
                     currentQueue = currentQueue,
+                    excludedIdsBeforeFetch = initialExclusions.trackIds,
                     trigger = trigger,
                     queueSnapshot = queueSnapshot,
                     remaining = remaining,
@@ -3236,13 +3341,16 @@ class PlayerViewModel(
     private fun selectQueueRecommendationAppend(
         candidates: List<NativeTrack>,
         currentQueue: List<NativeTrack>,
+        excludedIdsBeforeFetch: Set<Long>,
         trigger: String,
         queueSnapshot: List<NativeTrack>,
         remaining: Int,
     ): List<NativeTrack> {
+        // 推荐源会在返回前记录本批候选。历史排除沿用请求前快照，防止候选
+        // 因刚写入日志而被全部误删；当前队列及主动移除记录仍按最新状态去重。
         val append = filterQueueRecommendationCandidates(
             candidates = candidates,
-            exclusions = queueRecommendationExclusions(currentQueue),
+            exclusions = queueRecommendationExclusions(currentQueue, recentTrackIds = excludedIdsBeforeFetch),
         ).take(QUEUE_EXTEND_APPEND_TARGET)
         if (append.isNotEmpty()) {
             DiagnosticsLogStore.record(
@@ -3272,13 +3380,16 @@ class PlayerViewModel(
         return left.indices.all { idx -> left[idx].id == right[idx].id }
     }
 
-    private fun queueRecommendationExclusions(queue: List<NativeTrack>): QueueRecommendationExclusions {
+    private fun queueRecommendationExclusions(
+        queue: List<NativeTrack>,
+        recentTrackIds: Set<Long> = runCatching {
+            PipoGraph.recommendationLog.recentContext().last24hTrackIds
+        }.getOrDefault(emptySet()),
+    ): QueueRecommendationExclusions {
         val trackIds = LinkedHashSet<Long>()
         queue.mapNotNullTo(trackIds) { it.neteaseId }
         trackIds.addAll(queueRecommendationAvoidIds)
-        runCatching { PipoGraph.recommendationLog.recentContext().last24hTrackIds }
-            .getOrNull()
-            ?.let(trackIds::addAll)
+        trackIds.addAll(recentTrackIds)
 
         val songKeys = LinkedHashSet<String>()
         queue.mapTo(songKeys) { TrackDedupe.songKey(it) }

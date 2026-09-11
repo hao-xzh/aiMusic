@@ -56,6 +56,7 @@ internal fun LandscapePlayerLyricsScreen(
     album: String,
     trackId: String?,
     lyrics: List<PipoLyricLine>,
+    isLyricsLoading: Boolean,
     durationMs: Long,
     positionProvider: () -> Long,
     progressProvider: () -> Float,
@@ -153,6 +154,7 @@ internal fun LandscapePlayerLyricsScreen(
                             val lyricTextScale = 0.88f
                             AppleMusicLyricColumn(
                                 lines = lyrics,
+                                isLyricsLoading = isLyricsLoading,
                                 sessionId = trackId,
                                 isPlaying = isPlaying,
                                 positionProvider = positionProvider,

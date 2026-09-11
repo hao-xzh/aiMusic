@@ -7,12 +7,14 @@ import app.pipo.nativeapp.playback.PipoMediaCache
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import java.util.LinkedHashMap
 import java.util.Locale
 
@@ -40,9 +42,19 @@ class RustBridgeRepository(
     private val reliableLyricsSource = appContext?.let(::ReliableLyricsSource)
     private val accountState = MutableStateFlow<PipoAccount?>(null)
     private val playlistState = MutableStateFlow<List<PipoPlaylist>>(emptyList())
+    private val libraryRevisionState = MutableStateFlow(0L)
+    override val libraryRevision: Flow<Long> = libraryRevisionState.asStateFlow()
+    private val invalidatedPlaylistIds = mutableSetOf<Long>()
+    private val favoriteSongsState = MutableStateFlow(FavoriteSongsState())
+    override val favoriteSongs: StateFlow<FavoriteSongsState> = favoriteSongsState.asStateFlow()
+    private var favoriteRefreshRequested = false
+    private var favoriteRefreshGeneration: Long? = null
+    private var favoriteMutationRevision = 0L
+    private val favoriteChanges = mutableMapOf<Long, Pair<Long, Boolean>>()
     /** 网盘曲目 Flow —— init 从磁盘 cache 恢复，cloudDiskTracks 加载后 emit。让
      *  DistillLibrary 把 cover-flow 那一页的 cover / count 跨重挂载持久化。 */
     private val cloudTracksState = MutableStateFlow<List<NativeTrack>>(emptyList())
+    private var cloudLibraryLoaded = false
     private val audioCacheStatsState = MutableStateFlow(AudioCacheStats(0, 0, 0))
     private val aiConfigState = MutableStateFlow(AiConfigView(activeProvider = "", providers = emptyList()))
 
@@ -72,7 +84,7 @@ class RustBridgeRepository(
         playlistCache?.load()?.also(::applyRecoveredSnapshot)
     }
 
-    override val account: Flow<PipoAccount?> = accountState.asStateFlow()
+    override val account: StateFlow<PipoAccount?> = accountState.asStateFlow()
     override val playlists: Flow<List<PipoPlaylist>> = playlistState.asStateFlow()
     override val cloudTracks: Flow<List<NativeTrack>> = cloudTracksState.asStateFlow()
     override val distillState: Flow<DistillState> = fallback.distillState
@@ -102,6 +114,7 @@ class RustBridgeRepository(
             ) clearAccountCachesLocked() else null
         }
         reset?.completion?.await()
+        scheduleFavoriteSongsRefresh()
     }
 
     override suspend fun logout() {
@@ -162,6 +175,7 @@ class RustBridgeRepository(
     private suspend fun refreshPlaylistsInternal(reportFailure: Boolean) {
         awaitCacheRecovery()
         var requestGeneration = currentCacheGeneration()
+        var requestLibraryRevision = libraryRevisionState.value
         // stale-while-revalidate 的**正确**做法:UI 已经从 init 时的 cache 看到内容了,
         // 这里**总是后台拉网**覆盖。
         //
@@ -175,7 +189,7 @@ class RustBridgeRepository(
                     if (requestGeneration != cacheGeneration) return@safe emptyList()
                     accountState.value = account
                     if (account != null && cachedUserId != null && cachedUserId != account.userId) {
-                        clearAccountCachesLocked()
+                        clearAccountCachesLocked().also { requestLibraryRevision = libraryRevisionState.value }
                     } else null
                 }
                 if (reset != null) {
@@ -190,7 +204,7 @@ class RustBridgeRepository(
         )
         if (fresh.isNotEmpty()) {
             synchronized(cacheGenerationLock) {
-                if (requestGeneration != cacheGeneration) return
+                if (requestGeneration != cacheGeneration || requestLibraryRevision != libraryRevisionState.value) return
                 // 用 updateTime 对比精准 invalidate:网易云对每张歌单维护 updateTime,
                 // 同一 id 的歌单 updateTime 变了 = tracks 也可能变了,旧 cache 不可信。
                 // 不变的 → cache 仍可复用,省一次 tracksForPlaylist 网络往返。
@@ -211,7 +225,9 @@ class RustBridgeRepository(
                     tracksMemoryCache.keys.retainAll(freshIds)
                     tracksSnapshotLocked()
                 }
+                val libraryChanged = playlistState.value != fresh
                 playlistState.value = fresh
+                if (libraryChanged) libraryRevisionState.value += 1L
                 cacheStale = false
                 val uid = accountState.value?.userId
                 if (uid != null) {
@@ -219,12 +235,108 @@ class RustBridgeRepository(
                     playlistCache?.save(uid, fresh, tracksSnapshot)
                 }
             }
+            scheduleFavoriteSongsRefresh()
+        }
+    }
+
+    override fun requestFavoriteSongsRefresh() {
+        synchronized(cacheGenerationLock) {
+            // An app-entry request and a retry may arrive together; share the active read.
+            if (favoriteRefreshGeneration == cacheGeneration) return
+            favoriteRefreshRequested = true
+        }
+        scheduleFavoriteSongsRefresh()
+    }
+
+    private fun favoritePlaylist(): PipoPlaylist? {
+        val userId = accountState.value?.userId ?: return null
+        val own = playlistState.value.filter { it.userId == null || it.userId == userId }
+        return own.firstOrNull { it.specialType == 5 }
+            ?: own.firstOrNull { it.name == "我喜欢的音乐" || it.name.endsWith("喜欢的音乐") }
+    }
+
+    private fun scheduleFavoriteSongsRefresh() {
+        synchronized(cacheGenerationLock) {
+            if (!favoriteRefreshRequested || favoriteRefreshGeneration == cacheGeneration) return
+            val userId = accountState.value?.userId ?: return
+            val playlist = favoritePlaylist() ?: return
+            val generation = cacheGeneration
+            val mutationRevision = favoriteMutationRevision
+            favoriteRefreshRequested = false
+            favoriteRefreshGeneration = generation
+            val previous = favoriteSongsState.value.takeIf { it.userId == userId }
+                ?: FavoriteSongsState(userId = userId)
+            favoriteSongsState.value = previous.copy(isRefreshing = true, errorMessage = null)
+            cacheRecoveryScope.launch {
+                val startedAt = System.currentTimeMillis()
+                DiagnosticsLogStore.record("library", "favorite_snapshot_start")
+                try {
+                    val ids = bridge.neteasePlaylistSongIds(playlist.id).toMutableSet()
+                    val membershipChanged = synchronized(cacheGenerationLock) {
+                        if (generation != cacheGeneration || accountState.value?.userId != userId) return@launch
+                        val before = favoriteSongsState.value
+                        val previousIds = before.songIds?.toMutableSet()?.apply {
+                            before.changedSongs.forEach { (id, like) -> if (like) add(id) else remove(id) }
+                        } ?: synchronized(tracksCacheLock) {
+                            tracksMemoryCache[playlist.id]?.mapNotNullTo(HashSet()) { it.neteaseId }
+                        }
+                        // A slow app-entry read must not undo a later confirmed like/unlike.
+                        favoriteChanges.forEach { (id, change) ->
+                            if (change.first > mutationRevision) {
+                                if (change.second) ids.add(id) else ids.remove(id)
+                            }
+                        }
+                        favoriteSongsState.value = FavoriteSongsState(
+                            userId = userId, songIds = ids, pendingSongs = before.pendingSongs,
+                        )
+                        favoriteChanges.entries.removeAll { it.value.first <= mutationRevision }
+                        previousIds != null && previousIds != ids
+                    }
+                    // Changes made outside this app must also invalidate library/taste inputs.
+                    if (membershipChanged) publishLibraryMutation(userId, generation, setOf(playlist.id))
+                    DiagnosticsLogStore.record("library", "favorite_snapshot_loaded", mapOf(
+                        "count" to ids.size, "elapsedMs" to (System.currentTimeMillis() - startedAt),
+                    ))
+                } catch (e: CancellationException) {
+                    synchronized(cacheGenerationLock) {
+                        if (generation == cacheGeneration) {
+                            favoriteSongsState.value = favoriteSongsState.value.copy(isRefreshing = false)
+                        }
+                    }
+                    throw e
+                } catch (e: Exception) {
+                    synchronized(cacheGenerationLock) {
+                        if (generation == cacheGeneration && accountState.value?.userId == userId) {
+                            favoriteSongsState.value = favoriteSongsState.value.copy(
+                                isRefreshing = false, errorMessage = "暂时无法更新收藏状态，请重试",
+                            )
+                        }
+                    }
+                    DiagnosticsLogStore.record("library", "favorite_snapshot_failed", mapOf("errorType" to e.javaClass.simpleName))
+                } finally {
+                    synchronized(cacheGenerationLock) {
+                        if (favoriteRefreshGeneration == generation) favoriteRefreshGeneration = null
+                    }
+                }
+            }
+        }
+    }
+
+    private fun publishFavoriteChange(userId: Long?, generation: Long, ids: List<Long>, like: Boolean) {
+        synchronized(cacheGenerationLock) {
+            if (userId == null || generation != cacheGeneration || accountState.value?.userId != userId) return
+            favoriteMutationRevision += 1L
+            ids.forEach { favoriteChanges[it] = favoriteMutationRevision to like }
+            val previous = favoriteSongsState.value.takeIf { it.userId == userId }
+                ?: FavoriteSongsState(userId = userId)
+            favoriteSongsState.value = previous.copy(changedSongs = previous.changedSongs + ids.associateWith { like })
         }
     }
 
     override suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean): List<NativeTrack> {
         awaitCacheRecovery()
         val requestGeneration = currentCacheGeneration()
+        val requestLibraryRevision = libraryRevisionState.value
         // 网盘 sentinel 不是真实 NetEase 歌单，neteasePlaylistTracks(-1) 拿不到东西——
         // 路由到 cloudDiskTracks（同样命中 tracksMemoryCache[sentinel] 缓存）。让 AI 的
         // play_playlist / get_playlist_tracks 和蒸馏 DistillEngine 都能把"我的网盘"当普通歌单用。
@@ -253,7 +365,10 @@ class RustBridgeRepository(
                 fields = mapOf("playlistId" to playlistId),
             )
         }
-        val expectedCount = playlistState.value.firstOrNull { it.id == playlistId }?.trackCount
+        val expectedCount = synchronized(cacheGenerationLock) {
+            if (playlistId in invalidatedPlaylistIds) null
+            else playlistState.value.firstOrNull { it.id == playlistId }?.trackCount
+        }
         val fresh = try {
             bridge.neteasePlaylistTracks(playlistId)
         } catch (e: CancellationException) {
@@ -287,7 +402,7 @@ class RustBridgeRepository(
                 throw IllegalStateException("Playlist $playlistId expected $expectedCount tracks but detail returned empty")
             }
         }
-        if (fresh.isNotEmpty()) {
+        run {
             DiagnosticsLogStore.record(
                 area = "library",
                 event = "playlist_tracks_fetch_ok",
@@ -298,7 +413,8 @@ class RustBridgeRepository(
                 ),
             )
             synchronized(cacheGenerationLock) {
-                if (requestGeneration == cacheGeneration) {
+                if (requestGeneration == cacheGeneration && requestLibraryRevision == libraryRevisionState.value) {
+                    invalidatedPlaylistIds.remove(playlistId)
                     val tracksSnapshot = synchronized(tracksCacheLock) {
                         cacheTracksLocked(playlistId, fresh)
                         tracksSnapshotLocked()
@@ -385,9 +501,7 @@ class RustBridgeRepository(
                 "availableCover" to hydratedFresh.any { !it.artworkUrl.isNullOrBlank() },
             ),
         )
-        if (hydratedFresh.isNotEmpty()) {
-            replaceCloudTracks(hydratedFresh, requestGeneration)
-        }
+        replaceCloudTracks(hydratedFresh, requestGeneration)
         return hydratedFresh
     }
 
@@ -446,14 +560,25 @@ class RustBridgeRepository(
 
     private suspend fun loadLyricsForTrack(trackId: String, metadata: NativeTrack?): List<PipoLyricLine> {
         val cloudTrack = cachedCloudTrackFor(trackId)
-        reliableLyricsSource?.lyricsForTrack(trackId, metadata ?: cloudTrack)
-            ?.takeIf(::lyricsAreUsable)?.let { return completeExternalTranslations(trackId, it, cloudTrack) }
-        if (cloudTrack != null) {
-            val cloudLines = loadCloudLyricsById(trackId, cloudTrack)
-            if (lyricsAreUsable(cloudLines)) return cloudLines
+        // Fetch NetEase once and let its real word timestamps compete with the external documents.
+        val primaryLines = loadLyricsCandidate(trackId)
+        val cloudLines = cloudTrack?.let { loadCloudLyricsById(trackId, it) }
+        val neteaseCandidates = mutableListOf<OnlineLyrics>()
+        primaryLines.takeIf(::lyricsAreUsable)?.let { neteaseCandidates += OnlineLyrics("netease", trackId, it) }
+        cloudLines?.takeIf(::lyricsAreUsable)?.let {
+            neteaseCandidates += OnlineLyrics("netease_cloud", cloudTrack?.neteaseId?.toString() ?: trackId, it)
+        }
+        reliableLyricsSource?.lyricsForTrack(
+            trackId,
+            metadata ?: cloudTrack,
+            neteaseCandidates,
+        )?.takeIf { lyricsAreUsable(it.lines) }?.let { selected ->
+            return completeExternalTranslations(trackId, selected.lines, cloudTrack, cloudLines, primaryLines)
+        }
+        if (lyricsAreUsable(cloudLines.orEmpty())) {
+            return cloudLines.orEmpty()
         }
 
-        val primaryLines = loadLyricsById(trackId)
         if (lyricsAreUsable(primaryLines)) return primaryLines
 
         if (cloudTrack == null) return emptyList()
@@ -473,11 +598,20 @@ class RustBridgeRepository(
         // A search match used for cover art is not automatically a safe lyric recording match.
         if (OnlineLyricSupport.matchScore(
                 cloudTrack, matched.title, listOf(matched.artist), matched.album, matched.durationMs,
-            ) == null
+        ) == null
         ) return emptyList()
-        val matchedLines = reliableLyricsSource?.lyricsForTrack(matchedId.toString(), matched)
-            ?.takeIf(::lyricsAreUsable)?.let { completeExternalTranslations(matchedId.toString(), it) }
-            ?: loadLyricsById(matchedId.toString())
+        val matchedTrackId = matchedId.toString()
+        val matchedPrimaryLines = loadLyricsCandidate(matchedTrackId)
+        val matchedNeteaseCandidate = matchedPrimaryLines.takeIf(::lyricsAreUsable)?.let {
+            OnlineLyrics("netease", matchedTrackId, it)
+        }
+        val matchedLines = reliableLyricsSource?.lyricsForTrack(
+            matchedTrackId,
+            matched,
+            listOfNotNull(matchedNeteaseCandidate),
+        )?.takeIf { lyricsAreUsable(it.lines) }?.let { selected ->
+            completeExternalTranslations(matchedTrackId, selected.lines, neteaseDonor = matchedPrimaryLines)
+        } ?: matchedPrimaryLines
         if (lyricsAreUsable(matchedLines)) {
             DiagnosticsLogStore.record(
                 area = "lyrics",
@@ -514,12 +648,15 @@ class RustBridgeRepository(
         trackId: String,
         lines: List<PipoLyricLine>,
         cloudTrack: NativeTrack? = null,
+        cloudDonor: List<PipoLyricLine>? = null,
+        neteaseDonor: List<PipoLyricLine> = emptyList(),
     ): List<PipoLyricLine> {
         if (lines.all { it.role != PipoLyricRole.Primary || OnlineLyricSupport.hasTranslation(it) }) return lines
         return try {
-            val cloudDonor = cloudTrack?.let { loadCloudLyricsById(trackId, it) }
-            val donor = cloudDonor?.takeIf { it.any(OnlineLyricSupport::hasTranslation) }
-                ?: loadLyricsById(cloudTrack?.neteaseId?.toString() ?: trackId, outcome = "translation_only")
+            val translationDonor = neteaseDonor.takeIf { it.any(OnlineLyricSupport::hasTranslation) }
+                ?: cloudDonor ?: cloudTrack?.let { loadCloudLyricsById(trackId, it) }
+            val donor = translationDonor?.takeIf { it.any(OnlineLyricSupport::hasTranslation) }
+                ?: neteaseDonor
             val completed = OnlineLyricSupport.withMissingTranslations(lines, donor)
             DiagnosticsLogStore.record(
                 area = "lyrics", event = "translation_resolve",
@@ -551,6 +688,24 @@ class RustBridgeRepository(
             fields = mapOf("trackId" to trackId, "source" to "netease", "outcome" to outcome, "lineCount" to lines.size),
         )
         return lines
+    }
+
+    private suspend fun loadLyricsCandidate(trackId: String): List<PipoLyricLine> = try {
+        loadLyricsById(trackId, outcome = "candidate")
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        DiagnosticsLogStore.record(
+            area = "lyrics",
+            event = "source_resolve",
+            fields = mapOf(
+                "trackId" to trackId,
+                "source" to "netease",
+                "outcome" to "candidate_failed",
+                "errorType" to e::class.java.simpleName,
+            ),
+        )
+        emptyList()
     }
 
     private suspend fun loadCloudLyricsById(trackId: String, track: NativeTrack): List<PipoLyricLine> {
@@ -671,7 +826,10 @@ class RustBridgeRepository(
                 cacheTracksLocked(CLOUD_DISK_PLAYLIST_ID, tracks)
                 tracksSnapshotLocked()
             }
+            val libraryChanged = cloudLibraryLoaded && cloudTracksState.value != tracks
             cloudTracksState.value = tracks
+            cloudLibraryLoaded = true
+            if (libraryChanged) libraryRevisionState.value += 1L
             val uid = accountState.value?.userId ?: cachedUserId
             val playlists = playlistState.value
             if (uid != null && playlists.isNotEmpty()) {
@@ -822,10 +980,20 @@ class RustBridgeRepository(
         // (EmptyPipoRepository.likeSong = Unit) —— 结果就是 AI 说"加心"接口失败时
         // 上层 runCatching 永远看到 Success，没反馈、没诊断，用户感知就是"没反应"。
         // 改成异常透传给 NativeAiPet 的 runCatching 触发失败消息，并打 diagnostic 让日志能看到。
-        val userId = accountState.value?.userId
+        val (userId, requestGeneration) = synchronized(cacheGenerationLock) {
+            val owner = checkNotNull(accountState.value?.userId) { "请先登录网易云" }
+            val previous = favoriteSongsState.value.takeIf { it.userId == owner }
+                ?: FavoriteSongsState(userId = owner)
+            check(!previous.isPending(id)) { "这首歌的收藏操作正在同步，请稍后再试" }
+            // 所有入口共享待同步状态；弹窗销毁后仍保留即时红心。
+            favoriteSongsState.value = previous.copy(pendingSongs = previous.pendingSongs + (id to like))
+            owner to cacheGeneration
+        }
         try {
             bridge.neteaseLikeSong(id, like)
-            if (userId != null && accountState.value?.userId == userId) {
+            publishFavoriteChange(userId, requestGeneration, listOf(id), like)
+            publishLibraryMutation(userId, requestGeneration, favoritePlaylist()?.let { setOf(it.id) })
+            if (accountState.value?.userId == userId) {
                 runCatching { PipoGraph.recommendationLog.logFavorite(id, userId, like) }
             }
             DiagnosticsLogStore.record(
@@ -847,6 +1015,14 @@ class RustBridgeRepository(
                 ),
             )
             throw e
+        } finally {
+            synchronized(cacheGenerationLock) {
+                if (requestGeneration == cacheGeneration && accountState.value?.userId == userId) {
+                    // 成功使用已确认的新值，失败恢复最近的确认值；旧账号响应不能覆盖新账号。
+                    val current = favoriteSongsState.value
+                    favoriteSongsState.value = current.copy(pendingSongs = current.pendingSongs - id)
+                }
+            }
         }
     }
 
@@ -856,8 +1032,14 @@ class RustBridgeRepository(
         trackIds: List<Long>,
     ) {
         // 同 likeSong：写操作要让失败可见 —— 不再用 safe 吞错。
+        val userId = accountState.value?.userId
+        val requestGeneration = currentCacheGeneration()
         try {
             bridge.neteasePlaylistModifyTracks(playlistId, op, trackIds)
+            if (favoritePlaylist()?.id == playlistId) {
+                publishFavoriteChange(userId, requestGeneration, trackIds, like = op == "add")
+            }
+            publishLibraryMutation(userId, requestGeneration, setOf(playlistId))
             DiagnosticsLogStore.record(
                 area = "library",
                 event = "playlist_modify_ok",
@@ -884,8 +1066,11 @@ class RustBridgeRepository(
     override suspend fun createPlaylist(name: String): Long {
         val cleanName = name.trim()
         require(cleanName.isNotEmpty()) { "歌单名称不能为空" }
+        val userId = accountState.value?.userId
+        val requestGeneration = currentCacheGeneration()
         return try {
             bridge.neteasePlaylistCreate(cleanName).also { playlistId ->
+                publishLibraryMutation(userId, requestGeneration, setOf(playlistId))
                 DiagnosticsLogStore.record(
                     area = "library",
                     event = "playlist_create_ok",
@@ -910,6 +1095,27 @@ class RustBridgeRepository(
 
     override suspend fun updateSettings(settings: NativeSettings) {
         settingsStore?.update(settings) ?: fallback.updateSettings(settings)
+    }
+
+    private fun publishLibraryMutation(userId: Long?, generation: Long, playlistIds: Set<Long>?) {
+        synchronized(cacheGenerationLock) {
+            if (generation != cacheGeneration || userId != accountState.value?.userId) return
+            val ids = playlistIds ?: playlistState.value.mapTo(HashSet()) { it.id }
+            invalidatedPlaylistIds.addAll(ids)
+            val snapshot = synchronized(tracksCacheLock) {
+                ids.forEach(tracksMemoryCache::remove)
+                tracksSnapshotLocked()
+            }
+            if (userId != null) playlistCache?.save(userId, playlistState.value, snapshot)
+            libraryRevisionState.value += 1
+        }
+        // The write has already succeeded. A failed metadata refresh must not turn its
+        // receipt into a retry that repeats the cloud mutation.
+        cacheRecoveryScope.launch {
+            try { refreshPlaylists() }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* The next explicit refresh can retry the read. */ }
+        }
     }
 
     override suspend fun refreshAudioCacheStats() {
@@ -1024,7 +1230,10 @@ class RustBridgeRepository(
             playlistState.value = snap.playlists
             synchronized(tracksCacheLock) {
                 snap.tracks.forEach { (playlistId, tracks) -> cacheTracksLocked(playlistId, tracks) }
-                tracksMemoryCache[CLOUD_DISK_PLAYLIST_ID]?.let { cloudTracksState.value = it }
+                tracksMemoryCache[CLOUD_DISK_PLAYLIST_ID]?.let {
+                    cloudTracksState.value = it
+                    cloudLibraryLoaded = true
+                }
             }
             cacheStale = snap.isStale
             cachedUserId = snap.userId
@@ -1059,9 +1268,17 @@ class RustBridgeRepository(
 
     private fun clearAccountCachesLocked(clearAccountState: Boolean = false): CacheReset {
         cacheGeneration += 1L
+        invalidatedPlaylistIds.clear()
+        favoriteSongsState.value = FavoriteSongsState()
+        favoriteRefreshRequested = true
+        favoriteRefreshGeneration = null
+        favoriteChanges.clear()
+        favoriteMutationRevision = 0L
+        libraryRevisionState.value += 1L
         if (clearAccountState) accountState.value = null
         playlistState.value = emptyList()
         cloudTracksState.value = emptyList()
+        cloudLibraryLoaded = false
         synchronized(tracksCacheLock) {
             tracksMemoryCache.clear()
         }
@@ -1142,6 +1359,8 @@ interface RustPipoBridge {
     suspend fun neteaseLogout()
     suspend fun neteaseUserPlaylists(userId: Long): List<PipoPlaylist>
     suspend fun neteasePlaylistTracks(playlistId: Long): List<NativeTrack>
+    suspend fun neteasePlaylistSongIds(playlistId: Long): Set<Long> =
+        neteasePlaylistTracks(playlistId).mapNotNullTo(HashSet()) { it.neteaseId }
     /** 拉用户网盘里全部上传歌曲。和正常歌单一样可以喂给 tracksForPlaylist 用。 */
     suspend fun neteaseUserCloudTracks(): List<NativeTrack>
     suspend fun neteaseSearch(query: String, limit: Int): List<NativeTrack>

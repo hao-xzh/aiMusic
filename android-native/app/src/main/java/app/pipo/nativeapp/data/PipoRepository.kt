@@ -2,13 +2,27 @@ package app.pipo.nativeapp.data
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flowOf
 
 data class PipoAccount(
     val userId: Long,
     val nickname: String,
     val avatarUrl: String? = null,
 )
+
+data class FavoriteSongsState(
+    val userId: Long? = null,
+    val songIds: Set<Long>? = null,
+    val changedSongs: Map<Long, Boolean> = emptyMap(),
+    val isRefreshing: Boolean = false,
+    val errorMessage: String? = null,
+    val pendingSongs: Map<Long, Boolean> = emptyMap(),
+) {
+    fun isLiked(songId: Long): Boolean? = pendingSongs[songId] ?: changedSongs[songId] ?: songIds?.contains(songId)
+    fun isPending(songId: Long): Boolean = pendingSongs.containsKey(songId)
+}
 
 data class PipoPlaylist(
     val id: Long,
@@ -17,6 +31,7 @@ data class PipoPlaylist(
     val coverUrl: String? = null,
     val userId: Long? = null,
     val updateTime: Long? = null,
+    val specialType: Int = 0,
 )
 
 data class QrLoginStart(
@@ -164,7 +179,7 @@ data class NativeSettings(
 )
 
 interface PipoRepository {
-    val account: Flow<PipoAccount?>
+    val account: StateFlow<PipoAccount?>
     val playlists: Flow<List<PipoPlaylist>>
     /**
      * "我的网盘"曲目 Flow。冷启动时从磁盘 cache 同步恢复；[cloudDiskTracks] 加载完会 emit
@@ -185,6 +200,12 @@ interface PipoRepository {
     suspend fun verifyPhoneCaptcha(phone: String, captcha: String, countryCode: Int = 86): CaptchaSentStatus
     suspend fun loginWithPhone(phone: String, captcha: String, countryCode: Int = 86): PhoneLoginStatus
     suspend fun refreshPlaylists()
+    /** Confirmed account-library mutations invalidate mounted views and aggregate snapshots. */
+    val libraryRevision: Flow<Long> get() = flowOf(0L)
+    /** Account-scoped heart state, independent of the full playlist LRU cache. */
+    val favoriteSongs: StateFlow<FavoriteSongsState>
+    /** App entry or an explicit retry; opening a song menu must only observe [favoriteSongs]. */
+    fun requestFavoriteSongsRefresh() = Unit
     /** Browsing must distinguish an empty library from a failed refresh. */
     suspend fun refreshPlaylistsForBrowse() = refreshPlaylists()
     suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean = false): List<NativeTrack>

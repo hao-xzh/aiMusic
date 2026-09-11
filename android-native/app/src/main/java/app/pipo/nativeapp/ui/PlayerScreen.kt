@@ -77,7 +77,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
-import app.pipo.nativeapp.playback.LyricPlaybackPositionProvider
+import app.pipo.nativeapp.playback.PlayerLyricPlaybackPositionProvider
 import app.pipo.nativeapp.playback.PlayerViewModel
 import app.pipo.nativeapp.runtime.Amp
 import kotlinx.coroutines.delay
@@ -133,15 +133,7 @@ fun PlayerScreen(
         if (durationMs > 0) (viewModel.positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
     }
     val positionProvider = remember(viewModel) {
-        object : LyricPlaybackPositionProvider {
-            override fun invoke(): Long = viewModel.currentPlaybackPositionMs()
-
-            override val playbackSpeed: Float
-                get() = viewModel.lyricPlaybackSpeed
-
-            override val discontinuitySequence: Long
-                get() = viewModel.lyricPlaybackDiscontinuitySequence
-        }
+        PlayerLyricPlaybackPositionProvider(viewModel)
     }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
@@ -175,6 +167,7 @@ fun PlayerScreen(
                 album = state.album,
                 trackId = state.currentTrackId,
                 lyrics = state.lyrics,
+                isLyricsLoading = state.isLyricsLoading,
                 durationMs = state.durationMs,
                 positionProvider = positionProvider,
                 progressProvider = progressProvider,

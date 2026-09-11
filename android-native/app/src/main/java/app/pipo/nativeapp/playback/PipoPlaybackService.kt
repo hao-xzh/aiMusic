@@ -1819,7 +1819,12 @@ class PipoPlaybackService : MediaLibraryService() {
         val focusChange = lastExternalFocusChange
         val hasRecentFocusSignal = focusChange != null &&
             now - lastExternalFocusInterruptionAtMs <= EXTERNAL_FOCUS_FALLBACK_WINDOW_MS
-        if (!profile.hasAnyExternalAudio && !hasRecentFocusSignal) {
+        // Focus 回调通常先于 playback configuration 回调到达。若 transient/duck
+        // 之后配置已经明确为空，不要再被“最近有过焦点丢失”挡住恢复；只有永久
+        // LOSS 且还没有建立自动恢复状态时，才保留无配置也暂停的兜底。
+        val holdUnobservedPermanentLoss = focusChange == AudioManager.AUDIOFOCUS_LOSS &&
+            !resumeAfterAudioFocusLoss
+        if (!profile.hasAnyExternalAudio && !holdUnobservedPermanentLoss) {
             resetExternalAudioPolicyWindow()
             maybeRestoreExternalAudioDucking(reason)
             maybeResumeAfterExternalAudioStops(reason, configs)
@@ -2027,10 +2032,15 @@ class PipoPlaybackService : MediaLibraryService() {
             )
         }
         if (profile.hasExternalMediaOrGame) {
-            if (!hasRecentFocusSignal) {
+            // 部分短视频/游戏只更新 AudioPlaybackConfiguration，并不规范地申请
+            // AudioFocus。之前这里一律永久 ignore，导致“其他 App 明明在发声但
+            // Claudio 不避让”。保留一个很短的误触发确认窗，随后按同一套
+            // duck -> pause 策略处理；真正静默的残留配置会由 isActive 过滤掉。
+            if (!hasRecentFocusSignal && durationMs < EXTERNAL_MEDIA_MISFIRE_IGNORE_MS) {
                 return ExternalAudioPolicy(
                     action = ExternalAudioAction.Ignore,
-                    decision = "ignore_media_without_focus",
+                    decision = "ignore_media_confirming_without_focus",
+                    nextProbeMs = EXTERNAL_MEDIA_MISFIRE_IGNORE_MS - durationMs,
                 )
             }
             if (durationMs < EXTERNAL_MEDIA_MISFIRE_IGNORE_MS) {
@@ -2217,7 +2227,8 @@ class PipoPlaybackService : MediaLibraryService() {
 
     private fun isVoiceOrAssistantUsage(usage: Int): Boolean {
         return usage == android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION ||
-            usage == android.media.AudioAttributes.USAGE_ASSISTANT
+            usage == android.media.AudioAttributes.USAGE_ASSISTANT ||
+            usage == android.media.AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY
     }
 
     private fun isNavigationUsage(usage: Int): Boolean {
@@ -2565,8 +2576,9 @@ class PipoPlaybackService : MediaLibraryService() {
 
             runCatching {
                 val liveItem = player.currentMediaItem ?: return@runCatching
-                val itemIndex = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
+                val itemIndex = player.currentMediaItemIndex
                 if (itemIndex !in 0 until player.mediaItemCount) return@runCatching
+                if (player.getMediaItemAt(itemIndex).mediaId != mediaId) return@runCatching
                 val resumePositionMs = maxOf(startPositionMs, player.currentPosition.coerceAtLeast(0L))
                 notificationPlayer?.armRecoveryWindow()
                 DiagnosticsLogStore.record(
@@ -2681,10 +2693,6 @@ class PipoPlaybackService : MediaLibraryService() {
                 )
             }
         }, BAD_SOURCE_CONTROLLER_GRACE_MS)
-    }
-
-    private fun Player.indexOfMediaId(mediaId: String): Int? {
-        return (0 until mediaItemCount).firstOrNull { i -> getMediaItemAt(i).mediaId == mediaId }
     }
 
     private fun isWaitingForBadSourceController(player: Player, now: Long): Boolean {
@@ -2967,8 +2975,9 @@ class PipoPlaybackService : MediaLibraryService() {
                 return@launch
             }
             runCatching {
-                val idx = player.indexOfMediaId(mediaId) ?: player.currentMediaItemIndex
+                val idx = player.currentMediaItemIndex
                 if (idx !in 0 until player.mediaItemCount) return@runCatching
+                if (player.getMediaItemAt(idx).mediaId != mediaId) return@runCatching
                 val resumePositionMs = maxOf(startPositionMs, player.currentPosition.coerceAtLeast(0L))
                 notificationPlayer?.armRecoveryWindow()
                 markServiceUrlRefreshReplacement(mediaId)
@@ -3418,24 +3427,26 @@ class PipoPlaybackService : MediaLibraryService() {
         private const val NETWORK_RECOVERY_ARM_RETRY_BASE_MS = 1_500L
         private const val NETWORK_RECOVERY_ARM_MAX_ATTEMPTS = 3
         private const val AUDIO_FOCUS_FOREGROUND_GRACE_MS = 10 * 60 * 1_000L
-        private const val AUDIO_FOCUS_RESUME_PROBE_MS = 1_500L
+        // 外部声音结束后要尽快重新取回焦点；原先 1.5s 首次探测叠加静默窗，
+        // 会让短暂语音/视频结束后的恢复明显拖沓。
+        private const val AUDIO_FOCUS_RESUME_PROBE_MS = 350L
         private const val AUDIO_FOCUS_FAILED_RETRY_BASE_MS = 3_000L
         private const val AUDIO_FOCUS_RETRY_MAX_DELAY_MS = 30_000L
         private const val AUDIO_FOCUS_POLICY_CONFIRM_MS = 120L
-        private const val EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS = 1_200L
-        // 要覆盖 1.2s 的媒体确认/暂停阈值及主线程调度余量，否则 probe 稍晚就会
+        private const val EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS = 450L
+        // 要覆盖 0.9s 的媒体确认/暂停阈值及主线程调度余量，否则 probe 稍晚就会
         // 被误判成“没有最近焦点信号”，持续外部媒体反而不会暂停。
         private const val EXTERNAL_FOCUS_FALLBACK_WINDOW_MS = 2_500L
-        private const val EXTERNAL_MEDIA_MISFIRE_IGNORE_MS = 350L
-        // 短促误触发先忽略，确认是持续媒体后先柔和 duck；超过 1.2s 才暂停。
+        private const val EXTERNAL_MEDIA_MISFIRE_IGNORE_MS = 220L
+        // 短促误触发先忽略，确认是持续媒体后先柔和 duck；超过 0.9s 才暂停。
         // 这样通知/短音不打断，短视频/游戏持续出声也不会长期与音乐混播。
-        private const val EXTERNAL_MEDIA_PAUSE_AFTER_MS = 1_200L
+        private const val EXTERNAL_MEDIA_PAUSE_AFTER_MS = 900L
         private const val EXTERNAL_VOICE_PAUSE_AFTER_MS = 8_000L
-        private const val EXTERNAL_AUDIO_DUCK_FAST_ATTACK_MS = 100L
-        private const val EXTERNAL_AUDIO_DUCK_NOTIFICATION_ATTACK_MS = 80L
-        private const val EXTERNAL_AUDIO_DUCK_RESTORE_QUIET_MS = 600L
-        private const val EXTERNAL_AUDIO_DUCK_RESTORE_MS = 500L
-        private const val AUDIO_DUCKING_STATE_PROBE_MS = 500L
+        private const val EXTERNAL_AUDIO_DUCK_FAST_ATTACK_MS = 60L
+        private const val EXTERNAL_AUDIO_DUCK_NOTIFICATION_ATTACK_MS = 60L
+        private const val EXTERNAL_AUDIO_DUCK_RESTORE_QUIET_MS = 220L
+        private const val EXTERNAL_AUDIO_DUCK_RESTORE_MS = 220L
+        private const val AUDIO_DUCKING_STATE_PROBE_MS = 250L
         private const val EXTERNAL_AUDIO_DUCK_FRAME_MS = 16L
         private const val MEDIA_TRANSIENT_DUCK_GAIN = 0.55f
         private const val VOICE_DUCK_GAIN = 0.28f

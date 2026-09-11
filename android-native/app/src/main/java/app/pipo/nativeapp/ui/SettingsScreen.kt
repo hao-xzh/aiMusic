@@ -172,7 +172,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository, aiOnly: Bo
                 scope.launch { try { repository.updateSettings(settings.copy(userFacts = facts)); PipoGraph.petMemory.setUserFacts(facts) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { reply = e.message ?: "保存失败" } }
             }, label = "", placeholder = "写下你的喜好与习惯", singleLine = false, minLines = 3, maxLines = 6)
             Text("${settings.userFacts.length} / 400", color = BrowseMuted, modifier = Modifier.align(Alignment.End).padding(top = 6.dp))
-            PipoButton("清空 AI 对话记忆", { perform("AI 对话记忆已清空") { PipoGraph.petMemory.clearConversation(); PetChatStore.clear(); DiagnosticsLogStore.record("ai_pet", "clear_conversation") } }, modifier = Modifier.align(Alignment.End).padding(top = 10.dp))
+            PipoButton("清空 AI 对话记忆", { perform("AI 对话记忆已清空") { val epoch = PipoGraph.petMemory.clearConversation(); PetChatStore.clear(epoch); DiagnosticsLogStore.record("ai_pet", "clear_conversation") } }, modifier = Modifier.align(Alignment.End).padding(top = 10.dp))
             SettingsSectionHeader("存储与诊断")
             SettingsPanel {
             PipoRow("音频缓存", "${cacheStats.totalMb} MB / ${cacheStats.maxMb} MB") {

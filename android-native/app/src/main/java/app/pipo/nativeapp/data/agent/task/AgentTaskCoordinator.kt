@@ -12,6 +12,8 @@ import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.agent.domain.TurnOutcome
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.data.agent.runtime.AgentTurnExecutionException
+import app.pipo.nativeapp.playback.PlaybackSessionClock
+import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -39,9 +41,13 @@ class AgentTaskCoordinator(private val context: Context) {
     fun submit(userText: String, contextJson: String = "", onFinished: (Result<TurnOutcome>) -> Unit = {}): AgentTask {
         // A favorite failure has an exact song/account target. Give the new retry request to
         // the tool loop instead of replaying a whole old task against today's current song.
+        val conversationEpoch = PipoGraph.petMemory.conversationEpoch()
+        val playbackContext = JSONObject(contextJson.ifBlank { "{}" })
+            .put("manualSelectionRevision", PlaybackSessionClock.currentSelectionRevision())
+            .toString()
         val retriedTask = if (isRetryOnlyRequest(userText) && ledger.pendingFavorite() == null)
-            store.retryLatestFailed() else null
-        val task = retriedTask ?: store.enqueue(userText, contextJson)
+            store.retryLatestFailed(conversationEpoch) else null
+        val task = retriedTask ?: store.enqueue(userText, playbackContext, conversationEpoch)
         if (retriedTask?.error == AgentTaskStore.INTERRUPTED_EXECUTION_RESULT_UNKNOWN) {
             DiagnosticsLogStore.record(
                 "ai_agent_task",
@@ -59,6 +65,9 @@ class AgentTaskCoordinator(private val context: Context) {
             mapOf("taskId" to task.id, "contextBytes" to task.contextJson.length),
         )
         scope.launch {
+            if (retriedTask == null) {
+                PipoGraph.petMemory.recordUtterance(task.userText, task.conversationEpoch)
+            }
             // Persist the user's side as soon as the durable task exists. taskId makes
             // this idempotent with process-recovery / retry execution below.
             runCatching {
@@ -66,6 +75,8 @@ class AgentTaskCoordinator(private val context: Context) {
                     PetMemory.ROLE_USER,
                     task.userText,
                     task.id,
+                    task.conversationSequence,
+                    task.conversationEpoch,
                 )
             }
             execute(task.id, onFinished)
@@ -90,6 +101,8 @@ class AgentTaskCoordinator(private val context: Context) {
                 PetMemory.ROLE_USER,
                 task.userText,
                 task.id,
+                task.conversationSequence,
+                task.conversationEpoch,
             )
         }
         DiagnosticsLogStore.record(
@@ -99,17 +112,21 @@ class AgentTaskCoordinator(private val context: Context) {
         )
         return@withLock try {
             val outcome = activeGateway.execute(task)
-            store.succeed(task.id, outcome.reply)
+            store.succeed(task.id, outcome.reply, outcome.cards)
             // Conversation memory belongs to the durable task owner, not the page.
             // This also persists results produced after the UI or process has gone away.
-            runCatching {
-                PipoGraph.petMemory.recordConversationTurn(
-                    PetMemory.ROLE_ASSISTANT,
-                    outcome.reply,
-                    task.id,
-                )
+            outcome.reply.takeIf { it.isNotBlank() }?.let { reply ->
+                runCatching {
+                    PipoGraph.petMemory.recordConversationTurn(
+                        PetMemory.ROLE_ASSISTANT,
+                        reply,
+                        task.id,
+                        task.conversationSequence,
+                        task.conversationEpoch,
+                    )
+                }
             }
-            runCatching { PipoGraph.petMemory.recordMusicReferences(outcome.musicReferences) }
+            runCatching { PipoGraph.petMemory.recordMusicReferences(outcome.musicReferences, task.conversationEpoch) }
             DiagnosticsLogStore.record(
                 "ai_agent_task",
                 "succeeded",
@@ -125,9 +142,19 @@ class AgentTaskCoordinator(private val context: Context) {
             val terminal = task.attempts >= MAX_ATTEMPTS ||
                 (error is AgentTurnExecutionException && !error.retryable)
             if (terminal) {
-                val reply = if (error is AgentTurnExecutionException && error.message.orEmpty().endsWith(":auth")) {
-                    "AI 服务鉴权失败，请到设置中的 AI 设置检查 API Key 后重试。"
-                } else "这次请求没能完成，请重试。"
+                val reason = error.message.orEmpty()
+                val reply = when {
+                    error !is AgentTurnExecutionException -> "这次请求没能完成，请重试。"
+                    reason.endsWith(":auth") -> "AI 服务鉴权失败，请到设置中的 AI 设置检查 API Key 后重试。"
+                    reason.startsWith("音乐搜索服务暂时不可用") -> "音乐搜索服务暂时不可用，这次请求尚未完成，请稍后重试。"
+                    reason.startsWith("turn_budget_exhausted") -> "这次处理超过了等待时间，尚未完成。可以重试这条请求。"
+                    reason.startsWith("max_steps_exhausted") || reason.startsWith("no_progress") ->
+                        "多次调整后仍未得到符合要求的结果，已停止重复尝试。可以重试这条请求。"
+                    reason.endsWith(":timeout") || reason.endsWith(":network") ->
+                        "AI 服务连接超时或中断，这次请求尚未完成，请稍后重试。"
+                    reason.startsWith("assistant_parse_failed") -> "AI 返回的操作信息不完整，这次请求尚未完成，请重试。"
+                    else -> "这次请求没能完成，请重试。"
+                }
                 store.fail(task.id, error.message ?: error::class.java.simpleName, reply)
                 onFinished(Result.failure(error))
             } else {

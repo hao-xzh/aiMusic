@@ -234,6 +234,7 @@ class PlaylistCacheStore(context: Context) {
         p.coverUrl?.let { put("coverUrl", it) }
         p.userId?.let { put("userId", it) }
         p.updateTime?.let { put("updateTime", it) }
+        put("specialType", p.specialType)
     }
 
     private fun decodePlaylist(o: JSONObject): PipoPlaylist? = try {
@@ -244,6 +245,7 @@ class PlaylistCacheStore(context: Context) {
             coverUrl = o.optString("coverUrl").takeIf { it.isNotBlank() },
             userId = if (o.has("userId")) o.optLong("userId") else null,
             updateTime = if (o.has("updateTime")) o.optLong("updateTime") else null,
+            specialType = o.optInt("specialType", 0),
         )
     } catch (_: Exception) { null }
 

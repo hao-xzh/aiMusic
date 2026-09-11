@@ -12,8 +12,9 @@ class TrackResolver(
         requirement: TrackRequirement,
         library: List<NativeTrack>,
         allowOnline: Boolean = true,
+        acceptsTrack: (NativeTrack) -> Boolean = { true },
     ): ResolvedTrack {
-        val local = resolveLocal(requirement, library)
+        val local = resolveLocal(requirement, library).filter(acceptsTrack)
         val localPick = pickMatchingVersion(local, requirement)
         if (localPick != null) {
             val track = localPick
@@ -47,7 +48,7 @@ class TrackResolver(
         }
         val query = listOfNotNull(requirement.artist, requirement.title).joinToString(" ")
         val online = repository.searchTracks(query, limit = 8)
-        val matches = online.filter { requirementMatches(it, requirement) }
+        val matches = online.filter { requirementMatches(it, requirement) && acceptsTrack(it) }
         val distinctMatches = matches.distinctBy { it.id }
         val picked = pickMatchingVersion(distinctMatches, requirement)
         return ResolvedTrack(

@@ -3,6 +3,7 @@ package app.pipo.nativeapp.data.agent.task
 import android.content.ComponentName
 import android.content.Context
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import app.pipo.nativeapp.data.ContinuousQueueSource
@@ -18,6 +19,7 @@ import app.pipo.nativeapp.data.agent.runtime.AgentTurnExecutionException
 import app.pipo.nativeapp.data.agent.runtime.AgentRuntime
 import app.pipo.nativeapp.data.agent.memory.AgentLedgerStore
 import app.pipo.nativeapp.playback.PlaybackUrlResolver
+import app.pipo.nativeapp.playback.PlaybackSessionClock
 import app.pipo.nativeapp.playback.BackgroundAgentContinuation
 import app.pipo.nativeapp.playback.PipoPlaybackService
 import app.pipo.nativeapp.playback.PlayerMediaFactory
@@ -46,7 +48,10 @@ class BackgroundAgentTaskGateway(private val context: Context) : AgentTaskGatewa
         val queue = snapshot.optJSONArray("queue")?.let { arr ->
             List(arr.length()) { arr.optJSONObject(it)?.toTrack() }.filterNotNull()
         } ?: emptyList()
-        val executor = BackgroundPlayerAgentExecutor(controllerProvider, PipoGraph.repository)
+        val executor = BackgroundPlayerAgentExecutor(
+            controllerProvider, PipoGraph.repository,
+            snapshot.takeIf { it.has("manualSelectionRevision") }?.optLong("manualSelectionRevision"),
+        )
         val history = runCatching { PipoGraph.petMemory.conversationContext() }.getOrNull()
         val input = AgentTurnInput(
             userText = task.userText,
@@ -91,6 +96,7 @@ private fun JSONObject.toTrack() = NativeTrack(optString("id"), optLong("netease
 private class BackgroundPlayerAgentExecutor(
     private val controllerProvider: suspend () -> MediaController,
     private val repository: app.pipo.nativeapp.data.PipoRepository,
+    private val expectedSelectionRevision: Long?,
 ) : AgentActionExecutor {
     private data class PlaybackSnapshot(
         val current: NativeTrack?,
@@ -170,7 +176,11 @@ private class BackgroundPlayerAgentExecutor(
         }
         val controller = controllerProvider()
         val result = withContext(Dispatchers.Main.immediate) {
+            if (!PlaybackSessionClock.isSelectionCurrent(expectedSelectionRevision)) return@withContext null
             BackgroundAgentContinuation.install(continuous, primaryGoal)
+            if (continuous != null) {
+                controller.repeatMode = if (continuous.startsAutomatically()) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+            }
             if (preserveCurrent && controller.currentMediaItem != null) {
                 val start = (controller.currentMediaItemIndex + 1).coerceIn(0, controller.mediaItemCount)
                 controller.replaceMediaItems(start, controller.mediaItemCount, playable.map { factory.toMediaItem(it) })
@@ -182,6 +192,7 @@ private class BackgroundPlayerAgentExecutor(
                 controller.playWhenReady to controller.snapshot()
             }
         }
+            ?: return selectionChanged(actionId, "play_queue")
         runCatching { PipoGraph.recommendationLog.logTracks(playable, RecommendationLog.Source.Pet) }
         return ok(
             actionId,
@@ -205,6 +216,7 @@ private class BackgroundPlayerAgentExecutor(
         }
         val controller = controllerProvider()
         val result = withContext(Dispatchers.Main.immediate) {
+            if (!PlaybackSessionClock.isSelectionCurrent(expectedSelectionRevision)) return@withContext null
             val insertIndex = (controller.currentMediaItemIndex + 1).coerceIn(0, controller.mediaItemCount)
             controller.addMediaItems(insertIndex, playable.map { factory.toMediaItem(it) })
             controller.prepare()
@@ -214,6 +226,7 @@ private class BackgroundPlayerAgentExecutor(
             }
             (jumpToInserted && controller.playWhenReady) to controller.snapshot()
         }
+            ?: return selectionChanged(actionId, "insert_next")
         runCatching { PipoGraph.recommendationLog.logTracks(playable, RecommendationLog.Source.Pet) }
         return ok(
             actionId,
@@ -225,6 +238,13 @@ private class BackgroundPlayerAgentExecutor(
             snapshot = result.second,
         )
     }
+
+    private fun selectionChanged(actionId: String, type: String) = ActionExecutionResult(
+        actionId, type, false,
+        "你已经手动选了歌曲，已保留当前播放；想听这次推荐可以重新告诉我。",
+        acceptedByPlayer = false,
+        errorMessage = "playback_selection_changed",
+    )
 
     override suspend fun skip(actionId: String): ActionExecutionResult {
         val controller = controllerProvider()

@@ -12,6 +12,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -38,7 +39,6 @@ import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.IconButton
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -358,51 +358,51 @@ internal fun PetCommandBar(
     val canSend = input.isNotBlank() && !pending && !voiceBusy
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
+    val composerShape = RoundedCornerShape(26.dp)
+    val composerSurface = Color(0xFF171A21)
+    val composerText = Color(0xFFF2F3F6)
+    val inputStyle = TextStyle(color = composerText, fontSize = 15.sp, lineHeight = 20.sp)
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(requestKeyboard) {
         if (requestKeyboard) {
             focusRequester.requestFocus()
             keyboard?.show()
         }
     }
 
-    Column {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp)) {
         voiceStatus?.let {
-            Text(it, color = palette.panelTextDim, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
+            Text(it, color = composerText.copy(alpha = 0.62f), fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
         }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp)
                 .heightIn(min = 52.dp)
-                .clip(RoundedCornerShape(PipoDimens.SurfaceCornerDp))
-                .background(palette.panel)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .clip(composerShape)
+                .background(composerSurface)
+                .border(1.dp, palette.accent.copy(alpha = 0.42f), composerShape)
+                .padding(4.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             IconButton(onClick = onVoice, enabled = !pending, modifier = Modifier.size(44.dp)) {
                 Icon(if (voiceBusy) Icons.Rounded.Stop else Icons.Rounded.Mic,
                     contentDescription = if (voiceBusy) "结束语音输入" else "语音输入",
-                    tint = if (voiceBusy) palette.accent else palette.panelText,
-                    modifier = Modifier.size(24.dp))
+                    tint = if (voiceBusy) palette.accent else composerText.copy(alpha = 0.76f),
+                    modifier = Modifier.size(21.dp))
             }
 
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .padding(vertical = 4.dp),
+                    .padding(horizontal = 4.dp),
                 contentAlignment = Alignment.CenterStart,
             ) {
                 BasicTextField(
                     value = input,
                     onValueChange = onInputChange,
                     singleLine = true,
-                    textStyle = LocalTextStyle.current.copy(
-                        color = palette.panelText,
-                        fontSize = 14.sp,
-                        letterSpacing = 0.15.sp,
-                    ),
+                    textStyle = inputStyle,
                     cursorBrush = SolidColor(palette.accent.copy(alpha = 0.85f)),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(
@@ -413,45 +413,41 @@ internal fun PetCommandBar(
                         .onFocusChanged { if (it.isFocused) onTextMode() }
                         .focusRequester(focusRequester),
                     decorationBox = { innerTextField ->
-                        if (input.isEmpty()) {
-                            Text(
-                                text = hintText,
-                                color = palette.panelTextDim,
-                                style = TextStyle(
-                                    fontSize = 14.sp,
-                                    letterSpacing = 0.15.sp,
-                                ),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                        Box(contentAlignment = Alignment.CenterStart) {
+                            if (input.isEmpty()) {
+                                Text(
+                                    text = hintText,
+                                    color = composerText.copy(alpha = 0.54f),
+                                    style = inputStyle,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            innerTextField()
                         }
-                        innerTextField()
                     },
                 )
             }
 
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(
-                        if (canSend) palette.accent.copy(alpha = 0.88f)
-                        else Color(0x14FFFFFF),
-                    )
-                    .clickable(
-                        enabled = canSend,
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = onSend,
-                    ),
-                contentAlignment = Alignment.Center,
+            IconButton(
+                onClick = onSend,
+                enabled = canSend,
+                modifier = Modifier.size(44.dp),
             ) {
-                Icon(
-                    Icons.Rounded.ArrowUpward,
-                    contentDescription = "发送",
-                    tint = if (canSend) palette.actionText else palette.panelTextDim,
-                    modifier = Modifier.size(18.dp),
-                )
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                        .background(if (canSend) palette.accent else Color(0x0FFFFFFF)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Rounded.ArrowUpward,
+                        contentDescription = "发送",
+                        tint = if (canSend) palette.actionText else composerText.copy(alpha = 0.38f),
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
         }
     }
@@ -669,6 +665,8 @@ internal fun ChatHistoryPanel(
 
 @Composable
 internal fun MessageBubbleItem(msg: PetMessage, palette: PetPalette) {
+    // 成功动作可以只交付结果卡；不为没有自然点评的结果补一个空的助手气泡。
+    if (msg.card == null && msg.text.isBlank()) return
     // 结果卡片消息(放歌/收藏/加歌单等)—— 左对齐,助手侧。
     msg.card?.let { card ->
         Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
@@ -742,74 +740,29 @@ internal fun ThinkingBubbleItem(palette: PetPalette) {
     }
 }
 
-/**
- * AI 全屏对话覆盖层：真实播放页仍在下面，只做轻量压暗和封面色环境光。
- * 播放页 blur 在 PipoNativeApp 统一处理，避免这里再铺一张封面把页面盖掉。
- */
+/** 底部向上展开的一次性彩光；真实页面的水面折射由播放页图层承担。 */
 @Composable
 internal fun AiChatBackdrop(
-    coverUrl: String?,
-    palette: PetPalette,
+    wakeProgress: androidx.compose.runtime.State<Float>,
+    wakeStrength: androidx.compose.runtime.State<Float>,
     intensity: Float,
     modifier: Modifier = Modifier,
-    listening: Boolean = false,
-    audioLevel: Float = 0f,
 ) {
-    if (intensity <= 0.002f) return
-    val k = intensity.coerceIn(0f, 1f)
-    val breath = rememberInfiniteTransition(label = "assistantGlow")
-    val drift by breath.animateFloat(0f, 1f, infiniteRepeatable(tween(3800, easing = androidx.compose.animation.core.FastOutSlowInEasing), RepeatMode.Reverse), label = "assistantDrift")
-    val voiceLevel by androidx.compose.animation.core.animateFloatAsState(if (listening) audioLevel else 0f, tween(140), label = "assistantVoiceLevel")
-    val hasCover = !coverUrl.isNullOrBlank()
+    val lightVisible by remember(wakeStrength) {
+        androidx.compose.runtime.derivedStateOf { wakeStrength.value > 0f }
+    }
+    if (intensity <= 0.002f && !lightVisible) return
     Box(modifier = modifier.fillMaxSize()) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val w = size.width
-            val h = size.height
-            val bloom = (0.20f + 0.04f * drift + 0.12f * voiceLevel) * k
-            drawRect(Brush.radialGradient(
-                listOf(palette.accent.copy(alpha = bloom), palette.accent.copy(alpha = bloom * 0.26f), Color.Transparent),
-                center = Offset(w * (0.24f + 0.12f * drift), h + w * 0.06f),
-                radius = w * (0.64f + 0.12f * k + 0.06f * voiceLevel)))
-            drawRect(Brush.radialGradient(
-                listOf(palette.accentTop.copy(alpha = bloom * 0.85f), Color.Transparent),
-                center = Offset(w * (0.80f - 0.10f * drift), h + w * 0.10f),
-                radius = w * (0.66f + 0.08f * k)))
+        Canvas(Modifier.fillMaxSize()) {
             drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(
-                        Color(0xFF05070B).copy(alpha = 0.12f * k),
-                        Color(0xFF05070B).copy(alpha = 0.22f * k),
-                        Color(0xFF05070B).copy(alpha = 0.38f * k),
-                    ),
-                    startY = 0f,
-                    endY = h,
+                Brush.verticalGradient(
+                    listOf(Color.Transparent, Color(0xFF05070B).copy(alpha = 0.38f)),
+                    startY = size.height * 0.38f, endY = size.height,
                 ),
-                size = size,
-            )
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        palette.accent.copy(alpha = (if (hasCover) 0.14f else 0.22f) * k),
-                        palette.accent.copy(alpha = (if (hasCover) 0.05f else 0.08f) * k),
-                        Color.Transparent,
-                    ),
-                    center = Offset(w * 0.48f, h * 0.76f),
-                    radius = maxOf(w, h) * 0.66f,
-                ),
-                size = size,
-            )
-            drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(
-                        palette.accentTop.copy(alpha = 0.06f * k),
-                        Color.Transparent,
-                    ),
-                    startY = 0f,
-                    endY = h * 0.28f,
-                ),
-                size = Size(w, h * 0.28f),
+                alpha = intensity.coerceIn(0f, 1f),
             )
         }
+        AssistantWakeLight(wakeProgress, wakeStrength)
     }
 }
 

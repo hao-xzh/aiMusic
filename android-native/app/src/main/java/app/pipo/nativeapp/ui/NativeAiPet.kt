@@ -3,6 +3,8 @@ package app.pipo.nativeapp.ui
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterExitState
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -37,9 +39,9 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import app.pipo.nativeapp.data.AiCaptionBus
@@ -86,8 +88,32 @@ private fun AgentUiCard.toPetResultCard(): PetResultCard =
         AgentUiCard.Kind.Error -> PetResultCard.Action(icon = PetActionIcon.Error, label = label, ok = false)
     }
 
+private fun MutableList<PetMessage>.addTaskCardIfMissing(
+    taskId: String,
+    conversationSequence: Long?,
+    createdAtMillis: Long,
+    cardIndex: Int,
+    card: AgentUiCard,
+) {
+    if (any { it.taskId == taskId && it.resultCardIndex == cardIndex && it.card != null }) return
+    add(
+        PetMessage(
+            fromUser = false,
+            text = "",
+            card = card.toPetResultCard(),
+            createdAtMillis = createdAtMillis,
+            taskId = taskId,
+            conversationSequence = conversationSequence,
+            resultCardIndex = cardIndex,
+        ),
+    )
+}
+
 @Composable
 fun NativeAiPet(
+    wakeProgress: androidx.compose.runtime.State<Float>,
+    wakeStrength: androidx.compose.runtime.State<Float>,
+    wakeConversationReady: androidx.compose.runtime.State<Boolean>,
     isPlaying: Boolean,
     currentTrack: app.pipo.nativeapp.data.NativeTrack?,
     currentQueue: List<app.pipo.nativeapp.data.NativeTrack>,
@@ -118,16 +144,23 @@ fun NativeAiPet(
     var focusInputOnOpen by remember { mutableStateOf(true) }
     // 最新一条助手回复（贴在底部输入条上方，6s 后自动消散）
     var latestReply by remember { mutableStateOf<String?>(null) }
+    var conversationHydrated by remember { mutableStateOf(false) }
     val emptyHint = remember { EMPTY_HINTS.random() }
 
     // 冷启动回填：把 PetMemory 里持久化的最近对话还原成气泡。hydrateOnce 幂等，进程存活期间
     // 反复进出播放页不会重复回填，也不会覆盖本会话已累积的卡片；只有进程被杀后才真正再跑一次。
     LaunchedEffect(Unit) {
-        val turns = withContext(Dispatchers.IO) {
-            runCatching { PipoGraph.petMemory.conversationContext().turns }.getOrDefault(emptyList())
+        val conversationContext = withContext(Dispatchers.IO) {
+            runCatching { PipoGraph.petMemory.conversationContext() }
+                .getOrDefault(app.pipo.nativeapp.data.PetMemory.ConversationContext())
         }
-        PetChatStore.hydrateOnce(turns)
+        val taskSequenceById = PipoGraph.agentTasks.store.tasks.value.associate { task ->
+            task.id to (task.conversationSequence.takeIf { it > 0L } ?: task.createdAt)
+        }
+        PetChatStore.hydrateOnce(conversationContext, taskSequenceById)
+        conversationHydrated = true
     }
+    val activeConversationEpoch = PetChatStore.conversationEpoch
 
     val currentQueueSignature = remember(currentQueue) {
         currentQueue.joinToString(separator = "|") { it.id }
@@ -140,7 +173,6 @@ fun NativeAiPet(
         if (text.isBlank() || pending) return
         input = ""
         PetBubbleState.lastUserContext = text
-        runCatching { PipoGraph.petMemory.recordUtterance(text) }
         pending = true
         val taskContext = JSONObject()
             .put("currentTrack", currentTrack?.let { JSONObject().put("id", it.id).put("neteaseId", it.neteaseId).put("title", it.title).put("artist", it.artist).put("album", it.album).put("streamUrl", if (it.neteaseId == null) it.streamUrl else "") })
@@ -149,42 +181,73 @@ fun NativeAiPet(
             .put("persona", settings.personaId)
             .toString()
         var submittedTaskId = ""
+        var submittedConversationEpoch = Long.MIN_VALUE
+        var submittedConversationSequence = 0L
         val submittedTask = PipoGraph.agentTasks.submit(text, contextJson = taskContext, onFinished = { result ->
             scope.launch {
+                if (!PetChatStore.isCurrentConversation(submittedConversationEpoch)) return@launch
                 result.fold(
                     onSuccess = { outcome ->
                         val replyIndex = messages.indexOfFirst { it.taskId == submittedTaskId && !it.fromUser && it.card == null }
-                        if (replyIndex >= 0) {
+                        if (outcome.reply.isNotBlank() && replyIndex >= 0) {
                             messages[replyIndex] = messages[replyIndex].copy(text = outcome.reply)
-                        } else {
-                            messages += PetMessage(fromUser = false, text = outcome.reply, taskId = submittedTaskId)
+                        } else if (outcome.reply.isNotBlank()) {
+                            messages += PetMessage(
+                                fromUser = false,
+                                text = outcome.reply,
+                                taskId = submittedTaskId,
+                                conversationSequence = (submittedConversationSequence.takeIf { it > 0L }
+                                    ?: PipoGraph.agentTasks.store.tasks.value.firstOrNull { it.id == submittedTaskId }?.createdAt),
+                            )
                         }
-                        outcome.cards.forEach { card -> messages += PetMessage(false, "", card.toPetResultCard(), taskId = submittedTaskId) }
-                        latestReply = outcome.reply
-                        AiCaptionBus.show(outcome.reply)
+                        val taskSnapshot = PipoGraph.agentTasks.store.tasks.value
+                            .firstOrNull { it.id == submittedTaskId }
+                        outcome.cards.forEachIndexed { cardIndex, card ->
+                            messages.addTaskCardIfMissing(
+                                taskId = submittedTaskId,
+                                conversationSequence = submittedConversationSequence.takeIf { it > 0L }
+                                    ?: taskSnapshot?.createdAt,
+                                createdAtMillis = taskSnapshot?.createdAt ?: System.currentTimeMillis(),
+                                cardIndex = cardIndex,
+                                card = card,
+                            )
+                        }
+                        PetChatStore.sortMessages()
+                        latestReply = outcome.reply.takeIf { it.isNotBlank() }
+                        outcome.reply.takeIf { it.isNotBlank() }?.let { reply -> AiCaptionBus.show(reply) }
                     },
                     onFailure = {
                         val reply = PipoGraph.agentTasks.store.tasks.value
                             .firstOrNull { it.id == submittedTaskId }?.resultReply
                             ?.takeIf { it.isNotBlank() } ?: "这次请求没能完成，请重试。"
                         if (messages.none { it.taskId == submittedTaskId && !it.fromUser && it.card == null }) {
-                            messages += PetMessage(fromUser = false, text = reply, taskId = submittedTaskId)
+                            messages += PetMessage(
+                                fromUser = false,
+                                text = reply,
+                                taskId = submittedTaskId,
+                                conversationSequence = (submittedConversationSequence.takeIf { it > 0L }
+                                    ?: PipoGraph.agentTasks.store.tasks.value.firstOrNull { it.id == submittedTaskId }?.createdAt),
+                            )
                         }
+                        PetChatStore.sortMessages()
                         latestReply = reply
                         AiCaptionBus.show(reply)
                     },
                 )
-                pending = false
             }
         })
         submittedTaskId = submittedTask.id
+        submittedConversationEpoch = submittedTask.conversationEpoch
+        submittedConversationSequence = submittedTask.conversationSequence
         if (messages.none { it.taskId == submittedTask.id && it.fromUser && it.card == null }) {
             messages += PetMessage(
                 fromUser = true,
                 text = text,
                 createdAtMillis = submittedTask.createdAt,
                 taskId = submittedTask.id,
+                conversationSequence = submittedTask.conversationSequence.takeIf { it > 0L } ?: submittedTask.createdAt,
             )
+            PetChatStore.sortMessages()
         }
     }
 
@@ -229,10 +292,19 @@ fun NativeAiPet(
         }
     }
     // Observe durable task state so leaving/re-entering the player does not cancel the visual state.
-    LaunchedEffect(Unit) {
+    LaunchedEffect(conversationHydrated, activeConversationEpoch) {
+        if (!conversationHydrated) return@LaunchedEffect
         PipoGraph.agentTasks.store.tasks.collect { tasks ->
-            pending = tasks.any { it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.QUEUED || it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.RUNNING }
-            tasks.takeLast(3)
+            val currentConversationTasks = tasks
+                .filter { PetChatStore.isCurrentConversation(it.conversationEpoch) }
+                .sortedWith(compareBy<AgentTask> { it.conversationSequence }.thenBy { it.createdAt })
+            pending = currentConversationTasks.any {
+                it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.QUEUED ||
+                    it.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.RUNNING
+            }
+            // 仍只用队列末三组补上进程死亡时尚未来得及写入 PetMemory 的显示；
+            // 对话持久历史本身由上面的 hydrateOnce 负责，避免把完整任务队列当作历史来源。
+            currentConversationTasks.takeLast(3)
                 .forEach { task ->
                     val hasUser = messages.any {
                         it.taskId == task.id && it.fromUser && it.card == null
@@ -243,6 +315,7 @@ fun NativeAiPet(
                             text = task.userText,
                             createdAtMillis = task.createdAt,
                             taskId = task.id,
+                            conversationSequence = task.conversationSequence.takeIf { it > 0L } ?: task.createdAt,
                         )
                     }
                     val completed =
@@ -251,21 +324,41 @@ fun NativeAiPet(
                     val replyIndex = messages.indexOfFirst {
                         it.taskId == task.id && !it.fromUser && it.card == null
                     }
-                    val hasReply = replyIndex >= 0 || messages.any {
-                        !it.fromUser && it.taskId == null && it.text == task.resultReply
-                    }
+                    val hasReply = replyIndex >= 0
                     if (completed && task.resultReply.isNotBlank()) {
                         if (replyIndex >= 0 && messages[replyIndex].text != task.resultReply) {
                             messages[replyIndex] = messages[replyIndex].copy(text = task.resultReply)
                         } else if (!hasReply) {
-                            messages += PetMessage(fromUser = false, text = task.resultReply, taskId = task.id)
+                            messages += PetMessage(
+                                fromUser = false,
+                                text = task.resultReply,
+                                createdAtMillis = task.createdAt,
+                                taskId = task.id,
+                                conversationSequence = task.conversationSequence.takeIf { it > 0L } ?: task.createdAt,
+                            )
                         }
                     }
                 }
+            // 已还原的历史请求也需要结果卡，避免静默成功在重启后只剩用户指令。
+            currentConversationTasks.filter { task ->
+                task.status == app.pipo.nativeapp.data.agent.task.AgentTaskStatus.SUCCEEDED &&
+                    messages.any { it.taskId == task.id && it.fromUser }
+            }.forEach { task ->
+                task.resultCards.forEachIndexed { cardIndex, card ->
+                    messages.addTaskCardIfMissing(
+                        taskId = task.id,
+                        conversationSequence = task.conversationSequence.takeIf { it > 0L } ?: task.createdAt,
+                        createdAtMillis = task.createdAt,
+                        cardIndex = cardIndex,
+                        card = card,
+                    )
+                }
+            }
+            PetChatStore.sortMessages()
         }
     }
 
-    // open 变化镜像到共享状态 —— PipoNativeApp 读它给播放界面做唤起虚化(背景模糊)。
+    // open 镜像到共享状态，驱动播放页折射和彩光共用的入场时钟。
     LaunchedEffect(open) { AiPetCommandBus.isOpen.value = open }
     DisposableEffect(Unit) { onDispose { AiPetCommandBus.isOpen.value = false } }
 
@@ -285,12 +378,6 @@ fun NativeAiPet(
     // 封面采样色统一驱动宠物、输入条和回复气泡，避免常驻球体在播放页里突兀。
     val coverEdges = useCoverEdgeColors(coverUrl)
     val petPalette = rememberPetPalette(coverEdges)
-    val glowColor by androidx.compose.animation.animateColorAsState(
-        targetValue = lyricAccent(coverEdges.accent ?: coverEdges.ambient ?: coverEdges.seam)
-            .takeIf { it != Color.Transparent } ?: Color(0xFFE7EBEF),
-        animationSpec = tween(PipoMotion.CoverFadeMs),
-        label = "assistantCoverGlow",
-    )
     val latestCurrentTrack = rememberUpdatedState(currentTrack)
     val latestCurrentQueue = rememberUpdatedState(currentQueue)
     val agentRuntime = remember(repository, context) {
@@ -317,6 +404,8 @@ fun NativeAiPet(
                     onApplyAgentQueueRequest = onApplyAgentQueueRequest,
                     onSkip = onSkipFromAgent,
                     taskId = task.id,
+                    expectedSelectionRevision = JSONObject(task.contextJson.ifBlank { "{}" })
+                        .takeIf { it.has("manualSelectionRevision") }?.optLong("manualSelectionRevision"),
                 )
                 return agentRuntime.handle(
                     input = AgentTurnInput(
@@ -516,6 +605,10 @@ fun NativeAiPet(
 
     val density = androidx.compose.ui.platform.LocalDensity.current
     val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    // 手势导航隐藏时仍留出圆角屏安全距离；键盘/导航栏 inset 由下方布局另行处理。
+    val commandBarBottomGap = 24.dp
+    var commandBarHeight by remember { mutableStateOf(52.dp) }
+    val conversationBottomPadding = commandBarHeight + commandBarBottomGap + 12.dp
     val petSizePx = with(density) { 36.dp.toPx() }
     val freePadEndPx = with(density) { 18.dp.toPx() }
     val freePadBottomPx = with(density) { 96.dp.toPx() }
@@ -554,32 +647,22 @@ fun NativeAiPet(
         open = false
     }
 
-    var conversationReady by remember { mutableStateOf(false) }
-    LaunchedEffect(open) {
-        conversationReady = false
-        if (open) {
-            delay(320)
-            conversationReady = true
-        }
-    }
-    val conversationVisible = open && conversationReady
+    val conversationVisible = open && wakeConversationReady.value
 
-    // 光效先入场，再挂载对话和输入框，避免键盘抢先弹出。
+    // 对话与输入框由共享动效时钟放行，避免键盘在彩光展开前抢先弹出。
     val backdropIntensity by androidx.compose.animation.core.animateFloatAsState(
         targetValue = if (open) 1f else 0f,
-        animationSpec = tween(if (open) 480 else 240, easing = androidx.compose.animation.core.CubicBezierEasing(0.16f, 1f, 0.3f, 1f)),
+        animationSpec = tween(if (open) 480 else 900, easing = androidx.compose.animation.core.CubicBezierEasing(0.16f, 1f, 0.3f, 1f)),
         label = "aiBackdrop",
     )
 
     Box(modifier = modifier) {
-        // 像系统助手一样盖在播放页上：只轻压暗 + 封面色环境光，播放器本身仍然可见。
+        // 底部彩光独立绘制，输入框的 IME padding 不参与光效布局。
         // intensity≤0 时内部直接 return,关闭态零开销。
         AiChatBackdrop(
-            coverUrl = coverUrl,
-            palette = petPalette.copy(accent = glowColor, accentTop = glowColor),
+            wakeProgress = wakeProgress,
+            wakeStrength = wakeStrength,
             intensity = backdropIntensity,
-            listening = voice.listening,
-            audioLevel = voice.level,
         )
 
         // ---- 透明点击捕获层：panel 打开时点空白处 = 收起 ----
@@ -627,12 +710,8 @@ fun NativeAiPet(
         // ---- 历史对话面板 ----
         AnimatedVisibility(
             visible = conversationVisible && (messages.isNotEmpty() || pending),
-            // 不再是"从下往上的抽屉"——内容随光晕**就地浮现**(淡入 + 从底部 orb 处轻微放大),glow 略先一步。
-            enter = fadeIn(tween(300)) + scaleIn(
-                animationSpec = tween(360, easing = PipoMotion.FlipEase),
-                initialScale = 0.94f,
-                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 1f),
-            ),
+            // 对话、建议和输入条同时缓慢淡入，与唤起光效的渐隐交叠。
+            enter = fadeIn(tween(AssistantConversationFadeMillis, easing = LinearEasing)),
             exit = fadeOut(tween(150)) + scaleOut(
                 animationSpec = tween(150),
                 targetScale = 0.96f,
@@ -645,8 +724,8 @@ fun NativeAiPet(
                 // 而露出背后的播放页。
                 .statusBarsPadding()
                 .padding(horizontal = 14.dp)
-                // 输入条高 ~52dp + nav bar inset + 间距 8dp
-                .padding(bottom = if (voice.status != null) 98.dp else 70.dp)
+                // 随输入条和语音状态的实际高度留位，最后一条消息不压到输入框。
+                .padding(bottom = conversationBottomPadding)
                 .imePadding()
                 .navigationBarsPadding(),
         ) {
@@ -664,11 +743,11 @@ fun NativeAiPet(
         // ---- 空态建议 chips：贴命令条上方，点了填进输入框 ----
         AnimatedVisibility(
             visible = conversationVisible && messages.isEmpty() && !pending,
-            enter = fadeIn(tween(240)),
+            enter = fadeIn(tween(AssistantConversationFadeMillis, easing = LinearEasing)),
             exit = fadeOut(tween(140)),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = if (voice.status != null) 98.dp else 70.dp)
+                .padding(bottom = conversationBottomPadding)
                 .imePadding()
                 .navigationBarsPadding(),
         ) {
@@ -685,10 +764,7 @@ fun NativeAiPet(
         //    会让系统介入做 pan，pan 复位时偶发留下封面 stale frame）
         AnimatedVisibility(
             visible = conversationVisible,
-            enter = slideInVertically(
-                animationSpec = tween(durationMillis = 300, easing = PipoMotion.FlipEase),
-                initialOffsetY = { fullHeight -> fullHeight / 2 },
-            ) + fadeIn(tween(220)),
+            enter = fadeIn(tween(AssistantConversationFadeMillis, easing = LinearEasing)),
             exit = slideOutVertically(
                 animationSpec = tween(durationMillis = 220, easing = PipoMotion.CloseEase),
                 targetOffsetY = { fullHeight -> fullHeight },
@@ -696,14 +772,19 @@ fun NativeAiPet(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .imePadding()
-                .navigationBarsPadding(),
+                .navigationBarsPadding()
+                .padding(bottom = commandBarBottomGap)
+                .onSizeChanged { commandBarHeight = with(density) { it.height.toDp() } },
         ) {
             PetCommandBar(
                 palette = petPalette,
                 input = input,
                 pending = pending,
                 hintText = if (messages.isEmpty()) emptyHint else "说点什么…",
-                requestKeyboard = focusInputOnOpen,
+                // 输入条实际淡入完成后再弹键盘，避免键盘抢先挤动整张对话页面。
+                requestKeyboard = focusInputOnOpen && conversationVisible &&
+                    transition.currentState == EnterExitState.Visible &&
+                    transition.targetState == EnterExitState.Visible,
                 onInputChange = { voice.cancel(); input = it },
                 onSend = { voice.cancel(); submitMessage(input.trim()) },
                 voiceBusy = voice.listening || voice.processing,

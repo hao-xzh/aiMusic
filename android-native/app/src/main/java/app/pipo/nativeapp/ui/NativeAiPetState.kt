@@ -2,7 +2,10 @@ package app.pipo.nativeapp.ui
 
 import android.content.Context
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.runtime.setValue
 import app.pipo.nativeapp.data.PetMemory
 import java.time.LocalDate
 
@@ -14,6 +17,10 @@ internal data class PetMessage(
     val createdAtMillis: Long = System.currentTimeMillis(),
     /** Durable agent task id, used to make foreground callback + task observer delivery idempotent. */
     val taskId: String? = null,
+    /** Durable submission order shared by the user turn, reply and result cards. */
+    val conversationSequence: Long? = null,
+    /** Order among result cards produced by the same durable task. */
+    val resultCardIndex: Int? = null,
 )
 
 /**
@@ -68,16 +75,25 @@ internal object PetChatStore {
     @Volatile
     private var hydrated = false
 
+    /** Changes on persistent clear, so an already-running observer stops exposing old tasks. */
+    var conversationEpoch by mutableStateOf(0L)
+        private set
+
     /**
      * 冷启动只回填一次：把 PetMemory 持久化的最近对话轮次还原成文字气泡。
      * 进程存活期间反复进入播放页不会重复回填（幂等），所以不会覆盖本会话已累积的卡片。
-     * 卡片（放歌 / 收藏结果）不入 PetMemory，跨重启不还原；更早的轮次只在摘要里，也不重建。
+     * 卡片不入 PetMemory，由任务状态观察器恢复；更早的轮次只在摘要里，也不重建。
      */
     @Synchronized
-    fun hydrateOnce(turns: List<PetMemory.ConversationTurn>) {
+    fun hydrateOnce(
+        context: PetMemory.ConversationContext,
+        taskSequenceById: Map<String, Long> = emptyMap(),
+    ) {
         if (hydrated) return
+        if (context.conversationEpoch < conversationEpoch) return
         hydrated = true
-        for (t in turns) {
+        conversationEpoch = context.conversationEpoch
+        for (t in context.turns) {
             if (t.text.isBlank()) continue
             val fromUser = t.role == PetMemory.ROLE_USER
             val alreadyPresent = if (t.taskId.isNotBlank()) {
@@ -92,18 +108,45 @@ internal object PetChatStore {
                         text = t.text,
                         createdAtMillis = t.tsSec * 1000L,
                         taskId = t.taskId.ifBlank { null },
+                        conversationSequence = t.taskSequence.takeIf { it > 0L }
+                            ?: taskSequenceById[t.taskId]?.takeIf { it > 0L },
                     ),
                 )
             }
         }
-        messages.sortBy { it.createdAtMillis }
+        sortMessages()
     }
 
-    /** 清空对话流（配合 PetMemory.clearConversation()）。清空后标记已水合，避免又被回填。 */
+    /** 清空对话流（配合 PetMemory.clearConversation()）并切到下一持久会话。 */
     @Synchronized
-    fun clear() {
+    fun clear(nextConversationEpoch: Long) {
+        if (nextConversationEpoch < conversationEpoch) return
         messages.clear()
+        conversationEpoch = nextConversationEpoch
         hydrated = true
+    }
+
+    fun isCurrentConversation(taskConversationEpoch: Long): Boolean = taskConversationEpoch == conversationEpoch
+
+    @Synchronized
+    fun sortMessages() {
+        messages.sortWith { left, right ->
+            val leftSequence = left.conversationSequence ?: left.createdAtMillis
+            val rightSequence = right.conversationSequence ?: right.createdAtMillis
+            val sequenceComparison = leftSequence.compareTo(rightSequence)
+            if (sequenceComparison != 0) return@sortWith sequenceComparison
+            val partComparison = messagePart(left).compareTo(messagePart(right))
+            if (partComparison != 0) return@sortWith partComparison
+            val cardComparison = (left.resultCardIndex ?: 0).compareTo(right.resultCardIndex ?: 0)
+            if (cardComparison != 0) return@sortWith cardComparison
+            left.createdAtMillis.compareTo(right.createdAtMillis)
+        }
+    }
+
+    private fun messagePart(message: PetMessage): Int = when {
+        message.fromUser -> 0
+        message.card == null -> 1
+        else -> 2
     }
 
     @Synchronized

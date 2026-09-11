@@ -62,8 +62,13 @@ object MusicSemanticSignals {
         var tempo = "any"
 
         fun mentioned(vararg words: String): Boolean = words.any { it in key }
+        val styleText = text.lowercase().replace(Regex("\\s+"), "")
+        val excludedStyleItem = "(?:演唱会版|现场版|演唱会|现场|live|concert|嘻哈|说唱|hip-hop|hiphop|rap|电子|电音|edm|dance|house|摇滚|rock|民谣|folk|爵士|jazz)"
         fun negatedStyle(vararg words: String): Boolean = words.any { word ->
-            Regex("(?:不要|别|不想听|不听)${Regex.escape(word)}").containsMatchIn(key)
+            // A shared negation covers the whole list: “不要现场版和说唱”.
+            // Only consume music-style items and conjunctions, not a later positive request.
+            Regex("(?:不要|别|不想听|不听|避开|排除)(?:听|播放|放)?(?:${excludedStyleItem}(?:以及|和|及|与|或|、))*${Regex.escape(word)}")
+                .containsMatchIn(styleText)
         }
         fun addSeeds(vararg values: String) { values.filterTo(seeds) { it.isNotBlank() } }
 
@@ -157,8 +162,9 @@ object MusicSemanticSignals {
         if (mentioned("男声", "男生唱", "男歌手")) vocalTypes += "male"
         if (mentioned("纯音乐", "无人声", "instrumental")) vocalTypes += "instrumental"
 
-        if (mentioned("不要说唱", "别说唱", "不想听说唱")) { avoidTags += "rap-heavy"; avoidStyles += "hip-hop" }
-        if (mentioned("不要电音", "别电音", "不想听电音")) { avoidTags += "party"; avoidStyles += "electronic" }
+        if (negatedStyle("嘻哈", "说唱", "rap", "hiphop", "hip-hop")) { avoidTags += "rap-heavy"; avoidStyles += "hip-hop" }
+        if (negatedStyle("电子", "电音", "edm", "dance", "house")) { avoidTags += "party"; avoidStyles += "electronic" }
+        if (negatedStyle("现场", "现场版", "演唱会", "live", "concert")) avoidTags += "live"
         if (mentioned("别太吵", "不要太吵", "不吵")) { avoidTags += listOf("noisy", "aggressive"); avoidStyles += listOf("aggressive", "noisy") }
 
         val wantsCurrentStyle = mentioned(

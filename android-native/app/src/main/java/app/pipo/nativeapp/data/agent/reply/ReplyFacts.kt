@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.data.agent.reply
 
 import app.pipo.nativeapp.data.PetPersona
+import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
 import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
@@ -16,6 +17,8 @@ data class ReplyFacts(
     val firstTrackTitle: String = "",
     val firstTrackArtist: String = "",
     val queueCount: Int = 0,
+    val changedTrackCount: Int = 0,
+    val changedTracks: List<NativeTrack> = emptyList(),
     val requiredArtist: String = "",
     val artistScope: String = "",
     val includedTitles: List<String> = emptyList(),
@@ -29,10 +32,12 @@ data class ReplyFacts(
     val playlistName: String = "",
     val acceptedByPlayer: Boolean = false,
     val actuallyStarted: Boolean = false,
+    val preservedCurrent: Boolean = false,
     val validationPassed: Boolean = true,
     val warnings: List<String> = emptyList(),
     val errorMessage: String = "",
     val resultMessage: String = "",
+    val successShownByCard: Boolean = false,
 )
 
 object ReplyFactsBuilder {
@@ -47,7 +52,20 @@ object ReplyFactsBuilder {
         val firstResult = results.firstOrNull()
         val failed = results.firstOrNull { !it.success }
         val queue = firstResult?.queueSnapshot?.takeIf { it.isNotEmpty() } ?: firstResult?.tracks.orEmpty()
-        val firstTrack = queue.firstOrNull()
+        val actionType = when {
+            firstResult != null -> firstResult.type
+            primaryPlay?.mode == PlayMode.InsertNext -> "insert_next"
+            primaryPlay?.mode == PlayMode.PlayNow -> "play_now"
+            primaryPlay?.mode == PlayMode.ReplaceQueue -> "replace_queue"
+            else -> plan.actions.firstOrNull()?.javaClass?.simpleName.orEmpty()
+        }
+        // `queueSnapshot` 是操作后的完整播放队列；插播时它也包含此前就在队列里的歌。
+        // 本次真正写入/播放的曲目以 action result 的 tracks 为准，不能拿完整队列冒充插入数量。
+        val changedTracks = firstResult?.tracks.orEmpty().ifEmpty {
+            firstResult?.insertedTrack?.let(::listOf).orEmpty()
+        }
+        val responseTracks = if (actionType == "insert_next") changedTracks else queue.ifEmpty { changedTracks }
+        val firstTrack = responseTracks.firstOrNull()
         val summary = firstResult?.committedQueueSummary
         val requiredArtist = primaryGoal?.primaryArtists
             ?.filter { it.isNotBlank() }
@@ -56,13 +74,6 @@ object ReplyFactsBuilder {
             ?: CommandTextSignals.primaryArtistHints(plan.userText).joinToString("、")
         val artistScope = primaryGoal?.artistScope?.name
             ?: CommandTextSignals.artistScope(plan.userText).name
-        val actionType = when {
-            firstResult != null -> firstResult.type
-            primaryPlay?.mode == PlayMode.InsertNext -> "insert_next"
-            primaryPlay?.mode == PlayMode.PlayNow -> "play_now"
-            primaryPlay?.mode == PlayMode.ReplaceQueue -> "replace_queue"
-            else -> plan.actions.firstOrNull()?.javaClass?.simpleName.orEmpty()
-        }
         val warnings = (validation.messages + results.flatMap { it.warnings }).distinct()
         val validationPassed = validation.passed && (summary?.validationPassed ?: true)
         return ReplyFacts(
@@ -73,9 +84,11 @@ object ReplyFactsBuilder {
             firstTrackTitle = firstTrack?.title.orEmpty(),
             firstTrackArtist = firstTrack?.artist.orEmpty(),
             queueCount = queue.size,
+            changedTrackCount = changedTracks.size,
+            changedTracks = changedTracks,
             requiredArtist = requiredArtist,
             artistScope = artistScope,
-            includedTitles = queue.map { it.title }.filter { it.isNotBlank() },
+            includedTitles = (queue + changedTracks).map { it.title }.filter { it.isNotBlank() }.distinct(),
             closerTitle = primaryGoal?.closer?.title.orEmpty().takeIf { validation.closerSatisfied }.orEmpty(),
             reorderedForSeamless = summary?.reordered == true,
             mixMode = summary?.mixMode.orEmpty(),
@@ -86,6 +99,7 @@ object ReplyFactsBuilder {
             playlistName = firstResult?.playlistName.orEmpty(),
             acceptedByPlayer = results.any { it.acceptedByPlayer },
             actuallyStarted = results.any { it.actuallyStarted },
+            preservedCurrent = primaryPlay?.preserveCurrent == true,
             validationPassed = validationPassed,
             warnings = warnings,
             errorMessage = failed?.errorMessage ?: failed?.message.orEmpty(),

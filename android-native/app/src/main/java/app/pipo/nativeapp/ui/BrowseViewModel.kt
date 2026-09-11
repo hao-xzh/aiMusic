@@ -37,6 +37,7 @@ internal class BrowseViewModel : ViewModel() {
         private set
     var dismissedTrack by mutableStateOf<NativeTrack?>(null)
         private set
+    private var dismissedIndex = 0
     var homeLoading by mutableStateOf(true)
         private set
     var homeError by mutableStateOf<String?>(null)
@@ -126,13 +127,13 @@ internal class BrowseViewModel : ViewModel() {
                     PipoGraph.homeRecommendationStore.save(owner, homeSnapshot())
                     // Refresh collection membership before allocating saved/new slots.
                     PipoGraph.repository.refreshPlaylistsForBrowse()
-                    PipoGraph.library.invalidate()
                     val feed = PipoGraph.recommendEngine.homeFeed(
                         excludeIds = recommendations.mapNotNull { it.neteaseId }.toSet(), wantCount = 24,
                         excludeSongKeys = recommendations.mapTo(HashSet()) { TrackDedupe.songKey(it) },
                     )
                     if (feed.tracks.isNotEmpty()) {
                         recommendations = feed.tracks
+                        dismissedTrack = null
                         recommendationReasons = feed.reasons
                         describeCurrentBatch()
                     }
@@ -207,8 +208,11 @@ internal class BrowseViewModel : ViewModel() {
     }
 
     fun dismissRecommendation(track: NativeTrack) {
+        val index = recommendations.indexOfFirst { it.id == track.id }
+        if (index < 0) return
         PipoGraph.recommendationFeedbackLog.reject(track, "home_not_interested")
         dismissedTrack = track
+        dismissedIndex = index
         recommendations = recommendations.filterNot { it.id == track.id }
         describeCurrentBatch()
         persistHome()
@@ -217,7 +221,11 @@ internal class BrowseViewModel : ViewModel() {
     fun undoDismissal() {
         dismissedTrack?.let { track ->
             PipoGraph.recommendationFeedbackLog.restoreHomeDismissal(track)
-            recommendations = (recommendations + track).distinctBy { it.id }
+            if (recommendations.none { it.id == track.id }) {
+                recommendations = recommendations.toMutableList().apply {
+                    add(dismissedIndex.coerceIn(0, size), track)
+                }
+            }
         }
         dismissedTrack = null
         describeCurrentBatch()
@@ -271,7 +279,7 @@ internal class BrowseViewModel : ViewModel() {
             searchError = null
             try { results = PipoGraph.repository.searchTracks(keyword, limit = 100) }
             catch (e: CancellationException) { throw e }
-            catch (e: Exception) { searchError = e.message ?: "搜索失败，请重试" }
+            catch (e: Exception) { searchError = "暂时无法搜索，请检查网络后重试" }
             finally { searchLoading = false }
         }
     }

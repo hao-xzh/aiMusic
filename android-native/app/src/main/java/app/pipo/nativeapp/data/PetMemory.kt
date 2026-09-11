@@ -34,6 +34,7 @@ class PetMemory(context: Context) {
         var lastSeenAt: Long,
         var userFacts: String,
         var conversationSummary: String,
+        var conversationEpoch: Long,
     )
 
     data class Utterance(val tsSec: Long, val text: String)
@@ -42,6 +43,8 @@ class PetMemory(context: Context) {
         val text: String,
         val tsSec: Long,
         val taskId: String = "",
+        /** Same task sequence is shared by its request and reply, so they recover as one pair. */
+        val taskSequence: Long = 0L,
     )
     data class MusicReference(
         val title: String,
@@ -53,6 +56,7 @@ class PetMemory(context: Context) {
         val summary: String = "",
         val turns: List<ConversationTurn> = emptyList(),
         val musicReferences: List<MusicReference> = emptyList(),
+        val conversationEpoch: Long = 0L,
     )
 
     @Volatile
@@ -86,6 +90,7 @@ class PetMemory(context: Context) {
                                 text = text,
                                 tsSec = o.optLong("ts"),
                                 taskId = o.optString("taskId"),
+                                taskSequence = o.optLong("taskSequence"),
                             ),
                         )
                     }
@@ -113,6 +118,7 @@ class PetMemory(context: Context) {
                 lastSeenAt = parsed.optLong("lastSeenAt"),
                 userFacts = parsed.optString("userFacts"),
                 conversationSummary = parsed.optString("conversationSummary").take(MAX_SUMMARY_CHARS),
+                conversationEpoch = parsed.optLong("conversationEpoch"),
             )
         } else {
             val now = System.currentTimeMillis() / 1000
@@ -125,13 +131,14 @@ class PetMemory(context: Context) {
                 lastSeenAt = now,
                 userFacts = "",
                 conversationSummary = "",
+                conversationEpoch = 0L,
             )
         }
         return memo!!
     }
 
     @Synchronized
-    private fun save() {
+    private fun save(durable: Boolean = false) {
         val m = memo ?: return
         val arr = JSONArray()
         m.utterances.forEach {
@@ -144,6 +151,7 @@ class PetMemory(context: Context) {
                 put("text", it.text)
                 put("ts", it.tsSec)
                 if (it.taskId.isNotBlank()) put("taskId", it.taskId)
+                if (it.taskSequence > 0L) put("taskSequence", it.taskSequence)
             })
         }
         val refArr = JSONArray()
@@ -164,8 +172,10 @@ class PetMemory(context: Context) {
             put("lastSeenAt", m.lastSeenAt)
             put("userFacts", m.userFacts)
             put("conversationSummary", m.conversationSummary)
+            put("conversationEpoch", m.conversationEpoch)
         }
-        prefs.edit().putString(KEY, obj.toString()).apply()
+        val editor = prefs.edit().putString(KEY, obj.toString())
+        if (durable) editor.commit() else editor.apply()
     }
 
     /**
@@ -173,22 +183,28 @@ class PetMemory(context: Context) {
      * 主线程从 onSend 调用时不会被 SharedPrefs 写阻塞（之前在 30 条 utterance 时能 ~50ms）。
      * 自动过滤无意义短句。
      */
-    fun recordUtterance(text: String) {
+    fun recordUtterance(text: String, conversationEpoch: Long? = null) {
         val trimmed = text.trim()
         if (trimmed.length <= 2) return
         if (Regex("^(嗯|哦|好|谢谢|你好|您好|早|晚安|hi|hello|thanks|thx)$", RegexOption.IGNORE_CASE).matches(trimmed)) return
 
         ioScope.launch {
-            val m = load()
-            val now = System.currentTimeMillis() / 1000
-            m.utterances.add(Utterance(now, trimmed.take(80)))
-            val cutoff = now - UTTERANCE_TTL_DAYS * 86400L
-            val filtered = m.utterances.filter { it.tsSec >= cutoff }.takeLast(MAX_UTTERANCES)
-            m.utterances.clear()
-            m.utterances.addAll(filtered)
-            m.lastSeenAt = now
-            save()
+            recordUtteranceBlocking(trimmed, conversationEpoch)
         }
+    }
+
+    @Synchronized
+    private fun recordUtteranceBlocking(text: String, conversationEpoch: Long?) {
+        val m = load()
+        if (conversationEpoch != null && m.conversationEpoch != conversationEpoch) return
+        val now = System.currentTimeMillis() / 1000
+        m.utterances.add(Utterance(now, text.take(80)))
+        val cutoff = now - UTTERANCE_TTL_DAYS * 86400L
+        val filtered = m.utterances.filter { it.tsSec >= cutoff }.takeLast(MAX_UTTERANCES)
+        m.utterances.clear()
+        m.utterances.addAll(filtered)
+        m.lastSeenAt = now
+        save()
     }
 
     /** 最后一句有意义的话 + 上次时间标签 */
@@ -200,21 +216,37 @@ class PetMemory(context: Context) {
             summary = m.conversationSummary,
             turns = m.conversation.toList(),
             musicReferences = m.musicReferences.toList(),
+            conversationEpoch = m.conversationEpoch,
         )
     }
 
-    suspend fun recordConversationTurn(role: String, text: String, taskId: String = "") {
+    fun conversationEpoch(): Long = load().conversationEpoch
+
+    suspend fun recordConversationTurn(
+        role: String,
+        text: String,
+        taskId: String = "",
+        taskSequence: Long = 0L,
+        conversationEpoch: Long? = null,
+    ) {
         withContext(Dispatchers.IO) {
-            recordConversationTurnBlocking(role, text, taskId)
+            recordConversationTurnBlocking(role, text, taskId, taskSequence, conversationEpoch)
         }
     }
 
     @Synchronized
-    private fun recordConversationTurnBlocking(role: String, text: String, taskId: String) {
+    private fun recordConversationTurnBlocking(
+        role: String,
+        text: String,
+        taskId: String,
+        taskSequence: Long,
+        conversationEpoch: Long?,
+    ) {
         val normalizedRole = normalizeRole(role) ?: return
         val cleaned = cleanConversationText(text)
         if (cleaned.isBlank()) return
         val m = load()
+        if (conversationEpoch != null && m.conversationEpoch != conversationEpoch) return
         val normalizedTaskId = taskId.trim()
         if (
             normalizedTaskId.isNotBlank() &&
@@ -229,6 +261,7 @@ class PetMemory(context: Context) {
                 text = cleaned,
                 tsSec = now,
                 taskId = normalizedTaskId,
+                taskSequence = taskSequence.coerceAtLeast(0L),
             ),
         )
         trimConversation(m)
@@ -236,20 +269,21 @@ class PetMemory(context: Context) {
         save()
     }
 
-    suspend fun recordMusicReferences(references: List<MusicReference>) {
+    suspend fun recordMusicReferences(references: List<MusicReference>, conversationEpoch: Long? = null) {
         if (references.isEmpty()) return
         withContext(Dispatchers.IO) {
-            recordMusicReferencesBlocking(references)
+            recordMusicReferencesBlocking(references, conversationEpoch)
         }
     }
 
     @Synchronized
-    private fun recordMusicReferencesBlocking(references: List<MusicReference>) {
+    private fun recordMusicReferencesBlocking(references: List<MusicReference>, conversationEpoch: Long?) {
         val cleaned = references.mapNotNull {
             cleanMusicReference(it.title, it.artist, it.reason, it.tsSec)
         }
         if (cleaned.isEmpty()) return
         val m = load()
+        if (conversationEpoch != null && m.conversationEpoch != conversationEpoch) return
         val now = System.currentTimeMillis() / 1000
         val byKey = LinkedHashMap<String, MusicReference>()
         for (old in m.musicReferences) {
@@ -285,7 +319,7 @@ class PetMemory(context: Context) {
 
     fun clear() {
         val now = System.currentTimeMillis() / 1000
-        memo = Memory(VERSION, mutableListOf(), mutableListOf(), mutableListOf(), now, now, "", "")
+        memo = Memory(VERSION, mutableListOf(), mutableListOf(), mutableListOf(), now, now, "", "", 0L)
         save()
     }
 
@@ -295,14 +329,16 @@ class PetMemory(context: Context) {
      * 供设置页「清空 AI 对话记忆」调用，与 PetChatStore.clear() 一起把界面与底层都归零。
      */
     @Synchronized
-    fun clearConversation() {
+    fun clearConversation(): Long {
         val m = load()
         m.conversation.clear()
         m.musicReferences.clear()
         m.utterances.clear()
         m.conversationSummary = ""
+        m.conversationEpoch += 1L
         m.lastSeenAt = System.currentTimeMillis() / 1000
-        save()
+        save(durable = true)
+        return m.conversationEpoch
     }
 
     /**

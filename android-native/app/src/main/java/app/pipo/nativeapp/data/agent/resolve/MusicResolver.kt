@@ -16,9 +16,11 @@ import app.pipo.nativeapp.data.RecommendationFeedbackLog
 import app.pipo.nativeapp.data.TrackDedupe
 import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
 import app.pipo.nativeapp.data.agent.domain.ArtistScope
+import app.pipo.nativeapp.data.agent.domain.ContinuationMode
 import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
 import app.pipo.nativeapp.data.agent.domain.PlayMode
+import app.pipo.nativeapp.data.agent.domain.TrackPlacement
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
 import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CatalogLexicon
@@ -213,50 +215,83 @@ class MusicResolver(
                 val desired = action.desiredCount.coerceIn(minDesired, 60)
                 val intent = intentFor(action, plan, scopedTracks)
                 val artistScope = action.primaryGoal.artistScope
-                val ranked = rankForIntent(intent, input, scopedTracks, desired, artistScope, allowOnline = allowOnline)
-                val primaryResolved = action.primaryGoal.primaryTracks
-                    .mapNotNull { requirement ->
-                        trackResolver.resolve(requirement, scopedTracks, allowOnline = allowOnline).track?.let {
-                            ResolvedRequirement(requirement, it)
+                val acceptsRecommendation: (NativeTrack) -> Boolean = { track ->
+                    acceptsGoalConstraints(track, action, intent, plan.userText, enforceCatalog = true)
+                }
+                val (ranked, resolvedHardTracks) = coroutineScope {
+                    val ranking = async {
+                        rankForIntent(
+                            intent,
+                            input,
+                            scopedTracks,
+                            desired,
+                            artistScope,
+                            allowOnline = allowOnline,
+                            acceptsTrack = acceptsRecommendation,
+                        )
+                    }
+                    val primary = async {
+                        resolveTrackRequirements(
+                            action.primaryGoal.primaryTracks,
+                            scopedTracks,
+                            allowOnline,
+                        ) { _, track ->
+                            acceptsGoalConstraints(
+                                track,
+                                action,
+                                intent,
+                                plan.userText,
+                                enforceCatalog = true,
+                            )
                         }
                     }
-                val required = (action.primaryGoal.mustInclude + listOfNotNull(action.primaryGoal.closer))
-                    .mapNotNull { requirement ->
-                        trackResolver.resolve(requirement, scopedTracks, allowOnline = allowOnline).track?.let {
-                            ResolvedRequirement(requirement, it)
+                    val mustInclude = async {
+                        resolveTrackRequirements(
+                            action.primaryGoal.mustInclude,
+                            scopedTracks,
+                            allowOnline,
+                        ) { _, track ->
+                            acceptsGoalConstraints(track, action, intent, plan.userText, enforceCatalog = false)
                         }
                     }
+                    val closer = async {
+                        resolveTrackRequirements(
+                            listOfNotNull(action.primaryGoal.closer),
+                            scopedTracks,
+                            allowOnline,
+                        ) { _, track ->
+                            acceptsGoalConstraints(track, action, intent, plan.userText, enforceCatalog = false)
+                        }
+                    }
+                    ranking.await() to Triple(primary.await(), mustInclude.await(), closer.await())
+                }
+                val (primaryResolved, mustIncludeResolved, closerResolved) = resolvedHardTracks
+                val required = mustIncludeResolved + closerResolved
                 val includedArtistTracks = resolveIncludedArtistTracks(
                     includeArtists = action.primaryGoal.includeArtists,
                     ranked = ranked,
                     scopedTracks = scopedTracks,
                     allowOnline = allowOnline,
+                    reservedTracks = primaryResolved.map(ResolvedRequirement::track) + required.map(ResolvedRequirement::track),
+                    acceptsTrack = acceptsRecommendation,
                 )
-                val base = if (ranked.isNotEmpty()) {
-                    ranked
-                } else if (allowOnline) {
-                    onlineBackfill(intent, desired, artistScope)
-                } else {
-                    emptyList()
-                }
-                val seeded = if (primaryResolved.isNotEmpty()) injectPrimaryTracks(base, primaryResolved, desired) else base
-                val withRequiredTracks = injectRequired(seeded, required, desired)
-                val merged = injectIncludedArtistTracks(withRequiredTracks, includedArtistTracks, desired)
-                if (merged.isNotEmpty()) {
-                    merged
-                } else if (allowOnline) {
-                    onlineBackfill(intent, desired, artistScope)
-                } else {
-                    emptyList()
-                }
+                // rankForIntent already performs the constrained online backfill.
+                // Replaying it here would repeat the same failed searches in one draft.
+                assembleReplaceQueue(
+                    recommendations = ranked,
+                    primary = primaryResolved,
+                    required = required,
+                    includedArtistTracks = includedArtistTracks,
+                    desired = desired,
+                )
             }
         }
         return PlannedAction.PlayTracks(
             actionId = action.actionId,
             mode = action.mode,
             tracks = tracks,
-            continuous = if (action.mode != PlayMode.InsertNext && tracks.size > 1) {
-                continuousSourceFor(action, plan, input, scopedTracks, allowOnline)
+            continuous = if (action.mode != PlayMode.InsertNext && tracks.isNotEmpty()) {
+                continuousSourceFor(action, plan, input.copy(currentTrack = tracks.first()), scopedTracks, allowOnline)
             } else {
                 null
             },
@@ -400,8 +435,9 @@ class MusicResolver(
         desired: Int,
         artistScope: ArtistScope,
         allowOnline: Boolean = true,
+        acceptsTrack: (NativeTrack) -> Boolean = { true },
     ): List<NativeTrack> {
-        if (localTracks.isEmpty()) return if (allowOnline) onlineBackfill(intent, desired, artistScope) else emptyList()
+        if (localTracks.isEmpty()) return if (allowOnline) onlineBackfill(intent, desired, artistScope, acceptsTrack = acceptsTrack) else emptyList()
         val behaviorEvents = runCatching { PipoGraph.behaviorLog.readAll() }.getOrDefault(emptyList())
         val unifiedTaste = PipoGraph.userTaste.snapshot(PipoGraph.library.peek())
         val behaviorPreference = unifiedTaste.behavior
@@ -441,6 +477,7 @@ class MusicResolver(
         val ranked = rankedRaw
             .filterNot { feedback.contains(it.candidate.track) || hardRejected.contains(it.candidate.track) }
             .map { it.candidate.track }
+            .filter(acceptsTrack)
         val feedbackFiltered = rankedRaw.size - ranked.size
         if (feedbackFiltered > 0) {
             DiagnosticsLogStore.record(
@@ -491,13 +528,13 @@ class MusicResolver(
             // 本地有少量命中仍需联网补齐；保留相同硬约束和艺人范围。
             localResult.isNotEmpty() && allowOnline ->
                 takeWithinArtistScope(
-                    tracks = mergeUnique(localResult, onlineBackfill(intent, desired, artistScope)),
+                    tracks = mergeUnique(localResult, onlineBackfill(intent, desired, artistScope, acceptsTrack = acceptsTrack)),
                     artistKeys = artistKeys,
                     artistScope = artistScope,
                     desired = desired,
                 )
             localResult.isNotEmpty() -> localResult
-            allowOnline -> onlineBackfill(intent, desired, artistScope)
+            allowOnline -> onlineBackfill(intent, desired, artistScope, acceptsTrack = acceptsTrack)
             else -> emptyList()
         }
     }
@@ -522,6 +559,7 @@ class MusicResolver(
         intent: PetIntent,
         desired: Int,
         artistScope: ArtistScope,
+        acceptsTrack: (NativeTrack) -> Boolean = { true },
     ): List<NativeTrack> {
         val queries = buildSearchQueries(intent)
         val artistKeys = intent.hardArtists
@@ -569,6 +607,7 @@ class MusicResolver(
                         continue
                     }
                     if (hardRejected.contains(track)) continue
+                    if (!acceptsTrack(track)) continue
                     if (!FunctionalMusicFilter.acceptsCategory(track, intent.queryText)) continue
                     // 情绪词搜索的助眠/养生流水线内容不进候选（明确要纯音乐/点名歌手除外）。
                     if (!allowFunctional &&
@@ -686,6 +725,17 @@ class MusicResolver(
         return fresh + weekStale + dayStale
     }
 
+    /** 已选择真实歌曲的直接提交复用同一个来源工厂，无需再次在线解析首批歌曲。 */
+    suspend fun continuousSourceFor(
+        action: PlannedAction.PlayRequest,
+        plan: MusicTurnPlan,
+        input: AgentTurnInput,
+    ): ContinuousQueueSource? {
+        if (action.mode == PlayMode.InsertNext) return null
+        val localTracks = scopedTracksFor(action.primaryGoal.playlistName, loadLocalTracks())
+        return continuousSourceFor(action, plan, input, localTracks, action.primaryGoal.playlistName.isBlank())
+    }
+
     private fun continuousSourceFor(
         action: PlannedAction.PlayRequest,
         plan: MusicTurnPlan,
@@ -693,7 +743,20 @@ class MusicResolver(
         localTracks: List<NativeTrack>,
         allowOnline: Boolean,
     ): ContinuousQueueSource {
-        val intent = intentFor(action, plan, localTracks)
+        // 首曲/必含/收尾属于首批编排，续播继续音乐范围，不能反复搜索同一首。
+        val continuationAction = action.copy(
+            mode = PlayMode.ReplaceQueue,
+            target = null,
+            primaryGoal = action.primaryGoal.copy(primaryTracks = emptyList(), mustInclude = emptyList(), closer = null),
+        )
+        val baseIntent = intentFor(continuationAction, plan, localTracks)
+        val intent = baseIntent.copy(
+            hardTracks = emptyList(),
+            textTracks = emptyList(),
+            textArtists = if (action.mode == PlayMode.PlayNow && baseIntent.hardArtists.isEmpty()) {
+                mergeTextHints(baseIntent.textArtists, listOfNotNull(input.currentTrack?.artist))
+            } else baseIntent.textArtists,
+        )
         val artistKeys = intent.hardArtists
             .map(CommandTextSignals::normalizeForMatch)
             .filter { it.isNotBlank() }
@@ -760,24 +823,10 @@ class MusicResolver(
     ): ContinuousQueueSource {
         val goal = action.primaryGoal
         val strictArtists = goal.artistScope == ArtistScope.Strict && artistKeys.isNotEmpty()
-        val excludedTerms = mergeTextHints(intent.avoidWords, intent.excludeTags, intent.aiAvoidStyles)
 
         fun accepts(track: NativeTrack): Boolean {
-            if (!FunctionalMusicFilter.acceptsCategory(track, userRequest)) return false
+            if (!acceptsGoalConstraints(track, action, intent, userRequest, enforceCatalog = true)) return false
             if (strictArtists && !exactArtistMatchesAny(track.artist, artistKeys)) return false
-            if (goal.hardLanguages.isNotEmpty() &&
-                constraintScorer.hardLanguageEvidence(track, goal.hardLanguages) != ConstraintEvidence.Match
-            ) return false
-            if (goal.hardGenres.isNotEmpty() &&
-                constraintScorer.hardGenreEvidence(track, goal.hardGenres) != ConstraintEvidence.Match
-            ) return false
-            if (intent.excludeLanguages.isNotEmpty() &&
-                constraintScorer.excludedLanguageEvidence(track, intent.excludeLanguages) != ConstraintEvidence.Mismatch
-            ) return false
-            if (excludedTerms.isNotEmpty() &&
-                constraintScorer.avoidEvidence(track, excludedTerms) != ConstraintEvidence.Mismatch
-            ) return false
-            if (goal.catalogConstraint.isActive && !CatalogConstraintMatcher.matches(track, goal.catalogConstraint)) return false
             return true
         }
 
@@ -785,7 +834,36 @@ class MusicResolver(
             allowDefaultFallback = false,
             acceptsTrack = ::accepts,
             fetcher = { excludeIds -> fetcher(excludeIds).filter(::accepts) },
+            startAutomatically = goal.continuationPolicy.mode != ContinuationMode.Disabled,
         )
+    }
+
+    private fun acceptsGoalConstraints(
+        track: NativeTrack,
+        action: PlannedAction.PlayRequest,
+        intent: PetIntent,
+        userRequest: String,
+        enforceCatalog: Boolean,
+    ): Boolean {
+        val goal = action.primaryGoal
+        val excludedTerms = mergeTextHints(intent.avoidWords, intent.excludeTags, intent.aiAvoidStyles)
+        if (!FunctionalMusicFilter.acceptsCategory(track, userRequest)) return false
+        if (goal.hardLanguages.isNotEmpty() &&
+            constraintScorer.hardLanguageEvidence(track, goal.hardLanguages) == ConstraintEvidence.Mismatch
+        ) return false
+        if (goal.hardGenres.isNotEmpty() &&
+            constraintScorer.hardGenreEvidence(track, goal.hardGenres) == ConstraintEvidence.Mismatch
+        ) return false
+        if (intent.excludeLanguages.isNotEmpty() &&
+            constraintScorer.excludedLanguageEvidence(track, intent.excludeLanguages) == ConstraintEvidence.Match
+        ) return false
+        if (excludedTerms.isNotEmpty() &&
+            constraintScorer.avoidEvidence(track, excludedTerms) == ConstraintEvidence.Match
+        ) return false
+        if (enforceCatalog && goal.catalogConstraint.isActive && !CatalogConstraintMatcher.matches(track, goal.catalogConstraint)) {
+            return false
+        }
+        return true
     }
 
     /** 标题+歌手以拉丁字母为主（粗粒度语言判定，仅用于排序偏好，不做硬过滤）。 */
@@ -1033,6 +1111,8 @@ class MusicResolver(
         ranked: List<NativeTrack>,
         scopedTracks: List<NativeTrack>,
         allowOnline: Boolean,
+        reservedTracks: List<NativeTrack>,
+        acceptsTrack: (NativeTrack) -> Boolean,
     ): List<NativeTrack> {
         if (includeArtists.isEmpty()) return emptyList()
         val resolver = ArtistResolver(scopedTracks)
@@ -1045,13 +1125,20 @@ class MusicResolver(
         for (artist in canonical) {
             val key = CommandTextSignals.normalizeForMatch(artist)
             if (key.isBlank()) continue
+            if (reservedTracks.any { artistMatchesAny(it.artist, listOf(key)) }) continue
             val local = localPool.firstOrNull { track ->
-                TrackDedupe.songKey(track) !in seen && artistMatchesAny(track.artist, listOf(key))
+                TrackDedupe.songKey(track) !in seen &&
+                    artistMatchesAny(track.artist, listOf(key)) &&
+                    acceptsTrack(track)
             }
             val picked = local ?: if (allowOnline && !searchUnavailable) {
                 try {
                     repository.searchTracks(artist, limit = 12).also { searchedSuccessfully = true }
-                        .firstOrNull { track -> artistMatchesAny(track.artist, listOf(key)) && TrackDedupe.songKey(track) !in seen }
+                        .firstOrNull { track ->
+                            artistMatchesAny(track.artist, listOf(key)) &&
+                                TrackDedupe.songKey(track) !in seen &&
+                                acceptsTrack(track)
+                        }
                 } catch (error: MusicSearchException) {
                     if (!searchedSuccessfully && out.isEmpty()) throw error
                     searchUnavailable = true
@@ -1065,66 +1152,66 @@ class MusicResolver(
         return out
     }
 
-    private fun injectIncludedArtistTracks(
-        base: List<NativeTrack>,
-        artistTracks: List<NativeTrack>,
-        desired: Int,
-    ): List<NativeTrack> {
-        if (artistTracks.isEmpty()) return base.take(desired)
-        val out = base.toMutableList()
-        val seen = out.mapTo(HashSet()) { TrackDedupe.songKey(it) }
-        artistTracks.forEachIndexed { index, track ->
-            val key = TrackDedupe.songKey(track)
-            if (!seen.add(key)) return@forEachIndexed
-            val insertion = (3 + index * 2).coerceIn(0, out.size)
-            out.add(insertion, track)
-        }
-        return out.take(desired.coerceAtLeast(artistTracks.size + 1))
-    }
-
-    private fun injectRequired(
-        base: List<NativeTrack>,
-        required: List<ResolvedRequirement>,
-        desired: Int,
-    ): List<NativeTrack> {
-        if (required.isEmpty()) return base.take(desired)
-        val requiredKeys = required.mapTo(HashSet()) { TrackDedupe.songKey(it.track) }
-        val room = (desired - requiredKeys.size).coerceAtLeast(0)
-        val out = base.filter { TrackDedupe.songKey(it) !in requiredKeys }
-            .take(room)
-            .toMutableList()
-        for (item in required.filterNot { it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.Closer }) {
-            val insertion = when {
-                out.isEmpty() -> 0
-                out.size >= 3 -> 3
-                else -> out.size
+    private suspend fun resolveTrackRequirements(
+        requirements: List<TrackRequirement>,
+        scopedTracks: List<NativeTrack>,
+        allowOnline: Boolean,
+        acceptsTrack: (TrackRequirement, NativeTrack) -> Boolean,
+    ): List<ResolvedRequirement> = coroutineScope {
+        requirements.map { requirement ->
+            async {
+                trackResolver.resolve(
+                    requirement,
+                    scopedTracks,
+                    allowOnline = allowOnline,
+                    acceptsTrack = { track -> acceptsTrack(requirement, track) },
+                ).track?.let { ResolvedRequirement(requirement, it) }
             }
-            out.add(insertion.coerceIn(0, out.size), item.track)
-        }
-        for (item in required.filter { it.requirement.placement == app.pipo.nativeapp.data.agent.domain.TrackPlacement.Closer }) {
-            out.removeAll { TrackDedupe.songKey(it) == TrackDedupe.songKey(item.track) }
-            out.add(item.track)
-        }
-        return out.take(desired.coerceAtLeast(required.size))
+        }.awaitAll().filterNotNull()
     }
 
-    private fun injectPrimaryTracks(
-        base: List<NativeTrack>,
+    /**
+     * 先为所有可解析硬项预留槽位，之后才取推荐填充，避免一次次截断把收尾或必含艺人挤出队列。
+     * 主曲在开头，收尾曲固定在末尾；其它硬项放在中段附近。
+     */
+    private fun assembleReplaceQueue(
+        recommendations: List<NativeTrack>,
         primary: List<ResolvedRequirement>,
+        required: List<ResolvedRequirement>,
+        includedArtistTracks: List<NativeTrack>,
         desired: Int,
     ): List<NativeTrack> {
-        if (primary.isEmpty()) return base.take(desired)
-        val out = ArrayList<NativeTrack>(desired)
-        val seen = HashSet<String>()
-        for (item in primary) {
-            if (seen.add(TrackDedupe.songKey(item.track))) out.add(item.track)
-            if (out.size >= desired) return out
+        if (desired <= 0) return emptyList()
+        fun unique(tracks: List<NativeTrack>): List<NativeTrack> {
+            val seen = HashSet<String>()
+            return tracks.filter { seen.add(TrackDedupe.songKey(it)) }
         }
-        for (track in base) {
-            if (seen.add(TrackDedupe.songKey(track))) out.add(track)
-            if (out.size >= desired) break
-        }
-        return out
+
+        val closerTracks = unique(
+            required.filter { it.requirement.placement == TrackPlacement.Closer }.map(ResolvedRequirement::track),
+        )
+        val closerKeys = closerTracks.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+        val primaryTracks = unique(primary.map(ResolvedRequirement::track))
+            .filterNot { TrackDedupe.songKey(it) in closerKeys }
+        val primaryKeys = primaryTracks.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+        val middleTracks = unique(
+            required.filterNot { it.requirement.placement == TrackPlacement.Closer }.map(ResolvedRequirement::track) +
+                includedArtistTracks,
+        ).filterNot { TrackDedupe.songKey(it) in closerKeys || TrackDedupe.songKey(it) in primaryKeys }
+        val hardKeys = closerKeys + primaryKeys + middleTracks.mapTo(HashSet()) { TrackDedupe.songKey(it) }
+        val recommendationsWithoutHardItems = unique(recommendations)
+            .filterNot { TrackDedupe.songKey(it) in hardKeys }
+        val nonCloserCapacity = (desired - closerTracks.size).coerceAtLeast(0)
+        val midpoint = nonCloserCapacity / 2
+        val fillerCapacity = (desired - hardKeys.size).coerceAtLeast(0)
+        val beforeMiddleCapacity = minOf((midpoint - primaryTracks.size).coerceAtLeast(0), fillerCapacity)
+        val beforeMiddle = recommendationsWithoutHardItems.take(beforeMiddleCapacity)
+        val remainingCapacity = (fillerCapacity - beforeMiddle.size).coerceAtLeast(0)
+        val afterMiddle = recommendationsWithoutHardItems.drop(beforeMiddle.size).take(remainingCapacity)
+        return (primaryTracks + beforeMiddle + middleTracks + afterMiddle)
+            .take(nonCloserCapacity)
+            .plus(closerTracks.take(desired))
+            .take(desired)
     }
 
     private fun buildSummary(plan: MusicTurnPlan, actions: List<PlannedAction>): String {

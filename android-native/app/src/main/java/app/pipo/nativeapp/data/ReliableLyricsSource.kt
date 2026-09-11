@@ -24,36 +24,46 @@ internal class ReliableLyricsSource(context: Context) {
     // Bound synchronization state while coalescing repeated requests for the same recording.
     private val requestLocks = Array(16) { Mutex() }
 
-    suspend fun lyricsForTrack(trackId: String, track: NativeTrack?): List<PipoLyricLine>? =
+    suspend fun lyricsForTrack(
+        trackId: String,
+        track: NativeTrack?,
+        additionalCandidates: List<OnlineLyrics> = emptyList(),
+    ): OnlineLyrics? =
         withContext(Dispatchers.IO) {
             val lock = requestLocks[(trackId.hashCode() and Int.MAX_VALUE) % requestLocks.size]
-            lock.withLock { resolve(trackId, track) }
+            lock.withLock { resolve(trackId, track, additionalCandidates) }
         }
 
-    private suspend fun resolve(trackId: String, track: NativeTrack?): List<PipoLyricLine>? {
+    private suspend fun resolve(
+        trackId: String,
+        track: NativeTrack?,
+        additionalCandidates: List<OnlineLyrics>,
+    ): OnlineLyrics? {
         val amllId = track?.neteaseId?.toString() ?: trackId
         val amllLines = amll.lyricsForTrack(amllId)?.let(LyricCredits::stripLeading)
-            ?.takeIf { OnlineLyricSupport.validTimings(it, track?.durationMs ?: 0L) }
-        if (amllLines != null && OnlineLyricSupport.usableWordLyrics(amllLines, track?.durationMs ?: 0L)) {
-            record(trackId, "amll", "selected", amllLines)
-            return amllLines
+            ?.takeIf { OnlineLyricSupport.usableLyricsDocument(it, track?.durationMs ?: 0L) }
+        val sourceCandidates = additionalCandidates.filter {
+            OnlineLyricSupport.usableLyricsDocument(it.lines, track?.durationMs ?: 0L)
         }
+        val amllCandidate = amllLines?.let { OnlineLyrics("amll", amllId, it) }
 
         // Missing recording metadata is a reason to keep the ID-based fallback, never to guess.
         if (track == null || track.title.isBlank() || track.artist.isBlank() || track.durationMs <= 0L) {
             record(trackId, "external", "skip_missing_metadata")
-            return amllLines?.takeIf { it.isNotEmpty() }
+            return selectLyrics(sourceCandidates + listOfNotNull(amllCandidate))?.let { selected ->
+                val completed = completeAmllAlignment(selected, amllCandidate)
+                record(
+                    trackId, completed.lyrics.source, "selected", completed.lyrics.lines,
+                    completed.lyrics.sourceTrackId, completed.alignmentAddedLineCount,
+                )
+                completed.lyrics
+            }
         }
         val cache = readCache(track)
         val now = System.currentTimeMillis()
-        if (cache != null && now - cache.savedAt in 0 until cache.ttlMs) {
-            cache.lyrics?.let {
-                record(trackId, it.source, "selected_cache", it.lines, it.sourceTrackId)
-                return it.lines
-            }
-            record(trackId, "external", "cached_no_match")
-            return amllLines?.takeIf { it.isNotEmpty() }
-        }
+        val cacheCandidate = cache?.takeIf {
+            now - it.savedAt in 0 until STALE_CACHE_TTL_MS
+        }?.lyrics
 
         val attempts = coroutineScope {
             // Compare complete documents; the first network response need not have finer timing.
@@ -61,28 +71,77 @@ internal class ReliableLyricsSource(context: Context) {
             val kugouResult = attempt(track, "kugou", 6_000L) { kugou.lyricsForTrack(track) }
             kugouResult to qqRequest.await()
         }
-        val selected = selectWordLyrics(listOfNotNull(attempts.first.lyrics, attempts.second.lyrics))
+        // A cache is a reusable candidate, never an early platform-priority decision.
+        val selected = selectLyrics(
+            listOfNotNull(amllCandidate) + sourceCandidates +
+                listOfNotNull(attempts.first.lyrics, attempts.second.lyrics) + listOfNotNull(cacheCandidate),
+        )
         if (selected != null) {
-            writeCache(track, selected)
-            record(trackId, selected.source, "selected", selected.lines, selected.sourceTrackId)
-            return selected.lines
+            val completed = completeAmllAlignment(selected, amllCandidate)
+            if (selected !== cacheCandidate || completed.alignmentAddedLineCount > 0) {
+                writeCache(track, completed.lyrics)
+            }
+            val outcome = if (selected === cacheCandidate && completed.alignmentAddedLineCount == 0) {
+                "selected_cached_candidate"
+            } else "selected"
+            record(
+                trackId, completed.lyrics.source, outcome, completed.lyrics.lines,
+                completed.lyrics.sourceTrackId, completed.alignmentAddedLineCount,
+            )
+            return completed.lyrics
         }
-        if (cache?.lyrics != null && now - cache.savedAt in 0 until STALE_CACHE_TTL_MS) {
-            record(trackId, cache.lyrics.source, "selected_stale_cache", cache.lyrics.lines, cache.lyrics.sourceTrackId)
-            return cache.lyrics.lines
-        }
-        // Timeouts and server errors must not become persistent "no lyrics" cache entries.
-        if (attempts.first.completed && attempts.second.completed) writeCache(track, null)
-        return amllLines?.takeIf { it.isNotEmpty() }
+        return null
     }
 
-    private fun selectWordLyrics(candidates: List<OnlineLyrics>): OnlineLyrics? {
-        val measured = candidates.map { it to OnlineLyricSupport.wordQuality(it.lines) }
-        val mostTextUnits = measured.maxOfOrNull { it.second.textUnits } ?: return null
+    private fun selectLyrics(candidates: List<OnlineLyrics>): OnlineLyrics? {
+        val measured = candidates.map { candidate ->
+            CandidateQuality(
+                candidate,
+                OnlineLyricSupport.wordQuality(candidate.lines),
+                OnlineLyricSupport.documentSemantics(candidate.lines),
+            )
+        }
+        val mostTextUnits = measured.maxOfOrNull { it.wordQuality.textUnits } ?: return null
         // A much shorter document must not win just because its remaining words are finely timed.
-        // This is a conservative content/granularity comparison, not an audio-accuracy score.
-        return measured.filter { it.second.textUnits >= mostTextUnits * 0.9 }
-            .maxByOrNull { it.second.fineTimingRatio }?.first
+        // This compares source timestamp spans, not inferred audio alignment or token count.
+        return measured.filter { it.wordQuality.textUnits >= mostTextUnits * 0.9 }
+            .fold<CandidateQuality, CandidateQuality?>(null) { selected, candidate ->
+                if (selected == null || compareCandidateQuality(candidate, selected) > 0) candidate else selected
+            }?.lyrics
+    }
+
+    private fun compareCandidateQuality(left: CandidateQuality, right: CandidateQuality): Int =
+        compareTimingGranularity(left.wordQuality, right.wordQuality).takeIf { it != 0 }
+            ?: left.wordQuality.textUnits.compareTo(right.wordQuality.textUnits).takeIf { it != 0 }
+            ?: compareSemantics(left.semantics, right.semantics)
+
+    private fun compareTimingGranularity(left: LyricWordQuality, right: LyricWordQuality): Int = when {
+        left.fineTimingRatio != right.fineTimingRatio -> left.fineTimingRatio.compareTo(right.fineTimingRatio)
+        left.timedSegmentRatio != right.timedSegmentRatio -> left.timedSegmentRatio.compareTo(right.timedSegmentRatio)
+        left.timedSegments != right.timedSegments -> left.timedSegments.compareTo(right.timedSegments)
+        else -> 0
+    }
+
+    private fun compareSemantics(left: LyricDocumentSemantics, right: LyricDocumentSemantics): Int = when {
+        left.endAlignedPrimaryLines != right.endAlignedPrimaryLines ->
+            left.endAlignedPrimaryLines.compareTo(right.endAlignedPrimaryLines)
+        left.companionLines != right.companionLines -> left.companionLines.compareTo(right.companionLines)
+        else -> left.translationLines.compareTo(right.translationLines)
+    }
+
+    private fun completeAmllAlignment(selected: OnlineLyrics, amllCandidate: OnlineLyrics?): CompletedLyrics {
+        if (amllCandidate == null || selected.source == "amll" ||
+            selected.lines.any { it.role == PipoLyricRole.Primary && it.alignment == PipoLyricAlignment.End } ||
+            compareTimingGranularity(
+                OnlineLyricSupport.wordQuality(selected.lines),
+                OnlineLyricSupport.wordQuality(amllCandidate.lines),
+            ) <= 0
+        ) return CompletedLyrics(selected)
+        val completedLines = OnlineLyricSupport.withMissingAlignments(selected.lines, amllCandidate.lines)
+        val added = completedLines.count { line ->
+            line.role == PipoLyricRole.Primary && line.alignment == PipoLyricAlignment.End
+        }
+        return CompletedLyrics(selected.copy(lines = completedLines), added)
     }
 
     private suspend fun attempt(
@@ -96,18 +155,18 @@ internal class ReliableLyricsSource(context: Context) {
                 val fetched = fetch()
                 val stripped = fetched?.copy(lines = LyricCredits.stripLeading(fetched.lines))
                 val accepted = stripped?.takeIf {
-                    OnlineLyricSupport.usableWordLyrics(it.lines, track.durationMs)
+                    OnlineLyricSupport.usableLyricsDocument(it.lines, track.durationMs)
                 }
-                record(track.id, source, if (accepted != null) "matched" else "no_valid_word_lyrics",
+                record(track.id, source, if (accepted != null) "matched" else "no_valid_lyrics",
                     accepted?.lines.orEmpty(), accepted?.sourceTrackId)
-                Attempt(accepted, completed = true)
+                Attempt(accepted)
             }
-            result ?: Attempt(null, completed = false).also { record(track.id, source, "timeout") }
+            result ?: Attempt(null).also { record(track.id, source, "timeout") }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             record(track.id, source, "failed_${e::class.java.simpleName}")
-            Attempt(null, completed = false)
+            Attempt(null)
         }
     }
 
@@ -126,15 +185,14 @@ internal class ReliableLyricsSource(context: Context) {
             kotlin.math.abs(data.optLong("durationMs") - track.durationMs) > 1_000L
         ) return@runCatching null
         val savedAt = data.getLong("savedAt")
-        if (data.optBoolean("missing")) return@runCatching CachedLyrics(null, savedAt, MISS_TTL_MS)
         val source = data.getString("source")
-        if (source !in setOf("kugou", "qq")) return@runCatching null
+        if (source !in setOf("amll", "kugou", "netease", "netease_cloud", "qq")) return@runCatching null
         val lines = decodeLines(data.getJSONArray("lines"))
-        if (!OnlineLyricSupport.usableWordLyrics(lines, track.durationMs)) return@runCatching null
-        CachedLyrics(OnlineLyrics(source, data.getString("sourceTrackId"), lines), savedAt, CACHE_TTL_MS)
+        if (!OnlineLyricSupport.usableLyricsDocument(lines, track.durationMs)) return@runCatching null
+        CachedLyrics(OnlineLyrics(source, data.getString("sourceTrackId"), lines), savedAt)
     }.getOrNull()
 
-    private fun writeCache(track: NativeTrack, lyrics: OnlineLyrics?) {
+    private fun writeCache(track: NativeTrack, lyrics: OnlineLyrics) {
         runCatching {
             val target = cacheFile(track) ?: return
             cacheDirectory.mkdirs()
@@ -146,12 +204,9 @@ internal class ReliableLyricsSource(context: Context) {
                 put("album", track.album)
                 put("durationMs", track.durationMs)
                 put("savedAt", System.currentTimeMillis())
-                put("missing", lyrics == null)
-                if (lyrics != null) {
-                    put("source", lyrics.source)
-                    put("sourceTrackId", lyrics.sourceTrackId)
-                    put("lines", encodeLines(lyrics.lines))
-                }
+                put("source", lyrics.source)
+                put("sourceTrackId", lyrics.sourceTrackId)
+                put("lines", encodeLines(lyrics.lines))
             }
             val temporary = File.createTempFile("lyrics-", ".tmp", cacheDirectory)
             try {
@@ -232,6 +287,7 @@ internal class ReliableLyricsSource(context: Context) {
         outcome: String,
         lines: List<PipoLyricLine> = emptyList(),
         sourceTrackId: String? = null,
+        alignmentAddedLineCount: Int = 0,
     ) {
         val quality = OnlineLyricSupport.wordQuality(lines)
         DiagnosticsLogStore.record(
@@ -244,18 +300,24 @@ internal class ReliableLyricsSource(context: Context) {
                 "textUnits" to quality.textUnits, "timedSegments" to quality.timedSegments,
                 "coarseUnits" to quality.coarseUnits, "untimedUnits" to quality.untimedUnits,
                 "fineTimingPermille" to (quality.fineTimingRatio * 1_000).toInt(),
+                "timedSegmentPermille" to (quality.timedSegmentRatio * 1_000).toInt(),
+                "alignmentAddedLineCount" to alignmentAddedLineCount,
             ),
         )
     }
 
-    private data class Attempt(val lyrics: OnlineLyrics?, val completed: Boolean)
-    private data class CachedLyrics(val lyrics: OnlineLyrics?, val savedAt: Long, val ttlMs: Long)
+    private data class CandidateQuality(
+        val lyrics: OnlineLyrics,
+        val wordQuality: LyricWordQuality,
+        val semantics: LyricDocumentSemantics,
+    )
+    private data class CompletedLyrics(val lyrics: OnlineLyrics, val alignmentAddedLineCount: Int = 0)
+    private data class Attempt(val lyrics: OnlineLyrics?)
+    private data class CachedLyrics(val lyrics: OnlineLyrics?, val savedAt: Long)
 
     private companion object {
-        const val CACHE_VERSION = 3
-        const val CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000L
+        const val CACHE_VERSION = 5
         const val STALE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000L
-        const val MISS_TTL_MS = 3 * 60 * 60 * 1000L
         const val MAX_CACHE_BYTES = 2 * 1024 * 1024L
         const val MAX_CACHE_FILES = 128
     }

@@ -69,6 +69,8 @@ fn serialized_shapes_are_camel_case() {
         track_count: 0,
         cover_img_url: None,
         user_id: Some(1),
+        special_type: 0,
+        update_time: None,
     };
     assert_camel("PlaylistInfo", &serde_json::to_value(&pl).unwrap());
 
@@ -100,7 +102,11 @@ fn serialized_shapes_are_camel_case() {
         id: 1,
         name: "n".into(),
         track_count: 0,
+        cover_img_url: None,
+        update_time: None,
         tracks: vec![],
+        track_ids: vec![],
+        hydration_diagnostics: Default::default(),
     };
     assert_camel("PlaylistDetail", &serde_json::to_value(&pd).unwrap());
 

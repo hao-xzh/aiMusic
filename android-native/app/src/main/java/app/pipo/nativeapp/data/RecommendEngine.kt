@@ -686,19 +686,20 @@ class RecommendEngine(
                         add { repository.similarTracks(id) }
                     }
                 }
-                for (batch in platformRequests.chunked(3)) {
-                    val results = batch.map { request -> async {
-                        try {
-                            Result.success(withTimeoutOrNull(5_000L) { request() }
-                                ?: throw IllegalStateException("网易云推荐响应超时"))
-                        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                        catch (e: Exception) { Result.failure<List<NativeTrack>>(e) }
-                    } }.awaitAll()
-                    results.forEach { result ->
-                        if (result.isSuccess) successCount++ else if (failure == null) failure = result.exceptionOrNull()
-                        result.getOrDefault(emptyList()).filter { it.neteaseId != null && !excluded(it) }.forEach {
-                            pool.merge(Candidate(it, discoveryScore = 0.75, source = SOURCE_PLATFORM))
-                        }
+                // These requests feed the same candidate pool and were always all required before
+                // AI suggestions were verified. Run them together, but consume awaitAll's input
+                // order so source precedence and candidate merge order remain unchanged.
+                val results = platformRequests.map { request -> async {
+                    try {
+                        Result.success(withTimeoutOrNull(5_000L) { request() }
+                            ?: throw IllegalStateException("网易云推荐响应超时"))
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { Result.failure<List<NativeTrack>>(e) }
+                } }.awaitAll()
+                results.forEach { result ->
+                    if (result.isSuccess) successCount++ else if (failure == null) failure = result.exceptionOrNull()
+                    result.getOrDefault(emptyList()).filter { it.neteaseId != null && !excluded(it) }.forEach {
+                        pool.merge(Candidate(it, discoveryScore = 0.75, source = SOURCE_PLATFORM))
                     }
                 }
                 val suggestions = suggestionsJob.await()

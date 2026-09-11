@@ -236,13 +236,22 @@ object CommandTextSignals {
     }
 
     /** An opening-song constraint belongs to a queue; it is not a single-song request. */
-    private val openingTrackClause = Regex("(?:第一首|首曲)\\s*(?:要放|要听|播放|先放|放|要|是|用)?\\s*([^，。；,;！!？?]+)")
+    private val openingTrackClause = Regex("(?:第一首|首曲)\\s*(要放|要听|播放|先放|放|要|是|用)?\\s*([^，。；,;！!？?]+)")
+    private val openingPositionTail = Regex("^(?:开始|起)(?:(?:按)?顺序|依次)?(?:播放|听|放|播)?(?:就行|即可|吧|一下)?$")
 
-    fun textWithoutOpeningTrack(text: String): String = openingTrackClause.replaceFirst(text, "").trim(' ', '，', ',')
+    private fun openingTrackMatch(text: String): MatchResult? = openingTrackClause.findAll(text).firstOrNull { match ->
+        val prefix = text.substring(0, match.range.first).trimEnd()
+        val fromPosition = prefix.endsWith("从") || prefix.endsWith("由")
+        // “从第一首开始” refers to the playlist position. An explicit title cue still
+        // allows a song actually named 开始, as in “第一首播放《开始》”.
+        !fromPosition && (match.groupValues[1].isNotBlank() || !openingPositionTail.matches(match.groupValues[2].trim()))
+    }
+
+    fun textWithoutOpeningTrack(text: String): String =
+        (openingTrackMatch(text)?.let { text.removeRange(it.range) } ?: text).trim(' ', '，', ',')
 
     fun openingTrackRequirement(text: String): TrackRequirement? {
-        val clause = openingTrackClause
-            .find(text)?.groupValues?.getOrNull(1)?.trim() ?: return null
+        val clause = openingTrackMatch(text)?.groupValues?.getOrNull(2)?.trim() ?: return null
         val parts = if (clause.firstOrNull() in listOf('《', '「', '“', '"')) listOf(clause) else clause.split("的", limit = 2)
         val artist = parts.firstOrNull()?.trim()?.takeIf { parts.size == 2 && it.isNotBlank() }
         val title = sanitizeTitle(parts.last().trim())
@@ -250,18 +259,26 @@ object CommandTextSignals {
             ?.let { TrackRequirement(it, artist, TrackPlacement.Now) }
     }
 
-    fun closerTrackTitle(text: String): String? {
+    fun closerTrackTitle(text: String): String? = closerTrackRequirement(text)?.title
+
+    fun closerTrackRequirement(text: String): TrackRequirement? {
         val patterns = listOf(
-            Regex("(?:最后|末尾|结尾)(?:用|放)?\\s*([^，。,.!！?？]{1,28}?)(?:收尾|收一下|收住|结束)"),
-            Regex("(?:最后|末尾|结尾)(?:还是|依然是|仍然是)\\s*([^，。,.!！?？]{1,28})"),
+            Regex("(?:最后|末尾|结尾)(?:用|放|是)?\\s*([^，。,.!！?？]{1,80}?)(?:收尾|收一下|收住|结束)"),
+            Regex("(?:最后|末尾|结尾)(?:还是|依然是|仍然是|是)\\s*([^，。,.!！?？]{1,80})"),
             Regex("(?:最后|末尾|结尾)[^《「“\"]{0,16}[《「“\"]([^》」”\"]{1,32})[》」”\"]"),
-            Regex("(?:最后|末尾|结尾)\\s*([^，。,.!！?？]{1,28})(?:收一下|收住|压住|结束|结尾)?"),
+            Regex("(?:最后|末尾|结尾)(?:用|放)?\\s*([^，。,.!！?？]{1,80})(?:收一下|收住|压住|结束|结尾)?"),
             Regex("([^，。,.!！?？]{1,28})(?:收一下|收住)$"),
         )
         for (pattern in patterns) {
             val match = pattern.find(text) ?: continue
-            val title = sanitizeTitle(match.groupValues.lastOrNull().orEmpty())
-            if (title.isNotBlank()) return title
+            val clause = match.groupValues.lastOrNull().orEmpty().trim()
+            val parts = if (clause.firstOrNull() in listOf('《', '「', '“', '"')) listOf(clause)
+                else clause.split("的", limit = 2)
+            val artist = parts.firstOrNull()?.trim()?.takeIf { parts.size == 2 && it.isNotBlank() }
+            val title = sanitizeTitle(parts.last().trim())
+            if (title.isNotBlank() && !isGenericMusicNoun(title)) {
+                return TrackRequirement(title, artist, TrackPlacement.Closer)
+            }
         }
         return null
     }

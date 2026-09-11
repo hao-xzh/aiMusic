@@ -27,6 +27,7 @@ internal object BackgroundAgentContinuation {
     private var resolver: PlaybackUrlResolver? = null
     private var mediaFactory: PlayerMediaFactory? = null
     private var source: ContinuousQueueSource? = null
+    private var enabled = false
     private var goal: MusicGoal? = null
     private var generation = 0L
     private var appendJob: Job? = null
@@ -53,11 +54,25 @@ internal object BackgroundAgentContinuation {
         appendJob?.cancel()
         appendJob = null
         this.source = source
+        enabled = source?.startsAutomatically() == true
         this.goal = goal
         ownsQueue = true
         retryNotBeforeMs = 0L
-        if (source == null) return
+        if (!enabled) return
         scope?.launch { maybeExtend() }
+    }
+
+    /** 播放列表中的模式开关同时控制后台 owner；关闭时保留本轮对话来源。 */
+    fun setEnabled(value: Boolean): Boolean {
+        requireMainThread()
+        if (!ownsQueue || (value && source == null)) return false
+        generation += 1L
+        appendJob?.cancel()
+        appendJob = null
+        enabled = value
+        retryNotBeforeMs = 0L
+        if (value) scope?.launch { maybeExtend() }
+        return true
     }
 
     /** 前台成功接管一个新主队列后调用，禁止旧后台 source 再追加。 */
@@ -67,6 +82,7 @@ internal object BackgroundAgentContinuation {
         appendJob?.cancel()
         appendJob = null
         source = null
+        enabled = false
         goal = null
         ownsQueue = false
         retryNotBeforeMs = 0L
@@ -90,6 +106,7 @@ internal object BackgroundAgentContinuation {
     }
 
     private fun maybeExtend() {
+        if (!enabled) return
         if (android.os.SystemClock.elapsedRealtime() < retryNotBeforeMs) return
         val activeSource = source ?: return
         val livePlayer = player ?: return

@@ -42,8 +42,14 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
                 coverUrl = o.optStringOrNull("coverImgUrl"),
                 userId = o.optLongOrNull("userId"),
                 updateTime = o.optLongOrNull("updateTime"),
+                specialType = o.optInt("specialType", 0),
             )
         }
+    }
+
+    override suspend fun neteasePlaylistSongIds(playlistId: Long): Set<Long> {
+        val ids = callArray("netease_playlist_track_ids", jsonObject("id" to playlistId))
+        return (0 until ids.length()).mapTo(HashSet()) { ids.getLong(it) }
     }
 
     override suspend fun neteasePlaylistTracks(playlistId: Long): List<NativeTrack> {

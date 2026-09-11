@@ -1,7 +1,7 @@
 package app.pipo.nativeapp.data
 
 /**
- * 网易云 yrc（逐字）格式解析。镜像 src/lib/yrc.ts。
+ * 网易云 yrc（逐字）格式解析。
  *
  *   [39820,3170](39820,500,0)Some (40320,460,0)words
  *
@@ -42,41 +42,21 @@ object YrcParser {
                 val textEnd = tokenHeaders.getOrNull(tokenIndex + 1)?.range?.first ?: rest.length
                 val text = rest.substring(textStart, textEnd)
                 if (text.isEmpty()) return@forEachIndexed
-                // Apple Music Web 直接把歌词数据里的 word.content 渲染成一个 `.syllable`，
-                // 不会把中文 word 再拆成单字；英文异常粘连时仍按空格拆成多个 word。
-                // 空白和标点保留在它前一个非空白字符上，避免单独高亮一个空格闪烁。
-                val groups = splitIntoVisualChars(text)
-                if (groups.isEmpty()) return@forEachIndexed
-                val perDur = tokenDur / groups.size.coerceAtLeast(1)
-                groups.forEachIndexed { idx, charText ->
-                    chars.add(
-                        PipoLyricChar(
-                            startMs = tokenStart + idx * perDur,
-                            durationMs = if (idx == groups.size - 1) tokenDur - perDur * idx else perDur,
-                            text = charText,
-                            timingParts = listOf(
-                                PipoLyricTimingPart(
-                                    startMs = tokenStart + idx * perDur,
-                                    durationMs = if (idx == groups.size - 1) tokenDur - perDur * idx else perDur,
-                                    text = charText,
-                                ),
-                            ),
-                        )
-                    )
-                }
+                // 一个源时间头就是一个真实发音片段。中英混合或含空格的 token
+                // 也不能按字符组均分时间，否则会把估算时序误报为更细的逐字来源。
+                chars.add(
+                    PipoLyricChar(
+                        startMs = tokenStart,
+                        durationMs = tokenDur,
+                        text = text,
+                        timingParts = listOf(PipoLyricTimingPart(tokenStart, tokenDur, text)),
+                    ),
+                )
             }
 
-            val rawMergedChars = mergeAdjacentAsciiLyricChars(chars)
-            val mergedChars = normalizeYrcLineTimings(
-                chars = rawMergedChars,
-                lineStartMs = lineStart,
-                lineDurationMs = lineDur,
-                // Apple Music Web 的 data-duration 直接取每个 word 自己的 begin/end；
-                // 不会把上一个 syllable 的 end 强行裁到下一个 syllable start。保留
-                // YRC 原始 token duration，避免密集英文词被压成一帧扫完；下方的行尾
-                // tail cap 仍处理“整行余量塞进最后一个 token”的异常数据。
-                tightenInternalDurations = false,
-            )
+            // 与 QRC/KRC/TTML 一样保留源时间。行尾长音可能真实持续数秒，
+            // 不能根据文字长度或相邻词时长把它截成估算的短音。
+            val mergedChars = mergeAdjacentAsciiLyricChars(chars)
             val text = if (mergedChars.isNotEmpty()) mergedChars.joinToString("") { it.text } else ""
             if (mergedChars.isEmpty() && text.isEmpty()) continue
 
@@ -204,93 +184,14 @@ private fun audioEndMs(line: PipoLyricLine): Long {
     return maxOf(charEnd ?: line.startMs, line.startMs + line.durationMs)
 }
 
-private fun normalizeYrcLineTimings(
-    chars: List<PipoLyricChar>,
-    lineStartMs: Long,
-    lineDurationMs: Long,
-    tightenInternalDurations: Boolean,
-): List<PipoLyricChar> {
-    if (chars.isEmpty()) return chars
-    val normalizedChars = if (tightenInternalDurations) {
-        clampDurationsToNextTokenStart(chars)
-    } else {
-        chars
-    }
-    val lineEndMs = lineStartMs + lineDurationMs
-    val last = normalizedChars.last()
-    val lastEndMs = last.startMs + last.durationMs
-    val tailFromLastStartMs = lineEndMs - last.startMs
-    val previousTypicalMs = typicalPreviousTokenDurationMs(normalizedChars.dropLast(1))
-    val estimatedLastMs = estimateSungTokenDurationMs(last.text)
-    val maxVisualLastMs = maxOf(
-        estimatedLastMs,
-        (previousTypicalMs * 1.55f).toLong(),
-    ).coerceIn(MIN_LAST_TOKEN_VISUAL_MS, MAX_LAST_TOKEN_VISUAL_MS)
-
-    val looksLikeLineTailPackedIntoLast =
-        tailFromLastStartMs >= LONG_TAIL_AFTER_LAST_TOKEN_MS &&
-            kotlin.math.abs(lastEndMs - lineEndMs) <= LINE_END_SLOP_MS &&
-            last.durationMs > maxOf(maxVisualLastMs * 2L, previousTypicalMs * 2L)
-
-    if (!looksLikeLineTailPackedIntoLast) return normalizedChars
-
-    val cappedDuration = maxVisualLastMs.coerceAtLeast(1L)
-    val cappedLast = last.copy(
-        durationMs = cappedDuration,
-        timingParts = listOf(
-            PipoLyricTimingPart(
-                startMs = last.startMs,
-                durationMs = cappedDuration,
-                text = last.text,
-            ),
-        ),
-    )
-    return normalizedChars.dropLast(1) + cappedLast
-}
-
-private fun clampDurationsToNextTokenStart(chars: List<PipoLyricChar>): List<PipoLyricChar> {
-    if (chars.size <= 1) return chars
-    return chars.mapIndexed { idx, char ->
-        val next = chars.getOrNull(idx + 1) ?: return@mapIndexed char
-        val maxDurationMs = (next.startMs - char.startMs).coerceAtLeast(1L)
-        if (char.durationMs > maxDurationMs) {
-            char.copy(durationMs = maxDurationMs)
-        } else {
-            char
-        }
-    }
-}
-
-private fun typicalPreviousTokenDurationMs(chars: List<PipoLyricChar>): Long {
-    val values = chars
-        .map { it.durationMs }
-        .filter { it in 80L..2_200L }
-        .sorted()
-    if (values.isEmpty()) return DEFAULT_TOKEN_VISUAL_MS
-    return values[values.size / 2]
-}
-
-private fun estimateSungTokenDurationMs(text: String): Long {
-    val trimmed = text.trim()
-    if (trimmed.isEmpty()) return DEFAULT_TOKEN_VISUAL_MS
-    val asciiCount = trimmed.count { it in 'a'..'z' || it in 'A'..'Z' || it.isDigit() }
-    val cjkCount = trimmed.count { it in '一'..'鿿' || it in '぀'..'ヿ' || it in '가'..'힣' }
-    val raw = when {
-        asciiCount > 0 -> 520L + asciiCount.coerceAtMost(12) * 38L
-        cjkCount > 0 -> cjkCount * 280L
-        else -> DEFAULT_TOKEN_VISUAL_MS
-    }
-    return raw.coerceIn(MIN_LAST_TOKEN_VISUAL_MS, MAX_LAST_TOKEN_VISUAL_MS)
-}
-
 /**
  * 把"主体 (和声)"形式的行,在行尾括号处切成 [主行, 括号行]。
  *
  * 仅处理**行尾**的单个括号段、且括号前确有主体内容的安全情形：
  *   - 整行括号（"(oh)"）→ open==0，不切，仍由 isParentheticalLine 当整行 ad-lib。
  *   - 行中括号（"la (la) la"）→ 右括号后还有内容，不切。
- * 网易云 yrc 的括号符号往往附着在邻字上,故按 text 字符下标定位、必要时把跨界 char
- * 按文本比例切分时间（括号符号不发音,时间误差忽略不计）。返回 companion 仍以 Primary 标记,
+ * 只在原始时间片段边界拆分；同一片段横跨主体和和声时保留原行，不按文字比例估算时间。
+ * 返回 companion 仍以 Primary 标记,
  * 由 mergeSimultaneousYrcLines 按括号识别后统一改成 Companion 并就近挂载。
  */
 private fun splitTrailingAdlib(line: PipoLyricLine): Pair<PipoLyricLine, PipoLyricLine?> {
@@ -308,45 +209,18 @@ private fun splitTrailingAdlib(line: PipoLyricLine): Pair<PipoLyricLine, PipoLyr
     val mainChars = mutableListOf<PipoLyricChar>()
     val compChars = mutableListOf<PipoLyricChar>()
     var acc = 0
-    for (ch in line.chars) {
+    val sourceChars = line.chars.flatMap { char ->
+        char.timingPartsOrSelf().map { part ->
+            PipoLyricChar(part.startMs, part.durationMs, part.text, listOf(part))
+        }
+    }
+    for (ch in sourceChars) {
         val start = acc
         val end = acc + ch.text.length
         when {
             end <= open -> mainChars.add(ch)
             start >= open -> compChars.add(ch)
-            else -> {
-                // 跨界 char（含 '(' 的那个，如 "你 ("）：前半归主体、后半（'(' 起）归括号行。
-                val cut = (open - start).coerceIn(0, ch.text.length)
-                val head = ch.text.substring(0, cut)
-                val tail = ch.text.substring(cut)
-                val headDur = if (ch.text.isNotEmpty()) {
-                    (ch.durationMs * head.length / ch.text.length).coerceAtLeast(0L)
-                } else {
-                    0L
-                }
-                if (head.isNotEmpty()) {
-                    val d = headDur.coerceAtLeast(1L)
-                    mainChars.add(
-                        ch.copy(
-                            text = head,
-                            durationMs = d,
-                            timingParts = listOf(PipoLyricTimingPart(ch.startMs, d, head)),
-                        ),
-                    )
-                }
-                if (tail.isNotEmpty()) {
-                    val tStart = ch.startMs + headDur
-                    val tDur = (ch.durationMs - headDur).coerceAtLeast(1L)
-                    compChars.add(
-                        ch.copy(
-                            startMs = tStart,
-                            text = tail,
-                            durationMs = tDur,
-                            timingParts = listOf(PipoLyricTimingPart(tStart, tDur, tail)),
-                        ),
-                    )
-                }
-            }
+            else -> return line to null
         }
         acc = end
     }
@@ -459,62 +333,6 @@ private fun isCjkWordChar(c: Char): Boolean {
 
 private fun isAsciiWordJoiner(c: Char): Boolean {
     return c == '\'' || c == '’' || c == '-' || c.isLetterOrDigit()
-}
-
-/**
- * 把 yrc token 切成"视觉字符 / 视觉单词"。规则：
- *   - 中日韩 (CJK) 字符：保留同一个 YRC token 内的连续词组，不再二次切单字
- *   - ASCII 字母 / 数字：连续的当**一个 word**整体（不切！）—— 让英文按单词动画而不是逐字母
- *   - 空白和标点：附着到它前一个 char 上（不单独成字，避免高亮闪烁）
- *
- * 之前 bug：注释说"不切"，代码却 startNew(c) 每个字母都新起一个，
- * 导致 "hello" 被切成 h/e/l/l/o 五块，每个独立 bounce 起伏 → 用户报"逐字母跳"。
- */
-fun splitIntoVisualChars(text: String): List<String> {
-    if (text.isEmpty()) return emptyList()
-    val out = mutableListOf<StringBuilder>()
-    fun startNew(c: Char) {
-        out.add(StringBuilder().append(c))
-    }
-    fun appendToLast(c: Char) {
-        if (out.isEmpty()) startNew(c) else out.last().append(c)
-    }
-    var lastWasAsciiWord = false
-    var lastWasCjkWord = false
-    for (c in text) {
-        val isCjk = isCjkWordChar(c)
-        val isAsciiWord = isAsciiWordChar(c)
-        when {
-            isCjk -> {
-                if (lastWasCjkWord) appendToLast(c) else startNew(c)
-                lastWasAsciiWord = false
-                lastWasCjkWord = true
-            }
-            isAsciiWord -> {
-                // 关键修复：连续 ASCII 字母 / 数字合并到上一个单元 → 一个英文单词整体跳
-                if (lastWasAsciiWord) appendToLast(c) else startNew(c)
-                lastWasAsciiWord = true
-                lastWasCjkWord = false
-            }
-            else -> {
-                // 空白 / 标点：附在前一个字符上，不单独成字。
-                // 撇号 / 连字符仍保持 ASCII word 状态，让 can't / you're / uh-oh
-                // 在单个 YRC token 内直接成为一个视觉单词，避免后续碎片抢走扫色速度。
-                appendToLast(c)
-                lastWasAsciiWord = lastWasAsciiWord && isAsciiInlineWordJoiner(c)
-                lastWasCjkWord = lastWasCjkWord && isCjkInlineWordJoiner(c)
-            }
-        }
-    }
-    return out.map { it.toString() }
-}
-
-private fun isAsciiInlineWordJoiner(c: Char): Boolean {
-    return c == '\'' || c == '’' || c == '-'
-}
-
-private fun isCjkInlineWordJoiner(c: Char): Boolean {
-    return c == '・' || c == '·'
 }
 
 /**
@@ -754,8 +572,3 @@ fun PipoLyricChar.timingPartsOrSelf(): List<PipoLyricTimingPart> {
 private const val NEAR_SIMULTANEOUS_LINE_MS = 80L
 private const val MAX_COMPANION_LYRIC_LINES = 2
 private const val COMPANION_HOST_SLOP_MS = 650L
-private const val LONG_TAIL_AFTER_LAST_TOKEN_MS = 1_800L
-private const val LINE_END_SLOP_MS = 120L
-private const val DEFAULT_TOKEN_VISUAL_MS = 520L
-private const val MIN_LAST_TOKEN_VISUAL_MS = 320L
-private const val MAX_LAST_TOKEN_VISUAL_MS = 1_550L

@@ -36,7 +36,17 @@ internal data class LyricWordQuality(
     val fineTimingRatio: Double
         get() = if (textUnits == 0) 0.0 else
             (textUnits - coarseUnits - untimedUnits).coerceAtLeast(0).toDouble() / textUnits
+
+    // Counts distinct source timestamp spans after repeated character timestamps are grouped.
+    val timedSegmentRatio: Double
+        get() = if (textUnits == 0) 0.0 else timedSegments.toDouble() / textUnits
 }
+
+internal data class LyricDocumentSemantics(
+    val endAlignedPrimaryLines: Int,
+    val companionLines: Int,
+    val translationLines: Int,
+)
 
 /** Shared transport and conservative recording matching for the external lyric sources. */
 internal object OnlineLyricSupport {
@@ -126,6 +136,12 @@ internal object OnlineLyricSupport {
         return validTimings(lines, durationMs)
     }
 
+    /** Accept complete line or word lyrics as a source candidate without inventing word timing. */
+    fun usableLyricsDocument(lines: List<PipoLyricLine>, durationMs: Long): Boolean {
+        if (lines.none { it.role == PipoLyricRole.Primary && it.text.isNotBlank() }) return false
+        return validTimings(lines, durationMs)
+    }
+
     fun wordQuality(lines: List<PipoLyricLine>): LyricWordQuality {
         var textUnits = 0
         var timedSegments = 0
@@ -151,6 +167,24 @@ internal object OnlineLyricSupport {
             coarseUnits += lineCoarseUnits.coerceAtMost(units)
         }
         return LyricWordQuality(textUnits, timedSegments, coarseUnits, untimedUnits)
+    }
+
+    fun documentSemantics(lines: List<PipoLyricLine>): LyricDocumentSemantics {
+        var endAlignedPrimaryLines = 0
+        var companionLines = 0
+        var translationLines = 0
+        fun count(line: PipoLyricLine, isPrimary: Boolean) {
+            if (isPrimary && line.alignment == PipoLyricAlignment.End) endAlignedPrimaryLines++
+            line.companionLines.forEach { companion ->
+                if (companion.text.isNotBlank()) {
+                    companionLines++
+                    if (companion.role == PipoLyricRole.Translation) translationLines++
+                }
+                count(companion, isPrimary = false)
+            }
+        }
+        lines.forEach { line -> if (line.role == PipoLyricRole.Primary) count(line, isPrimary = true) }
+        return LyricDocumentSemantics(endAlignedPrimaryLines, companionLines, translationLines)
     }
 
     fun hasTranslation(line: PipoLyricLine): Boolean =
@@ -186,6 +220,39 @@ internal object OnlineLyricSupport {
             line.copy(companionLines = line.companionLines + translations)
         }
     }
+
+    /** Copy only unambiguous, source-provided duet side information; lyric timing and text stay intact. */
+    fun withMissingAlignments(
+        primary: List<PipoLyricLine>,
+        donor: List<PipoLyricLine>,
+    ): List<PipoLyricLine> {
+        if (donor.none { it.role == PipoLyricRole.Primary && it.alignment == PipoLyricAlignment.End }) return primary
+        val donorByText = donor.filter {
+            it.role == PipoLyricRole.Primary && it.text.isNotBlank()
+        }.groupBy { normalize(it.text) }
+        val primaryByText = primary.filter {
+            it.role == PipoLyricRole.Primary && it.text.isNotBlank()
+        }.groupBy { normalize(it.text) }
+        return primary.map { line ->
+            if (line.role != PipoLyricRole.Primary || line.alignment == PipoLyricAlignment.End) return@map line
+            val textKey = normalize(line.text)
+            if (textKey.isEmpty()) return@map line
+            // 同句可能被左右歌手轮流唱，必须把两侧都纳入消歧，不能只找右侧行。
+            val candidates = donorByText[textKey].orEmpty()
+                .filter { abs(it.startMs - line.startMs) <= MAX_DURATION_DIFFERENCE_MS }
+            val matched = candidates.singleOrNull() ?: return@map line
+            if (matched.alignment != PipoLyricAlignment.End) return@map line
+            val reverseMatches = primaryByText[textKey].orEmpty()
+                .count { abs(it.startMs - matched.startMs) <= MAX_DURATION_DIFFERENCE_MS }
+            if (reverseMatches != 1) return@map line
+            line.withAlignment(matched.alignment)
+        }
+    }
+
+    private fun PipoLyricLine.withAlignment(alignment: PipoLyricAlignment): PipoLyricLine = copy(
+        alignment = alignment,
+        companionLines = companionLines.map { it.withAlignment(alignment) },
+    )
 
     private fun pronunciationUnits(text: String): Int {
         var units = 0

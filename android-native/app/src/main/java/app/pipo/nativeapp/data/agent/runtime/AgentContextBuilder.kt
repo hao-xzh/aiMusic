@@ -182,7 +182,7 @@ object AgentListeningRequestCodec {
     private const val MAX_ITEMS_PER_ARRAY = 12
     private const val MAX_VALUE_CHARS = 160
 
-    private val topLevelStrings = listOf("intent_mode", "artist_scope", "playlist_name", "query")
+    private val topLevelStrings = listOf("intent_mode", "artist_scope", "playlist_name", "query", "continuation_mode")
     private val topLevelArrays = listOf(
         "artists", "genres", "languages", "moods", "scenes", "exclude_terms", "include_artists",
     )
@@ -205,6 +205,9 @@ object AgentListeningRequestCodec {
         }
         for (key in topLevelArrays) {
             if (source.has(key)) canonical.put(key, source.optStringArray(key) ?: return null)
+        }
+        if (source.has("strict_semantics")) {
+            canonical.put("strict_semantics", source.opt("strict_semantics") as? Boolean ?: return null)
         }
         if (source.has("style")) canonical.put("style", source.optJSONObject("style")?.canonicalStyle() ?: return null)
         if (source.has("catalog")) canonical.put("catalog", source.optJSONObject("catalog")?.canonicalCatalog() ?: return null)
@@ -282,7 +285,7 @@ object AgentListeningRequestCodec {
         SECRET_OR_INSTRUCTION.containsMatchIn(value)
 
     private val allowedTopLevelKeys = (topLevelStrings + topLevelArrays + listOf(
-        "style", "catalog", "must_include", "closer",
+        "style", "catalog", "must_include", "closer", "strict_semantics",
     )).toSet()
     private val SECRET_OR_INSTRUCTION = Regex(
         "(?i)(sk-[a-z0-9_-]{16,}|api[_ -]?key|access[_ -]?token|secret\\s*[:=]|password\\s*[:=]|bearer\\s+|system\\s*(prompt|message)|developer\\s*message|ignore\\s+(previous|all)|tool[_ -]?call)",

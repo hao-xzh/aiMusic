@@ -1,9 +1,12 @@
 package app.pipo.nativeapp.data
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 
 /**
@@ -16,52 +19,131 @@ import kotlinx.coroutines.sync.withPermit
  */
 class LibraryLoader(private val repository: PipoRepository) {
 
-    @Volatile
-    private var cached: List<NativeTrack>? = null
+    private data class CacheEntry(
+        val revision: Long,
+        val generation: Long,
+        val tracks: List<NativeTrack>,
+    )
+
+    private data class LibraryLoad(
+        val tracks: List<NativeTrack>,
+        val complete: Boolean,
+    )
+
+    private data class SourceLoad(
+        val tracks: List<NativeTrack>,
+        val complete: Boolean,
+    )
+
+    private val cacheLock = Any()
+    private var cached: CacheEntry? = null
+    private var invalidationGeneration = 0L
+    private val loadMutex = Mutex()
     private val playlistLoadSemaphore = Semaphore(TRACKS_LOAD_CONCURRENCY)
 
     suspend fun library(forceRefresh: Boolean = false): List<NativeTrack> {
-        if (!forceRefresh) cached?.let { return it }
-        var playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
-        if (playlists.isEmpty()) {
-            runCatching {
-                repository.refreshAccount()
-                repository.refreshPlaylists()
+        val revision = repository.libraryRevision.first()
+        if (!forceRefresh) cachedFor(revision)?.let { return it }
+        return loadMutex.withLock {
+            while (true) {
+                val loadRevision = repository.libraryRevision.first()
+                if (!forceRefresh) cachedFor(loadRevision)?.let { return@withLock it }
+                val loadGeneration = synchronized(cacheLock) { invalidationGeneration }
+                val load = loadLibrary()
+                val tracks = load.tracks
+                // A like/add/delete may have changed the library while its playlists were being
+                // aggregated. Retry instead of publishing an old snapshot to recommendation.
+                if (loadRevision != repository.libraryRevision.first()) continue
+                val committed = synchronized(cacheLock) {
+                    if (loadGeneration != invalidationGeneration) false else {
+                        if (load.complete && tracks.isNotEmpty()) {
+                            cached = CacheEntry(loadRevision, loadGeneration, tracks)
+                        }
+                        true
+                    }
+                }
+                if (committed) return@withLock tracks
             }
-            playlists = runCatching { repository.playlists.first() }.getOrDefault(emptyList())
+            error("unreachable")
         }
-        val tracks = coroutineScope {
+    }
+
+    private suspend fun loadLibrary(): LibraryLoad {
+        var playlists = readPlaylists()
+        var playlistMembershipComplete = true
+        if (playlists.isEmpty()) {
+            playlistMembershipComplete = try {
+                repository.refreshAccount()
+                repository.refreshPlaylistsForBrowse()
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                false
+            }
+            playlists = readPlaylists()
+        }
+        return coroutineScope {
             val deferred = playlists.map { p ->
                 async {
                     playlistLoadSemaphore.withPermit {
-                        runCatching { repository.tracksForPlaylist(p.id) }.getOrDefault(emptyList())
+                        try {
+                            val tracks = repository.tracksForPlaylist(p.id)
+                            SourceLoad(tracks, tracks.size >= p.trackCount)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            SourceLoad(emptyList(), complete = false)
+                        }
                     }
                 }
             }
             val cloudDeferred = async {
-                runCatching { repository.cloudDiskTracks() }.getOrDefault(emptyList())
+                try {
+                    SourceLoad(repository.cloudDiskTracksForBrowse(), complete = true)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    SourceLoad(emptyList(), complete = false)
+                }
             }
             val seen = HashSet<String>()
             val out = ArrayList<NativeTrack>()
+            var complete = playlistMembershipComplete
             deferred.forEach { d ->
-                d.await().forEach { t ->
+                val source = d.await()
+                complete = complete && source.complete
+                source.tracks.forEach { t ->
                     if (seen.add(t.id)) out.add(t)
                 }
             }
-            cloudDeferred.await().forEach { t ->
+            val cloud = cloudDeferred.await()
+            complete = complete && cloud.complete
+            cloud.tracks.forEach { t ->
                 if (seen.add(t.id)) out.add(t)
             }
-            out
+            LibraryLoad(out, complete)
         }
-        if (tracks.isNotEmpty()) {
-            cached = tracks
-        }
-        return tracks
     }
 
-    fun peek(): List<NativeTrack> = cached.orEmpty()
+    private suspend fun readPlaylists(): List<PipoPlaylist> = try {
+        repository.playlists.first()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        emptyList()
+    }
 
-    fun invalidate() { cached = null }
+    private fun cachedFor(revision: Long): List<NativeTrack>? = synchronized(cacheLock) {
+        cached?.takeIf { it.revision == revision && it.generation == invalidationGeneration }?.tracks
+    }
+
+    fun peek(): List<NativeTrack> = synchronized(cacheLock) { cached?.tracks.orEmpty() }
+
+    fun invalidate() = synchronized(cacheLock) {
+        invalidationGeneration += 1L
+        cached = null
+    }
 
     companion object {
         private const val TRACKS_LOAD_CONCURRENCY = 4

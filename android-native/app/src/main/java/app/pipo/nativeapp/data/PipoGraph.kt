@@ -2,6 +2,7 @@ package app.pipo.nativeapp.data
 
 import android.content.Context
 import app.pipo.nativeapp.data.agent.task.AgentTaskCoordinator
+import app.pipo.nativeapp.playback.PlaybackSessionClock
 
 /**
  * 全局 DI 容器。RustBridgeRepository 在 PipoApplication.onCreate 装配；
@@ -165,6 +166,7 @@ object PipoGraph {
 
     fun installContext(context: Context) {
         val app = context.applicationContext
+        PlaybackSessionClock.installContext(app)
         if (!::homeRecommendationStore.isInitialized) homeRecommendationStore = HomeRecommendationStore(app)
         if (agentTaskCoordinator == null) agentTaskCoordinator = AgentTaskCoordinator(app)
         if (profileStore == null) profileStore = TasteProfileStore(app)

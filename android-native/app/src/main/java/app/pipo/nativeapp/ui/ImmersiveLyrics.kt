@@ -58,6 +58,7 @@ fun ImmersiveLyricsOverlay(
     artist: String,
     trackId: String?,
     lyrics: List<PipoLyricLine>,
+    isLyricsLoading: Boolean,
     positionProvider: () -> Long,
     isPlaying: Boolean,
     showTranslation: Boolean,
@@ -214,6 +215,7 @@ fun ImmersiveLyricsOverlay(
         // 等校准完成后才随 contentProgress 淡入，避免首屏可见跳动。
         ImmersiveLyricsColumnLayer(
             lyrics = lyrics,
+            isLyricsLoading = isLyricsLoading,
             trackId = trackId,
             positionProvider = positionProvider,
             isPlaying = isPlaying,
@@ -233,6 +235,7 @@ fun ImmersiveLyricsOverlay(
 @Composable
 private fun ImmersiveLyricsColumnLayer(
     lyrics: List<PipoLyricLine>,
+    isLyricsLoading: Boolean,
     trackId: String?,
     positionProvider: () -> Long,
     isPlaying: Boolean,
@@ -262,6 +265,7 @@ private fun ImmersiveLyricsColumnLayer(
             )
             AppleMusicLyricColumn(
                 lines = lyrics,
+                isLyricsLoading = isLyricsLoading,
                 sessionId = trackId,
                 isPlaying = isPlaying,
                 positionProvider = positionProvider,
