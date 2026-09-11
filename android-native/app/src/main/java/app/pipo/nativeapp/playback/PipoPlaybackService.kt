@@ -138,6 +138,9 @@ class PipoPlaybackService : MediaLibraryService() {
     private var lastExternalPolicyLogKey: String? = null
     private var lastExternalPolicyLogAtMs = 0L
     private var lastExternalMisfireLogAtMs = 0L
+    // Android 15 的公开 AudioPlaybackConfiguration 会隐藏 UID/active state；先记录
+    // 当前播放会话启动时已经存在的无焦点 media 数，只把后续净增量视作外部声音。
+    private var unfocusedMediaBaselineCount: Int? = null
     private var audioFocusRequest: AudioFocusRequest? = null
     private var lastAudioFocusRequestResult = AudioManager.AUDIOFOCUS_REQUEST_FAILED
     private var playbackCallbackRegistered = false
@@ -196,6 +199,8 @@ class PipoPlaybackService : MediaLibraryService() {
         val inactiveConfigCount: Int,
         val ownUidConfigCount: Int,
         val ownExpectedMediaCount: Int,
+        val observedExternalMediaOrGameCount: Int,
+        val unfocusedMediaBaselineCount: Int,
         val externalMediaOrGameCount: Int,
         val hasExternalMediaOrGame: Boolean,
         val hasVoiceOrAssistant: Boolean,
@@ -1486,6 +1491,9 @@ class PipoPlaybackService : MediaLibraryService() {
     private fun handleSessionPlayWhenReadyCommand(playWhenReady: Boolean) {
         val player = mediaSession?.player ?: return
         if (playWhenReady) {
+            // 用户/控制器明确重启播放时重新学习当前无焦点基线；这样一次自动暂停后
+            // 的手动播放也是显式覆盖，不会被同一条匿名配置再次立刻暂停。
+            unfocusedMediaBaselineCount = null
             if (autoResumeState != null) {
                 clearAudioFocusAutoResume("session-play-command")
             }
@@ -1732,7 +1740,11 @@ class PipoPlaybackService : MediaLibraryService() {
             clearAudioFocusAutoResume("not-needed-$reason")
             return
         }
-        val profile = externalAudioProfile(configs)
+        val now = SystemClock.elapsedRealtime()
+        val focusChange = lastExternalFocusChange
+        val hasRecentFocusSignal = focusChange != null &&
+            now - lastExternalFocusInterruptionAtMs <= EXTERNAL_FOCUS_FALLBACK_WINDOW_MS
+        val profile = externalAudioProfileForPolicy(configs, hasRecentFocusSignal, reason)
         if (hasExternalPauseBlockingAudio(profile)) {
             externalAudioObservedSincePause = true
             externalAudioQuietSinceMs = 0L
@@ -1753,7 +1765,6 @@ class PipoPlaybackService : MediaLibraryService() {
             scheduleAudioFocusResumeProbe(AUDIO_FOCUS_RESUME_PROBE_MS, "wait-external-observed")
             return
         }
-        val now = SystemClock.elapsedRealtime()
         if (externalAudioQuietSinceMs == 0L) {
             externalAudioQuietSinceMs = now
             scheduleAudioFocusResumeProbe(EXTERNAL_AUDIO_QUIET_BEFORE_RESUME_MS, "quiet-window")
@@ -1814,11 +1825,11 @@ class PipoPlaybackService : MediaLibraryService() {
         configs: List<AudioPlaybackConfiguration> = audioManager.activePlaybackConfigurations,
     ) {
         val player = mediaSession?.player ?: return
-        val profile = externalAudioProfile(configs)
         val now = SystemClock.elapsedRealtime()
         val focusChange = lastExternalFocusChange
         val hasRecentFocusSignal = focusChange != null &&
             now - lastExternalFocusInterruptionAtMs <= EXTERNAL_FOCUS_FALLBACK_WINDOW_MS
+        val profile = externalAudioProfileForPolicy(configs, hasRecentFocusSignal, reason)
         // Focus 回调通常先于 playback configuration 回调到达。若 transient/duck
         // 之后配置已经明确为空，不要再被“最近有过焦点丢失”挡住恢复；只有永久
         // LOSS 且还没有建立自动恢复状态时，才保留无配置也暂停的兜底。
@@ -1918,12 +1929,60 @@ class PipoPlaybackService : MediaLibraryService() {
             inactiveConfigCount = configs.size - activeConfigs.size,
             ownUidConfigCount = ownUidConfigs.size,
             ownExpectedMediaCount = ownExpectedCount,
+            observedExternalMediaOrGameCount = externalMediaCount,
+            unfocusedMediaBaselineCount = 0,
             externalMediaOrGameCount = externalMediaCount,
             hasExternalMediaOrGame = externalMediaCount > 0,
             hasVoiceOrAssistant = usages.any(::isVoiceOrAssistantUsage),
             hasNavigation = usages.any(::isNavigationUsage),
             hasNotification = usages.any(::isNotificationOrSonificationUsage),
             hasAlarmOrRingtone = usages.any(::isAlarmOrRingtoneUsage),
+        )
+    }
+
+    private fun externalAudioProfileForPolicy(
+        configs: List<AudioPlaybackConfiguration>,
+        hasRecentFocusSignal: Boolean,
+        reason: String,
+    ): ExternalAudioProfile {
+        val profile = externalAudioProfile(configs)
+        if (hasRecentFocusSignal) {
+            return profile.copy(
+                unfocusedMediaBaselineCount = unfocusedMediaBaselineCount ?: 0,
+            )
+        }
+        // 能识别本进程 UID 时，externalMediaOrGameCount 已经是真实外部数量，不需要基线。
+        if (profile.ownUidConfigCount > 0) {
+            unfocusedMediaBaselineCount = null
+            return profile
+        }
+
+        val observedCount = profile.externalMediaOrGameCount
+        val previousBaseline = unfocusedMediaBaselineCount
+        val baseline = when {
+            previousBaseline == null -> observedCount
+            observedCount < previousBaseline -> observedCount
+            else -> previousBaseline
+        }
+        if (baseline != previousBaseline) {
+            unfocusedMediaBaselineCount = baseline
+            DiagnosticsLogStore.record(
+                area = "playback_service",
+                event = "external_audio_unfocused_media_baseline",
+                fields = mediaSession?.player?.let(::playerFields).orEmpty() + mapOf(
+                    "reason" to reason,
+                    "previousBaselineCount" to previousBaseline,
+                    "baselineCount" to baseline,
+                    "observedExternalMediaOrGameCount" to observedCount,
+                ),
+            )
+        }
+        val effectiveCount = (observedCount - baseline).coerceAtLeast(0)
+        return profile.copy(
+            observedExternalMediaOrGameCount = observedCount,
+            unfocusedMediaBaselineCount = baseline,
+            externalMediaOrGameCount = effectiveCount,
+            hasExternalMediaOrGame = effectiveCount > 0,
         )
     }
 
@@ -2033,9 +2092,8 @@ class PipoPlaybackService : MediaLibraryService() {
         }
         if (profile.hasExternalMediaOrGame) {
             // 部分短视频/游戏只更新 AudioPlaybackConfiguration，并不规范地申请
-            // AudioFocus。之前这里一律永久 ignore，导致“其他 App 明明在发声但
-            // Claudio 不避让”。保留一个很短的误触发确认窗，随后按同一套
-            // duck -> pause 策略处理；真正静默的残留配置会由 isActive 过滤掉。
+            // AudioFocus。只有其数量相对当前播放会话的匿名 media 基线确实增加，
+            // 才会走到这里；保留一个很短的误触发确认窗后再 duck -> pause。
             if (!hasRecentFocusSignal && durationMs < EXTERNAL_MEDIA_MISFIRE_IGNORE_MS) {
                 return ExternalAudioPolicy(
                     action = ExternalAudioAction.Ignore,
@@ -2137,6 +2195,8 @@ class PipoPlaybackService : MediaLibraryService() {
                 "inactiveConfigCount" to profile.inactiveConfigCount,
                 "ownUidConfigCount" to profile.ownUidConfigCount,
                 "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                "observedExternalMediaOrGameCount" to profile.observedExternalMediaOrGameCount,
+                "unfocusedMediaBaselineCount" to profile.unfocusedMediaBaselineCount,
                 "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                 "targetGain" to target,
                 "durationMs" to durationMs,
@@ -2170,6 +2230,8 @@ class PipoPlaybackService : MediaLibraryService() {
                     "inactiveConfigCount" to profile.inactiveConfigCount,
                     "ownUidConfigCount" to profile.ownUidConfigCount,
                     "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                    "observedExternalMediaOrGameCount" to profile.observedExternalMediaOrGameCount,
+                    "unfocusedMediaBaselineCount" to profile.unfocusedMediaBaselineCount,
                     "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                     "targetGain" to policy.targetGain,
                     "durationMs" to durationMs,
@@ -2293,6 +2355,8 @@ class PipoPlaybackService : MediaLibraryService() {
                 "inactiveConfigCount" to profile.inactiveConfigCount,
                 "ownUidConfigCount" to profile.ownUidConfigCount,
                 "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                "observedExternalMediaOrGameCount" to profile.observedExternalMediaOrGameCount,
+                "unfocusedMediaBaselineCount" to profile.unfocusedMediaBaselineCount,
                 "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                 "targetGain" to policy.targetGain,
                 "durationMs" to durationMs,
@@ -2324,6 +2388,8 @@ class PipoPlaybackService : MediaLibraryService() {
                 "inactiveConfigCount" to profile.inactiveConfigCount,
                 "ownUidConfigCount" to profile.ownUidConfigCount,
                 "ownExpectedMediaCount" to profile.ownExpectedMediaCount,
+                "observedExternalMediaOrGameCount" to profile.observedExternalMediaOrGameCount,
+                "unfocusedMediaBaselineCount" to profile.unfocusedMediaBaselineCount,
                 "externalMediaOrGameCount" to profile.externalMediaOrGameCount,
                 "targetGain" to policy.targetGain,
                 "durationMs" to durationMs,
