@@ -13,15 +13,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import coil.compose.AsyncImage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 @Composable
 fun LoginScreen(onBack: () -> Unit) {
     val repository = PipoGraph.repository
     val account by repository.account.collectAsState(initial = null)
+    val qqTransport = PipoGraph.music.qqTransport
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val qqConnection by qqTransport.connection.collectAsState()
     val scope = rememberCoroutineScope()
+    var provider by remember { mutableStateOf<LoginProvider?>(null) }
     var mode by remember { mutableStateOf(LoginMode.Phone) }
     var phone by remember { mutableStateOf("") }
     var captcha by remember { mutableStateOf("") }
@@ -33,14 +41,27 @@ fun LoginScreen(onBack: () -> Unit) {
     var qrContent by remember { mutableStateOf<String?>(null) }
     var qrRefreshNonce by remember { mutableIntStateOf(0) }
     var qrStatus by remember { mutableStateOf("用网易云 App 扫码确认登录。") }
+    var qqMethod by remember { mutableStateOf(qqTransport.loginMethods.firstOrNull().orEmpty()) }
+    var qqQrContent by remember { mutableStateOf<String?>(null) }
+    var qqQrRefreshNonce by remember { mutableIntStateOf(0) }
+    var qqQrStatus by remember { mutableStateOf("选择登录方式后获取二维码。") }
     val phoneOk = Regex("^1[0-9]{10}$").matches(phone)
     val captchaOk = captcha.length in 4..6
-    LaunchedEffect(account) { if (account != null) onBack() }
+    LaunchedEffect(provider, account?.userId, qqConnection.account?.id) {
+        if (provider == LoginProvider.NetEase && account != null) onBack()
+        if (provider == LoginProvider.Qq && qqConnection.account != null) onBack()
+    }
     LaunchedEffect(cooldown) { if (cooldown > 0) { delay(1_000); cooldown-- } }
     LaunchedEffect(loginCooldown) { if (loginCooldown > 0) { delay(1_000); loginCooldown-- } }
-    LaunchedEffect(mode, qrRefreshNonce) {
-        if (mode != LoginMode.Qr) { qrContent = null; return@LaunchedEffect }
+    LaunchedEffect(provider, mode, qrRefreshNonce) {
+        if (provider != LoginProvider.NetEase || mode != LoginMode.Qr) { qrContent = null; return@LaunchedEffect }
         runQrFlow(repository, onContent = { qrContent = it }, onStatus = { qrStatus = it })
+    }
+    LaunchedEffect(provider, qqMethod, qqQrRefreshNonce, lifecycle) {
+        if (provider != LoginProvider.Qq || qqMethod.isBlank()) { qqQrContent = null; return@LaunchedEffect }
+        runQqQrFlow(qqTransport, qqMethod,
+            awaitVisible = { lifecycle.currentStateFlow.first { it.isAtLeast(Lifecycle.State.STARTED) } },
+            onContent = { qqQrContent = it }, onStatus = { qqQrStatus = it })
     }
     val fieldColors = OutlinedTextFieldDefaults.colors(
         focusedBorderColor = BrowseMuted, unfocusedBorderColor = Color.White.copy(alpha = 0.12f),
@@ -50,17 +71,31 @@ fun LoginScreen(onBack: () -> Unit) {
         focusedPrefixColor = BrowseInk, unfocusedPrefixColor = BrowseInk, cursorColor = PipoColors.Mint
     )
     BrowsePageScaffold("", coverUrl = "file:///android_asset/artwork/login-music-classics.png", artistic = true, onBack = onBack) {
-        Text("旧日有声，\n此刻重逢。", color = BrowseInk, fontSize = 36.sp, lineHeight = 48.sp)
-        Text("让网易云里的珍藏，继续陪你往前走。", color = BrowseMuted, fontSize = 16.sp, modifier = Modifier.padding(top = 16.dp, bottom = 72.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-            TextButton(enabled = !sending && !loggingIn, onClick = { mode = LoginMode.Phone }) { Text("手机号登录", color = if (mode == LoginMode.Phone) BrowseInk else BrowseMuted) }
-            TextButton(enabled = !sending && !loggingIn, onClick = { mode = LoginMode.Qr }) { Text("扫码登录", color = if (mode == LoginMode.Qr) BrowseInk else BrowseMuted) }
+        Text("把两份喜欢，\n放在一起。", color = BrowseInk, fontSize = 36.sp, lineHeight = 48.sp)
+        Text("可分别连接网易云音乐和 QQ 音乐，资料库会统一整理。", color = BrowseMuted, fontSize = 16.sp, modifier = Modifier.padding(top = 16.dp, bottom = 40.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            PlatformLoginButton("网易云音乐", account?.nickname, provider == LoginProvider.NetEase) { provider = LoginProvider.NetEase }
+            PlatformLoginButton("QQ 音乐", qqConnection.account?.nickname, provider == LoginProvider.Qq) { provider = LoginProvider.Qq }
         }
-        if (mode == LoginMode.Phone) {
-            OutlinedTextField(phone, { phone = it.filter { c -> c in '0'..'9' }.take(11) }, Modifier.fillMaxWidth().padding(top = 18.dp), colors = fieldColors, textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp), prefix = { Text("+86  ") }, placeholder = { Text("11 位手机号") }, singleLine = true, readOnly = sending || loggingIn, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp))
-            OutlinedTextField(captcha, { captcha = it.filter { c -> c in '0'..'9' }.take(6) }, Modifier.fillMaxWidth().padding(top = 18.dp), colors = fieldColors, textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp), placeholder = { Text("短信验证码") }, singleLine = true, readOnly = sending || loggingIn, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp), trailingIcon = {
-                TextButton(enabled = phoneOk && !sending && !loggingIn && cooldown == 0 && loginCooldown == 0, onClick = {
-                    if (sending || loggingIn || cooldown > 0 || loginCooldown > 0) return@TextButton
+        when (provider) {
+            null -> BrowseNotice("选择一个平台开始登录；已连接的平台仍可在这里切换。")
+            LoginProvider.NetEase -> NetEaseLoginContent(
+                account = account,
+                mode = mode,
+                onModeChange = { mode = it },
+                phone = phone,
+                onPhoneChange = { phone = it },
+                captcha = captcha,
+                onCaptchaChange = { captcha = it },
+                phoneOk = phoneOk,
+                captchaOk = captchaOk,
+                sending = sending,
+                loggingIn = loggingIn,
+                cooldown = cooldown,
+                loginCooldown = loginCooldown,
+                status = status,
+                onSend = {
+                    if (sending || loggingIn || cooldown > 0 || loginCooldown > 0) return@NetEaseLoginContent
                     val requestedPhone = phone
                     sending = true
                     cooldown = 60
@@ -75,39 +110,186 @@ fun LoginScreen(onBack: () -> Unit) {
                         catch (e: Exception) { status = phoneStatus(null, e) }
                         finally { sending = false }
                     }
-                }) { Text(if (sending) "发送中" else if (cooldown > 0) "${cooldown}s" else "发送验证码", fontSize = 12.sp) }
-            })
-            Button(enabled = phoneOk && captchaOk && !sending && !loggingIn && loginCooldown == 0, onClick = {
-                if (sending || loggingIn || loginCooldown > 0) return@Button
-                val requestedPhone = phone
-                val requestedCaptcha = captcha
-                loggingIn = true
-                status = "正在登录…"
-                scope.launch {
-                    try {
-                        val result = repository.loginWithPhone(requestedPhone, requestedCaptcha)
-                        status = phoneLoginStatus(result, null)
-                        if (isPhoneLoginRestricted(result.code, result.message)) loginCooldown = 60
-                        if (result.code == 200) { DiagnosticsLogStore.record("login", "phone_login_success"); repository.refreshAccount() }
-                        else DiagnosticsLogStore.record("login", "phone_login_failed", mapOf("code" to result.code))
-                    } catch (e: CancellationException) { throw e }
-                    catch (e: Exception) { loginCooldown = 60; status = phoneLoginStatus(null, e) }
-                    finally { loggingIn = false }
-                }
-            }, modifier = Modifier.fillMaxWidth().padding(top = 22.dp).heightIn(min = 52.dp), colors = ButtonDefaults.buttonColors(containerColor = BrowseInk, contentColor = Color.Black), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp)) { Text(if (loggingIn) "登录中…" else if (loginCooldown > 0) "${loginCooldown}s 后重试" else "登录") }
-            if (status.isNotEmpty()) BrowseNotice(status)
-            Text("使用已注册的网易云账号登录", color = BrowseMuted, fontSize = 13.sp, modifier = Modifier.padding(top = 14.dp))
-        } else {
-            Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
-                qrContent?.let { QrCode(content = it, modifier = Modifier.size(200.dp)) } ?: Text(qrStatus, color = BrowseMuted)
-            }
-            Text(qrStatus, color = BrowseMuted)
-            TextButton(onClick = { qrRefreshNonce++ }) { Text("刷新二维码") }
+                },
+                onLogin = {
+                    if (sending || loggingIn || loginCooldown > 0) return@NetEaseLoginContent
+                    val requestedPhone = phone
+                    val requestedCaptcha = captcha
+                    loggingIn = true
+                    status = "正在登录…"
+                    scope.launch {
+                        try {
+                            val result = repository.loginWithPhone(requestedPhone, requestedCaptcha)
+                            status = phoneLoginStatus(result, null)
+                            if (isPhoneLoginRestricted(result.code, result.message)) loginCooldown = 60
+                            if (result.code == 200) { DiagnosticsLogStore.record("login", "phone_login_success"); repository.refreshAccount() }
+                            else DiagnosticsLogStore.record("login", "phone_login_failed", mapOf("code" to result.code))
+                        } catch (e: CancellationException) { throw e }
+                        catch (e: Exception) { loginCooldown = 60; status = phoneLoginStatus(null, e) }
+                        finally { loggingIn = false }
+                    }
+                },
+                fieldColors = fieldColors,
+                qrContent = qrContent,
+                qrStatus = qrStatus,
+                onRefreshQr = { qrRefreshNonce++ },
+            )
+            LoginProvider.Qq -> QqLoginContent(
+                connection = qqConnection,
+                methods = qqTransport.loginMethods,
+                selectedMethod = qqMethod,
+                onMethodChange = { qqMethod = it; qqQrRefreshNonce++ },
+                qrContent = qqQrContent,
+                qrStatus = qqQrStatus,
+                onRefreshQr = { qqQrRefreshNonce++ },
+            )
         }
     }
 }
 
+@Composable
+private fun PlatformLoginButton(name: String, accountName: String?, selected: Boolean, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.heightIn(min = 58.dp),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = if (selected) BrowseInk else BrowseMuted),
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (selected) BrowseInk else Color.White.copy(alpha = 0.16f)),
+        shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp),
+    ) {
+        Column(horizontalAlignment = Alignment.Start) {
+            Text(name, fontSize = 14.sp)
+            Text(accountName ?: "未登录", fontSize = 12.sp, color = BrowseMuted)
+        }
+    }
+}
+
+@Composable
+private fun NetEaseLoginContent(
+    account: PipoAccount?, mode: LoginMode, onModeChange: (LoginMode) -> Unit,
+    phone: String, onPhoneChange: (String) -> Unit, captcha: String, onCaptchaChange: (String) -> Unit,
+    phoneOk: Boolean, captchaOk: Boolean, sending: Boolean, loggingIn: Boolean, cooldown: Int, loginCooldown: Int,
+    status: String, onSend: () -> Unit, onLogin: () -> Unit,
+    fieldColors: TextFieldColors, qrContent: String?, qrStatus: String, onRefreshQr: () -> Unit,
+) {
+    account?.let { BrowseNotice("已连接 · ${it.nickname}") }
+    Row(horizontalArrangement = Arrangement.spacedBy(20.dp), modifier = Modifier.padding(top = 18.dp)) {
+        TextButton(enabled = !sending && !loggingIn, onClick = { onModeChange(LoginMode.Phone) }) { Text("手机号登录", color = if (mode == LoginMode.Phone) BrowseInk else BrowseMuted) }
+        TextButton(enabled = !sending && !loggingIn, onClick = { onModeChange(LoginMode.Qr) }) { Text("扫码登录", color = if (mode == LoginMode.Qr) BrowseInk else BrowseMuted) }
+    }
+    if (mode == LoginMode.Phone) {
+        OutlinedTextField(phone, { onPhoneChange(it.filter { c -> c in '0'..'9' }.take(11)) }, Modifier.fillMaxWidth().padding(top = 18.dp), colors = fieldColors, textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp), prefix = { Text("+86  ") }, placeholder = { Text("11 位手机号") }, singleLine = true, readOnly = sending || loggingIn, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp))
+        OutlinedTextField(captcha, { onCaptchaChange(it.filter { c -> c in '0'..'9' }.take(6)) }, Modifier.fillMaxWidth().padding(top = 18.dp), colors = fieldColors, textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp), placeholder = { Text("短信验证码") }, singleLine = true, readOnly = sending || loggingIn, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp), trailingIcon = {
+            TextButton(enabled = phoneOk && !sending && !loggingIn && cooldown == 0 && loginCooldown == 0, onClick = onSend) { Text(if (sending) "发送中" else if (cooldown > 0) "${cooldown}s" else "发送验证码", fontSize = 12.sp) }
+        })
+        Button(enabled = phoneOk && captchaOk && !sending && !loggingIn && loginCooldown == 0, onClick = onLogin, modifier = Modifier.fillMaxWidth().padding(top = 22.dp).heightIn(min = 52.dp), colors = ButtonDefaults.buttonColors(containerColor = BrowseInk, contentColor = Color.Black), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp)) { Text(if (loggingIn) "登录中…" else if (loginCooldown > 0) "${loginCooldown}s 后重试" else "登录") }
+        if (status.isNotEmpty()) BrowseNotice(status)
+        Text("使用已注册的网易云账号登录", color = BrowseMuted, fontSize = 13.sp, modifier = Modifier.padding(top = 14.dp))
+    } else {
+        Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+            qrContent?.let { QrCode(content = it, modifier = Modifier.size(200.dp)) } ?: Text(qrStatus, color = BrowseMuted)
+        }
+        Text(qrStatus, color = BrowseMuted)
+        TextButton(onClick = onRefreshQr) { Text("刷新二维码") }
+    }
+}
+
+@Composable
+private fun QqLoginContent(
+    connection: MusicProviderConnection,
+    methods: List<String>,
+    selectedMethod: String,
+    onMethodChange: (String) -> Unit,
+    qrContent: String?,
+    qrStatus: String,
+    onRefreshQr: () -> Unit,
+) {
+    connection.account?.let { BrowseNotice("已连接 · ${it.nickname}") }
+    connection.error?.let { BrowseNotice(it, "重试", onRefreshQr) }
+    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 18.dp)) {
+        methods.forEach { method ->
+            TextButton(onClick = { onMethodChange(method) }) {
+                Text(if (method == "wechat") "微信扫码" else "QQ 扫码", color = if (selectedMethod == method) BrowseInk else BrowseMuted)
+            }
+        }
+    }
+    Box(Modifier.fillMaxWidth().padding(vertical = 24.dp), contentAlignment = Alignment.Center) {
+        qrContent?.let { AsyncImage(model = it, contentDescription = "QQ 音乐登录二维码", modifier = Modifier.size(200.dp)) } ?: Text(qrStatus, color = BrowseMuted)
+    }
+    Text(qrStatus, color = BrowseMuted)
+    TextButton(onClick = onRefreshQr) { Text("刷新二维码") }
+}
+
+private enum class LoginProvider { NetEase, Qq }
 private enum class LoginMode { Phone, Qr }
+
+private suspend fun runQqQrFlow(
+    transport: app.pipo.nativeapp.data.qqnative.QqNativeTransport,
+    channel: String,
+    awaitVisible: suspend () -> Unit,
+    onContent: (String?) -> Unit,
+    onStatus: (String) -> Unit,
+) {
+    onContent(null)
+    onStatus("正在请求二维码…")
+    val start = try {
+        transport.startQr(channel)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        onContent(null)
+        onStatus(e.message ?: "二维码加载失败，检查网络后刷新。")
+        return
+    }
+    if (start.qrContent.isBlank()) {
+        onContent(null)
+        onStatus("二维码加载失败，检查网络后刷新。")
+        return
+    }
+    onContent(start.qrContent)
+    onStatus("等待扫码。")
+    try {
+        // The transport owns the QR expiry; do not stop listening before it expires.
+        while (true) {
+            delay(2_000)
+            // Keep the QR session while QQ is foreground; query its status when PIPO is visible again.
+            awaitVisible()
+            val status = try {
+                transport.checkQr(start.key)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                onContent(null)
+                onStatus(e.message ?: "登录状态获取失败，稍等后刷新。")
+                return
+            }
+            when (status.code) {
+                801 -> onStatus(status.message ?: "等待扫码。")
+                802 -> onStatus(status.message ?: "已扫码，在手机上确认登录。")
+                803 -> {
+                    onStatus(status.nickname?.let { "已登录 · $it" } ?: "登录成功。")
+                    onContent(null)
+                    return
+                }
+                800 -> {
+                    onStatus(status.message ?: "二维码已过期，点刷新重新生成。")
+                    onContent(null)
+                    return
+                }
+                else -> {
+                    onStatus(status.message ?: "登录状态异常，请刷新二维码。")
+                    onContent(null)
+                    return
+                }
+            }
+        }
+    } finally {
+        if (transport.connection.value.account == null) {
+            try { transport.cancelQr(start.key) }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { }
+        }
+    }
+}
 
 private suspend fun runQrFlow(
     repository: PipoRepository,

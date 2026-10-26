@@ -429,7 +429,8 @@ fun PipoNativeApp(
                 Box(
                     Modifier.fillMaxSize()
                         .zIndex(if (route != Route.Player && backStack.contains(Route.Player)) 2f else 0f)
-                        .blur(aiBackgroundBlur),
+                        .blur(aiBackgroundBlur)
+                        .assistantWaterSurface(aiWakeEffect),
                 ) {
                     CompositionLocalProvider(
                         LocalOnBack provides goBack,
@@ -471,7 +472,8 @@ fun PipoNativeApp(
                         if (pageRoute != Route.Login && pageRoute != Route.AiSettings && !createOpen && !browseKeyboardOpen) {
                             BrowseChrome(browseSession.tab, viewModel,
                                 { browseSession.select(it); backStack = emptyList(); route = Route.Browse },
-                                openPlayer, { queueOpen = true }, { miniPlayerBounds = it }, showMiniPlayer = pageRoute != Route.Browse)
+                                openPlayer, { queueOpen = true }, { miniPlayerBounds = it },
+                                showMiniPlayer = pageRoute != Route.Browse && pageRoute != Route.Taste)
                         }
                         }
                     }
@@ -504,12 +506,12 @@ fun PipoNativeApp(
 
             }
 
-            BackHandler(enabled = !aiOverlayOpen && (queueOpen || immersive || route != Route.Browse || browseSession.playlist != null || browseSession.cloud || browseSession.searchOpen)) {
+            BackHandler(enabled = !aiOverlayOpen && (queueOpen || immersive || route != Route.Browse || browseSession.playlist != null || browseSession.unifiedPlaylistId != null || browseSession.cloud || browseSession.searchOpen)) {
                 when {
                     queueOpen -> queueOpen = false
                     route == Route.Player && isLandscape -> exitLandscape()
                     immersive -> immersive = false
-                    route == Route.Browse && (browseSession.playlist != null || browseSession.cloud) -> browseSession.closeDetail()
+                    route == Route.Browse && (browseSession.playlist != null || browseSession.unifiedPlaylistId != null || browseSession.cloud) -> browseSession.closeDetail()
                     route == Route.Browse && browseSession.searchOpen -> { browseSession.closeSearch(); browseModel.editQuery("") }
                     else -> goBack()
                 }

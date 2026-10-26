@@ -71,6 +71,8 @@ pub struct UserProfile {
     pub nickname: String,
     #[serde(default, rename = "avatarUrl")]
     pub avatar_url: Option<String>,
+    #[serde(default, rename = "hasMusicSubscription")]
+    pub has_music_subscription: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +110,8 @@ pub struct UserPlaylistsResp {
     pub code: i32,
     #[serde(default)]
     pub playlist: Vec<PlaylistInfo>,
+    #[serde(default)]
+    pub more: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,18 +461,16 @@ where
 
 impl UserCloudTrack {
     /// 云盘"列表"用：每条 cloud entry 只产出一个 (id, TrackInfo)。
-    /// 优先级：simpleSong.id > privateCloud.songId > songId > id > fileId。
+    /// 优先使用用户上传的 songId，simpleSong.id 可能指向仅提供试听的公开曲库版本。
     /// hydration 那条路径要用 [`Self::into_track_candidates`] 拿到所有可能的 id（
     /// 因为 NetEase 一条云盘记录在歌单 trackIds 里可能出现多种 id 形式）。
     pub fn into_primary_track(self) -> Option<(i64, TrackInfo)> {
         let private_id = self.private_cloud.as_ref().and_then(|p| p.song_id);
         let simple_id = self.simple_song.as_ref().map(|t| t.id);
-        let primary_id = simple_id
-            .or(private_id)
-            .or(self.song_id)
-            .or(self.id)
-            .or(self.file_id)
-            .filter(|id| *id != 0)?;
+        let primary_id = [private_id, self.song_id, simple_id, self.id, self.file_id]
+            .into_iter()
+            .flatten()
+            .find(|id| *id > 0)?;
 
         let base = if let Some(track) = self.simple_song {
             track
@@ -586,6 +588,9 @@ pub struct SongUrl {
     /// 文件大小（字节）
     #[serde(default)]
     pub size: i64,
+    /// Present when the provider returned only a preview segment (for example 0..30s).
+    #[serde(default, rename = "freeTrialInfo")]
+    pub free_trial_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

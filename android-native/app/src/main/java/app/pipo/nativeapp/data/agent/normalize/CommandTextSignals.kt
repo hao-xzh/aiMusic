@@ -314,12 +314,12 @@ object CommandTextSignals {
             "为主", "主打", "混一点", "混点", "夹一点", "带一点", "穿插一点",
             "穿插点", "加点类似", "加一点类似", "为主混", "主打混",
         ).any { it in key }
-        if (focusCue) return ArtistScope.Focus
+        if (focusCue || Regex("\\b(mainly|mostly|mix in|mixed with)\\b", RegexOption.IGNORE_CASE).containsMatchIn(text)) return ArtistScope.Focus
 
         val similarCue = listOf(
-            "类似", "那种", "这种风格", "风格", "像", "同味", "同类型", "差不多", "接近",
+            "类似", "那种", "这种风格", "像", "同味", "同类型", "差不多", "接近",
         ).any { it in key }
-        if (similarCue) return ArtistScope.Similar
+        if (similarCue || Regex("\\b(similar to|in the style of|inspired by|(?:something|songs?|music|artists?)\\s+like)\\b", RegexOption.IGNORE_CASE).containsMatchIn(text)) return ArtistScope.Similar
 
         return ArtistScope.Strict.takeIf { primaryArtistHints(text).isNotEmpty() }
     }

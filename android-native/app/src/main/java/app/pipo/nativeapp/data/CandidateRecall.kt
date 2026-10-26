@@ -1,5 +1,7 @@
 package app.pipo.nativeapp.data
 
+import app.pipo.nativeapp.data.agent.resolve.ArtistResolver
+
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
@@ -55,6 +57,7 @@ object CandidateRecall {
         limit: Int = 200,
         queryVector: FloatArray? = null,
         embeddingStore: EmbeddingStore? = null,
+        userTaste: UserTasteSnapshot? = null,
     ): List<Candidate> {
         if (library.isEmpty()) return emptyList()
 
@@ -94,8 +97,8 @@ object CandidateRecall {
         )) hit(h.track, Source.Semantic, h.score)
         // 4) semantic_broad
         for (h in SemanticRecall.recallBroad(intent, library, semanticMap)) hit(h.track, Source.SemanticBroad, h.score)
-        // 5) profile —— 艺人维度(弱信号,避免老推同几个艺人)
-        for (h in recallByProfile(intent, library, tasteProfile)) hit(h.track, Source.Profile, h.score)
+        // 5) profile —— 艺人偏好只是软信号，不能改变本轮风格/语言等条件。
+        for (h in recallByProfile(library, tasteProfile, userTaste)) hit(h.track, Source.Profile, h.score)
         // 5.1) profile_tags —— 画像派生的风格维度(主信号)
         for (h in recallByProfileTags(tasteProfile, library, semanticMap)) hit(h.track, Source.ProfileTags, h.score)
         // 5.2) acoustic —— 声学指纹距离匹配
@@ -163,25 +166,24 @@ object CandidateRecall {
         return out.take(80)
     }
 
-    private fun recallByProfile(intent: PetIntent, library: List<NativeTrack>, profile: TasteProfile?): List<Hit> {
-        if (profile == null) return emptyList()
+    private fun recallByProfile(
+        library: List<NativeTrack>,
+        profile: TasteProfile?,
+        userTaste: UserTasteSnapshot?,
+    ): List<Hit> {
+        if (profile == null && userTaste == null) return emptyList()
         val topArtistKeys = HashMap<String, Double>()
-        profile.topArtists.take(40).forEach { topArtistKeys[normalize(it.name)] = it.affinity.toDouble() }
-        val tagWords = (intent.musicHintsMoods + intent.musicHintsGenres).map(::normalize).filter { it.isNotBlank() }.toSet()
-
-        // affinity * 0.45 → * 0.06:让艺人维度只做轻微加分,不能把心动模式锁死在
-        // Taylor / 陈奕迅 这类画像 top artist 上。真正的画像主信号走
-        // recallByProfileTags / recallByAcoustic / recommendationPlan。
+        profile?.topArtists?.take(40)?.forEach {
+            val key = ArtistResolver.identityKey(it.name)
+            if (key.isNotBlank()) {
+                topArtistKeys[key] = maxOf(topArtistKeys[key] ?: 0.0, it.affinity.toDouble().coerceIn(0.0, 1.0))
+            }
+        }
         val out = ArrayList<Hit>()
         for (t in library) {
-            var score = 0.0
-            t.artist.split("/", "&", ",").forEach { a ->
-                topArtistKeys[normalize(a.trim())]?.let { score += it * 0.06 }
-            }
-            if (tagWords.isNotEmpty()) {
-                val titleN = normalize(t.title)
-                if (tagWords.any { it in titleN }) score += 0.2
-            }
+            val score = userTaste?.artistAffinity(t) ?: t.artist.split("/", "&", ",", "、")
+                .maxOfOrNull { topArtistKeys[ArtistResolver.identityKey(it)] ?: 0.0 }
+                ?: 0.0
             if (score > 0) out.add(Hit(t, score))
         }
         out.sortByDescending { it.score }

@@ -10,6 +10,7 @@ data class PipoAccount(
     val userId: Long,
     val nickname: String,
     val avatarUrl: String? = null,
+    val hasMusicSubscription: Boolean? = null,
 )
 
 data class FavoriteSongsState(
@@ -61,6 +62,7 @@ data class NativeSongUrl(
     val url: String?,
     val bitrate: Int,
     val sizeBytes: Long,
+    val isTrial: Boolean = false,
 )
 
 data class AudioCacheStats(
@@ -176,6 +178,8 @@ data class NativeSettings(
     val playbackMode: String = "PlaylistLoop",
     val userFacts: String = "",
     val personaId: String = PetPersona.DEFAULT.id,
+    val preferredSearchProviderId: String = MusicProviders.NETEASE,
+    val allowConcurrentPlayback: Boolean = false,
 )
 
 interface PipoRepository {
@@ -209,6 +213,8 @@ interface PipoRepository {
     /** Browsing must distinguish an empty library from a failed refresh. */
     suspend fun refreshPlaylistsForBrowse() = refreshPlaylists()
     suspend fun tracksForPlaylist(playlistId: Long, forceRefresh: Boolean = false): List<NativeTrack>
+    suspend fun playlistContainsTrack(playlistId: Long, trackId: Long): Boolean =
+        tracksForPlaylist(playlistId, forceRefresh = true).any { it.neteaseId == trackId }
     /**
      * 加载"我的网盘"全部上传歌曲。和 [tracksForPlaylist] 行为对齐：
      * 第一次命中网，后续走内存 / 磁盘缓存；forceRefresh=true 触发重抓。

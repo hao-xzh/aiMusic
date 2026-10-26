@@ -72,7 +72,7 @@ fun ImmersiveLyricsOverlay(
     if (progress <= 0.001f) return
 
     val edges = useCoverEdgeColors(coverUrl)
-    val tone = toneForColor(appleMusicPureSurfaceColor(edges))
+    val tone = toneForColor(appleMusicPortraitSurfaceColor(edges))
     val fg = pickFg(tone)
     val fgDim = pickFgDim(tone)
     val fgUnsung = pickFgUnsung(tone)

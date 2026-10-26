@@ -7,14 +7,15 @@ class ArtistResolver(
     private val library: List<NativeTrack>,
 ) {
     fun resolve(raw: String): ResolvedArtist {
-        val aliases = MANUAL_ALIASES[CommandTextSignals.normalizeForMatch(raw)].orEmpty()
+        val rawKey = CommandTextSignals.normalizeForMatch(raw)
+        val group = aliasGroup(rawKey)
+        val aliases = group?.let { listOf(it.key) + it.value }.orEmpty()
         val candidates = library.asSequence()
             .flatMap { it.artist.split("/", "&", ",", " feat.", "feat.").asSequence() }
             .map { it.trim() }
             .filter { it.isNotBlank() }
             .distinct()
             .toList()
-        val rawKey = CommandTextSignals.normalizeForMatch(raw)
         val exact = candidates.firstOrNull { CommandTextSignals.normalizeForMatch(it) == rawKey }
         val aliasHit = if (exact == null) {
             candidates.firstOrNull { candidate ->
@@ -22,13 +23,7 @@ class ArtistResolver(
                 aliases.any { alias -> CommandTextSignals.normalizeForMatch(alias) == candidateKey }
             }
         } else null
-        val partial = if (exact == null && aliasHit == null) {
-            candidates.firstOrNull { candidate ->
-                val key = CommandTextSignals.normalizeForMatch(candidate)
-                rawKey in key || key in rawKey
-            }
-        } else null
-        val canonical = exact ?: aliasHit ?: partial ?: raw
+        val canonical = exact ?: aliasHit ?: group?.key ?: raw
         return ResolvedArtist(
             raw = raw,
             canonical = canonical,
@@ -36,14 +31,24 @@ class ArtistResolver(
             confidence = when {
                 exact != null -> 1.0
                 aliasHit != null -> 0.92
-                partial != null -> 0.74
                 else -> 0.55
             },
         )
     }
 
-    private companion object {
-        val MANUAL_ALIASES = mapOf(
+    companion object {
+        fun identityKey(raw: String): String {
+            val key = CommandTextSignals.normalizeForMatch(raw)
+            return aliasGroup(key)?.key?.let(CommandTextSignals::normalizeForMatch) ?: key
+        }
+
+        private fun aliasGroup(key: String): Map.Entry<String, List<String>>? =
+            MANUAL_ALIASES.entries.firstOrNull { (name, aliases) ->
+                CommandTextSignals.normalizeForMatch(name) == key ||
+                    aliases.any { CommandTextSignals.normalizeForMatch(it) == key }
+            }
+
+        private val MANUAL_ALIASES = mapOf(
             "陈奕迅" to listOf("Eason Chan", "Eason"),
             "eason" to listOf("陈奕迅", "Eason Chan"),
             "周杰伦" to listOf("Jay Chou", "Jay"),
@@ -52,7 +57,7 @@ class ArtistResolver(
             "karenmok" to listOf("莫文蔚"),
             "汪苏泷" to listOf("Silence Wang"),
             "silencewang" to listOf("汪苏泷"),
-            "theweeknd" to listOf("Weeknd", "The Weekend", "威肯", "盆栽"),
+            "The Weeknd" to listOf("Weeknd", "The Weekend", "威肯", "盆栽"),
             "sza" to listOf("SZA"),
         )
     }

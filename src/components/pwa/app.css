@@ -1,0 +1,42 @@
+.pipo-water-page,.pipo-scene {position:absolute;inset:0;display:flex;flex-direction:column;min-height:0;}.pipo-scene {transition:filter 900ms var(--flip-ease);}.pipo-scene[data-ai-open=true] {filter:blur(6px);transition-duration:480ms;transition-delay:650ms;}.pipo-browse-persistent {display:flex;flex-direction:column;flex:1;min-height:0;position:relative;}.pipo-route-page {position:absolute;inset:0;display:flex;flex-direction:column;z-index:20;background:var(--browse-bg);}.pipo-native[data-route=settings] .pipo-page-slot,.pipo-native[data-route=aiSettings] .pipo-page-slot,.pipo-native[data-route=taste] .pipo-page-slot,.pipo-native[data-route=login] .pipo-page-slot {z-index:20;}.pipo-native:not([data-route=browse]):not([data-route=player]) .pipo-mini-dock {z-index:21;}.pipo-native:not([data-route=browse]):not([data-route=player]) .pipo-bottom-nav {z-index:21;}.pipo-audio {position:absolute;width:0;height:0;visibility:hidden;}.pipo-alert-scrim {position:absolute;inset:0;background:rgba(0,0,0,.32);z-index:80;display:flex;align-items:center;justify-content:center;padding:24px;}.pipo-alert {width:100%;max-width:360px;background:#191f26;border-radius:28px;padding:24px;box-shadow:0 16px 56px rgba(0,0,0,.18);}.pipo-alert h2 {font-size:22px;font-weight:400;line-height:30px;}.pipo-alert p {font-size:14px;line-height:21px;color:#b7c1ca;padding:16px 0;}.pipo-alert>div {display:flex;justify-content:flex-end;gap:12px;}.pipo-native .pipo-alert button {min-height:48px;padding:8px 12px;color:#9be3c6;}.pipo-app-error {position:absolute;z-index:90;bottom:calc(18px + env(safe-area-inset-bottom));left:18px;right:18px;border-radius:14px;background:#291b20;color:#ffd9d9;font-size:13px;padding:12px;display:flex;align-items:center;gap:12px;}.pipo-app-error>span {flex:1;}.pipo-native .pipo-app-error>button {min-height:36px;}
+
+/* Keep interactive content outside iPhone cutouts; artwork may extend edge to edge. */
+.pipo-app-shell {position:fixed;inset:0;width:100%;height:100dvh;overflow:hidden;}
+.pipo-native {--pwa-bottom-safe:env(safe-area-inset-bottom,0px);--nav-inset:0px;position:relative;width:100%;height:100%;background:var(--browse-bg);touch-action:pan-x pan-y;}
+body:has(.pipo-app-shell) {overscroll-behavior:none;}
+/* Installed WebKit apps can report dvh without the safe-area portion of the screen. */
+@media (display-mode:standalone) {body:has(.pipo-app-shell),.pipo-app-shell {height:100vh;}}
+.pipo-native[data-keyboard=true] {--pwa-bottom-safe:0px;}
+/* Pages and their artwork continue behind the bottom controls all the way to the screen edge. */
+.pipo-bottom-nav {position:absolute;bottom:0;left:0;right:0;background:transparent;backdrop-filter:blur(20px) brightness(.65);-webkit-backdrop-filter:blur(20px) brightness(.65);}
+.pipo-mini-dock {bottom:var(--nav-inset);}
+.pipo-scroll {padding-bottom:calc(20px + var(--mini-inset,0px) + var(--nav-inset) + var(--keyboard-inset,0px));scroll-padding-bottom:calc(20px + var(--mini-inset,0px) + var(--nav-inset) + var(--keyboard-inset,0px));}
+.pipo-scaffold {padding-bottom:calc(28px + var(--mini-inset,0px) + max(var(--nav-inset),var(--pwa-bottom-safe)) + var(--keyboard-inset,0px));}
+.pipo-sheet-layer {bottom:var(--keyboard-inset,0px);}
+.pipo-sheet {padding-bottom:var(--pwa-bottom-safe);}
+.pipo-create-content {min-height:0;overflow-y:auto;overscroll-behavior:contain;}
+.pipo-player-toolbar {left:max(12px,env(safe-area-inset-left));right:max(12px,env(safe-area-inset-right));}
+.pipo-portrait-controls {padding-left:max(clamp(16px,4vw,40px),env(safe-area-inset-left));padding-right:max(clamp(16px,4vw,40px),env(safe-area-inset-right));}
+.pipo-immersive-overlay {display:flex;flex-direction:column;padding-top:calc(env(safe-area-inset-top) + min(calc(var(--player-w) - 18px),calc((var(--player-h) - env(safe-area-inset-top) - env(safe-area-inset-bottom)) * .43)));padding-bottom:0;}
+.pipo-immersive-heading {position:relative;top:auto;left:auto;right:auto;flex-shrink:0;min-height:48px;margin-left:max(24px,env(safe-area-inset-left));margin-right:max(24px,env(safe-area-inset-right));}
+.pipo-immersive-lyric-slot {position:relative;top:auto;bottom:auto;left:auto;right:auto;flex:1;min-height:0;margin-top:2px;}
+.pipo-landscape-panel {padding-top:max(8px,env(safe-area-inset-top));}
+.pipo-ai-conversation {left:max(14px,env(safe-area-inset-left));right:max(14px,env(safe-area-inset-right));bottom:calc(var(--ai-composer-height,52px) + 36px + var(--pwa-bottom-safe) + var(--keyboard-inset));}
+.pipo-ai-composer {left:max(18px,env(safe-area-inset-left));right:max(18px,env(safe-area-inset-right));bottom:calc(24px + var(--pwa-bottom-safe) + var(--keyboard-inset));}
+.pipo-native .pipo-pet-orb {right:max(18px,env(safe-area-inset-right));bottom:calc(96px + env(safe-area-inset-bottom));}
+.pipo-sheet-content {padding-left:max(24px,env(safe-area-inset-left));padding-right:max(24px,env(safe-area-inset-right));}
+.pipo-create-content {padding-left:max(24px,env(safe-area-inset-left));padding-right:max(24px,env(safe-area-inset-right));}
+.pipo-alert-scrim {padding:max(24px,env(safe-area-inset-top)) max(24px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(24px,env(safe-area-inset-left));}
+.pipo-alert {max-height:100%;overflow:auto;}
+@supports (-webkit-touch-callout:none) {
+  .pipo-ai-composer input,.pipo-native select {font-size:16px;}
+}
+
+@media (orientation:landscape) and (max-height:600px) {
+  .pipo-home-spacer {height:32px;}
+  .pipo-detail-spacer {height:48px;}
+  .pipo-bottom-nav > button {flex-direction:row;justify-content:center;gap:8px;padding:6px 0;}
+  .pipo-login-caption {padding-bottom:24px;}
+  .pipo-ai-composer {bottom:calc(10px + var(--pwa-bottom-safe) + var(--keyboard-inset));}
+  .pipo-ai-conversation {bottom:calc(var(--ai-composer-height,52px) + 22px + var(--pwa-bottom-safe) + var(--keyboard-inset));}
+}

@@ -1,5 +1,6 @@
 node_modules
 .next
+.next-router/
 out
 .DS_Store
 *.log
@@ -33,3 +34,7 @@ android-native/local.properties
 
 # Local audio export output from the standalone tester
 netease-export/
+
+# PWA server sessions, credentials and Rust output
+.pwa-data/
+services/pwa-bridge/target/

@@ -18,4 +18,16 @@ data class NativeTrack(
     val streamCacheKey: String? = null,
     val artworkUrl: String? = null,
     val durationMs: Long = 0L,
-)
+    val sourceRef: MusicSourceRef? = null,
+    val recordingId: String? = null,
+    val alternateSources: List<MusicSourceRef> = emptyList(),
+) {
+    /** Old snapshots already identify NetEase explicitly; retain their queue IDs during migration. */
+    val musicSource: MusicSourceRef?
+        get() = sourceRef ?: neteaseId?.takeIf { it > 0 }?.let {
+            MusicSourceRef(MusicProviders.NETEASE, it.toString())
+        }
+
+    val sourceKey: String get() = musicSource?.key ?: id
+    val canResolveAudio: Boolean get() = streamUrl.isNotBlank() || musicSource != null
+}

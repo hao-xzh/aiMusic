@@ -10,10 +10,17 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicBoolean
 
 object StabilityDiagnostics {
     private val installed = AtomicBoolean(false)
+    private val _networkRecoveries = MutableStateFlow(0L)
+    val networkRecoveries = _networkRecoveries.asStateFlow()
+
+    fun networkSnapshot(context: Context): Map<String, Any?> =
+        runCatching { activeNetworkFields(context.applicationContext) }.getOrDefault(emptyMap())
 
     fun install(context: Context) {
         val app = context.applicationContext
@@ -77,6 +84,7 @@ object StabilityDiagnostics {
         )
         runCatching {
             manager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                private var validatedNetwork: Network? = null
                 override fun onAvailable(network: Network) {
                     DiagnosticsLogStore.record(
                         area = AREA,
@@ -86,6 +94,7 @@ object StabilityDiagnostics {
                 }
 
                 override fun onLost(network: Network) {
+                    if (validatedNetwork == network) validatedNetwork = null
                     DiagnosticsLogStore.record(
                         area = AREA,
                         event = "network_lost",
@@ -104,6 +113,7 @@ object StabilityDiagnostics {
                 }
 
                 override fun onUnavailable() {
+                    validatedNetwork = null
                     DiagnosticsLogStore.record(
                         area = AREA,
                         event = "network_unavailable",
@@ -115,6 +125,14 @@ object StabilityDiagnostics {
                     network: Network,
                     networkCapabilities: NetworkCapabilities,
                 ) {
+                    val usable = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    if (usable && validatedNetwork != network) {
+                        validatedNetwork = network
+                        _networkRecoveries.value += 1L
+                    } else if (!usable && validatedNetwork == network) {
+                        validatedNetwork = null
+                    }
                     DiagnosticsLogStore.record(
                         area = AREA,
                         event = "network_capabilities",

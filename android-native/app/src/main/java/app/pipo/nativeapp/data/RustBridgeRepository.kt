@@ -17,6 +17,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Repository implementation target for the full native build.
@@ -41,6 +42,7 @@ class RustBridgeRepository(
     private val playlistCache = appContext?.let(::PlaylistCacheStore)
     private val reliableLyricsSource = appContext?.let(::ReliableLyricsSource)
     private val accountState = MutableStateFlow<PipoAccount?>(null)
+    private val accountRequestSequence = AtomicLong(0L)
     private val playlistState = MutableStateFlow<List<PipoPlaylist>>(emptyList())
     private val libraryRevisionState = MutableStateFlow(0L)
     override val libraryRevision: Flow<Long> = libraryRevisionState.asStateFlow()
@@ -92,7 +94,12 @@ class RustBridgeRepository(
     override val audioCacheStats: Flow<AudioCacheStats> = audioCacheStatsState.asStateFlow()
     override val aiConfig: Flow<AiConfigView> = aiConfigState.asStateFlow()
 
+    private fun nextAccountRequest(): Long = synchronized(cacheGenerationLock) {
+        accountRequestSequence.incrementAndGet()
+    }
+
     override suspend fun refreshAccount() {
+        val accountRequest = nextAccountRequest()
         awaitCacheRecovery()
         val requestGeneration = currentCacheGeneration()
         val acc = try {
@@ -103,7 +110,7 @@ class RustBridgeRepository(
             return
         }
         val reset = synchronized(cacheGenerationLock) {
-            if (requestGeneration != cacheGeneration) return
+            if (requestGeneration != cacheGeneration || accountRequest != accountRequestSequence.get()) return
             accountState.value = acc
             // 账号提交与缓存失效必须原子完成，不能在锁外清掉后来的账号结果。
             val newUserId = acc?.userId
@@ -118,6 +125,7 @@ class RustBridgeRepository(
     }
 
     override suspend fun logout() {
+        nextAccountRequest()
         awaitCacheRecovery()
         safe({ bridge.neteaseLogout() }, { Unit })
         clearAccountCaches(clearAccountState = true)
@@ -138,7 +146,9 @@ class RustBridgeRepository(
 
     override suspend fun checkQrLogin(key: String): QrLoginStatus {
         try {
-            return bridge.neteaseQrCheck(key)
+            return bridge.neteaseQrCheck(key).also {
+                if (it.code == 803) nextAccountRequest()
+            }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -165,7 +175,9 @@ class RustBridgeRepository(
         captcha: String,
         countryCode: Int,
     ): PhoneLoginStatus {
-        return bridge.neteasePhoneLogin(phone, captcha, countryCode)
+        return bridge.neteasePhoneLogin(phone, captcha, countryCode).also {
+            if (it.code == 200) nextAccountRequest()
+        }
     }
 
     override suspend fun refreshPlaylists() = refreshPlaylistsInternal(reportFailure = false)
@@ -174,6 +186,7 @@ class RustBridgeRepository(
 
     private suspend fun refreshPlaylistsInternal(reportFailure: Boolean) {
         awaitCacheRecovery()
+        val accountRequest = accountRequestSequence.get()
         var requestGeneration = currentCacheGeneration()
         var requestLibraryRevision = libraryRevisionState.value
         // stale-while-revalidate 的**正确**做法:UI 已经从 init 时的 cache 看到内容了,
@@ -186,7 +199,7 @@ class RustBridgeRepository(
             {
                 val account = accountState.value ?: bridge.neteaseAccount()
                 val reset = synchronized(cacheGenerationLock) {
-                    if (requestGeneration != cacheGeneration) return@safe emptyList()
+                    if (requestGeneration != cacheGeneration || accountRequest != accountRequestSequence.get()) return@safe emptyList()
                     accountState.value = account
                     if (account != null && cachedUserId != null && cachedUserId != account.userId) {
                         clearAccountCachesLocked().also { requestLibraryRevision = libraryRevisionState.value }
@@ -353,12 +366,7 @@ class RustBridgeRepository(
                 return it
             }
         } else {
-            // 手动下拉刷新：先抹掉 in-memory cache 让本次拿到 fresh 数据再重新写回。
-            synchronized(cacheGenerationLock) {
-                if (requestGeneration == cacheGeneration) {
-                    synchronized(tracksCacheLock) { tracksMemoryCache.remove(playlistId) }
-                }
-            }
+            // Bypass the cache for this read; replace it only after a complete successful response.
             DiagnosticsLogStore.record(
                 area = "library",
                 event = "playlist_tracks_force_refresh",
@@ -374,6 +382,7 @@ class RustBridgeRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (forceRefresh) throw e
             val fallbackTracks = runCatching { fallback.tracksForPlaylist(playlistId) }.getOrDefault(emptyList())
             DiagnosticsLogStore.record(
                 area = "library",
@@ -559,6 +568,9 @@ class RustBridgeRepository(
         loadLyricsForTrack(track.id, track)
 
     private suspend fun loadLyricsForTrack(trackId: String, metadata: NativeTrack?): List<PipoLyricLine> {
+        if (metadata?.musicSource?.providerId?.let { it != MusicProviders.NETEASE } == true) {
+            return reliableLyricsSource?.lyricsForTrack(trackId, metadata)?.lines.orEmpty()
+        }
         val cloudTrack = cachedCloudTrackFor(trackId)
         // Fetch NetEase once and let its real word timestamps compete with the external documents.
         val primaryLines = loadLyricsCandidate(trackId)
@@ -779,6 +791,8 @@ class RustBridgeRepository(
     private suspend fun currentUserIdForCloudLyric(): Long? {
         accountState.value?.userId?.let { return it }
         cachedUserId?.let { return it }
+        val accountRequest = accountRequestSequence.get()
+        val requestGeneration = currentCacheGeneration()
         val account = try {
             bridge.neteaseAccount()
         } catch (e: CancellationException) {
@@ -786,8 +800,11 @@ class RustBridgeRepository(
         } catch (_: Exception) {
             null
         }
-        accountState.value = account
-        return account?.userId?.also { cachedUserId = it }
+        return synchronized(cacheGenerationLock) {
+            if (requestGeneration != cacheGeneration || accountRequest != accountRequestSequence.get()) return@synchronized null
+            accountState.value = account
+            account?.userId?.also { cachedUserId = it }
+        }
     }
 
     private fun lyricsAreUsable(lines: List<PipoLyricLine>): Boolean {
@@ -973,6 +990,13 @@ class RustBridgeRepository(
             normalized == "未知歌手" ||
             normalized == "未知曲目" ||
             normalized == "未知专辑"
+    }
+
+    override suspend fun playlistContainsTrack(playlistId: Long, trackId: Long): Boolean {
+        val owner = requireNotNull(accountState.value?.userId) { "请先登录网易云" }
+        val ids = bridge.neteasePlaylistSongIds(playlistId)
+        check(accountState.value?.userId == owner) { "网易云账号已切换" }
+        return trackId in ids
     }
 
     override suspend fun likeSong(id: Long, like: Boolean) {

@@ -25,7 +25,7 @@ object TagRecall {
             var score = 0.0
             score += matchLanguages(intent.hardLanguages, profile.language.key) * 0.8
             score += matchArray(intent.hardRegions, listOf(profile.region.key)) * 0.7
-            score += matchArray(intent.hardGenres, profile.genres) * 0.7
+            score += matchArray(intent.hardGenres, profile.genres + profile.subGenres) * 0.7
             score += matchArray(intent.hardSubGenres, profile.subGenres) * 0.55
             score += matchArray(intent.hardVocalTypes, listOf(profile.vocalType.key)) * 0.5
             score += matchArray(intent.softMoods, profile.moods) * 0.28
@@ -64,7 +64,7 @@ object TagRecall {
     fun passesHardConstraints(profile: TrackSemanticProfile, intent: PetIntent): Boolean {
         if (intent.hardLanguages.isNotEmpty() && !matchesAnyLanguage(intent.hardLanguages, profile.language.key)) return false
         if (intent.hardRegions.isNotEmpty() && !includesAny(intent.hardRegions, listOf(profile.region.key))) return false
-        if (intent.hardGenres.isNotEmpty() && !includesAny(intent.hardGenres, profile.genres)) return false
+        if (intent.hardGenres.isNotEmpty() && !includesAny(intent.hardGenres, profile.genres + profile.subGenres)) return false
         if (intent.hardSubGenres.isNotEmpty() && !includesAny(intent.hardSubGenres, profile.subGenres)) return false
         if (intent.hardVocalTypes.isNotEmpty() &&
             profile.vocalType != VocalType.Unknown &&

@@ -11,14 +11,17 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
  * 同进程后台 Agent 提交队列后的续播 owner。
  *
- * 这个 source 是运行时对象，不承诺在 Service/进程重建后恢复；它只避免后台任务绕过
- * PlayerViewModel 时，让旧的前台 source 继续给新队列续杯。
+ * 原选歌条件随播放快照持久化；Service 重建时恢复 source，前台退出时可交接给这里。
+ * 它也避免后台任务绕过 PlayerViewModel 时，让旧的前台 source 继续给新队列续杯。
  */
 @UnstableApi
 internal object BackgroundAgentContinuation {
@@ -31,8 +34,11 @@ internal object BackgroundAgentContinuation {
     private var goal: MusicGoal? = null
     private var generation = 0L
     private var appendJob: Job? = null
+    private var preparationJob: Job? = null
+    private var retryJob: Job? = null
     private var ownsQueue = false
     private var retryNotBeforeMs = 0L
+    private val pendingRetryNotBeforeMs = mutableMapOf<String, Long>()
 
     fun bind(
         scope: CoroutineScope,
@@ -45,6 +51,13 @@ internal object BackgroundAgentContinuation {
         this.player = player
         this.resolver = resolver
         this.mediaFactory = mediaFactory
+        preparationJob?.cancel()
+        preparationJob = scope.launch {
+            PlaybackPreparationGate.snapshots
+                .map { it.canSeedNextTrack }
+                .distinctUntilChanged()
+                .collect { ready -> if (ready) maybeExtend() }
+        }
     }
 
     /** BackgroundPlayerAgentExecutor 在成功替换主队列前调用；null 清掉 source 但保留队列所有权。 */
@@ -53,11 +66,14 @@ internal object BackgroundAgentContinuation {
         generation += 1L
         appendJob?.cancel()
         appendJob = null
+        retryJob?.cancel()
+        retryJob = null
         this.source = source
         enabled = source?.startsAutomatically() == true
         this.goal = goal
         ownsQueue = true
         retryNotBeforeMs = 0L
+        pendingRetryNotBeforeMs.clear()
         if (!enabled) return
         scope?.launch { maybeExtend() }
     }
@@ -69,8 +85,11 @@ internal object BackgroundAgentContinuation {
         generation += 1L
         appendJob?.cancel()
         appendJob = null
+        retryJob?.cancel()
+        retryJob = null
         enabled = value
         retryNotBeforeMs = 0L
+        pendingRetryNotBeforeMs.clear()
         if (value) scope?.launch { maybeExtend() }
         return true
     }
@@ -81,15 +100,20 @@ internal object BackgroundAgentContinuation {
         generation += 1L
         appendJob?.cancel()
         appendJob = null
+        retryJob?.cancel()
+        retryJob = null
         source = null
         enabled = false
         goal = null
         ownsQueue = false
         retryNotBeforeMs = 0L
+        pendingRetryNotBeforeMs.clear()
     }
 
     /** source 为空的后台主队列仍归 Service 所有，不能让 VM 的旧 source 接管。 */
     fun isActive(): Boolean = ownsQueue
+
+    fun currentSource(): ContinuousQueueSource? = source.takeIf { ownsQueue }
 
     /** 前台重连时以后台正在执行的模式更新显示，避免仍显示旧队列的模式。 */
     fun playbackMode(): PlaybackQueueMode? = when {
@@ -107,6 +131,8 @@ internal object BackgroundAgentContinuation {
 
     fun release() {
         requireMainThread()
+        preparationJob?.cancel()
+        preparationJob = null
         clear()
         scope = null
         player = null
@@ -122,27 +148,48 @@ internal object BackgroundAgentContinuation {
         val activeResolver = resolver ?: return
         val factory = mediaFactory ?: return
         if (appendJob?.isActive == true) return
+        // 后台接管的 AI 队列也要给切歌缓冲让路，不能与新主曲同时批量取流。
+        if (!livePlayer.isPlaying || livePlayer.playbackState != Player.STATE_READY ||
+            !PlaybackPreparationGate.canSeedNextTrack()
+        ) return
         val currentIndex = livePlayer.currentMediaItemIndex
         if (currentIndex !in 0 until livePlayer.mediaItemCount) return
         val remaining = livePlayer.mediaItemCount - currentIndex - 1
-        if (remaining > EXTEND_THRESHOLD) return
-
-        val expectedGeneration = generation
         val timelineIds = timelineIds(livePlayer)
         val excludedNeteaseIds = timelineIds.mapNotNull(String::toLongOrNull).toSet()
+        val nowMs = android.os.SystemClock.elapsedRealtime()
+        pendingRetryNotBeforeMs.entries.removeAll { it.value <= nowMs }
+        val pending = activeSource.pendingTracks().filter {
+            it.id !in timelineIds && it.id !in pendingRetryNotBeforeMs &&
+                (it.neteaseId == null || it.neteaseId !in excludedNeteaseIds)
+        }
+        if (remaining > EXTEND_THRESHOLD && pending.isEmpty()) return
+
+        val expectedGeneration = generation
         val currentGoal = goal
         val workerScope = scope ?: return
         appendJob = workerScope.launch {
             try {
-                val candidates = withContext(Dispatchers.IO) {
-                    activeSource.fetchMore(excludedNeteaseIds)
+                val resolvedPending = if (pending.isEmpty()) emptyList() else withContext(Dispatchers.IO) {
+                    activeResolver.resolvePlayableQueue(pending)
                 }
-                val resolved = withContext(Dispatchers.IO) {
-                    activeResolver.resolvePlayableQueue(candidates)
+                if (generation != expectedGeneration || source !== activeSource || player !== livePlayer) return@launch
+                deferPendingRetry(pending)
+                var append = dedupeNew(resolvedPending, timelineIds, activeSource)
+                // 无法播放的待入队曲目不能一直挡住新的推荐召回。
+                if (append.isEmpty() && remaining <= EXTEND_THRESHOLD) {
+                    val candidates = withContext(Dispatchers.IO) {
+                        activeSource.fetchMore(excludedNeteaseIds)
+                    }
+                    if (generation != expectedGeneration || source !== activeSource || player !== livePlayer) return@launch
+                    val resolved = withContext(Dispatchers.IO) {
+                        activeResolver.resolvePlayableQueue(candidates)
+                    }
+                    if (generation != expectedGeneration || source !== activeSource || player !== livePlayer) return@launch
+                    append = dedupeNew(resolved, timelineIds, activeSource)
                 }
-                val append = dedupeNew(resolved, timelineIds, activeSource)
                 if (append.isEmpty()) {
-                    retryNotBeforeMs = android.os.SystemClock.elapsedRealtime() + EXHAUSTED_BACKOFF_MS
+                    scheduleRetry(EXHAUSTED_BACKOFF_MS, expectedGeneration, activeSource, livePlayer)
                     DiagnosticsLogStore.record(
                         area = "background_agent_continuation",
                         event = "source_exhausted",
@@ -155,10 +202,13 @@ internal object BackgroundAgentContinuation {
                     )
                     return@launch
                 }
-                if (generation != expectedGeneration || source !== activeSource ||
-                    player !== livePlayer || timelineIds(livePlayer) != timelineIds
-                ) return@launch
+                if (timelineIds(livePlayer) != timelineIds) {
+                    scheduleRetry(FAILURE_BACKOFF_MS, expectedGeneration, activeSource, livePlayer)
+                    return@launch
+                }
                 livePlayer.addMediaItems(append.map(factory::toMediaItem))
+                retryJob?.cancel()
+                retryJob = null
                 retryNotBeforeMs = 0L
                 DiagnosticsLogStore.record(
                     area = "background_agent_continuation",
@@ -168,7 +218,9 @@ internal object BackgroundAgentContinuation {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
-                retryNotBeforeMs = android.os.SystemClock.elapsedRealtime() + FAILURE_BACKOFF_MS
+                if (generation != expectedGeneration || source !== activeSource || player !== livePlayer) return@launch
+                deferPendingRetry(pending)
+                scheduleRetry(FAILURE_BACKOFF_MS, expectedGeneration, activeSource, livePlayer)
                 DiagnosticsLogStore.record(
                     area = "background_agent_continuation",
                     event = "fetch_failed",
@@ -180,6 +232,24 @@ internal object BackgroundAgentContinuation {
                 )
             } finally {
                 if (generation == expectedGeneration) appendJob = null
+            }
+        }
+    }
+
+    private fun deferPendingRetry(tracks: List<NativeTrack>) {
+        val retryAtMs = android.os.SystemClock.elapsedRealtime() + PENDING_RETRY_BACKOFF_MS
+        // 已成功入队的曲目会被 timeline 排除，其余候选稍后再试，给新推荐留出机会。
+        tracks.forEach { pendingRetryNotBeforeMs[it.id] = retryAtMs }
+    }
+
+    private fun scheduleRetry(delayMs: Long, expectedGeneration: Long, activeSource: ContinuousQueueSource, livePlayer: Player) {
+        retryNotBeforeMs = android.os.SystemClock.elapsedRealtime() + delayMs
+        retryJob?.cancel()
+        retryJob = scope?.launch {
+            delay(delayMs)
+            retryJob = null
+            if (enabled && generation == expectedGeneration && source === activeSource && player === livePlayer) {
+                maybeExtend()
             }
         }
     }
@@ -205,6 +275,7 @@ internal object BackgroundAgentContinuation {
     private const val EXTEND_THRESHOLD = 3
     private const val EXHAUSTED_BACKOFF_MS = 60_000L
     private const val FAILURE_BACKOFF_MS = 15_000L
+    private const val PENDING_RETRY_BACKOFF_MS = 300_000L
 
     private fun requireMainThread() {
         check(Looper.myLooper() == Looper.getMainLooper()) {

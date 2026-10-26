@@ -21,16 +21,18 @@ internal fun BrowsePageScaffold(title: String, coverUrl: String? = null, artisti
     Box(Modifier.fillMaxSize().background(BrowseBackground)) {
         if (coverUrl != null) PlaylistDetailBackdrop(coverUrl, useCoverEdgeColors(coverUrl), artistic, 400.dp, 0f, darkSurface = true)
         Box(Modifier.fillMaxSize().background(BrowseBackground.copy(alpha = if (artistic) 0.42f else 0.8f)))
-        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 22.dp).padding(bottom = 28.dp)) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(bottom = 28.dp)) {
             Row(Modifier.fillMaxWidth().heightIn(min = 56.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = { onBack?.invoke() }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "返回", tint = BrowseInk) }
                 Text("PIPO", color = BrowseInk, fontSize = 18.sp, fontWeight = FontWeight.Medium, letterSpacing = 3.sp,
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center, modifier = Modifier.weight(1f))
                 Spacer(Modifier.width(48.dp))
             }
-            if (artistic) Spacer(Modifier.height(110.dp))
-            if (title.isNotEmpty()) Text(title, color = BrowseInk, fontSize = 34.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 14.dp, bottom = 18.dp))
-            content()
+            Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp)) {
+                if (artistic) Spacer(Modifier.height(110.dp))
+                if (title.isNotEmpty()) Text(title, color = BrowseInk, fontSize = 34.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 14.dp, bottom = 18.dp))
+                content()
+            }
         }
     }
 }

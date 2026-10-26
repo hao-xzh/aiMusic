@@ -3,11 +3,23 @@ package app.pipo.nativeapp.data
 import app.pipo.nativeapp.DiagnosticsLogStore
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.FutureTask
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     init {
@@ -24,6 +36,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
             userId = o.getLong("userId"),
             nickname = o.getString("nickname"),
             avatarUrl = o.optStringOrNull("avatarUrl"),
+            hasMusicSubscription = o.opt("hasMusicSubscription") as? Boolean,
         )
     }
 
@@ -84,7 +97,10 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
                 "missingIdSample" to diagnostics?.optJSONArray("missingIdSample")?.toCompactList(),
             ),
         )
-        return parseTracks(tracks)
+        val parsed = parseTracks(tracks)
+        val expected = maxOf(o.optInt("trackCount", 0), o.optJSONArray("trackIds")?.length() ?: 0)
+        check(parsed.size >= expected) { "网易云歌单曲目未完整读取（${parsed.size}/$expected），请稍后重试" }
+        return parsed
     }
 
     override suspend fun neteaseSearch(query: String, limit: Int): List<NativeTrack> {
@@ -214,6 +230,7 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
                 url = o.optStringOrNull("url"),
                 bitrate = o.optInt("br", o.optInt("bitrate", 0)),
                 sizeBytes = o.optLong("size", o.optLong("sizeBytes", 0L)),
+                isTrial = o.optJSONObject("freeTrialInfo") != null,
             )
         }
     }
@@ -292,10 +309,17 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     }
 
     override suspend fun audioGetFeatures(trackId: Long, url: String, cacheBytes: Boolean): AudioFeatures {
-        val o = callObject(
-            "audio_get_features",
-            jsonObject("trackId" to trackId, "url" to url, "cacheBytes" to cacheBytes),
-        )
+        val raw = try {
+            withTimeout(DEFAULT_CALL_TIMEOUT_MS) {
+                awaitAudioFeatures(
+                    trackId = trackId,
+                    args = jsonObject("trackId" to trackId, "url" to url, "cacheBytes" to cacheBytes),
+                )
+            }
+        } catch (e: TimeoutCancellationException) {
+            throw RustBridgeException("audio_get_features", "timeout after ${DEFAULT_CALL_TIMEOUT_MS / 1000}s")
+        }
+        val o = JSONObject(raw)
         return AudioFeatures(
             trackId = o.getLong("trackId"),
             durationS = o.getDouble("durationS"),
@@ -428,45 +452,117 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         return JSONArray(callRaw(command, args, timeoutMs))
     }
 
+    /**
+     * 同一首歌的特征只保留一条 JNI 分析；多个调用方共享其成功或失败结果。
+     * 单个调用方取消时仍让其他等待者继续，最后一个等待者离开才通知 Rust 停止。
+     */
+    private suspend fun awaitAudioFeatures(trackId: Long, args: JSONObject): String =
+        suspendCancellableCoroutine { continuation ->
+            val (request, created) = synchronized(audioFeatureRequests) {
+                val existing = audioFeatureRequests[trackId]
+                val request = if (existing != null && !existing.finished.get() && !existing.cancelled.get()) {
+                    existing
+                } else {
+                    AudioFeatureRequest(
+                        trackId = trackId,
+                        requestId = "audio-$trackId-${nextAudioRequestId.incrementAndGet()}",
+                        args = JSONObject(args.toString()).put("maxWorkMs", DEFAULT_CALL_TIMEOUT_MS),
+                    ).also { created ->
+                        audioFeatureRequests[trackId] = created
+                    }
+                }
+                request.waiters.incrementAndGet()
+                request to (request !== existing)
+            }
+            if (created) audioFeatureExecutor.execute { runAudioFeatureRequest(request) }
+
+            continuation.invokeOnCancellation { releaseAudioFeatureWaiter(request) }
+            request.result.whenComplete { raw, error ->
+                if (!continuation.isActive) return@whenComplete
+                if (error != null) {
+                    continuation.resumeWithException(error)
+                } else {
+                    continuation.resume(raw)
+                }
+            }
+        }
+
+    private fun runAudioFeatureRequest(request: AudioFeatureRequest) {
+        // Register the transition to JNI under the same lock as the last waiter.
+        // A queued cancellation must not create a Rust flag for work that never starts.
+        val shouldRun = synchronized(audioFeatureRequests) {
+            if (request.cancelled.get() || request.waiters.get() == 0) false
+            else {
+                request.started.set(true)
+                true
+            }
+        }
+        if (!shouldRun) {
+            request.result.completeExceptionally(RustBridgeException("audio_get_features", "cancelled"))
+            request.finished.set(true)
+            return
+        }
+        val outcome = runCatching {
+            validateRawResponse(
+                "audio_get_features",
+                invokeNative(
+                    "audio_get_features",
+                    request.args.put("requestId", request.requestId).toString(),
+                ),
+            )
+        }
+        request.finished.set(true)
+        synchronized(audioFeatureRequests) {
+            if (audioFeatureRequests[request.trackId] === request) {
+                audioFeatureRequests.remove(request.trackId)
+            }
+        }
+        outcome.fold(request.result::complete, request.result::completeExceptionally)
+    }
+
+    private fun releaseAudioFeatureWaiter(request: AudioFeatureRequest) {
+        val shouldCancel = synchronized(audioFeatureRequests) {
+            val remaining = request.waiters.decrementAndGet()
+            if (remaining != 0 || request.finished.get() || !request.cancelled.compareAndSet(false, true)) {
+                false
+            } else {
+                if (audioFeatureRequests[request.trackId] === request) {
+                    audioFeatureRequests.remove(request.trackId)
+                }
+                request.started.get()
+            }
+        }
+        if (shouldCancel) {
+            // This command only flips an atomic flag under a short registry lock;
+            // it performs no I/O. Never queue cancellation behind slow search/AI calls.
+            runCatching {
+                invokeNative(
+                    "audio_cancel_features",
+                    jsonObject("requestId" to request.requestId).toString(),
+                )
+            }
+        }
+    }
+
     private suspend fun callRaw(
         command: String,
         args: JSONObject = JSONObject(),
         timeoutMs: Long = DEFAULT_CALL_TIMEOUT_MS,
     ): String {
-        // 给 JNI 调用一个硬上限。invokeNative 是同步 native 调用,withTimeout cancel
-        // 只能解锁 Kotlin 这边的 suspend —— 底层 native 线程不响应 Java thread interrupt,
-        // 会继续跑到 Rust 端自己的 timeout / 完成。我们容忍这种"僵尸 IO 线程",
-        // 关键是上层 viewModelScope 不会永久 pending(协程堆积、歌词不显示、续杯不来
-        // 都会消解)。
+        // 普通 invokeNative 是同步调用，withContext 仍须等 native 返回。
+        // 搜索、资料库水合与单曲成员确认分别限制并发/排队；只读取消不占住播放与账号的 bridge 池。
+        // 音频分析改由 awaitAudioFeatures 单独调度，并通过专用原子标记传播取消。
         //
         // 默认 30s 是按网易 API 估的(正常 RTT < 2s)。AI chat/tools 的 Rust 硬超时
         // 是 24s；embedding 仍保留 60s。Kotlin 分别多留 3/5s，让 Rust 先收口，
         // 避免 Kotlin 提前取消 JNI 协程后留下仍在网络中的 zombie bridge 线程。
         return try {
             withTimeout(timeoutMs) {
-                withContext(bridgeDispatcher) {
-                    invokeNative(command, args.toString()).also { raw ->
-                        val trimmed = raw.trimStart()
-                        if (trimmed.isBlank()) {
-                            throw RustBridgeException(command, "empty response")
-                        }
-                        if (trimmed.startsWith("{")) {
-                            val obj = runCatching { JSONObject(raw) }.getOrNull()
-                            // 显式 error 字段 → bridge 层传上来的错误(不是网易业务码)
-                            val message = obj?.optStringOrNull("error")
-                            if (!message.isNullOrBlank()) {
-                                throw RustBridgeException(command, message)
-                            }
-                            // 注意:**不在这里检测网易业务级 code**。
-                            // 网易各接口的 code 语义不一致,且很多 code 是合法状态:
-                            //   - qrCheck: 800/801/802/803 都是 QR 各种状态
-                            //   - captchaSent: 503 = 频繁请求(用户体验信息,不是错)
-                            //   - phoneLogin: 502 = 验证码错(要给用户看 message)
-                            // 之前在这里 throw 把扫码登录的 801/802 也当成异常,
-                            // 导致永远拿不到 803 成功 → 扫码登录全失败。
-                            // 业务码由各 caller 自己处理(QrLoginStatus.code / PhoneLoginStatus.code 等)。
-                        }
-                    }
+                if (command in CANCELLABLE_CATALOG_READS) awaitCatalogRead(command, args.toString(), catalogReadExecutor)
+                else if (command == "netease_playlist_track_ids") awaitCatalogRead(command, args.toString(), membershipReadExecutor)
+                else if (command in CANCELLABLE_LIBRARY_READS) awaitCatalogRead(command, args.toString(), libraryReadExecutor)
+                else withContext(bridgeDispatcher) {
+                    validateRawResponse(command, invokeNative(command, args.toString()))
                 }
             }
         } catch (e: TimeoutCancellationException) {
@@ -476,6 +572,46 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         }
     }
 
+    /** Cancel the waiter/queued read immediately; running JNI reads retain their native
+     * HTTP deadlines on bounded executors. Multi-request hydration may finish later,
+     * but cannot keep a foreground coroutine (and its library/UI lock) waiting.
+     * Account mutations, playback resolution and audio analysis retain their own owners. */
+    private suspend fun awaitCatalogRead(command: String, args: String, executor: ThreadPoolExecutor): String =
+        suspendCancellableCoroutine { continuation ->
+            val task = FutureTask<Unit> {
+                if (continuation.isActive) {
+                    try {
+                        val raw = validateRawResponse(command, invokeNative(command, args))
+                        continuation.resume(raw)
+                    } catch (error: Exception) {
+                        continuation.resumeWithException(error)
+                    }
+                }
+            }
+            continuation.invokeOnCancellation {
+                task.cancel(false)
+                executor.remove(task)
+            }
+            try { executor.execute(task) }
+            catch (error: RejectedExecutionException) { continuation.resumeWithException(error) }
+        }
+
+    private fun validateRawResponse(command: String, raw: String): String {
+        val trimmed = raw.trimStart()
+        if (trimmed.isBlank()) {
+            throw RustBridgeException(command, "empty response")
+        }
+        if (trimmed.startsWith("{")) {
+            val obj = runCatching { JSONObject(raw) }.getOrNull()
+            // 显式 error 字段 → bridge 层传上来的错误(不是网易业务码)
+            val message = obj?.optStringOrNull("error")
+            if (!message.isNullOrBlank()) {
+                throw RustBridgeException(command, message)
+            }
+        }
+        return raw
+    }
+
     private external fun invokeNative(command: String, argsJson: String): String
 
     private fun callInit(appDataDir: String) {
@@ -483,6 +619,27 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
     }
 
     companion object {
+        private val CANCELLABLE_CATALOG_READS = setOf(
+            "netease_search", "netease_daily_recommended_tracks",
+            "netease_personal_fm_tracks", "netease_similar_tracks",
+        )
+        // Library hydration must release the synchronizer's lock when foreground work arrives.
+        // Keep running JNI reads bounded and separate from search, playback and account writes.
+        private val CANCELLABLE_LIBRARY_READS = setOf(
+            "netease_user_playlists", "netease_playlist_detail",
+        )
+        private val membershipReadExecutor = ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(4),
+            { task -> Thread(task, "pipo-membership-read").apply { isDaemon = true } },
+        )
+        private val libraryReadExecutor = ThreadPoolExecutor(
+            2, 2, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(4),
+            { task -> Thread(task, "pipo-library-read").apply { isDaemon = true } },
+        )
+        private val catalogReadExecutor = ThreadPoolExecutor(
+            3, 3, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(12),
+            { task -> Thread(task, "pipo-catalog-read").apply { isDaemon = true } },
+        )
         private const val DEFAULT_CALL_TIMEOUT_MS = 30_000L
 
         /** Chat/tools: Rust 硬超时 24s，Kotlin 留 27s 等 Rust 收口。 */
@@ -490,15 +647,34 @@ class JsonRustPipoBridge(appDataDir: String? = null) : RustPipoBridge {
         /** Embedding 可批处理较大输入；Rust 60s，Kotlin 留 65s。 */
         private const val AI_EMBED_CALL_TIMEOUT_MS = 65_000L
 
+        private val audioFeatureExecutor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "pipo-audio-analysis").apply { isDaemon = true }
+        }
+
+        private val audioFeatureRequests = HashMap<Long, AudioFeatureRequest>()
+        private val nextAudioRequestId = AtomicLong(0)
+
         private const val BRIDGE_PARALLELISM = 6
-        private val bridgeDispatcher = Executors.newFixedThreadPool(BRIDGE_PARALLELISM) { task ->
+        private val bridgeExecutor = Executors.newFixedThreadPool(BRIDGE_PARALLELISM) { task ->
             Thread(task, "pipo-rust-bridge").apply { isDaemon = true }
-        }.asCoroutineDispatcher()
+        }
+        private val bridgeDispatcher = bridgeExecutor.asCoroutineDispatcher()
 
         init {
             System.loadLibrary("pipo_native_bridge")
         }
     }
+
+    private class AudioFeatureRequest(
+        val trackId: Long,
+        val requestId: String,
+        val args: JSONObject,
+        val result: CompletableFuture<String> = CompletableFuture(),
+        val waiters: AtomicInteger = AtomicInteger(),
+        val started: AtomicBoolean = AtomicBoolean(),
+        val cancelled: AtomicBoolean = AtomicBoolean(),
+        val finished: AtomicBoolean = AtomicBoolean(),
+    )
 }
 
 class RustBridgeException(command: String, message: String) : RuntimeException("$command: $message")

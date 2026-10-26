@@ -1,20 +1,24 @@
 package app.pipo.nativeapp.data.agent.resolve
 
 import app.pipo.nativeapp.data.NativeTrack
-import app.pipo.nativeapp.data.PipoRepository
+import app.pipo.nativeapp.data.PipoGraph
+import app.pipo.nativeapp.data.MusicProviders
+import app.pipo.nativeapp.data.SearchVersionPolicy
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
 
-class TrackResolver(
-    private val repository: PipoRepository,
-) {
+class TrackResolver {
     suspend fun resolve(
         requirement: TrackRequirement,
         library: List<NativeTrack>,
         allowOnline: Boolean = true,
         acceptsTrack: (NativeTrack) -> Boolean = { true },
     ): ResolvedTrack {
-        val local = resolveLocal(requirement, library).filter(acceptsTrack)
+        val preferred = PipoGraph.music.preferredProviderId()
+        val local = resolveLocal(requirement, library).filter {
+            acceptsTrack(it) && SearchVersionPolicy.accepts(it, requirement.title) &&
+                (!allowOnline || (it.musicSource?.providerId ?: MusicProviders.NETEASE) == preferred)
+        }
         val localPick = pickMatchingVersion(local, requirement)
         if (localPick != null) {
             val track = localPick
@@ -47,7 +51,9 @@ class TrackResolver(
             )
         }
         val query = listOfNotNull(requirement.artist, requirement.title).joinToString(" ")
-        val online = repository.searchTracks(query, limit = 8)
+        val online = PipoGraph.music.searchCandidates(query, limit = 30, acceptCandidate = {
+            requirementMatches(it, requirement) && acceptsTrack(it) && SearchVersionPolicy.accepts(it, requirement.title)
+        })
         val matches = online.filter { requirementMatches(it, requirement) && acceptsTrack(it) }
         val distinctMatches = matches.distinctBy { it.id }
         val picked = pickMatchingVersion(distinctMatches, requirement)

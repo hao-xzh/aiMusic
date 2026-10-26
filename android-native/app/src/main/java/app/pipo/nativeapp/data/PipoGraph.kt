@@ -9,6 +9,12 @@ import app.pipo.nativeapp.playback.PlaybackSessionClock
  * TasteProfileStore / DistillEngine 在 installContext 时装配（需要 Application Context）。
  */
 object PipoGraph {
+    private var applicationContext: Context? = null
+    @Volatile private var musicCatalog: MusicCatalog? = null
+    val music: MusicCatalog
+        get() = musicCatalog ?: synchronized(this) {
+            musicCatalog ?: MusicCatalog(checkNotNull(applicationContext), repository).also { musicCatalog = it }
+        }
     lateinit var homeRecommendationStore: HomeRecommendationStore
         private set
 
@@ -126,7 +132,9 @@ object PipoGraph {
             .also { engine = it }
 
     val distillCoordinator: DistillCoordinator
-        get() = distillCoord ?: DistillCoordinator(distillEngine).also { distillCoord = it }
+        get() = distillCoord ?: synchronized(this) {
+            distillCoord ?: DistillCoordinator(distillEngine).also { distillCoord = it }
+        }
 
     /** 低成本本地偏好 delta：从 BehaviorLog 推导最近口味，不走 AI / 网络。 */
     val behaviorPreference: BehaviorPreferenceEngine
@@ -166,6 +174,7 @@ object PipoGraph {
 
     fun installContext(context: Context) {
         val app = context.applicationContext
+        applicationContext = app
         PlaybackSessionClock.installContext(app)
         if (!::homeRecommendationStore.isInitialized) homeRecommendationStore = HomeRecommendationStore(app)
         if (agentTaskCoordinator == null) agentTaskCoordinator = AgentTaskCoordinator(app)

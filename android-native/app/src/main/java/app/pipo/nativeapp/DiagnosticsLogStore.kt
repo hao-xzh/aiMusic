@@ -37,9 +37,11 @@ object DiagnosticsLogStore {
     fun install(context: Context) {
         val app = context.applicationContext
         appContext = app
-        // 清理 + start 事件都走后台队列;FIFO 保证 reset 先于 start 落盘,且不阻塞冷启动主线程。
+        // 归档 + start 事件都走后台队列;FIFO 保证上次会话归档先于本次 start 落盘,且不阻塞冷启动主线程。
         ioExecutor.execute {
-            synchronized(lock) { resetEventLogs(app) }
+            runCatching {
+                synchronized(lock) { archiveCurrentLogOnStartup(app) }
+            }
         }
         runCatching {
             record(
@@ -130,11 +132,14 @@ object DiagnosticsLogStore {
         }
     }
 
-    private fun resetEventLogs(context: Context) {
-        diagnosticsDir(context).listFiles()
-            ?.filter { it.isFile && it.name.endsWith(".ndjson") }
-            ?.forEach { it.delete() }
-        File(context.cacheDir, SHARE_DIR_NAME).deleteRecursively()
+    private fun archiveCurrentLogOnStartup(context: Context) {
+        val dir = diagnosticsDir(context)
+        val file = currentFile(dir)
+        if (file.isFile && file.length() > 0L) {
+            val archive = File(dir, "diagnostics-${fileTimestamp()}.ndjson")
+            file.renameTo(archive)
+        }
+        trimArchives(dir)
     }
 
     private fun StringBuilder.appendCrashSection(context: Context) {
@@ -241,7 +246,7 @@ object DiagnosticsLogStore {
 
     private fun trimArchives(dir: File) {
         val archives = dir.listFiles()
-            ?.filter { it.isFile && it.name.startsWith("diagnostics-") && it.name.endsWith(".ndjson") }
+            ?.filter { it.isFile && it.name != CURRENT_FILE && it.name.startsWith("diagnostics-") && it.name.endsWith(".ndjson") }
             ?.sortedByDescending { it.lastModified() }
             .orEmpty()
         archives.drop(MAX_ARCHIVE_FILES).forEach { it.delete() }

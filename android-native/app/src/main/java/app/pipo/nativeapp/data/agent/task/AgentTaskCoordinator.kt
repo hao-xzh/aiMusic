@@ -61,8 +61,14 @@ class AgentTaskCoordinator(private val context: Context) {
         }
         DiagnosticsLogStore.record(
             "ai_agent_task",
-            if (retriedTask == null) "enqueued" else "manual_retry_enqueued",
-            mapOf("taskId" to task.id, "contextBytes" to task.contextJson.length),
+            if (retriedTask == null) "submitted" else "manual_retry_submitted",
+            mapOf(
+                "taskId" to task.id,
+                "conversationEpoch" to task.conversationEpoch,
+                "conversationSequence" to task.conversationSequence,
+                "source" to "ui",
+                "contextBytes" to task.contextJson.length,
+            ),
         )
         scope.launch {
             if (retriedTask == null) {
@@ -79,38 +85,67 @@ class AgentTaskCoordinator(private val context: Context) {
                     task.conversationEpoch,
                 )
             }
-            execute(task.id, onFinished)
+            execute(task.id, onFinished, executionSource = "ui")
         }
         scheduleRecovery()
         return task
     }
 
-    suspend fun executePersisted(taskId: String): Boolean = execute(taskId) {}
+    suspend fun executePersisted(taskId: String): Boolean = execute(
+        taskId,
+        onFinished = {},
+        executionSource = "background",
+    )
 
-    private suspend fun execute(taskId: String, onFinished: (Result<TurnOutcome>) -> Unit): Boolean = mutex.withLock {
-        val task = store.claim(taskId) ?: return@withLock false
-        if (task.status == AgentTaskStatus.SUCCEEDED) return@withLock true
-        if (task.status == AgentTaskStatus.FAILED) return@withLock false
-        val activeGateway = gateway ?: detachedGateway
-        val startedAt = System.currentTimeMillis()
-        scope.launch { PipoGraph.userTaste.learnConversation(task.userText, task.id) }
-        // WorkManager may win the race with submit's IO coroutine, or recreate the
-        // process entirely. Ensure the question is durable before doing expensive work.
-        runCatching {
-            PipoGraph.petMemory.recordConversationTurn(
-                PetMemory.ROLE_USER,
-                task.userText,
-                task.id,
-                task.conversationSequence,
-                task.conversationEpoch,
+    private suspend fun execute(
+        taskId: String,
+        onFinished: (Result<TurnOutcome>) -> Unit,
+        executionSource: String,
+    ): Boolean {
+        val lockWaitStartedAt = System.currentTimeMillis()
+        return mutex.withLock {
+            val lockWaitMs = System.currentTimeMillis() - lockWaitStartedAt
+            val task = store.claim(taskId) ?: return@withLock false
+            if (task.status == AgentTaskStatus.SUCCEEDED) return@withLock true
+            if (task.status == AgentTaskStatus.FAILED) return@withLock false
+            val activeGateway = gateway ?: detachedGateway
+            val startedAt = System.currentTimeMillis()
+            DiagnosticsLogStore.record(
+                "ai_agent_task",
+                "lock_wait",
+                mapOf(
+                    "taskId" to task.id,
+                    "conversationEpoch" to task.conversationEpoch,
+                    "conversationSequence" to task.conversationSequence,
+                    "source" to executionSource,
+                    "elapsedMs" to lockWaitMs,
+                ),
             )
-        }
-        DiagnosticsLogStore.record(
-            "ai_agent_task",
-            "started",
-            mapOf("taskId" to task.id, "attempt" to task.attempts, "gateway" to if (gateway == null) "background" else "ui"),
-        )
-        return@withLock try {
+            scope.launch { PipoGraph.userTaste.learnConversation(task.userText, task.id) }
+            // WorkManager may win the race with submit's IO coroutine, or recreate the
+            // process entirely. Ensure the question is durable before doing expensive work.
+            runCatching {
+                PipoGraph.petMemory.recordConversationTurn(
+                    PetMemory.ROLE_USER,
+                    task.userText,
+                    task.id,
+                    task.conversationSequence,
+                    task.conversationEpoch,
+                )
+            }
+            DiagnosticsLogStore.record(
+                "ai_agent_task",
+                "started",
+                mapOf(
+                    "taskId" to task.id,
+                    "conversationEpoch" to task.conversationEpoch,
+                    "conversationSequence" to task.conversationSequence,
+                    "attempt" to task.attempts,
+                    "source" to executionSource,
+                    "gateway" to if (gateway == null) "background" else "ui",
+                ),
+            )
+            return@withLock try {
             val outcome = activeGateway.execute(task)
             store.succeed(task.id, outcome.reply, outcome.cards)
             // Conversation memory belongs to the durable task owner, not the page.
@@ -130,11 +165,19 @@ class AgentTaskCoordinator(private val context: Context) {
             DiagnosticsLogStore.record(
                 "ai_agent_task",
                 "succeeded",
-                mapOf("taskId" to task.id, "attempt" to task.attempts, "elapsedMs" to (System.currentTimeMillis() - startedAt)),
+                mapOf(
+                    "taskId" to task.id,
+                    "turnId" to outcome.trace.turnId,
+                    "conversationEpoch" to task.conversationEpoch,
+                    "conversationSequence" to task.conversationSequence,
+                    "attempt" to task.attempts,
+                    "source" to executionSource,
+                    "elapsedMs" to (System.currentTimeMillis() - startedAt),
+                ),
             )
             onFinished(Result.success(outcome))
             true
-        } catch (error: Throwable) {
+            } catch (error: Throwable) {
             if (error is CancellationException) {
                 store.retry(task.id, "cancelled")
                 throw error
@@ -147,6 +190,7 @@ class AgentTaskCoordinator(private val context: Context) {
                     error !is AgentTurnExecutionException -> "这次请求没能完成，请重试。"
                     reason.endsWith(":auth") -> "AI 服务鉴权失败，请到设置中的 AI 设置检查 API Key 后重试。"
                     reason.startsWith("音乐搜索服务暂时不可用") -> "音乐搜索服务暂时不可用，这次请求尚未完成，请稍后重试。"
+                    reason.startsWith("selection_failed:") -> reason.substringAfter("selection_failed:")
                     reason.startsWith("turn_budget_exhausted") -> "这次处理超过了等待时间，尚未完成。可以重试这条请求。"
                     reason.startsWith("max_steps_exhausted") || reason.startsWith("no_progress") ->
                         "多次调整后仍未得到符合要求的结果，已停止重复尝试。可以重试这条请求。"
@@ -167,12 +211,16 @@ class AgentTaskCoordinator(private val context: Context) {
                 if (terminal) "failed" else "retry_queued",
                 mapOf(
                     "taskId" to task.id,
+                    "conversationEpoch" to task.conversationEpoch,
+                    "conversationSequence" to task.conversationSequence,
                     "attempt" to task.attempts,
+                    "source" to executionSource,
                     "elapsedMs" to (System.currentTimeMillis() - startedAt),
                     "errorType" to error::class.java.simpleName,
                 ),
             )
-            false
+                false
+            }
         }
     }
 

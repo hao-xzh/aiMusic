@@ -54,7 +54,18 @@ class ReplyVerifier {
                         facts.closerTitle,
                     )
                 ).map { it.trim() }.filter { it.isNotBlank() }
-            val actualNamedItems = (actualTitles + facts.playlistName.trim())
+            // 有操作表述时仍仅接受本次事实，不能拿前文曲目为本轮动作背书。
+            val mentionsOperation = listOf(
+                "收藏", "播放", "下一首", "插播", "切歌", "排好", "排了", "放了", "切了",
+                "收好", "收了", "接上", "加入", "加到", "安排",
+            ).any { it in compact }
+            val contextualTitles = if (mentionsOperation) emptyList() else {
+                facts.conversation.musicReferences.map { it.title } +
+                    listOfNotNull(facts.currentTrackBeforeAction?.title, facts.currentTrackBeforeAction?.album)
+            }
+            val actualNamedItems = (actualTitles + facts.playlistName.trim() +
+                facts.changedTracks.map { it.album } + contextualTitles)
+                .map(String::trim)
                 .filter { it.isNotBlank() }
             val allReal = mentionedQuoted.all { quoted ->
                 actualNamedItems.any { item -> item == quoted || item.contains(quoted) || quoted.contains(item) }

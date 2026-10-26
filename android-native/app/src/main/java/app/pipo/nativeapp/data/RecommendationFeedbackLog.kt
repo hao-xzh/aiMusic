@@ -16,10 +16,14 @@ class RecommendationFeedbackLog(context: Context) {
         val trackIds: Set<Long>,
         val songKeys: Set<String>,
         val trackRefs: Set<String> = emptySet(),
+        val sourceKeys: Set<String> = emptySet(),
+        val recordingIds: Set<String> = emptySet(),
     ) {
         fun contains(track: NativeTrack): Boolean {
             val id = track.neteaseId
             return (id != null && id in trackIds) ||
+                TrackDedupe.sourceKeys(track).any { it in sourceKeys } ||
+                track.recordingId?.takeIf { it.isNotBlank() }?.let { it in recordingIds } == true ||
                 (track.id in trackRefs || TrackDedupe.idKey(track)?.let { it in trackRefs } == true) ||
                 TrackDedupe.compatibleKeys(track).any { it in songKeys }
         }
@@ -30,6 +34,8 @@ class RecommendationFeedbackLog(context: Context) {
         val trackId: Long?,
         val trackRef: String,
         val songKey: String,
+        val sourceKey: String?,
+        val recordingId: String?,
         val tsSec: Long,
         val sourceText: String,
     )
@@ -47,17 +53,17 @@ class RecommendationFeedbackLog(context: Context) {
         val now = System.currentTimeMillis() / 1000
         val event = Event(
             contextKey = contextKey,
-            trackId = track.neteaseId,
+            trackId = track.neteaseId?.takeIf { it > 0L },
             trackRef = TrackDedupe.idKey(track) ?: track.id,
             songKey = TrackDedupe.songKey(track),
+            sourceKey = track.sourceKey,
+            recordingId = track.recordingId?.takeIf { it.isNotBlank() },
             tsSec = now,
             sourceText = sourceText.take(180),
         )
         val buf = ensureBuffer()
             .filterNot {
-                it.contextKey == event.contextKey &&
-                    it.songKey == event.songKey &&
-                    it.trackId == event.trackId
+                it.contextKey == event.contextKey && sameTrack(it, event)
             }
             .toMutableList()
         buf.add(event)
@@ -71,16 +77,17 @@ class RecommendationFeedbackLog(context: Context) {
         val now = System.currentTimeMillis() / 1000
         val event = Event(
             contextKey = GLOBAL_CONTEXT,
-            trackId = track.neteaseId,
+            trackId = track.neteaseId?.takeIf { it > 0L },
             trackRef = TrackDedupe.idKey(track) ?: track.id,
             songKey = TrackDedupe.songKey(track),
+            sourceKey = track.sourceKey,
+            recordingId = track.recordingId?.takeIf { it.isNotBlank() },
             tsSec = now,
             sourceText = sourceText,
         )
         val buf = ensureBuffer()
             .filterNot { it.contextKey == GLOBAL_CONTEXT &&
-                (it.trackRef == event.trackRef || it.songKey == event.songKey ||
-                    (it.trackId != null && it.trackId == event.trackId)) }
+                sameTrack(it, event) }
             .toMutableList()
         buf.add(event)
         buffer = trimFresh(buf, now)
@@ -89,9 +96,14 @@ class RecommendationFeedbackLog(context: Context) {
 
     @Synchronized
     fun restoreHomeDismissal(track: NativeTrack) {
+        val sourceKey = track.sourceKey
+        val recordingId = track.recordingId?.takeIf { it.isNotBlank() }
         val songKey = TrackDedupe.songKey(track)
         buffer = ensureBuffer().filterNot { it.contextKey == GLOBAL_CONTEXT &&
-            it.sourceText == "home_not_interested" && it.songKey == songKey }.toMutableList()
+            it.sourceText == "home_not_interested" &&
+            ((it.sourceKey != null && it.sourceKey == sourceKey) ||
+                (it.recordingId != null && it.recordingId == recordingId) ||
+                (it.sourceKey == null && it.recordingId == null && it.songKey == songKey)) }.toMutableList()
         flush()
     }
 
@@ -100,11 +112,7 @@ class RecommendationFeedbackLog(context: Context) {
     fun globallyRejected(): RejectedContext {
         val now = System.currentTimeMillis() / 1000
         val matched = trimFresh(ensureBuffer(), now).filter { it.contextKey == GLOBAL_CONTEXT }
-        return RejectedContext(
-            trackIds = matched.mapNotNullTo(HashSet()) { it.trackId },
-            songKeys = matched.mapTo(HashSet()) { it.songKey },
-            trackRefs = matched.mapTo(HashSet()) { it.trackRef },
-        )
+        return rejectedContext(matched)
     }
 
     @Synchronized
@@ -115,11 +123,7 @@ class RecommendationFeedbackLog(context: Context) {
         val matched = trimFresh(ensureBuffer(), now).filter { event ->
             contextMatches(event.contextKey, contextKey)
         }
-        return RejectedContext(
-            trackIds = matched.mapNotNullTo(HashSet()) { it.trackId },
-            songKeys = matched.mapTo(HashSet()) { it.songKey },
-            trackRefs = matched.mapTo(HashSet()) { it.trackRef },
-        )
+        return rejectedContext(matched)
     }
 
     @Synchronized
@@ -138,9 +142,12 @@ class RecommendationFeedbackLog(context: Context) {
                     out.add(
                         Event(
                             contextKey = key,
-                            trackId = if (o.has("trackId")) o.optLong("trackId") else null,
+                            trackId = o.optLong("trackId")
+                                .takeIf { o.has("trackId") && !o.isNull("trackId") && it > 0L },
                             trackRef = o.optString("trackRef", ""),
                             songKey = songKey,
+                            sourceKey = o.optString("sourceKey", "").takeIf { it.isNotBlank() },
+                            recordingId = o.optString("recordingId", "").takeIf { it.isNotBlank() },
                             tsSec = o.optLong("ts"),
                             sourceText = o.optString("sourceText"),
                         ),
@@ -161,6 +168,8 @@ class RecommendationFeedbackLog(context: Context) {
                 event.trackId?.let { put("trackId", it) }
                 if (event.trackRef.isNotBlank()) put("trackRef", event.trackRef)
                 put("songKey", event.songKey)
+                event.sourceKey?.let { sourceKey -> put("sourceKey", sourceKey) }
+                event.recordingId?.let { recordingId -> put("recordingId", recordingId) }
                 put("ts", event.tsSec)
                 put("sourceText", event.sourceText)
             })
@@ -179,6 +188,26 @@ class RecommendationFeedbackLog(context: Context) {
             .takeLast((MAX_EVENTS - hard.size).coerceAtLeast(0))
         val kept = (soft + hard).sortedBy { it.tsSec }.takeLast(MAX_EVENTS)
         return kept.toMutableList()
+    }
+
+    private fun rejectedContext(events: List<Event>): RejectedContext {
+        val legacy = events.filter { it.sourceKey.isNullOrBlank() && it.recordingId.isNullOrBlank() }
+        return RejectedContext(
+            trackIds = events.mapNotNullTo(HashSet()) { it.trackId },
+            songKeys = legacy.mapTo(HashSet()) { it.songKey },
+            trackRefs = legacy.mapTo(HashSet()) { it.trackRef },
+            sourceKeys = events.mapNotNullTo(HashSet()) { it.sourceKey },
+            recordingIds = events.mapNotNullTo(HashSet()) { it.recordingId },
+        )
+    }
+
+    private fun sameTrack(first: Event, second: Event): Boolean {
+        if (!first.sourceKey.isNullOrBlank() && first.sourceKey == second.sourceKey) return true
+        if (!first.recordingId.isNullOrBlank() && first.recordingId == second.recordingId) return true
+        return first.sourceKey.isNullOrBlank() && first.recordingId.isNullOrBlank() &&
+            second.sourceKey.isNullOrBlank() && second.recordingId.isNullOrBlank() &&
+            (first.trackRef == second.trackRef || first.songKey == second.songKey ||
+                (first.trackId != null && first.trackId == second.trackId))
     }
 
     companion object {

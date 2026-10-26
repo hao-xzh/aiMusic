@@ -168,8 +168,8 @@ fun NativeAiPet(
         PetBubbleState.lastUserContext = text
         pending = true
         val taskContext = JSONObject()
-            .put("currentTrack", currentTrack?.let { JSONObject().put("id", it.id).put("neteaseId", it.neteaseId).put("title", it.title).put("artist", it.artist).put("album", it.album).put("streamUrl", if (it.neteaseId == null) it.streamUrl else "") })
-            .put("queue", JSONArray(currentQueue.take(24).map { JSONObject().put("id", it.id).put("neteaseId", it.neteaseId).put("title", it.title).put("artist", it.artist).put("album", it.album).put("streamUrl", if (it.neteaseId == null) it.streamUrl else "").put("artworkUrl", it.artworkUrl) }))
+            .put("currentTrack", currentTrack?.let { app.pipo.nativeapp.data.NativeTrackJson.encode(it, includeStreamUrl = it.musicSource == null) })
+            .put("queue", JSONArray(currentQueue.take(24).map { app.pipo.nativeapp.data.NativeTrackJson.encode(it, includeStreamUrl = it.musicSource == null) }))
             .put("userFacts", settings.userFacts)
             .put("persona", settings.personaId)
             .toString()

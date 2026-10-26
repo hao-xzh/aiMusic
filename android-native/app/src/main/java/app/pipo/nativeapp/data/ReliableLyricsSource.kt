@@ -39,13 +39,15 @@ internal class ReliableLyricsSource(context: Context) {
         track: NativeTrack?,
         additionalCandidates: List<OnlineLyrics>,
     ): OnlineLyrics? {
-        val amllId = track?.neteaseId?.toString() ?: trackId
-        val amllLines = amll.lyricsForTrack(amllId)?.let(LyricCredits::stripLeading)
+        val amllId = track?.neteaseId?.toString()
+            ?: track?.alternateSources?.firstNotNullOfOrNull { it.neteaseId }?.toString()
+            ?: trackId.takeIf { track?.musicSource == null && it.toLongOrNull() != null }
+        val amllLines = amllId?.let { amll.lyricsForTrack(it) }?.let(LyricCredits::stripLeading)
             ?.takeIf { OnlineLyricSupport.usableLyricsDocument(it, track?.durationMs ?: 0L) }
         val sourceCandidates = additionalCandidates.filter {
             OnlineLyricSupport.usableLyricsDocument(it.lines, track?.durationMs ?: 0L)
         }
-        val amllCandidate = amllLines?.let { OnlineLyrics("amll", amllId, it) }
+        val amllCandidate = amllLines?.let { OnlineLyrics("amll", requireNotNull(amllId), it) }
 
         // Missing recording metadata is a reason to keep the ID-based fallback, never to guess.
         if (track == null || track.title.isBlank() || track.artist.isBlank() || track.durationMs <= 0L) {

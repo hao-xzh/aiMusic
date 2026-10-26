@@ -37,6 +37,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -47,19 +48,16 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.Image
 import androidx.compose.ui.layout.ContentScale
@@ -96,13 +94,13 @@ fun PlayerScreen(
     onToggleTranslation: () -> Unit,
     isVisible: Boolean = true,
     viewModel: PlayerViewModel = viewModel(),
-) {
+) = CompositionLocalProvider(LocalCoverTransitionVisible provides (isVisible && viewModel.state.isReady)) {
     val state = viewModel.state
     val lifecycleOwner = LocalLifecycleOwner.current
 
     LaunchedEffect(state.isPlaying, isVisible) {
-        // 不在播 → 单次 reset Amp,然后退出。之前 while(true) 在暂停态也每 420ms tick
-        // 一次 refreshPosition,viewmodel 走 syncFrom + 歌词比对 + 续杯检查,待机也耗电。
+        // 不在播 → 单次 reset Amp,然后退出。之前 while(true) 在暂停态也每 420ms tick。
+        // refreshPosition 现在只更新位置/续播快照和到点预热；Media3 事件负责全量同步。
         // isPlaying 变 true 时 LaunchedEffect 自动 relaunch,重新进入 30Hz tick 循环。
         if (!state.isPlaying) {
             Amp.set(0f)
@@ -248,7 +246,7 @@ private fun PortraitPlayerContent(
             val titleFs = clampSp(17, viewportW.value * 0.04f, 22)
             val subtitleFs = clampSp(12, viewportW.value * 0.032f, 14)
             val controlEdges = useCoverEdgeColors(artworkUrl)
-            val controlTone = toneForColor(appleMusicPureSurfaceColor(controlEdges))
+            val controlTone = toneForColor(appleMusicPortraitSurfaceColor(controlEdges))
             val fg = pickFg(controlTone)
             val fgDim = pickFgDim(controlTone)
             val fgFaint = if (controlTone == Tone.Dark) {
@@ -452,118 +450,73 @@ private fun AppleMusicPlayerBackdrop(coverUrl: String?) {
         .coerceAtLeast(screenW)
         .coerceAtMost(screenH * 0.64f)
     val edges = useCoverEdgeColors(coverUrl)
-    // 取色与归一化只在封面 palette 真正变化时计算一次；颜色动画每帧重组时
-    // 不再重复 blendRgb/HSV 分配，避免切歌同时与歌词入场争抢主线程。
-    val targetSurfaceColor = remember(edges) { appleMusicPureSurfaceColor(edges) }
-    val targetBridgeColor = remember(edges, targetSurfaceColor) {
-        appleMusicDissolveBridgeColor(edges, fallback = targetSurfaceColor)
+    // 取色与归一化只在封面 palette 真正变化时计算一次，避免在切歌动画中重复 HSV 分配。
+    val targetSurfaceColor = remember(edges) { appleMusicPortraitSurfaceColor(edges) }
+    val targetMiddleColor = remember(edges, targetSurfaceColor) {
+        rgbToColor(edges.bottomMiddle ?: edges.seam ?: edges.bottom, fallback = targetSurfaceColor)
     }
-    val targetTransitionColor = remember(edges, targetBridgeColor) {
-        appleMusicTransitionWashColor(edges, fallback = targetBridgeColor)
+    val targetLeftColor = remember(edges, targetMiddleColor) {
+        rgbToColor(edges.bottomLeft, fallback = targetMiddleColor)
     }
-    val targetTopColor = remember(edges, targetBridgeColor) {
-        appleMusicPureTopColor(edges, fallback = targetBridgeColor)
+    val targetRightColor = remember(edges, targetMiddleColor) {
+        rgbToColor(edges.bottomRight, fallback = targetMiddleColor)
     }
     // 调色板与封面共用 1100ms 软切。只在切歌/新封面采样完成时运行，
     // 正常播放期不更新，不会与歌词 60fps 动画争抢帧预算。
-    val surfaceColor by animateColorAsState(
+    val surfaceColor = animateColorAsState(
         targetValue = targetSurfaceColor,
         animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
         label = "playerBackdropSurface",
     )
-    val bridgeColor by animateColorAsState(
-        targetValue = targetBridgeColor,
+    val middleColor = animateColorAsState(
+        targetValue = targetMiddleColor,
         animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
-        label = "playerBackdropBridge",
+        label = "playerBackdropMiddle",
     )
-    val transitionColor by animateColorAsState(
-        targetValue = targetTransitionColor,
+    val leftColor = animateColorAsState(
+        targetValue = targetLeftColor,
         animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
-        label = "playerBackdropSongWash",
+        label = "playerBackdropLeft",
     )
-    val topColor by animateColorAsState(
-        targetValue = targetTopColor,
+    val rightColor = animateColorAsState(
+        targetValue = targetRightColor,
         animationSpec = tween(PipoMotion.CoverFadeMs, easing = PipoMotion.FlipEase),
-        label = "playerBackdropTop",
+        label = "playerBackdropRight",
     )
     Box(
         modifier = Modifier
             .fillMaxSize()
-            // 一个缓存绘制层完成底色与两团超大半径柔光，不创建窄色条/独立面板。
-            // 颜色只在换歌的 1100ms 内变化，正常歌词播放时 Brush 与 shader 都保持稳定。
+            // 底部三个分区的原色向下延展，再在控制区渐收为同一底色。
+            // 动画状态在绘制阶段读取；切歌只更新画笔，不带动播放器内容重组。
             .drawWithCache {
-                val maxDimension = maxOf(size.width, size.height).coerceAtLeast(1f)
-                val baseBrush = Brush.verticalGradient(
+                val edgeField = Brush.horizontalGradient(
                     colorStops = arrayOf(
-                        0.00f to topColor,
-                        0.32f to bridgeColor,
-                        0.70f to lerp(bridgeColor, surfaceColor, 0.64f),
-                        1.00f to surfaceColor,
+                        0.00f to leftColor.value,
+                        0.20f to leftColor.value,
+                        0.50f to middleColor.value,
+                        0.80f to rightColor.value,
+                        1.00f to rightColor.value,
                     ),
-                    startY = 0f,
-                    endY = size.height,
                 )
-                val leftCloudColor = lerp(bridgeColor, topColor, 0.62f)
-                val rightCloudColor = lerp(bridgeColor, transitionColor, 0.74f)
-                val leftCloud = Brush.radialGradient(
+                val coverEnd = clearCoverHeight.toPx().coerceAtMost(size.height)
+                val surfaceWash = Brush.verticalGradient(
                     colorStops = arrayOf(
-                        0.00f to leftCloudColor.copy(alpha = 0.17f),
-                        0.48f to leftCloudColor.copy(alpha = 0.075f),
-                        1.00f to leftCloudColor.copy(alpha = 0f),
+                        0.00f to surfaceColor.value.copy(alpha = 0f),
+                        0.45f to surfaceColor.value.copy(alpha = 0.25f),
+                        1.00f to surfaceColor.value,
                     ),
-                    center = Offset(size.width * 0.04f, size.height * 0.34f),
-                    radius = maxDimension * 0.64f,
-                )
-                val rightCloud = Brush.radialGradient(
-                    colorStops = arrayOf(
-                        0.00f to rightCloudColor.copy(alpha = 0.14f),
-                        0.52f to rightCloudColor.copy(alpha = 0.055f),
-                        1.00f to rightCloudColor.copy(alpha = 0f),
-                    ),
-                    center = Offset(size.width * 1.04f, size.height * 0.51f),
-                    radius = maxDimension * 0.66f,
+                    startY = coverEnd * 0.60f,
+                    endY = maxOf(coverEnd, size.height * 0.78f),
                 )
                 onDrawBehind {
-                    drawRect(brush = baseBrush)
-                    drawRect(brush = leftCloud)
-                    drawRect(brush = rightCloud)
+                    drawRect(brush = edgeField)
+                    drawRect(brush = surfaceWash)
                 }
             },
     ) {
-        AppleMusicLowerGlassWash(
-            coverUrl = coverUrl,
-        )
-
         AppleMusicTopCover(
             coverUrl = coverUrl,
             height = clearCoverHeight,
-        )
-
-    }
-}
-
-@Composable
-private fun AppleMusicLowerGlassWash(
-    coverUrl: String?,
-) {
-    if (coverUrl == null) return
-    Box(
-        modifier = Modifier
-            .fillMaxSize(),
-    ) {
-        CrossfadeCoverImage(
-            url = coverUrl,
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer {
-                    alpha = 0.20f
-                    scaleX = 1.92f
-                    scaleY = 1.92f
-                }
-                .blur(64.dp),
-            contentScale = ContentScale.Crop,
-            durationMs = PipoMotion.CoverFadeMs,
-            maxDecodeSizePx = 448,
         )
     }
 }
@@ -579,10 +532,9 @@ private fun AppleMusicTopCover(
         Brush.verticalGradient(
             colorStops = arrayOf(
                 0.00f to Color.Black,
-                0.48f to Color.Black,
-                0.64f to Color.Black.copy(alpha = 0.92f),
-                0.80f to Color.Black.copy(alpha = 0.54f),
-                0.94f to Color.Black.copy(alpha = 0.13f),
+                0.60f to Color.Black,
+                0.76f to Color.Black.copy(alpha = 0.88f),
+                0.90f to Color.Black.copy(alpha = 0.28f),
                 1.00f to Color.Transparent,
             ),
         )

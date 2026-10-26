@@ -5,7 +5,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -64,7 +63,7 @@ internal fun PlaylistBrowseDetail(session: BrowseSession, playlist: PipoPlaylist
                 }
                 Spacer(Modifier.height(200.dp))
                 Text(if (cloud) "网易云 · 网盘" else "PIPO · 歌单", color = BrowseMuted, fontSize = 13.sp)
-                Text(playlist?.name ?: "我的网盘", fontSize = 34.sp, color = BrowseInk, modifier = Modifier.padding(vertical = 10.dp))
+                Text(playlist?.name ?: "我的网盘", fontSize = 34.sp, lineHeight = 42.sp, color = BrowseInk, modifier = Modifier.padding(vertical = 10.dp))
                 Text(if (loading && tracks.isEmpty()) "正在加载…" else "${tracks.size} 首歌曲", color = BrowseMuted)
                 Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(onClick = { onPlay(tracks) }, enabled = tracks.isNotEmpty(), modifier = Modifier.weight(1f).heightIn(min = 48.dp), colors = ButtonDefaults.buttonColors(containerColor = BrowseInk, contentColor = Color.Black), shape = RoundedCornerShape(PipoDimens.SurfaceCornerDp)) { PlayGlyph(Color.Black, Modifier.size(24.dp)); Spacer(Modifier.width(8.dp)); Text("播放", fontSize = 16.sp) }
@@ -86,40 +85,48 @@ internal fun PlaylistBrowseDetail(session: BrowseSession, playlist: PipoPlaylist
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun BrowseQueueSheet(player: PlayerViewModel, onDismiss: () -> Unit) {
-    val repository = PipoGraph.repository
-    val account by repository.account.collectAsState()
-    val favorites by repository.favoriteSongs.collectAsState()
-    val snackbar = remember(account?.userId) { SnackbarHostState() }
+    val library = PipoGraph.music.library
+    val unifiedState by library.state.collectAsState()
+    val queue = player.state.queue
+    val upcomingStart = (player.state.currentIndex + 1).coerceIn(0, queue.size)
+    // 序号只区分同一来源歌曲的重复项；播放推进或删掉前面的歌，不重建后面所有行。
+    val queueKeys = remember(queue) {
+        val occurrences = mutableMapOf<String, Int>()
+        queue.map { track ->
+            val sourceKey = track.sourceKey
+            val occurrence = occurrences.getOrDefault(sourceKey, 0)
+            occurrences[sourceKey] = occurrence + 1
+            "queue:$sourceKey:$occurrence"
+        }
+    }
+    val snackbar = remember { SnackbarHostState() }
+    var favoriteRequests by remember { mutableStateOf(emptySet<String>()) }
     val feedbackScope = rememberCoroutineScope()
     fun showMessage(message: String) {
         feedbackScope.launch { snackbar.showSnackbar(message) }
     }
-    fun isLiked(track: NativeTrack): Boolean? = track.neteaseId?.let { id ->
-        favorites.takeIf { account != null && it.userId == account?.userId }?.isLiked(id)
-    }
+    fun isLiked(track: NativeTrack): Boolean? = library.isLiked(track)
     fun toggleLike(track: NativeTrack) {
-        val id = track.neteaseId ?: return
-        if (favorites.userId == account?.userId && favorites.isPending(id)) return
-        if (account == null) {
-            showMessage("请先在设置中登录网易云")
-            return
-        }
+        if (track.sourceKey in favoriteRequests) return
         val previous = isLiked(track)
         if (previous == null) {
-            if (favorites.errorMessage != null && !favorites.isRefreshing) {
-                repository.requestFavoriteSongsRefresh()
-            }
-            showMessage("正在确认收藏状态，请稍后再试")
+            showMessage("请先连接音乐账号并刷新资料库")
             return
         }
         // 写入由播放器生命周期承接，关闭弹窗或移除这一行不会取消收藏请求。
+        favoriteRequests = favoriteRequests + track.sourceKey
         player.viewModelScope.launch {
             try {
-                repository.likeSong(id, !previous)
+                val result = library.like(track, !previous)
+                if (result.pendingProviderIds.isNotEmpty()) {
+                    showMessage(favoriteWriteMessage(result.confirmedProviderIds, result.pendingProviderIds, !previous))
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
                 showMessage("《${track.title}》${if (previous) "取消喜欢" else "收藏"}失败，请重试")
+            } finally {
+                favoriteRequests = favoriteRequests - track.sourceKey
             }
         }
     }
@@ -127,7 +134,7 @@ internal fun BrowseQueueSheet(player: PlayerViewModel, onDismiss: () -> Unit) {
         BrowseSheetSystemBars()
         Box(Modifier.fillMaxWidth()) {
             LazyColumn(Modifier.fillMaxWidth().heightIn(max = 620.dp).padding(horizontal = 22.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
-                item {
+                item(key = "queue-header", contentType = "queue-header") {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("接下来播放", color = BrowseInk, fontSize = 24.sp, modifier = Modifier.weight(1f))
                         val mode = player.state.playbackMode
@@ -157,22 +164,26 @@ internal fun BrowseQueueSheet(player: PlayerViewModel, onDismiss: () -> Unit) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             BrowseArtwork(track.artworkUrl, Modifier.size(48.dp))
                             Column(Modifier.weight(1f).padding(12.dp)) { Text(track.title, color = BrowseInk); Text(track.artist, color = BrowseMuted, fontSize = 13.sp) }
-                            QueueFavoriteButton(track, isLiked(track), track.neteaseId?.let(favorites::isPending) == true) { toggleLike(track) }
+                            QueueFavoriteButton(track, remember(unifiedState, track) { isLiked(track) }, track.sourceKey in favoriteRequests) { toggleLike(track) }
                             IconButton(onClick = player::toggle, modifier = Modifier.size(48.dp)) { Icon(if (player.state.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, if (player.state.isPlaying) "暂停" else "播放", tint = PipoColors.Accent, modifier = Modifier.size(24.dp)) }
                         }
                     } ?: BrowseNotice("还没有正在播放的歌曲")
                     Text("待播歌曲", color = BrowseMuted, modifier = Modifier.padding(vertical = 18.dp))
                 }
-                val upcoming = player.state.queue.drop(player.state.currentIndex + 1)
-                itemsIndexed(upcoming, key = { index, track -> "upcoming:$index:${track.id}" }) { _, track ->
+                items(
+                    count = queue.size - upcomingStart,
+                    key = { queueKeys[upcomingStart + it] },
+                    contentType = { "queue-track" },
+                ) { index ->
+                    val track = queue[upcomingStart + index]
                     Row(Modifier.fillMaxWidth().heightIn(min = 60.dp), verticalAlignment = Alignment.CenterVertically) {
                         BrowseArtwork(track.artworkUrl, Modifier.size(44.dp))
                         Column(Modifier.weight(1f).clickable { player.playCurrentQueueTrack(track.id) }.padding(horizontal = 12.dp)) { Text(track.title, color = BrowseInk, maxLines = 1); Text(track.artist, color = BrowseMuted, fontSize = 13.sp, maxLines = 1) }
-                        QueueFavoriteButton(track, isLiked(track), track.neteaseId?.let(favorites::isPending) == true) { toggleLike(track) }
+                        QueueFavoriteButton(track, remember(unifiedState, track) { isLiked(track) }, track.sourceKey in favoriteRequests) { toggleLike(track) }
                         IconButton(onClick = { player.removeTrack(track.id) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.RemoveCircleOutline, "从待播队列移除${track.title}", tint = BrowseMuted, modifier = Modifier.size(24.dp)) }
                     }
                 }
-                if (upcoming.isEmpty()) item { BrowseNotice("没有更多待播歌曲") }
+                if (upcomingStart == queue.size) item(key = "queue-empty", contentType = "queue-empty") { BrowseNotice("没有更多待播歌曲") }
             }
             SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
         }
@@ -183,7 +194,7 @@ internal fun BrowseQueueSheet(player: PlayerViewModel, onDismiss: () -> Unit) {
 private fun QueueFavoriteButton(track: NativeTrack, liked: Boolean?, pending: Boolean, onClick: () -> Unit) {
     IconButton(
         onClick = onClick,
-        enabled = track.neteaseId != null && !pending,
+        enabled = track.musicSource != null && liked != null && !pending,
         modifier = Modifier.size(48.dp).semantics {
             contentDescription = "${if (liked == true) "取消喜欢" else "喜欢"}${track.title}"
             stateDescription = when (liked) {
@@ -236,17 +247,16 @@ internal fun CreatePlaylistSheet(onDismiss: () -> Unit, onCreated: (PipoPlaylist
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, player: PlayerViewModel, onDismiss: () -> Unit, onChanged: () -> Unit, onNotInterested: (() -> Unit)? = null) {
-    val repository = PipoGraph.repository
-    val account by repository.account.collectAsState()
-    val playlists by repository.playlists.collectAsState(initial = emptyList())
-    val favorites by repository.favoriteSongs.collectAsState()
+internal fun TrackActionsSheet(track: NativeTrack, unifiedPlaylistId: String?, player: PlayerViewModel, onDismiss: () -> Unit, onChanged: () -> Unit, onNotInterested: (() -> Unit)? = null) {
+    val library = PipoGraph.music.library
+    val unifiedState by library.state.collectAsState()
     val scope = rememberCoroutineScope()
-    val liked = track.neteaseId?.takeIf { account != null && favorites.userId == account?.userId }?.let(favorites::isLiked)
+    val liked = library.isLiked(track)
+    val favoriteSources = favoriteSourceLabels(track, unifiedState)
+    val sourceLabel = track.musicSource?.providerId?.let(MusicProviders::label) ?: "当前平台"
     var choosing by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
-    val likePending = favorites.userId == account?.userId && track.neteaseId?.let(favorites::isPending) == true
-    var message by remember(track.neteaseId, account?.userId) { mutableStateOf<String?>(null) }
+    var message by remember(track.sourceKey) { mutableStateOf<String?>(null) }
     fun perform(block: suspend () -> Unit) {
         if (busy) return
         busy = true
@@ -258,20 +268,20 @@ internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, play
             finally { busy = false }
         }
     }
-    fun toggleLike() {
-        if (likePending || account == null || liked == null) return
-        val trackId = track.neteaseId ?: return
-        val previous = liked == true
+    fun changeLike() {
+        if (busy || liked == null) return
+        busy = true
         message = null
-        player.viewModelScope.launch {
+        scope.launch {
             try {
-                repository.likeSong(trackId, !previous)
-                // Repository publishes the library revision after the confirmed write.
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                message = e.message ?: "收藏操作失败，请重试"
-            }
+                val result = library.like(track, !liked)
+                // The library publishes this song's confirmed membership. A full catalog refresh
+                // here would restart unrelated background synchronization after every heart tap.
+                if (result.pendingProviderIds.isEmpty()) onDismiss()
+                else message = favoriteWriteMessage(result.confirmedProviderIds, result.pendingProviderIds, !liked)
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { message = "收藏暂未完成，请稍后重试。" }
+            finally { busy = false }
         }
     }
     ModalBottomSheet(onDismissRequest = { if (!busy) onDismiss() }, containerColor = Color(0xFF191F26), sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), dragHandle = { BottomSheetDefaults.DragHandle(color = BrowseMuted) }) {
@@ -283,24 +293,21 @@ internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, play
                 IconButton(onClick = onDismiss, enabled = !busy) { CloseIcon(BrowseMuted, Modifier.size(22.dp)) }
             }
             message?.let { BrowseNotice(it) }
-            if (favorites.userId == account?.userId && favorites.errorMessage != null && !favorites.isRefreshing) {
-                TextButton(onClick = repository::requestFavoriteSongsRefresh, enabled = !busy && !likePending) {
-                    Text("收藏状态更新失败，点击重试", color = BrowseMuted)
-                }
-            }
+            if (favoriteSources.isNotEmpty()) BrowseNotice("已收藏来源：${favoriteSources.joinToString(" · ")}")
             if (busy) BrowseNotice("正在处理…")
             if (choosing) {
                 TextButton(onClick = { choosing = false }, enabled = !busy) { Text("‹ 返回歌曲操作") }
                 Text("添加到歌单", color = BrowseInk, fontSize = 22.sp)
-                val writable = playlists.filter { account != null && it.userId == account?.userId }
-                if (writable.isEmpty()) BrowseNotice("没有可添加的自建歌单，请先在资料库新建歌单。")
-                writable.forEach { target -> TextButton(onClick = { perform { repository.playlistModifyTracks(target.id, "add", listOf(requireNotNull(track.neteaseId))); repository.refreshPlaylists() } }, enabled = !busy) { Text(target.name, color = BrowseInk) } }
+                val writable = unifiedState.playlists.filter { it.bindings.none { binding -> binding.isFavorites } }
+                if (writable.isEmpty()) BrowseNotice("没有统一歌单，请先在资料库新建或绑定歌单。")
+                writable.forEach { target -> TextButton(onClick = { perform { library.add(target.id, track) } }, enabled = !busy) { Text(target.name, color = BrowseInk) } }
             } else {
                 TextButton(onClick = { if (player.queueNext(track)) onDismiss() else message = "暂时无法加入队列" }, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), contentPadding = PaddingValues(vertical = 8.dp)) { Icon(Icons.AutoMirrored.Rounded.PlaylistPlay, null, tint = BrowseInk, modifier = Modifier.size(24.dp)); Spacer(Modifier.width(18.dp)); Text("下一首播放", color = BrowseInk, fontSize = 18.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Normal, modifier = Modifier.weight(1f)) }
-                TextButton(onClick = { if (account == null) message = "请先在设置中登录网易云" else choosing = true }, enabled = !busy && track.neteaseId != null, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), contentPadding = PaddingValues(vertical = 8.dp)) { PlaylistAddGlyph(BrowseInk, Modifier.size(24.dp)); Spacer(Modifier.width(18.dp)); Text("添加到歌单", color = BrowseInk, fontSize = 18.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Normal, modifier = Modifier.weight(1f)) }
+                TextButton(onClick = { choosing = true }, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), contentPadding = PaddingValues(vertical = 8.dp)) { PlaylistAddGlyph(BrowseInk, Modifier.size(24.dp)); Spacer(Modifier.width(18.dp)); Text("添加到歌单", color = BrowseInk, fontSize = 18.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Normal, modifier = Modifier.weight(1f)) }
                 TextButton(onClick = {
-                    if (account == null) message = "请先在设置中登录网易云" else toggleLike()
-                }, enabled = !busy && !likePending && track.neteaseId != null && (account == null || liked != null), modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), contentPadding = PaddingValues(vertical = 8.dp)) {
+                    if (liked == null) message = "请先连接音乐账号并刷新资料库"
+                    else changeLike()
+                }, enabled = !busy && liked != null, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), contentPadding = PaddingValues(vertical = 8.dp)) {
                     HeartGlyph(filled = liked == true, color = when (liked) {
                         true -> Color(0xFFFF4D67)
                         false -> BrowseInk
@@ -309,13 +316,9 @@ internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, play
                     Spacer(Modifier.width(18.dp))
                     Text(
                         when (liked) {
-                            true -> "取消喜欢"
-                            false -> "喜欢这首歌"
-                            null -> when {
-                                account == null -> "喜欢这首歌"
-                                favorites.errorMessage != null && !favorites.isRefreshing -> "收藏状态暂不可用"
-                                else -> "正在确认收藏状态…"
-                            }
+                            true -> "取消在${sourceLabel}的收藏"
+                            false -> "添加到我喜欢"
+                            null -> "正在确认收藏状态…"
                         },
                         color = if (liked == null) BrowseMuted else BrowseInk,
                         fontSize = 18.sp,
@@ -323,6 +326,7 @@ internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, play
                         modifier = Modifier.weight(1f),
                     )
                 }
+                if (liked == true) Text("仅取消当前音源的收藏，不影响另一端。", color = BrowseMuted, fontSize = 12.sp, modifier = Modifier.padding(start = 42.dp, bottom = 6.dp))
                 if (onNotInterested != null) {
                     TextButton(onClick = { onNotInterested(); onDismiss() }, enabled = !busy,
                         modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), contentPadding = PaddingValues(vertical = 8.dp)) {
@@ -331,9 +335,9 @@ internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, play
                         Text("不感兴趣", color = BrowseInk, fontSize = 18.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Normal, modifier = Modifier.weight(1f))
                     }
                 }
-                if (playlist != null && account != null && playlist.userId == account?.userId && track.neteaseId != null) {
+                if (unifiedPlaylistId != null && unifiedState.playlists.any { it.id == unifiedPlaylistId && it.bindings.none { binding -> binding.isFavorites } }) {
                     HorizontalDivider(color = BrowseMuted.copy(alpha = 0.15f))
-                    TextButton(onClick = { perform { repository.playlistModifyTracks(playlist.id, "del", listOf(track.neteaseId)); repository.refreshPlaylists() } }, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp), contentPadding = PaddingValues(vertical = 8.dp)) { Icon(Icons.Rounded.RemoveCircleOutline, null, tint = Color(0xFFFF7668)); Spacer(Modifier.width(18.dp)); Text("从歌单移除", color = Color(0xFFFF7668), fontSize = 18.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Normal, modifier = Modifier.weight(1f)) }
+                    TextButton(onClick = { perform { library.remove(unifiedPlaylistId, track) } }, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp), contentPadding = PaddingValues(vertical = 8.dp)) { Icon(Icons.Rounded.RemoveCircleOutline, null, tint = Color(0xFFFF7668)); Spacer(Modifier.width(18.dp)); Text("从歌单移除", color = Color(0xFFFF7668), fontSize = 18.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Normal, modifier = Modifier.weight(1f)) }
                 }
             }
             FilledTonalButton(onClick = onDismiss, enabled = !busy, colors = ButtonDefaults.filledTonalButtonColors(containerColor = Color.White.copy(alpha = 0.06f), contentColor = BrowseInk), modifier = Modifier.fillMaxWidth().padding(vertical = 18.dp).heightIn(min = 50.dp)) { Text("取消", color = BrowseInk) }
@@ -343,7 +347,7 @@ internal fun TrackActionsSheet(track: NativeTrack, playlist: PipoPlaylist?, play
 
 /** Material 3 1.3 uses the device theme for its separate dialog window. */
 @Composable
-private fun BrowseSheetSystemBars() {
+internal fun BrowseSheetSystemBars() {
     val view = androidx.compose.ui.platform.LocalView.current
     DisposableEffect(view) {
         val window = (view.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window

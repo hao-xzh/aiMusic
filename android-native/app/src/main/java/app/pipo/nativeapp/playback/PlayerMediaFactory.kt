@@ -8,6 +8,7 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.util.UnstableApi
 import app.pipo.nativeapp.DiagnosticsLogStore
 import app.pipo.nativeapp.data.AudioFeaturesStore
+import app.pipo.nativeapp.data.MusicSourceRef
 import app.pipo.nativeapp.data.NativeTrack
 import kotlin.math.min
 
@@ -34,11 +35,21 @@ internal class PlayerMediaFactory(
             .setArtist(track.artist)
             .setAlbumTitle(track.album)
             .setArtworkUri(artworkUri)
-        track.durationMs.takeIf { it > 0L }?.let { durationMs ->
+        val extras = Bundle().apply {
+            track.durationMs.takeIf { it > 0L }?.let { durationMs ->
+                putLong(SOURCE_DURATION_MS_EXTRA, durationMs)
+            }
+            track.musicSource?.let { source ->
+                putString(SOURCE_PROVIDER_EXTRA, source.providerId)
+                putString(SOURCE_MEDIA_ID_EXTRA, source.mediaId)
+                source.mediaFileId?.let { putString(SOURCE_MEDIA_FILE_ID_EXTRA, it) }
+                source.numericId?.let { putLong(SOURCE_NUMERIC_ID_EXTRA, it) }
+                putInt(SOURCE_SONG_TYPE_EXTRA, source.songType)
+            }
+        }
+        if (!extras.isEmpty) {
             metadataBuilder.setExtras(
-                Bundle().apply {
-                    putLong(SOURCE_DURATION_MS_EXTRA, durationMs)
-                },
+                extras,
             )
         }
         val metadata = metadataBuilder.build()
@@ -100,6 +111,29 @@ internal class PlayerMediaFactory(
 
     companion object {
         internal const val SOURCE_DURATION_MS_EXTRA = "app.pipo.nativeapp.source_duration_ms"
+        private const val SOURCE_PROVIDER_EXTRA = "app.pipo.nativeapp.source_provider"
+        private const val SOURCE_MEDIA_ID_EXTRA = "app.pipo.nativeapp.source_media_id"
+        private const val SOURCE_MEDIA_FILE_ID_EXTRA = "app.pipo.nativeapp.source_media_file_id"
+        private const val SOURCE_NUMERIC_ID_EXTRA = "app.pipo.nativeapp.source_numeric_id"
+        private const val SOURCE_SONG_TYPE_EXTRA = "app.pipo.nativeapp.source_song_type"
+
+        internal fun sourceRefFrom(metadata: MediaMetadata): MusicSourceRef? {
+            val extras = metadata.extras ?: return null
+            val providerId = extras.getString(SOURCE_PROVIDER_EXTRA)?.takeIf { it.isNotBlank() } ?: return null
+            val mediaId = extras.getString(SOURCE_MEDIA_ID_EXTRA)?.takeIf { it.isNotBlank() } ?: return null
+            return try {
+                MusicSourceRef(
+                    providerId = providerId,
+                    mediaId = mediaId,
+                    mediaFileId = extras.getString(SOURCE_MEDIA_FILE_ID_EXTRA)?.takeIf { it.isNotBlank() },
+                    numericId = extras.takeIf { it.containsKey(SOURCE_NUMERIC_ID_EXTRA) }
+                        ?.getLong(SOURCE_NUMERIC_ID_EXTRA),
+                    songType = extras.getInt(SOURCE_SONG_TYPE_EXTRA, 0),
+                )
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+        }
 
         private const val FEATURE_DURATION_MIN_RATIO = 0.88
         private const val FEATURE_DURATION_MAX_SHORTFALL_MS = 20_000L

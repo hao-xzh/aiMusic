@@ -249,31 +249,10 @@ class PlaylistCacheStore(context: Context) {
         )
     } catch (_: Exception) { null }
 
-    private fun encodeTrack(t: NativeTrack): JSONObject = JSONObject().apply {
-        put("id", t.id)
-        t.neteaseId?.let { put("ne", it) }
-        put("title", t.title)
-        put("artist", t.artist)
-        put("album", t.album)
-        // ⚠️ 故意不持久化 streamUrl —— netease 直链是时效签名 URL（几小时~1天就过期），
-        //    存盘下次启动用旧 URL 进 ExoPlayer 会 403/404 没声。让 resolvePlayableQueue
-        //    每次冷启动通过 neteaseId 重新拉直链。
-        t.artworkUrl?.let { put("artworkUrl", it) }
-        put("durationMs", t.durationMs)
-    }
+    // 故意不持久化 streamUrl：直链有时效，恢复后必须由上层重新签名。
+    private fun encodeTrack(t: NativeTrack): JSONObject = NativeTrackJson.encode(t)
 
-    private fun decodeTrack(o: JSONObject): NativeTrack? = try {
-        NativeTrack(
-            id = o.optString("id").ifEmpty { return null },
-            neteaseId = if (o.has("ne")) o.optLong("ne") else null,
-            title = o.optString("title"),
-            artist = o.optString("artist"),
-            album = o.optString("album"),
-            streamUrl = "",  // 见 encodeTrack 注释：从盘恢复时 streamUrl 必须空，强制重新签名
-            artworkUrl = o.optString("artworkUrl").takeIf { it.isNotBlank() },
-            durationMs = o.optLong("durationMs", 0L),
-        )
-    } catch (_: Exception) { null }
+    private fun decodeTrack(o: JSONObject): NativeTrack? = NativeTrackJson.decode(o)
 
     companion object {
         private const val FILE_NAME = "playlist_cache_v1.json"

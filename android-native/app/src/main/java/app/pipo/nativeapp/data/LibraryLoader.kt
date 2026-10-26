@@ -42,12 +42,15 @@ class LibraryLoader(private val repository: PipoRepository) {
     private val playlistLoadSemaphore = Semaphore(TRACKS_LOAD_CONCURRENCY)
 
     suspend fun library(forceRefresh: Boolean = false): List<NativeTrack> {
+        if (!forceRefresh && PipoGraph.music.library.state.value.playlists.any { it.tracks.isNotEmpty() }) {
+            return withUnifiedTracks(synchronized(cacheLock) { cached?.tracks.orEmpty() })
+        }
         val revision = repository.libraryRevision.first()
-        if (!forceRefresh) cachedFor(revision)?.let { return it }
+        if (!forceRefresh) cachedFor(revision)?.let { return withUnifiedTracks(it) }
         return loadMutex.withLock {
             while (true) {
                 val loadRevision = repository.libraryRevision.first()
-                if (!forceRefresh) cachedFor(loadRevision)?.let { return@withLock it }
+                if (!forceRefresh) cachedFor(loadRevision)?.let { return@withLock withUnifiedTracks(it) }
                 val loadGeneration = synchronized(cacheLock) { invalidationGeneration }
                 val load = loadLibrary()
                 val tracks = load.tracks
@@ -62,7 +65,7 @@ class LibraryLoader(private val repository: PipoRepository) {
                         true
                     }
                 }
-                if (committed) return@withLock tracks
+                if (committed) return@withLock withUnifiedTracks(tracks)
             }
             error("unreachable")
         }
@@ -138,7 +141,12 @@ class LibraryLoader(private val repository: PipoRepository) {
         cached?.takeIf { it.revision == revision && it.generation == invalidationGeneration }?.tracks
     }
 
-    fun peek(): List<NativeTrack> = synchronized(cacheLock) { cached?.tracks.orEmpty() }
+    private fun withUnifiedTracks(tracks: List<NativeTrack>): List<NativeTrack> {
+        val library = PipoGraph.music.library
+        return RecordingMatcher.displayTracks((tracks + library.state.value.playlists.flatMap { it.tracks }).map(library::annotate))
+    }
+
+    fun peek(): List<NativeTrack> = withUnifiedTracks(synchronized(cacheLock) { cached?.tracks.orEmpty() })
 
     fun invalidate() = synchronized(cacheLock) {
         invalidationGeneration += 1L

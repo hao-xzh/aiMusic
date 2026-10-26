@@ -1,33 +1,42 @@
 package app.pipo.nativeapp.ui
 
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import app.pipo.nativeapp.data.coverImageRequest
 import coil.compose.AsyncImage
-import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 private val SoftEase = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)
 
 private data class LoadedCover(val url: String?, val painter: Painter?)
 
-/** 新图解码完成后才过渡；命中缓存也执行动画，加载期间保留已显示的封面。 */
+internal val LocalCoverTransitionVisible = staticCompositionLocalOf { true }
+
+/** 可见时在新图解码后过渡；不可见期间直接同步，恢复页面不补播旧封面动画。 */
 @Composable
 fun CrossfadeCoverImage(
     url: String?,
@@ -37,29 +46,79 @@ fun CrossfadeCoverImage(
     maxDecodeSizePx: Int? = 960,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val isVisible = LocalCoverTransitionVisible.current
+    val latestVisible by rememberUpdatedState(isVisible)
     val latestUrl by rememberUpdatedState(url)
     val latestDuration by rememberUpdatedState(durationMs)
-    var loaded by remember { mutableStateOf(LoadedCover(null, null)) }
+    val scope = rememberCoroutineScope()
     var current by remember { mutableStateOf(LoadedCover(null, null)) }
     var previous by remember { mutableStateOf<Painter?>(null) }
-    val progress = remember { Animatable(1f) }
+    var progress by remember { mutableFloatStateOf(1f) }
+    var animationJob by remember { mutableStateOf<Job?>(null) }
+    var needsSync by remember { mutableStateOf(true) }
+    var wasActive by remember { mutableStateOf(false) }
+    var immediateUrl by remember { mutableStateOf(url) }
+    val isActive = isVisible && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
     val model = remember(context, url, maxDecodeSizePx) {
         coverImageRequest(context, url, maxDecodeSizePx)
     }
-    LaunchedEffect(url) {
-        if (url == null) loaded = LoadedCover(null, null)
+
+    fun finishTransition() {
+        animationJob?.cancel()
+        animationJob = null
+        previous = null
+        progress = 1f
     }
-    LaunchedEffect(Unit) {
-        // 完成正在显示的两层混合，再接最新结果；连续切歌不重置到半途消失的旧图。
-        snapshotFlow { loaded }.collect { next ->
-            if (next.url != latestUrl || next == current) return@collect
-            previous = current.painter
-            current = next
-            progress.snapTo(0f)
-            progress.animateTo(1f, tween(latestDuration.coerceAtLeast(0), easing = SoftEase))
-            previous = null
+
+    fun showCover(next: LoadedCover) {
+        if (next.url != latestUrl || next == current) return
+        val animateChange = latestVisible && wasActive && !needsSync && immediateUrl != next.url &&
+            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        // 连续切歌从当前占主导的图接入最新结果，不排队等待历史动画。
+        val outgoing = if (previous != null && progress < 0.5f) previous else current.painter
+        finishTransition()
+        current = next
+        if (animateChange && outgoing != null && latestDuration > 0) {
+            previous = outgoing
+            progress = 0f
+            animationJob = scope.launch {
+                animate(0f, 1f, animationSpec = tween(latestDuration, easing = SoftEase)) { value, _ ->
+                    progress = value
+                }
+                previous = null
+            }
         }
     }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_RESUME) {
+                // 生命周期回调直接结束动画，不依赖后台已经暂停的 Compose 帧时钟。
+                needsSync = true
+                finishTransition()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            animationJob?.cancel()
+        }
+    }
+    SideEffect {
+        if (!isActive || !wasActive || needsSync) {
+            // 即使这首歌的图到恢复后才解码成功，也只直接显示这一次同步的目标。
+            immediateUrl = url
+            needsSync = false
+            finishTransition()
+        } else if (immediateUrl != url) {
+            immediateUrl = null
+        }
+        wasActive = isActive
+        if (url == null) showCover(LoadedCover(null, null))
+    }
+    // 恢复时新图尚未就绪，不把后台前留下的封面重新画到当前歌曲上。
+    val showCurrent = current.url == url || (isActive && wasActive && !needsSync && immediateUrl != url)
     Box(modifier = modifier) {
         // 收到成功回调前不让新请求覆盖可见层，并核对结果所属 URL。
         AsyncImage(
@@ -68,29 +127,29 @@ fun CrossfadeCoverImage(
             contentScale = contentScale,
             modifier = Modifier.fillMaxSize().graphicsLayer { alpha = 0f },
             onSuccess = { state ->
-                if (state.result.request.data == latestUrl) loaded = LoadedCover(latestUrl, state.painter)
+                if (state.result.request.data == latestUrl) showCover(LoadedCover(latestUrl, state.painter))
             },
             onError = { state ->
-                if (state.result.request.data == latestUrl) loaded = LoadedCover(latestUrl, null)
+                if (state.result.request.data == latestUrl) showCover(LoadedCover(latestUrl, null))
             },
         )
-        previous?.let { painter ->
+        previous?.takeIf { showCurrent }?.let { painter ->
             Image(
                 painter = painter,
                 contentDescription = null,
                 contentScale = contentScale,
                 modifier = Modifier.fillMaxSize().graphicsLayer {
                     // 不同时降低两层透明度，避免混合中途露底、发暗。
-                    alpha = if (current.painter == null) 1f - progress.value else 1f
+                    alpha = if (current.painter == null) 1f - progress else 1f
                 },
             )
         }
-        current.painter?.let { painter ->
+        current.painter?.takeIf { showCurrent }?.let { painter ->
             Image(
                 painter = painter,
                 contentDescription = null,
                 contentScale = contentScale,
-                modifier = Modifier.fillMaxSize().graphicsLayer { alpha = progress.value },
+                modifier = Modifier.fillMaxSize().graphicsLayer { alpha = progress },
             )
         }
     }

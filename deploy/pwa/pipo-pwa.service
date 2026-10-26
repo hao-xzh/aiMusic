@@ -1,0 +1,52 @@
+[Unit]
+Description=PIPO personal music PWA
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pipo
+Group=pipo
+WorkingDirectory=/opt/pipo/current
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=4331
+Environment=NODE_OPTIONS=--max-old-space-size=384
+Environment=TOKIO_WORKER_THREADS=2
+Environment=UV_THREADPOOL_SIZE=2
+Environment=PIPO_PWA_DATA_DIR=/var/lib/pipo
+Environment=PIPO_PWA_BRIDGE_BIN=/opt/pipo/current/bin/pipo_pwa_bridge
+EnvironmentFile=/etc/pipo/pwa.env
+ExecStart=/usr/bin/node /opt/pipo/current/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+CPUQuota=75%
+MemoryMax=768M
+TasksMax=256
+Nice=10
+UMask=0077
+StateDirectory=pipo
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+InaccessiblePaths=/var/www /etc/chromdata
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=link-local
+IPAddressDeny=10.0.0.0/8
+IPAddressDeny=172.16.0.0/12
+IPAddressDeny=192.168.0.0/16
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

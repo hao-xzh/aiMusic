@@ -72,7 +72,7 @@ object MusicSemanticSignals {
         }
         fun addSeeds(vararg values: String) { values.filterTo(seeds) { it.isNotBlank() } }
 
-        // 语言 / 地区：这里是硬偏好，但仍允许 Resolver 结合用户排除词做过滤。
+        // 语言 / 地区仅在用户明确提及时作为选歌条件。
         if (mentioned("华语", "中文", "国语", "普通话", "中文歌")) languages += "mandarin"
         if (mentioned("粤语")) languages += "cantonese"
         if (mentioned("英文", "英语", "欧美", "欧美歌", "english")) languages += "english"
@@ -82,7 +82,7 @@ object MusicSemanticSignals {
         // 明确风格词。
         if (mentioned("r&b", "rnb", "节奏布鲁斯")) {
             genres += "r&b"; moods += listOf("chill", "smooth"); scenes += listOf("night", "city walk")
-            textures += listOf("smooth", "warm"); addSeeds("R&B 律动", "夜晚 R&B", "华语 R&B")
+            textures += listOf("smooth", "warm"); addSeeds("R&B 律动", "夜晚 R&B", "R&B 热门")
         }
         if (mentioned("摇滚", "rock")) { genres += "rock"; textures += "guitar"; addSeeds("燃 摇滚", "摇滚 热歌") }
         if (mentioned("民谣", "folk")) { genres += "folk"; textures += listOf("acoustic", "warm"); addSeeds("温柔 民谣", "民谣 治愈") }
@@ -108,7 +108,7 @@ object MusicSemanticSignals {
             scenes += listOf("party", "workout", "driving")
             textures += listOf("punchy", "rhythmic", "dance")
             mainStyles += listOf("energetic", "high", "party")
-            addSeeds("高能 华语 热歌", "燃 向上 歌曲", "派对 动感 热歌", "节奏感 强 歌曲", "健身 高燃 音乐")
+            addSeeds("高能 热歌", "燃 向上 歌曲", "派对 动感 热歌", "节奏感 强 歌曲", "健身 高燃 音乐")
         }
         if (mentioned("轻快", "有活力", "活泼", "开心", "明亮", "阳光", "快乐")) {
             if (energy == "any") energy = "mid_high"
@@ -139,7 +139,7 @@ object MusicSemanticSignals {
             scenes += listOf("late-night", "rainy day", "city walk")
             textures += listOf("atmospheric", "soft")
             mainStyles += listOf("melancholic", "night")
-            addSeeds("伤感 华语 歌曲", "emo 流行", "深夜 孤独 歌曲", "雨天 忧郁 音乐")
+            addSeeds("伤感 流行歌曲", "emo 流行", "深夜 孤独 歌曲", "雨天 忧郁 音乐")
         }
         if (mentioned("开车", "车上", "公路", "通勤")) {
             scenes += listOf("driving", "commute")
@@ -169,6 +169,7 @@ object MusicSemanticSignals {
 
         val wantsCurrentStyle = mentioned(
             "当前风格", "这首风格", "这个风格", "这种风格", "当前这种", "这种感觉", "这个感觉", "这个调调", "刚才那个感觉", "刚才这种",
+            "刚才那种", "刚才的风格", "类似当前", "像当前", "跟当前类似",
         ) || (mentioned("类似这首", "像这首", "跟这首类似") && !mentioned("歌单"))
         val wantsMoreLikeCurrent = wantsCurrentStyle && mentioned("多来", "来几首", "再来", "继续", "接着", "多放", "多排")
         val asksStyleQuestion = mentioned("什么风格", "什么类型", "啥风格", "啥类型", "这首歌风格", "这歌风格", "这首什么歌路")

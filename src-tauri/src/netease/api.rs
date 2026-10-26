@@ -71,7 +71,7 @@ impl NeteaseClient {
         Ok(resp)
     }
 
-    /// 显式校验短信验证码；验证码登录由 w/login/cellphone 自行校验，不重复请求。
+    /// 显式校验短信验证码；验证码登录由 login/cellphone 自行校验，不重复请求。
     pub async fn captcha_verify(
         &self,
         phone: &str,
@@ -95,19 +95,16 @@ impl NeteaseClient {
         captcha: &str,
         ctcode: i32,
     ) -> Result<CellphoneLoginResp> {
-        // Follow api-enhanced's current web SMS flow, using the same cookie jar as captcha_sent.
-        // https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/blob/main/module/login_cellphone.js
+        // music.163.com's captcha-login uses /api/login/cellphone; its password
+        // login uses /api/w/login/cellphone. Keep the SMS flow and cookie jar intact.
         let resp: CellphoneLoginResp = self
             .weapi_login(
-                "w/login/cellphone",
+                "login/cellphone",
                 json!({
-                    "type": "1",
-                    "https": "true",
                     "phone": phone,
                     "countrycode": ctcode.to_string(),
                     "captcha": captcha,
-                    "remember": "true",
-                    "secureCaptcha": "",
+                    "rememberLogin": true,
                 }),
             )
             .await?;
@@ -127,6 +124,41 @@ impl NeteaseClient {
         Ok(resp.profile)
     }
 
+    pub async fn music_subscription(&self, user_id: i64) -> Option<bool> {
+        // Contract: Music163Api-Go api/vipInfo.go and types/vipInfo.go.
+        let response: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.eapi("music-vip-membership/client/vip/info", json!({})),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if response.get("code")?.as_i64()? != 200 {
+            return None;
+        }
+        let data = response.get("data")?;
+        if data.get("userId")?.as_i64()? != user_id {
+            return None;
+        }
+        let now = data.get("now")?.as_i64()?;
+        if now <= 0 {
+            return None;
+        }
+        let expirations = ["associator", "musicPackage"].map(|key| {
+            data.get(key)?
+                .get("expireTime")?
+                .as_i64()
+                .filter(|value| *value >= 0)
+        });
+        if expirations.iter().flatten().any(|expiry| *expiry > now) {
+            Some(true)
+        } else if expirations.iter().all(Option::is_some) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub async fn user_playlists(&self, uid: i64, limit: i64) -> Result<Vec<PlaylistInfo>> {
         let resp: UserPlaylistsResp = self
             .weapi(
@@ -138,6 +170,33 @@ impl NeteaseClient {
             return Err(anyhow!("user_playlists code={}", resp.code));
         }
         Ok(resp.playlist)
+    }
+
+    /// Android library consumers need the entire directory, not the first request-sized page.
+    pub async fn user_playlists_complete(&self, uid: i64, page_size: i64) -> Result<Vec<PlaylistInfo>> {
+        let page_size = page_size.clamp(1, 1000);
+        let mut offset = 0;
+        let mut playlists = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            let resp: UserPlaylistsResp = self
+                .weapi("user/playlist", json!({ "uid": uid, "limit": page_size, "offset": offset }))
+                .await?;
+            if resp.code != 200 {
+                return Err(anyhow!("user_playlists code={}", resp.code));
+            }
+            let count = resp.playlist.len();
+            let more = resp.more.unwrap_or(count >= page_size as usize);
+            let before = playlists.len();
+            playlists.extend(resp.playlist.into_iter().filter(|playlist| seen.insert(playlist.id)));
+            if (count > 0 && playlists.len() == before) || (more && count == 0) {
+                return Err(anyhow!("user_playlists pagination made no progress"));
+            }
+            if !more {
+                return Ok(playlists);
+            }
+            offset += count as i64;
+        }
     }
 
     pub async fn playlist_detail(&self, id: i64) -> Result<PlaylistDetail> {
@@ -178,7 +237,7 @@ impl NeteaseClient {
             Ok(resp) => {
                 fallback_error = Some(compact_error(format!("linuxapi_v3 code={}", resp.code)));
                 let fallback: PlaylistDetailResp = self
-                    .weapi("v6/playlist/detail", json!({ "id": id, "n": 1000 }))
+                    .weapi("v6/playlist/detail", json!({ "id": id, "n": 100000 }))
                     .await?;
                 if fallback.code != 200 {
                     return Err(anyhow!("playlist_detail fallback code={}", fallback.code));
@@ -188,7 +247,7 @@ impl NeteaseClient {
             Err(e) => {
                 fallback_error = Some(compact_error(format!("{e:#}")));
                 let fallback: PlaylistDetailResp = self
-                    .weapi("v6/playlist/detail", json!({ "id": id, "n": 1000 }))
+                    .weapi("v6/playlist/detail", json!({ "id": id, "n": 100000 }))
                     .await?;
                 if fallback.code != 200 {
                     return Err(anyhow!("playlist_detail fallback code={}", fallback.code));

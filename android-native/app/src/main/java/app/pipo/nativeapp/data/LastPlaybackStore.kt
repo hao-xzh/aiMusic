@@ -27,12 +27,80 @@ class LastPlaybackStore(context: Context) {
      *  之前裸 `var` 会让两个线程同时通过 `now - lastSavedAtMs < THROTTLE` 判断,都赋值同一个 now,
      *  都 launch 写盘 → 浪费一次 IO。CAS 保证只有"第一个抢到节流窗口的"会写。 */
     private val lastSavedAtMs = AtomicLong(0L)
+    private val writeRevision = AtomicLong(0L)
+    private val writeLock = Any()
+    private var metadataLoaded = false
+    private var continuationJson: String? = null
+    private var playbackMode: String? = null
 
     data class Snapshot(
         val queue: List<NativeTrack>,
         val currentIndex: Int,
         val positionMs: Long,
     )
+
+    @Synchronized
+    private fun loadMetadata() {
+        if (metadataLoaded) return
+        val saved = runCatching { JSONObject(prefs.getString(KEY, "{}").orEmpty()) }.getOrNull()
+        continuationJson = saved?.opt("continuation")?.takeUnless { it == JSONObject.NULL }?.toString()
+        playbackMode = saved?.optString("playbackMode")?.takeIf { it.isNotBlank() }
+        metadataLoaded = true
+    }
+
+    @Synchronized
+    fun continuationSnapshot(): AiQueueContinuationSnapshot? {
+        loadMetadata()
+        return continuationJson?.let { raw ->
+            runCatching { AiQueueContinuationSnapshot.fromJson(JSONObject(raw)) }.getOrNull()
+        }
+    }
+
+    /** A damaged scoped request must not silently become unrestricted recommendations. */
+    @Synchronized
+    fun hasContinuation(): Boolean {
+        loadMetadata()
+        return continuationJson != null
+    }
+
+    fun restoreContinuation(
+        repository: PipoRepository, currentTrack: NativeTrack?, queue: List<NativeTrack>,
+    ): ContinuousQueueSource? {
+        if (!hasContinuation()) return null
+        continuationSnapshot()?.let { return it.restoreSource(repository, currentTrack, queue) }
+        return object : ContinuousQueueSource {
+            override suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack> =
+                error("原来的选歌条件暂时无法恢复，请重新选择播放列表")
+            override fun permitsDefaultFallback() = false
+            override fun startsAutomatically() = false
+            override fun acceptsResolved(track: NativeTrack) = false
+        }
+    }
+
+    @Synchronized
+    fun savedPlaybackMode(): String? {
+        loadMetadata()
+        return playbackMode
+    }
+
+    /** Called only when a new main queue takes ownership; insertions keep its scope. */
+    @Synchronized
+    fun setContinuation(snapshot: AiQueueContinuationSnapshot?) {
+        loadMetadata()
+        continuationJson = snapshot?.toJson()?.toString()
+    }
+
+    @Synchronized
+    fun setPlaybackMode(mode: String) {
+        loadMetadata()
+        playbackMode = mode
+    }
+
+    @Synchronized
+    private fun metadata(): Pair<String?, String?> {
+        loadMetadata()
+        return continuationJson to playbackMode
+    }
 
     fun load(): Snapshot? {
         val raw = prefs.getString(KEY, null) ?: return null
@@ -65,17 +133,27 @@ class LastPlaybackStore(context: Context) {
         if (!lastSavedAtMs.compareAndSet(prev, now)) return
         // 主线程只做一次窗口浅拷贝：长歌单保留当前曲附近，而不是永远截前 200 首。
         val (snap, snapIndex) = snapshotWindow(queue, currentIndex)
-        ioScope.launch { writeSnapshot(snap, snapIndex, positionMs) }
+        enqueueSnapshot(snap, snapIndex, positionMs)
     }
 
     /** 强制落盘（用户主动切歌 / 应用进入后台时调）—— 同样异步，不阻塞调用方 */
     fun save(queue: List<NativeTrack>, currentIndex: Int, positionMs: Long) {
         if (queue.isEmpty()) return
         val (snap, snapIndex) = snapshotWindow(queue, currentIndex)
-        ioScope.launch { writeSnapshot(snap, snapIndex, positionMs) }
+        enqueueSnapshot(snap, snapIndex, positionMs)
     }
 
-    private fun writeSnapshot(queue: List<NativeTrack>, currentIndex: Int, positionMs: Long) {
+    @Synchronized
+    private fun enqueueSnapshot(queue: List<NativeTrack>, currentIndex: Int, positionMs: Long) {
+        val metadata = metadata()
+        val revision = writeRevision.incrementAndGet()
+        ioScope.launch { writeSnapshot(queue, currentIndex, positionMs, metadata, revision) }
+    }
+
+    private fun writeSnapshot(
+        queue: List<NativeTrack>, currentIndex: Int, positionMs: Long,
+        metadata: Pair<String?, String?>, revision: Long,
+    ) {
         val arr = JSONArray()
         queue.forEach { arr.put(encodeTrack(it)) }
         val safeIndex = if (queue.isEmpty()) 0 else currentIndex.coerceIn(0, queue.size - 1)
@@ -84,7 +162,12 @@ class LastPlaybackStore(context: Context) {
             .put("currentIndex", safeIndex)
             .put("positionMs", positionMs.coerceAtLeast(0))
             .put("savedAtMs", System.currentTimeMillis())
-        prefs.edit().putString(KEY, obj.toString()).apply()
+        metadata.first?.let { obj.put("continuation", it) }
+        metadata.second?.let { obj.put("playbackMode", it) }
+        synchronized(writeLock) {
+            if (writeRevision.get() != revision) return
+            prefs.edit().putString(KEY, obj.toString()).apply()
+        }
     }
 
     private fun snapshotWindow(queue: List<NativeTrack>, currentIndex: Int): Pair<List<NativeTrack>, Int> {
@@ -96,35 +179,21 @@ class LastPlaybackStore(context: Context) {
         return snap to (safeIndex - start)
     }
 
+    @Synchronized
     fun clear() {
-        prefs.edit().remove(KEY).apply()
+        continuationJson = null
+        playbackMode = null
+        metadataLoaded = true
+        synchronized(writeLock) {
+            writeRevision.incrementAndGet()
+            prefs.edit().remove(KEY).apply()
+        }
     }
 
-    private fun encodeTrack(t: NativeTrack): JSONObject = JSONObject().apply {
-        put("id", t.id)
-        t.neteaseId?.let { put("neteaseId", it) }
-        put("title", t.title)
-        put("artist", t.artist)
-        put("album", t.album)
-        // ⚠️ 故意不持久化 streamUrl —— netease 直链是时效签名 URL（几小时~1天就过期），
-        //    冷启动用旧 URL 给 ExoPlayer 会 403/404 没声。让 resolvePlayableQueue
-        //    通过 neteaseId 重新拉直链。
-        t.artworkUrl?.let { put("artworkUrl", it) }
-        put("durationMs", t.durationMs)
-    }
+    // 故意不持久化 streamUrl：直链有时效，恢复后必须由上层重新签名。
+    private fun encodeTrack(t: NativeTrack): JSONObject = NativeTrackJson.encode(t)
 
-    private fun decodeTrack(o: JSONObject): NativeTrack? = try {
-        NativeTrack(
-            id = o.optString("id").ifEmpty { return null },
-            neteaseId = if (o.has("neteaseId")) o.optLong("neteaseId") else null,
-            title = o.optString("title"),
-            artist = o.optString("artist"),
-            album = o.optString("album"),
-            streamUrl = "",  // 见 encodeTrack 注释：恢复时强制空，让上层重新签名
-            artworkUrl = o.optString("artworkUrl").takeIf { it.isNotBlank() },
-            durationMs = o.optLong("durationMs", 0L),
-        )
-    } catch (_: Exception) { null }
+    private fun decodeTrack(o: JSONObject): NativeTrack? = NativeTrackJson.decode(o)
 
     companion object {
         private const val PREFS_NAME = "claudio_last_playback"

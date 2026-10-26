@@ -25,6 +25,8 @@ class LocalSettingsStore(context: Context) {
             .putString(KEY_PLAYBACK_MODE, next.playbackMode)
             .putString(KEY_USER_FACTS, next.userFacts)
             .putString(KEY_PERSONA_ID, next.personaId)
+            .putString(KEY_SEARCH_PROVIDER, next.preferredSearchProviderId)
+            .putBoolean(KEY_ALLOW_CONCURRENT_PLAYBACK, next.allowConcurrentPlayback)
             .commit()
         state.value = next
     }
@@ -39,6 +41,9 @@ class LocalSettingsStore(context: Context) {
             userFacts = prefs.getString(KEY_USER_FACTS, "").orEmpty(),
             personaId = prefs.getString(KEY_PERSONA_ID, PetPersona.DEFAULT.id).orEmpty()
                 .ifBlank { PetPersona.DEFAULT.id },
+            preferredSearchProviderId = prefs.getString(KEY_SEARCH_PROVIDER, MusicProviders.NETEASE)
+                ?.takeIf { it in setOf(MusicProviders.NETEASE, MusicProviders.QQ) } ?: MusicProviders.NETEASE,
+            allowConcurrentPlayback = prefs.getBoolean(KEY_ALLOW_CONCURRENT_PLAYBACK, false),
         )
     }
 
@@ -49,5 +54,7 @@ class LocalSettingsStore(context: Context) {
         const val KEY_PLAYBACK_MODE = "playback-mode"
         const val KEY_USER_FACTS = "user-facts"
         const val KEY_PERSONA_ID = "persona-id"
+        const val KEY_SEARCH_PROVIDER = "preferred-search-provider"
+        const val KEY_ALLOW_CONCURRENT_PLAYBACK = "allow-concurrent-playback"
     }
 }

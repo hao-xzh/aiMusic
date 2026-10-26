@@ -9,6 +9,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.Alignment
@@ -25,6 +26,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.pipo.nativeapp.data.NativeTrack
+import app.pipo.nativeapp.data.MusicProviders
 import app.pipo.nativeapp.data.PipoPlaylist
 import coil.compose.AsyncImage
 
@@ -39,7 +41,7 @@ internal fun BrowseBrand(onAccount: () -> Unit, onSearch: (() -> Unit)? = null) 
         Text("PIPO", fontSize = 18.sp, fontWeight = FontWeight.Medium, letterSpacing = 3.sp,
             color = BrowseInk, modifier = Modifier.weight(1f))
         if (onSearch != null) IconButton(onClick = onSearch, modifier = Modifier.semantics { contentDescription = "搜索" }) { SearchIcon(BrowseInk, Modifier.size(24.dp)) }
-        IconButton(onClick = onAccount, modifier = Modifier.semantics { contentDescription = "账号与设置" }) { ProfileIcon(BrowseInk, Modifier.size(26.dp)) }
+        IconButton(onClick = onAccount, modifier = Modifier.semantics { contentDescription = "设置" }) { Icon(Icons.Rounded.Settings, contentDescription = null, tint = BrowseInk, modifier = Modifier.size(26.dp)) }
     }
 }
 
@@ -60,12 +62,16 @@ internal fun BrowseArtwork(url: String?, modifier: Modifier = Modifier) {
 }
 
 @Composable
-internal fun BrowseTrackRow(track: NativeTrack, onPlay: () -> Unit, onMore: () -> Unit, current: Boolean = false) {
+internal fun BrowseTrackRow(track: NativeTrack, onPlay: () -> Unit, onMore: () -> Unit, current: Boolean = false, showSource: Boolean = false) {
     Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).clickable(onClick = onPlay), verticalAlignment = Alignment.CenterVertically) {
         BrowseArtwork(track.artworkUrl, Modifier.size(46.dp))
         Column(Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 6.dp)) {
             Text(track.title, color = if (current) PipoColors.Accent else BrowseInk, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(track.artist, color = BrowseMuted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                listOf(track.artist, track.musicSource?.providerId?.let(app.pipo.nativeapp.data.MusicProviders::label).takeIf { showSource })
+                    .filterNotNull().filter { it.isNotBlank() }.joinToString(" · "),
+                color = BrowseMuted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
         }
         IconButton(onClick = onMore) { Icon(Icons.Rounded.MoreHoriz, "${track.title}的歌曲操作", tint = BrowseMuted) }
     }
@@ -102,20 +108,22 @@ internal fun HomeBrowseScreen(
             item {
                 Spacer(Modifier.height(140.dp))
                 Text("听点不一样。", color = BrowseInk, fontSize = 36.sp, fontWeight = FontWeight.Bold)
-                Text(model.homeCaption.ifBlank {
-                    when {
+                Text(when {
+                    model.homeShowingPreviousBatch && model.homeLoading -> "正在更新推荐，当前仍是上一批。"
+                    model.homeShowingPreviousBatch -> "暂时保留上一批推荐，稍后可以再换一批。"
+                    else -> model.homeCaption.ifBlank { when {
                         model.recommendations.isNotEmpty() -> "这一批，慢慢听。"
                         model.homeLoading -> "正在寻找与你合拍的音乐"
                         else -> "下一首喜欢，等你发现。"
-                    }
+                    } }
                 }, color = BrowseMuted, fontSize = 15.sp,
                     modifier = Modifier.padding(top = 8.dp, bottom = 22.dp))
                 Column {
-                    Text("此刻，为你", color = BrowseMuted, fontSize = 13.sp)
+                    Text(if (model.homeShowingPreviousBatch) "上一批推荐" else "此刻，为你", color = BrowseMuted, fontSize = 13.sp)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(model.recommendations.firstOrNull()?.title ?: "听见新的喜欢", color = BrowseInk, fontSize = 22.sp, maxLines = 2, modifier = Modifier.weight(1f))
                         FilledIconButton(onClick = { onPlay(model.recommendations) }, enabled = model.recommendations.isNotEmpty(), colors = IconButtonDefaults.filledIconButtonColors(containerColor = BrowseInk, contentColor = Color.Black)) {
-                            Icon(Icons.Rounded.PlayArrow, "播放此刻推荐")
+                            Icon(Icons.Rounded.PlayArrow, if (model.homeShowingPreviousBatch) "播放上一批推荐" else "播放此刻推荐")
                         }
                     }
                 }
@@ -125,11 +133,11 @@ internal fun HomeBrowseScreen(
                 ) {
                     Text("为你推荐", color = BrowseInk, fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f))
-                    if (model.homeLoading) {
+                    if (model.homeLoading || model.homeAppending) {
                         Row(Modifier.heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(Modifier.size(14.dp), color = BrowseMuted, strokeWidth = 1.5.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text("正在寻找…", color = BrowseMuted, fontSize = 14.sp)
+                            Text(if (model.homeAppending) "后台补充…" else "正在寻找…", color = BrowseMuted, fontSize = 14.sp)
                         }
                     } else if (model.homeError == null) {
                         TextButton(onClick = model::refreshHome, contentPadding = PaddingValues(vertical = 8.dp)) {
@@ -161,24 +169,40 @@ internal fun HomeBrowseScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun LibraryBrowseScreen(session: BrowseSession, model: BrowseViewModel, playlists: List<PipoPlaylist>, signedIn: Boolean, cloudCount: Int, onAccount: () -> Unit, onSearch: () -> Unit, onPlaylist: (PipoPlaylist) -> Unit, onCloud: () -> Unit, onCreate: () -> Unit, onLogin: () -> Unit, onPlay: (List<NativeTrack>) -> Unit, onMore: (NativeTrack) -> Unit, onAi: () -> Unit) {
+internal fun LibraryBrowseScreen(session: BrowseSession, model: BrowseViewModel, signedIn: Boolean, qqSignedIn: Boolean, cloudCount: Int, unifiedLibrary: app.pipo.nativeapp.data.library.UnifiedLibraryState, manualLibraryRefreshing: Boolean, onAccount: () -> Unit, onSearch: () -> Unit, onCloud: () -> Unit, onCreate: () -> Unit, onUnifiedPlaylist: (String) -> Unit, onCreateUnified: () -> Unit, onBindUnified: () -> Unit, onRefreshUnified: () -> Unit, onLogin: () -> Unit, onPlay: (List<NativeTrack>) -> Unit, onMore: (NativeTrack) -> Unit, onAi: () -> Unit) {
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val submit: () -> Unit = { model.search(); keyboard?.hide(); focusManager.clearFocus() }
     val closeSearch: () -> Unit = { session.closeSearch(); model.editQuery(""); keyboard?.hide(); focusManager.clearFocus() }
     val filter = session.libraryFilter
-    val grid = session.libraryGrid
-    val sort = session.librarySort
-    var sortOpen by remember { mutableStateOf(false) }
-    val ordered = remember(playlists, sort) { when (sort) { "名称" -> playlists.sortedBy { it.name }; "曲目数" -> playlists.sortedByDescending { it.trackCount }; else -> playlists.sortedByDescending { it.updateTime ?: 0L } } }
+    var createMenuOpen by remember(filter, session.searchOpen) { mutableStateOf(false) }
+    PullToRefreshBox(
+        isRefreshing = !session.searchOpen && if (filter == "网盘") model.libraryLoading else manualLibraryRefreshing,
+        onRefresh = {
+            if (!session.searchOpen) {
+                if (filter == "网盘") model.refreshLibrary(showRefresh = true) else onRefreshUnified()
+            }
+        },
+        modifier = Modifier.fillMaxSize(),
+    ) {
     LazyColumn(Modifier.fillMaxSize().background(BrowseBackground).statusBarsPadding(), state = if (session.searchOpen) session.librarySearchScroll else session.libraryScroll, contentPadding = PaddingValues(start = 22.dp, end = 22.dp, bottom = 20.dp + LocalBrowseBottomInset.current)) {
         item {
             BrowseBrand(onAccount, onSearch)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("资料库", color = BrowseInk, fontSize = 36.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 if (session.searchOpen) TextButton(onClick = closeSearch) { Text("取消", color = BrowseMuted) }
-                else TextButton(onClick = if (signedIn) onCreate else onLogin) { Icon(Icons.Rounded.Add, null); Text("新建", color = BrowseInk) }
+                else Box {
+                    TextButton(onClick = {
+                        if (filter == "网盘") { if (signedIn) onCreate() else onLogin() }
+                        else createMenuOpen = true
+                    }) { Icon(Icons.Rounded.Add, null); Text("新建", color = BrowseInk) }
+                    DropdownMenu(expanded = createMenuOpen, onDismissRequest = { createMenuOpen = false }) {
+                        DropdownMenuItem(text = { Text("新建歌单") }, onClick = { createMenuOpen = false; onCreateUnified() })
+                        if (signedIn && qqSignedIn) DropdownMenuItem(text = { Text("绑定歌单") }, onClick = { createMenuOpen = false; onBindUnified() })
+                    }
+                }
             }
             if (session.searchOpen) {
                 val requester = remember { androidx.compose.ui.focus.FocusRequester() }
@@ -205,67 +229,35 @@ internal fun LibraryBrowseScreen(session: BrowseSession, model: BrowseViewModel,
                 }
                 return@item
             }
-            Text("你的歌单，都在这里。", color = BrowseMuted, modifier = Modifier.padding(top = 8.dp, bottom = 22.dp))
+            Spacer(Modifier.height(16.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                listOf("全部", "歌单", "网盘").forEach { value ->
+                listOf("全部", "网易云", "QQ音乐", "网盘").forEach { value ->
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         TextButton(onClick = { session.libraryFilter = value }, modifier = Modifier.semantics { selected = value == filter }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(value, color = if (value == filter) BrowseInk else BrowseMuted, fontSize = 16.sp) }
                         Box(Modifier.width(28.dp).height(2.dp).background(if (value == filter) BrowseInk else Color.Transparent, RoundedCornerShape(1.dp)))
                     }
                 }
-                Spacer(Modifier.weight(1f))
-                IconButton(onClick = { session.libraryGrid = true }, modifier = Modifier.semantics { selected = grid }) { Icon(Icons.Rounded.GridView, "网格视图", tint = if (grid) BrowseInk else BrowseMuted.copy(alpha = 0.55f)) }
-                IconButton(onClick = { session.libraryGrid = false }, modifier = Modifier.semantics { selected = !grid }) { ListIcon(if (!grid) BrowseInk else BrowseMuted.copy(alpha = 0.55f), Modifier.size(24.dp)) }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box {
-                    TextButton(onClick = { sortOpen = !sortOpen }) {
-                        Text(sort, color = BrowseMuted)
-                        Spacer(Modifier.width(6.dp))
-                        Icon(
-                            if (sortOpen) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
-                            contentDescription = null,
-                            tint = BrowseMuted,
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                    DropdownMenu(expanded = sortOpen, onDismissRequest = { sortOpen = false }) {
-                        listOf("最近更新", "名称", "曲目数").forEach { value -> DropdownMenuItem(text = { Text(value) }, onClick = { session.librarySort = value; sortOpen = false }) }
-                    }
-                }
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = model::refreshLibrary, enabled = !model.libraryLoading) { Text(if (model.libraryLoading) "刷新中…" else "刷新", color = BrowseMuted) }
-            }
-            if (!signedIn) BrowseNotice("登录后查看你的歌单和网盘。", "登录网易云", onLogin)
-            model.libraryError?.let { BrowseNotice(it, "重试", model::refreshLibrary) }
+            Spacer(Modifier.height(12.dp))
+            if (!signedIn && filter == "网盘") BrowseNotice("登录后查看网易云网盘。", "登录网易云", onLogin)
+            if (filter == "网盘" && model.libraryError != null) BrowseNotice("网盘暂时无法加载，请稍后重试。", "重试", { model.refreshLibrary(showRefresh = true) })
         }
         if (session.searchOpen) {
             items(model.results, key = { it.id }) { track ->
-                BrowseTrackRow(track, { onPlay(listOf(track)) }, { onMore(track) })
+                BrowseTrackRow(track, { onPlay(listOf(track)) }, { onMore(track) }, showSource = true)
             }
             return@LazyColumn
         }
-        if (signedIn && filter != "网盘") {
-            if (grid) items(ordered.chunked(2)) { pair ->
-                Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    pair.forEach { playlist ->
-                        Column(Modifier.weight(1f).clickable { onPlaylist(playlist) }) {
-                            BrowseArtwork(playlist.coverUrl, Modifier.fillMaxWidth().aspectRatio(1f))
-                            Text(playlist.name, color = BrowseInk, maxLines = 2, modifier = Modifier.padding(top = 8.dp))
-                            Text("${playlist.trackCount} 首", color = BrowseMuted, fontSize = 13.sp)
-                        }
-                    }
-                    if (pair.size == 1) Spacer(Modifier.weight(1f))
-                }
-            } else items(ordered, key = { it.id }) { BrowsePlaylistRow(it) { onPlaylist(it) } }
-            if (ordered.isEmpty() && !model.libraryLoading) item { BrowseNotice("还没有歌单。", "新建歌单", onCreate) }
+        if (filter != "网盘") {
+            unifiedLibraryItems(unifiedLibrary, if (filter == "QQ音乐") MusicProviders.QQ else if (filter == "网易云") MusicProviders.NETEASE else null, signedIn, qqSignedIn, onUnifiedPlaylist, onRefreshUnified, onLogin)
         }
-        if (signedIn && filter != "歌单") item {
+        if (signedIn && filter == "网盘") item {
             Row(Modifier.fillMaxWidth().clickable(onClick = onCloud).padding(vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Rounded.Cloud, null, tint = BrowseMuted, modifier = Modifier.size(48.dp))
                 Column(Modifier.weight(1f).padding(start = 14.dp)) { Text("我的网盘", color = BrowseInk); Text(if (cloudCount > 0) "$cloudCount 首" else "网易云网盘", color = BrowseMuted, fontSize = 13.sp) }
                 Icon(Icons.Rounded.ChevronRight, null, tint = BrowseMuted)
             }
         }
+    }
     }
 }

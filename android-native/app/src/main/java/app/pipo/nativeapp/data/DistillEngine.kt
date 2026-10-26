@@ -58,8 +58,13 @@ class DistillEngine(
                 async {
                     playlistLoadSemaphore.withPermit {
                         onProgress(DistillProgress.LoadingTracks(i, playlists.size))
-                        val tracks = runCatching { repository.tracksForPlaylist(p.id) }
-                            .getOrDefault(emptyList())
+                        val tracks = try {
+                            repository.tracksForPlaylist(p.id)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                         Triple(p.id, p.name, tracks)
                     }
                 }
@@ -143,17 +148,21 @@ class DistillEngine(
 
         // ---- 4) AI 调用 ----
         onProgress(DistillProgress.CallingAi)
-        val raw = runCatching {
+        val raw = try {
             repository.aiChat(
                 system = "你是 Pipo 的口味蒸馏器。听过比客人多的曲库 + 像独立唱片店老板。只输出 JSON，不要解释。",
                 user = user,
                 temperature = temperature,
                 maxTokens = 1400,
             )
-        }.getOrDefault("")
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            ""
+        }
 
         // ---- 5) 解析（AI 失败走本地兜底） ----
-        val parsed = TasteProfileSerde.parseAiBody(raw) ?: buildFallbackBody(sample, details)
+        val parsed = TasteProfileSerde.parseAiBody(raw) ?: buildFallbackBody(sample, details.map { it.second to it.third })
 
         val profile = TasteProfile(
             version = 1,
@@ -187,12 +196,160 @@ class DistillEngine(
         return profile
     }
 
+    /**
+     * Distils only the tracks that [MixedTasteLoader] actually read. The caller owns the
+     * account-stability check and persistence so an account switch cannot save this result.
+     */
+    suspend fun distillMixed(
+        input: MixedTasteInput,
+        sampleSize: Int = 200,
+        onProgress: (DistillProgress) -> Unit = {},
+    ): TasteProfile {
+        require(input.complete) { "资料库尚未完整读取，不能生成口味画像" }
+        require(input.slices.any { it.tracks.isNotEmpty() }) { "没有读取到可用于画像的歌单样本" }
+        onProgress(DistillProgress.LoadingTracks(input.slices.size, input.slices.size))
+
+        val seen = mutableSetOf<String>()
+        val details = input.slices.map { slice ->
+            MixedTasteSampleSlice(slice.providerId, slice.playlistName, slice.tracks.filter { track ->
+                seen.add(track.recordingId?.takeIf { it.isNotBlank() }?.let { "recording:$it" } ?: track.sourceKey)
+            })
+        }
+        val fullLibrary = details.flatMap { it.tracks }
+        val behaviorSummary = behaviorLog.summary()
+
+        onProgress(DistillProgress.Sampling)
+        val sample = mixedBehaviorWeightedSample(details, sampleSize, behaviorSummary)
+        val aggregate = LibraryAggregator.aggregate(
+            library = fullLibrary,
+            featuresStore = featuresStore,
+            semanticStore = PipoGraph.trackSemanticStore,
+            ruleSemanticIndexer = PipoGraph.semanticIndexer,
+            behaviorSummary = behaviorSummary,
+        )
+        val aggregateBlock = LibraryAggregator.toPromptBlock(aggregate)
+        val providerTrackCounts = input.providerIds.joinToString("、") { providerId ->
+            val sourceCount = input.slices.filter { it.providerId == providerId }
+                .flatMap { it.tracks }.distinctBy { it.sourceKey }.size
+            "${MusicProviders.label(providerId)} $sourceCount 首"
+        }
+        val playlistList = input.slices.joinToString("、") { slice ->
+            "「${slice.playlistName}」（${slice.tracks.size} 首，${MusicProviders.label(slice.providerId)}）"
+        }
+        val lines = sample.mapIndexed { index, track ->
+            val album = track.album.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
+            "${index + 1}. ${track.id}. ${track.title} — ${track.artist}$album"
+        }.joinToString("\n")
+        val user = buildString {
+            append("以下是用户已完整读取的资料库：${input.providerIds.size} 个已登录平台、${input.slices.size} 张远端歌单。\n")
+            append("平台曲目统计：$providerTrackCounts。\n")
+            append("歌单：$playlistList\n")
+            append("按已确认 recordingId 或 sourceKey 去重后 ${fullLibrary.size} 首；sample 抽了 ${sample.size} 首（按平台配额、行为加权 + 艺人天花板）。\n\n")
+            append(aggregateBlock)
+            append("\n## Sample（${sample.size} 首代表曲目，只用于举例）\n")
+            append(lines)
+            append("\n\n任务：基于上面的完整资料库统计和代表曲目，画一份这个用户的\"音乐口味画像\"。\n")
+            append("要求：\n")
+            append("1) 不写官话套话，像独立唱片店老板对客人聊天那种语气。\n")
+            append("2) genres 至少给 4 个具体子流派，按权重降序，每个带 2~3 首列表里出现过的代表曲。\n")
+            append("3) eras 用具体十年段（\"1990s\" / \"2000s\" / \"2010s\" / \"2020-now\"），权重 0~1。\n")
+            append("4) moods 给 3~6 个有质感的形容词或短语；topArtists 选 6~10 个，affinity 0~1。\n")
+            append("5) culturalContext 给 2~4 个文化坐标，taglines 给 1~3 句一句话人设，summary ≤30 个汉字。\n\n")
+            append("严格只输出一行 JSON：\n")
+            append("{\"genres\":[{\"tag\":\"...\",\"weight\":0.42,\"examples\":[\"...\",\"...\"]}],")
+            append("\"eras\":[{\"label\":\"2010s\",\"weight\":0.55}],\"moods\":[\"...\"],")
+            append("\"topArtists\":[{\"name\":\"...\",\"affinity\":0.9}],\"culturalContext\":[\"...\"],")
+            append("\"taglines\":[\"...\"],\"summary\":\"...\"}\n")
+            append("不要 markdown，不要解释，不要代码块包裹，只一行 JSON。")
+        }
+
+        onProgress(DistillProgress.CallingAi)
+        val raw = try {
+            repository.aiChat(
+                system = "你是 Pipo 的口味蒸馏器。只根据完整资料库统计和代表曲目给出画像，只输出 JSON。",
+                user = user,
+                temperature = 0.5f,
+                maxTokens = 1400,
+            )
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            throw IllegalStateException("口味画像生成失败", error)
+        }
+        val parsed = TasteProfileSerde.parseAiBody(raw)
+            ?: throw IllegalStateException("口味画像返回内容无效")
+        val profile = TasteProfile(
+            version = 2,
+            derivedAt = System.currentTimeMillis() / 1000,
+            sourcePlaylistCount = input.slices.size,
+            sampledTrackCount = sample.size,
+            totalTrackCount = fullLibrary.size,
+            sourcePlaylistIds = input.slices.mapNotNull { slice ->
+                slice.playlistKey.takeIf { slice.providerId == MusicProviders.NETEASE }
+                    ?.substringAfterLast(':')?.toLongOrNull()
+            },
+            sourceHash = input.sourceHash,
+            genres = parsed.genres,
+            eras = parsed.eras,
+            moods = parsed.moods,
+            topArtists = parsed.topArtists,
+            culturalContext = parsed.culturalContext,
+            taglines = parsed.taglines,
+            summary = parsed.summary,
+            sourceProviderIds = input.providerIds,
+            sourceAccountKey = input.accountKey,
+            sourceDataComplete = true,
+        )
+        onProgress(DistillProgress.Done)
+        return profile
+    }
+
     companion object {
         private const val PLAYLIST_TRACK_LOAD_CONCURRENCY = 4
     }
 }
 
 // ---------- 行为加权 + 艺人天花板的样本 ----------
+
+private data class MixedTasteSampleSlice(
+    val providerId: String,
+    val playlistName: String,
+    val tracks: List<NativeTrack>,
+)
+
+/** Keeps samples balanced across providers while retaining the existing playlist-level weighting. */
+private fun mixedBehaviorWeightedSample(
+    details: List<MixedTasteSampleSlice>,
+    target: Int,
+    behaviorSummary: BehaviorSummary,
+): List<NativeTrack> {
+    val totalTracks = details.sumOf { it.tracks.size }
+    val targetCount = minOf(target, totalTracks)
+    if (targetCount <= 0) return emptyList()
+    if (totalTracks <= targetCount) return details.flatMap { it.tracks }
+
+    val byProvider = details.groupBy { it.providerId }
+        .filterValues { slices -> slices.any { it.tracks.isNotEmpty() } }
+        .toSortedMap()
+    val quotas = byProvider.mapValues { 1 }.toMutableMap()
+    var assigned = quotas.size
+    while (assigned < targetCount) {
+        val providerId = byProvider.keys.maxBy { id ->
+            val tracks = byProvider.getValue(id).sumOf { it.tracks.size }
+            tracks.toDouble() / quotas.getValue(id)
+        }
+        quotas[providerId] = quotas.getValue(providerId) + 1
+        assigned++
+    }
+
+    return byProvider.flatMap { (providerId, slices) ->
+        behaviorWeightedSample(
+            details = slices.filter { it.tracks.isNotEmpty() }.map { it.playlistName to it.tracks },
+            target = quotas.getValue(providerId),
+            behaviorSummary = behaviorSummary,
+        ).take(quotas.getValue(providerId))
+    }
+}
 
 /**
  * 升级版 sample 选择 —— 镜像 sample 真正"代表"用户口味，不再是均匀随机：
@@ -322,7 +479,7 @@ private fun quickHash(input: String): String {
 // AI JSON 解析失败时拿统计学画像兜底，至少不让用户卡在"无画像"状态。
 private fun buildFallbackBody(
     sample: List<NativeTrack>,
-    details: List<Triple<Long, String, List<NativeTrack>>>,
+    details: List<Pair<String, List<NativeTrack>>>,
 ): TasteProfileSerde.ParsedAiBody {
     val artistCounts = mutableMapOf<String, Int>()
     var chineseLike = 0
@@ -353,7 +510,7 @@ private fun buildFallbackBody(
         if (chineseLike / total > 0.35f) "华语音乐" else null,
         if (latinLike / total > 0.35f) "欧美/英语语境" else null,
         if (japaneseLike / total > 0.08f) "日系音乐" else null,
-        if (details.any { (_, name, _) -> name.contains("喜欢") || name.contains("收藏", true) }) "私人常听收藏" else null,
+        if (details.any { (name, _) -> name.contains("喜欢") || name.contains("收藏", true) }) "私人常听收藏" else null,
     ).filterNotNull()
 
     fun trackLabel(t: NativeTrack) = if (t.artist.isNotBlank()) "${t.title} - ${t.artist}" else t.title

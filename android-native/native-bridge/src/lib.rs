@@ -2,8 +2,13 @@ use jni::objects::{JObject, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
 use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 mod ai;
@@ -11,6 +16,59 @@ mod audio;
 mod netease;
 
 static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+const RETIRED_AUDIO_FEATURE_REQUESTS: usize = 128;
+
+#[derive(Default)]
+struct AudioFeatureCancellationRegistry {
+    active: HashMap<String, Arc<AtomicBool>>,
+    finished: VecDeque<String>,
+}
+
+static AUDIO_FEATURE_CANCELLATIONS: OnceLock<Mutex<AudioFeatureCancellationRegistry>> =
+    OnceLock::new();
+
+fn audio_feature_cancellations() -> &'static Mutex<AudioFeatureCancellationRegistry> {
+    AUDIO_FEATURE_CANCELLATIONS.get_or_init(|| Mutex::new(AudioFeatureCancellationRegistry::default()))
+}
+
+fn audio_feature_cancellation(request_id: &str) -> Arc<AtomicBool> {
+    let mut requests = audio_feature_cancellations()
+        .lock()
+        .expect("lock audio feature cancellations");
+    requests
+        .active
+        .entry(request_id.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+fn cancel_audio_feature(request_id: &str) {
+    let mut requests = audio_feature_cancellations()
+        .lock()
+        .expect("lock audio feature cancellations");
+    if requests.finished.iter().any(|finished| finished == request_id) {
+        return;
+    }
+    requests
+        .active
+        .entry(request_id.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .store(true, Ordering::Release);
+}
+
+fn finish_audio_feature(request_id: &str) {
+    let mut requests = audio_feature_cancellations()
+        .lock()
+        .expect("lock audio feature cancellations");
+    requests.active.remove(request_id);
+    if request_id.is_empty() {
+        return;
+    }
+    requests.finished.push_back(request_id.to_string());
+    if requests.finished.len() > RETIRED_AUDIO_FEATURE_REQUESTS {
+        requests.finished.pop_front();
+    }
+}
 
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -86,7 +144,13 @@ fn dispatch(command: &str, args: Value) -> String {
             "null".to_string()
         }
         "netease_account" => run_json(async {
-            let account = netease_client().account().await?;
+            let mut account = netease_client().account().await?;
+            if let Some(profile) = account.as_mut() {
+                // Optional entitlement lookup must not make an otherwise valid login fail.
+                profile.has_music_subscription = netease_client()
+                    .music_subscription(profile.user_id)
+                    .await;
+            }
             Ok(serde_json::to_value(account)?)
         }),
         "netease_logout" => match netease_client().logout() {
@@ -97,7 +161,7 @@ fn dispatch(command: &str, args: Value) -> String {
             let uid = args.get("uid").and_then(Value::as_i64).unwrap_or(0);
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(1000);
             run_json(async move {
-                let playlists = netease_client().user_playlists(uid, limit).await?;
+                let playlists = netease_client().user_playlists_complete(uid, limit).await?;
                 Ok(serde_json::to_value(playlists)?)
             })
         }
@@ -335,11 +399,37 @@ fn dispatch(command: &str, args: Value) -> String {
                 .get("cacheBytes")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            run_json(async move {
+            let request_id = args
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let max_work_ms = args
+                .get("maxWorkMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(30_000)
+                .clamp(1, 30_000);
+            let control = audio::AnalysisControl::new(
+                audio_feature_cancellation(&request_id),
+                Duration::from_millis(max_work_ms),
+            );
+            let output = run_json(async move {
                 audio_store()
-                    .features_json(track_id, url, cache_bytes)
+                    .features_json(track_id, url, cache_bytes, &control)
                     .await
-            })
+            });
+            finish_audio_feature(&request_id);
+            output
+        }
+        "audio_cancel_features" => {
+            let request_id = args
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !request_id.is_empty() {
+                cancel_audio_feature(request_id);
+            }
+            "null".to_string()
         }
         "ai_set_provider" => {
             let provider = args

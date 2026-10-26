@@ -11,6 +11,7 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.RecommendationLog
+import app.pipo.nativeapp.data.library.UnifiedPlaylist
 import app.pipo.nativeapp.data.agent.domain.*
 import app.pipo.nativeapp.data.agent.execute.AgentActionExecutor
 import app.pipo.nativeapp.data.agent.execute.PlaylistImportService
@@ -25,6 +26,7 @@ import app.pipo.nativeapp.playback.PipoPlaybackService
 import app.pipo.nativeapp.playback.PlayerMediaFactory
 import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -91,7 +93,7 @@ class BackgroundAgentTaskGateway(private val context: Context) : AgentTaskGatewa
     }
 }
 
-private fun JSONObject.toTrack() = NativeTrack(optString("id"), optLong("neteaseId").takeIf { it != 0L }, optString("title"), optString("artist"), optString("album"), optString("streamUrl"), artworkUrl = optString("artworkUrl").takeIf { it.isNotBlank() })
+private fun JSONObject.toTrack() = app.pipo.nativeapp.data.NativeTrackJson.decode(this, includeStreamUrl = true)
 
 private class BackgroundPlayerAgentExecutor(
     private val controllerProvider: suspend () -> MediaController,
@@ -107,6 +109,7 @@ private class BackgroundPlayerAgentExecutor(
     private val playlistImportService = PlaylistImportService(repository)
     private val playbackUrlResolver = PlaybackUrlResolver(
         repository = repository,
+        music = PipoGraph.music,
         streamLevelFallbacks = STREAM_LEVEL_FALLBACKS,
         streamUrlTimeoutMs = STREAM_URL_TIMEOUT_MS,
     )
@@ -148,14 +151,20 @@ private class BackgroundPlayerAgentExecutor(
 
     private fun MediaItem.toNativeTrack(): NativeTrack? {
         val id = mediaId.takeIf { it.isNotBlank() } ?: return null
+        val source = PlayerMediaFactory.sourceRefFrom(mediaMetadata)
         return NativeTrack(
             id = id,
-            neteaseId = id.toLongOrNull(),
+            neteaseId = if (source != null) source.neteaseId else id.toLongOrNull(),
             title = mediaMetadata.title?.toString().orEmpty(),
             artist = mediaMetadata.artist?.toString().orEmpty(),
             album = mediaMetadata.albumTitle?.toString().orEmpty(),
             streamUrl = localConfiguration?.uri?.toString().orEmpty(),
             artworkUrl = mediaMetadata.artworkUri?.toString(),
+            durationMs = mediaMetadata.extras
+                ?.takeIf { it.containsKey(PlayerMediaFactory.SOURCE_DURATION_MS_EXTRA) }
+                ?.getLong(PlayerMediaFactory.SOURCE_DURATION_MS_EXTRA)
+                ?: 0L,
+            sourceRef = source,
         )
     }
 
@@ -177,8 +186,14 @@ private class BackgroundPlayerAgentExecutor(
         val controller = controllerProvider()
         val result = withContext(Dispatchers.Main.immediate) {
             if (!PlaybackSessionClock.isSelectionCurrent(expectedSelectionRevision)) return@withContext null
+            PipoGraph.lastPlayback.setContinuation(continuous?.snapshot())
             BackgroundAgentContinuation.install(continuous, primaryGoal)
             if (continuous != null) {
+                PipoGraph.lastPlayback.setPlaybackMode(when {
+                    continuous.repeatsCurrentTrack() -> "SingleLoop"
+                    continuous.startsAutomatically() -> "AiRadio"
+                    else -> "OrderOnce"
+                })
                 controller.repeatMode = when {
                     continuous.repeatsCurrentTrack() -> Player.REPEAT_MODE_ONE
                     continuous.startsAutomatically() -> Player.REPEAT_MODE_ALL
@@ -188,12 +203,16 @@ private class BackgroundPlayerAgentExecutor(
             if (preserveCurrent && controller.currentMediaItem != null) {
                 val start = (controller.currentMediaItemIndex + 1).coerceIn(0, controller.mediaItemCount)
                 controller.replaceMediaItems(start, controller.mediaItemCount, playable.map { factory.toMediaItem(it) })
-                false to controller.snapshot()
+                val snapshot = controller.snapshot()
+                PipoGraph.lastPlayback.save(snapshot.queue, controller.currentMediaItemIndex, controller.currentPosition)
+                false to snapshot
             } else {
                 controller.setMediaItems(playable.map { factory.toMediaItem(it) })
                 controller.prepare()
                 controller.play()
-                controller.playWhenReady to controller.snapshot()
+                val snapshot = controller.snapshot()
+                PipoGraph.lastPlayback.save(snapshot.queue, controller.currentMediaItemIndex, controller.currentPosition)
+                controller.playWhenReady to snapshot
             }
         }
             ?: return selectionChanged(actionId, "play_queue")
@@ -270,12 +289,26 @@ private class BackgroundPlayerAgentExecutor(
 
     override suspend fun likeCurrent(actionId: String, like: Boolean): ActionExecutionResult {
         val current = playbackSnapshot().current
-        return likeTrackId(actionId, current?.neteaseId, like, current)
+            ?: return ActionExecutionResult(actionId, "like", false, "现在没在放歌，没法${if (like) "收藏" else "取消收藏"}。", acceptedByPlayer = false)
+                .withPlaybackSnapshot()
+        return applyLibraryLike(actionId, current, like)
     }
 
     override suspend fun likeTrack(actionId: String, like: Boolean, target: TrackRequirement): ActionExecutionResult {
-        val track = resolveTrackForLike(target, playbackSnapshot().current)
-        return likeTrackId(actionId, track?.neteaseId, like, track)
+        val track = try {
+            resolveTrackForLike(target, playbackSnapshot().current)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            return ActionExecutionResult(
+                actionId, "like", false,
+                "搜索歌曲失败：${error.message ?: error::class.java.simpleName}",
+                acceptedByPlayer = false,
+            ).withPlaybackSnapshot()
+        }
+            ?: return ActionExecutionResult(actionId, "like", false, "找不到歌曲", acceptedByPlayer = false)
+                .withPlaybackSnapshot()
+        return applyLibraryLike(actionId, track, like)
     }
 
     override suspend fun retryFavorite(
@@ -292,18 +325,21 @@ private class BackgroundPlayerAgentExecutor(
             return ActionExecutionResult(id, "like", false, "找不到歌曲", acceptedByPlayer = false)
                 .withPlaybackSnapshot()
         }
-        return runCatching { repository.likeSong(neteaseId, like) }.fold(
-            { ActionExecutionResult(id, "like", true, if (like) "收藏好了" else "取消收藏", tracks = listOfNotNull(track), likedTrack = track) },
-            { ActionExecutionResult(id, "like", false, "收藏失败", tracks = listOfNotNull(track), acceptedByPlayer = false) },
-        ).withPlaybackSnapshot()
+        return try {
+            repository.likeSong(neteaseId, like)
+            ActionExecutionResult(id, "like", true, if (like) "收藏好了" else "取消收藏", tracks = listOfNotNull(track), likedTrack = track)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            ActionExecutionResult(id, "like", false, "收藏失败", tracks = listOfNotNull(track), acceptedByPlayer = false)
+        }.withPlaybackSnapshot()
     }
 
     private suspend fun resolveTrackForLike(target: TrackRequirement, current: NativeTrack?): NativeTrack? {
         current?.takeIf { matchesTarget(it, target) }?.let { return it }
         val query = listOfNotNull(target.artist, target.title).joinToString(" ").trim()
         if (query.isBlank()) return null
-        return runCatching { repository.searchTracks(query, limit = 10) }
-            .getOrDefault(emptyList())
+        return PipoGraph.music.searchCandidates(query, limit = 10, offset = 0)
             .filter { matchesTarget(it, target) }
             .minByOrNull { candidateScore(it, target) }
     }
@@ -332,38 +368,126 @@ private class BackgroundPlayerAgentExecutor(
 
     override suspend fun modifyPlaylist(actionId: String, add: Boolean, playlistName: String): ActionExecutionResult {
         val current = playbackSnapshot().current
-        val tid = current?.neteaseId ?: return ActionExecutionResult(actionId, "playlist", false, "找不到歌曲", acceptedByPlayer = false)
+        if (current == null) return ActionExecutionResult(actionId, "playlist", false, "找不到歌曲", acceptedByPlayer = false)
             .withPlaybackSnapshot()
-        var playlists = repository.playlists.first()
-        if (playlists.isEmpty()) {
-            runCatching { repository.refreshPlaylists() }
-            playlists = repository.playlists.first()
+        val matches = try {
+            uniquePlaylistCandidates(playlistName)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            return ActionExecutionResult(
+                actionId, "playlist", false,
+                "读取资料库失败：${error.message ?: error::class.java.simpleName}",
+                acceptedByPlayer = false,
+            ).withPlaybackSnapshot()
         }
-        val playlist = playlists.firstOrNull {
-            it.name.equals(playlistName, true) ||
-                it.name.contains(playlistName, true) ||
-                playlistName.contains(it.name, true)
-        }
-            ?: return ActionExecutionResult(actionId, "playlist", false, "后台歌单未找到", acceptedByPlayer = false)
+        val playlist = matches.singleOrNull()
+            ?: return playlistBindingRequired(actionId, playlistName, matches.size)
                 .withPlaybackSnapshot()
-        return runCatching { repository.playlistModifyTracks(playlist.id, if (add) "add" else "del", listOf(tid)) }
-            .fold(
-                onSuccess = {
-                    val snapshot = playbackSnapshot()
-                    ok(
-                        actionId,
-                        "playlist",
-                        if (add) "已加入歌单" else "已移出歌单",
-                        tracks = listOfNotNull(current),
-                        snapshot = snapshot,
-                    )
-                },
-                onFailure = {
-                    ActionExecutionResult(actionId, "playlist", false, "歌单操作失败", acceptedByPlayer = false)
-                        .withPlaybackSnapshot()
-                },
-            )
+        return applyLibraryPlaylist(actionId, playlist, current, add)
     }
+
+    private suspend fun applyLibraryLike(actionId: String, track: NativeTrack, like: Boolean): ActionExecutionResult {
+        val library = PipoGraph.music.library
+        val before = library.state.value
+        return try {
+            library.like(track, like)
+            val after = library.state.value
+            val errors = newLibraryErrors(before.errors, after.errors)
+            val confirmed = library.isLiked(track) == like &&
+                after.pendingCount <= before.pendingCount && errors.isEmpty()
+            if (confirmed) {
+                ActionExecutionResult(
+                    actionId, "like", true,
+                    if (like) "收藏好了：${trackLabel(track)}" else "取消收藏了：${trackLabel(track)}",
+                    tracks = listOf(track), likedTrack = track,
+                ).withPlaybackSnapshot()
+            } else {
+                val detail = errors.values.firstOrNull()
+                ActionExecutionResult(
+                    actionId, "like", false,
+                    detail?.let { "${if (like) "收藏" else "取消收藏"}未确认：$it" }
+                        ?: "${if (like) "收藏" else "取消收藏"}已提交，正在等待资料库确认（待同步 ${after.pendingCount} 项）。",
+                    tracks = listOf(track), acceptedByPlayer = false,
+                ).withPlaybackSnapshot()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            ActionExecutionResult(
+                actionId, "like", false,
+                "${if (like) "收藏" else "取消收藏"}失败：${error.message ?: error::class.java.simpleName}",
+                tracks = listOf(track), acceptedByPlayer = false,
+            ).withPlaybackSnapshot()
+        }
+    }
+
+    private suspend fun uniquePlaylistCandidates(name: String): List<UnifiedPlaylist> {
+        val library = PipoGraph.music.library
+        if (library.state.value.playlists.isEmpty()) library.refresh()
+        val query = name.trim()
+        return if (query.isBlank()) emptyList() else library.state.value.playlists.filter { it.name.equals(query, ignoreCase = true) }
+    }
+
+    private suspend fun applyLibraryPlaylist(
+        actionId: String,
+        playlist: UnifiedPlaylist,
+        track: NativeTrack,
+        add: Boolean,
+    ): ActionExecutionResult {
+        val library = PipoGraph.music.library
+        val before = library.state.value
+        return try {
+            if (add) library.add(playlist.id, track) else library.remove(playlist.id, track)
+            val after = library.state.value
+            val errors = newLibraryErrors(before.errors, after.errors)
+            val updated = after.playlists.firstOrNull { it.id == playlist.id }
+            val containsTrack = updated?.tracks?.any { sameLibraryTrack(it, track) }
+            val confirmed = after.pendingCount <= before.pendingCount && errors.isEmpty() &&
+                (if (add) containsTrack == true else containsTrack == false)
+            if (confirmed) {
+                ActionExecutionResult(
+                    actionId, "playlist", true,
+                    "${if (add) "已加入" else "已移出"}「${playlist.name}」",
+                    tracks = listOf(track), playlistName = playlist.name,
+                ).withPlaybackSnapshot()
+            } else {
+                val detail = errors.values.firstOrNull()
+                ActionExecutionResult(
+                    actionId, "playlist", false,
+                    detail?.let { "歌单操作未确认：$it" }
+                        ?: "歌单操作已提交，正在等待资料库确认（待同步 ${after.pendingCount} 项）。",
+                    tracks = listOf(track), playlistName = playlist.name, acceptedByPlayer = false,
+                ).withPlaybackSnapshot()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            ActionExecutionResult(
+                actionId, "playlist", false,
+                "操作歌单失败：${error.message ?: error::class.java.simpleName}",
+                tracks = listOf(track), playlistName = playlist.name, acceptedByPlayer = false,
+            ).withPlaybackSnapshot()
+        }
+    }
+
+    private fun playlistBindingRequired(actionId: String, name: String, matches: Int): ActionExecutionResult =
+        ActionExecutionResult(
+            actionId, "playlist", false,
+            if (matches == 0) "资料库没有唯一歌单「$name」，请先在资料库选择并绑定。"
+            else "歌单「$name」有多个绑定，请先在资料库选择要操作的绑定。",
+            acceptedByPlayer = false,
+        )
+
+    private fun newLibraryErrors(before: Map<String, String>, after: Map<String, String>): Map<String, String> =
+        after.filter { (id, message) -> before[id] != message }
+
+    private fun sameLibraryTrack(left: NativeTrack, right: NativeTrack): Boolean =
+        left.sourceKey == right.sourceKey ||
+            (!left.recordingId.isNullOrBlank() && left.recordingId == right.recordingId)
+
+    private fun trackLabel(track: NativeTrack): String =
+        listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" - ").ifBlank { track.title }
 
     override suspend fun createPlaylist(
         actionId: String,

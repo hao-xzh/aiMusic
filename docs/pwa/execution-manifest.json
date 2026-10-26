@@ -1,0 +1,108 @@
+{
+  "manifest_version": 3,
+  "manifest_kind": "execution_control",
+  "scope_id": "android-pwa-parity",
+  "objective": "按 Android 原生版基线 d1d81284435d726c89b5435c0e58de8ae73d1d70 迁移 PWA 样式、动画与全部功能；用户 2026-09-11 已授权持续实现，并要求尽量高性能、接近原生体验。平台与性能结论分别实测。",
+  "canonical_execution_manifest": "docs/pwa/execution-manifest.json",
+  "work_queue_status": "blocked",
+  "items": [
+    {
+      "item_id": "BRIDGE",
+      "title": "复用 Android Rust 业务桥接与浏览器会话",
+      "source_ref": "android-native/native-bridge/src/lib.rs@d1d8128; android-native/app/src/main/java/app/pipo/nativeapp/data/JsonRustPipoBridge.kt",
+      "contract_ref": null,
+      "depends_on": [],
+      "phase": "validation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "Rust release 与业务 HTTP、音频范围响应、会话隔离已核验；复用当前固定预览。",
+      "result_ref": "docs/pwa/README.md",
+      "audit_ref": null,
+      "updated_at": "2026-09-11"
+    },
+    {
+      "item_id": "BROWSE",
+      "title": "Android 共享视觉、首页、搜索、资料库与歌单弹层",
+      "source_ref": "android-native/app/src/main/java/app/pipo/nativeapp/ui/BrowseHost.kt; BrowseChrome.kt; BrowseScreens.kt; BrowseOverlays.kt; BrowseVisuals.kt; PipoDesign.kt",
+      "contract_ref": null,
+      "depends_on": [
+        "BRIDGE"
+      ],
+      "phase": "validation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "正式首页、全局搜索、资料库、歌单、收藏和菜单已接入；真实账号浏览与可逆添加移除通过。",
+      "result_ref": "docs/pwa/README.md",
+      "audit_ref": null,
+      "updated_at": "2026-09-11"
+    },
+    {
+      "item_id": "PLAYER",
+      "title": "全屏播放器、歌词、横屏、队列、播放模式与缓存",
+      "source_ref": "android-native/app/src/main/java/app/pipo/nativeapp/ui/PlayerScreen.kt; ImmersiveLyrics.kt; AmllNativeLyricColumn.kt; playback/PlayerViewModel.kt; playback/PipoPlaybackService.kt",
+      "contract_ref": null,
+      "depends_on": [
+        "BROWSE"
+      ],
+      "phase": "validation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "播放器、歌词、队列、模式、过渡和缓存已实现；真实前台播放、自动跨曲、末尾停止、模式持久化和最终离线重开通过。硬件表现见 IPHONE。",
+      "result_ref": "docs/pwa/README.md",
+      "audit_ref": null,
+      "updated_at": "2026-09-11"
+    },
+    {
+      "item_id": "ACCOUNT",
+      "title": "扫码与短信登录、设置、AI 配置、音乐口味",
+      "source_ref": "android-native/app/src/main/java/app/pipo/nativeapp/ui/LoginScreen.kt; SettingsScreen.kt; TasteScreen.kt; data/LocalSettingsStore.kt; data/TasteProfileStore.kt",
+      "contract_ref": null,
+      "depends_on": [
+        "BROWSE"
+      ],
+      "phase": "validation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "扫码登录、设置、AI 配置与音乐口味已接入；用户完成真实登录及 AI 配置。短信发送和新建外部歌单未实际执行，见验证记录。",
+      "result_ref": "docs/pwa/README.md",
+      "audit_ref": null,
+      "updated_at": "2026-09-11"
+    },
+    {
+      "item_id": "ASSISTANT",
+      "title": "AI 唤醒、对话、工具执行、推荐与持久任务",
+      "source_ref": "android-native/app/src/main/java/app/pipo/nativeapp/ui/NativeAiPet.kt; NativeAiPetComponents.kt; AssistantWakeEffects.kt; data/agent; data/RecommendEngine.kt",
+      "contract_ref": null,
+      "depends_on": [
+        "PLAYER",
+        "ACCOUNT"
+      ],
+      "phase": "validation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "真实模型精确点歌、排序、真实歌单、插播、刷新恢复和失败反馈已复测；本地会话隔离通过。语音与 iOS 后台表现见 IPHONE。",
+      "result_ref": "docs/pwa/README.md",
+      "audit_ref": null,
+      "updated_at": "2026-09-11"
+    },
+    {
+      "item_id": "IPHONE",
+      "title": "安装、离线、后台、蓝牙与中断恢复验收",
+      "source_ref": "android-native/app/src/main/java/app/pipo/nativeapp/playback/PipoPlaybackService.kt; public/pwa-sw.js; public/pwa/manifest.webmanifest",
+      "contract_ref": null,
+      "depends_on": [
+        "PLAYER",
+        "ACCOUNT",
+        "ASSISTANT"
+      ],
+      "phase": "validation",
+      "status": "blocked",
+      "blocker": "性能与水波纹修复已构建并在浏览器和桌面 Safari 复测；iPhone 17 Pro 的水波清晰度、帧率、安全区、键盘与原硬件路径仍待设备反馈。新增灵动岛返回其他网站问题，缺少实际返回域名/路径，本机无法控制目标 iPhone。",
+      "next_action": "同一 HTTPS 链接已更新至 20260912-180207。收到灵动岛返回网站地址后先区分同域根路径、旧入口与外域来源，再沿用授权定点修复；继续收集真机表现。",
+      "result_ref": "docs/pwa/README.md",
+      "audit_ref": null,
+      "updated_at": "2026-09-12"
+    }
+  ],
+  "updated_at": "2026-09-12"
+}

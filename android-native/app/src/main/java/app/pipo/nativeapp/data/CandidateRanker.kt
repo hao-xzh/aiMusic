@@ -24,8 +24,8 @@ object CandidateRanker {
     )
 
     // 权重 v2(2026-05) —— 跟 Web 端 candidate-ranker.ts 对齐。
-    // TASTE 0.25 → 0.40,内部走 max(profileTags/1.2, acoustic*0.9, profile*0.25, audio*0.7),
-    // 让画像维度(风格/情绪/年代/文化/声学)替代旧版"只看 topArtists"的主信号。
+    // TASTE 0.25 → 0.40,内部走 max(profileTags/1.2, acoustic*0.9, audio*0.7)；
+    // 艺人亲和度另以固定 0.20 软加分，既能反映偏好，也不会成为硬范围。
     private const val W_INTENT = 0.30
     // 接歌适配只做同档候选的 tie-breaker，不能压过用户需求/口味画像。
     private const val W_TRANSITION = 0.12
@@ -63,7 +63,8 @@ object CandidateRanker {
                 intent.textArtists, intent.textTracks,
                 intent.textAlbums,
             )
-            if (c.semanticProfile != null && !explicitlyMentioned &&
+            // 点名歌手不代表该歌手的所有歌曲都满足本轮风格、语言等条件。
+            if (c.semanticProfile != null &&
                 !TagRecall.passesHardConstraints(c.semanticProfile, intent)
             ) continue
             val neteaseId = c.track.neteaseId
@@ -75,17 +76,15 @@ object CandidateRanker {
                 c.sourceScores[CandidateRecall.Source.Semantic] ?: 0.0,
                 (c.sourceScores[CandidateRecall.Source.SemanticBroad] ?: 0.0) * 0.65,
             ))
-            // taste 内部:ProfileTags(风格维度) + Acoustic(声学维度)主导,Profile(artist) 0.25×
+            // taste 内部只保留风格与声学维度；艺人偏好独立计分，避免被 max 吞掉。
             val tasteScore = clamp01(maxOf(
                 maxOf(
                     (c.sourceScores[CandidateRecall.Source.ProfileTags] ?: 0.0) / 1.2,
                     (c.sourceScores[CandidateRecall.Source.Acoustic] ?: 0.0) * 0.9,
                 ),
-                maxOf(
-                    (c.sourceScores[CandidateRecall.Source.Profile] ?: 0.0) * 0.25,
-                    (c.sourceScores[CandidateRecall.Source.Audio] ?: 0.0) * 0.7,
-                ),
+                (c.sourceScores[CandidateRecall.Source.Audio] ?: 0.0) * 0.7,
             ))
+            val profileScore = clamp01(c.sourceScores[CandidateRecall.Source.Profile] ?: 0.0)
             val behaviorScore = clamp01((c.sourceScores[CandidateRecall.Source.Behavior] ?: 0.0) / 1.5)
             val sourcePreferenceDelta = (c.sourceScores[CandidateRecall.Source.PreferenceDelta] ?: 0.0) / 1.4
             val scoredPreferenceDelta = options.behaviorPreference.scoreTrack(c.track, c.semanticProfile, c.features)
@@ -109,12 +108,13 @@ object CandidateRanker {
             val baseScore = intentScore * W_INTENT +
                 tagScore * w.tag + semanticScore * w.semantic +
                 tasteScore * w.taste + behaviorAffinityScore * w.behavior +
-                transitionScore * W_TRANSITION + freshnessScore * W_FRESHNESS + explicitTaste * 0.10
+                transitionScore * W_TRANSITION + freshnessScore * W_FRESHNESS + explicitTaste * 0.10 +
+                profileScore * 0.20
 
             val recentPlayPenalty = if (explicitlyMentioned) 0.0
                 else recentPenalty(neteaseId, options.recentPlay?.last24hTrackIds, options.recentPlay?.last7dTrackIds, 0.5, 0.25)
             val recentRecPenalty = if (explicitlyMentioned) 0.0
-                else recentPenalty(neteaseId, options.recentRecommendation?.last24hTrackIds, options.recentRecommendation?.last7dTrackIds, 0.55, 0.24)
+                else recentRecommendationPenalty(c.track, options.recentRecommendation, 0.55, 0.24)
             // artist-level fatigue —— 修"自由推荐总是同一歌手"。
             // 阈值: 24h ≥5 次 -0.30, ≥10 -0.30(累计), 7d ≥20 -0.20。explicit 时不 fatigue。
             val artistFatiguePenalty = if (explicitlyMentioned) 0.0
@@ -232,7 +232,8 @@ object CandidateRanker {
         val vibeCount = intent.softMoods.size + intent.softScenes.size + intent.softTextures.size +
             (if (intent.softEnergy == "any") 0 else 1)
         return when {
-            hardCount > 0 -> Weights(0.34, 0.24, 0.12, 0.06)
+            // 硬条件已在入池前过滤；在符合本轮要求的歌曲中继续按个人品味选。
+            hardCount > 0 -> Weights(0.16, 0.20, 0.32, 0.08)
             vibeCount > 0 -> Weights(0.18, 0.34, 0.16, 0.08)
             else -> Weights(0.08, 0.16, W_TASTE, W_BEHAVIOR)
         }
@@ -261,6 +262,25 @@ object CandidateRanker {
         if (in24h?.contains(trackId) == true) return last24hPenalty
         if (in7d?.contains(trackId) == true) return last7dPenalty
         return 0.0
+    }
+
+    private fun recentRecommendationPenalty(
+        track: NativeTrack,
+        context: RecommendationLog.RecentContext?,
+        last24hPenalty: Double,
+        last7dPenalty: Double,
+    ): Double {
+        if (context == null) return 0.0
+        val sourceKeys = TrackDedupe.sourceKeys(track)
+        val recordingId = track.recordingId?.takeIf { it.isNotBlank() }
+        val in24h = track.neteaseId in context.last24hTrackIds ||
+            sourceKeys.any { it in context.last24hSourceKeys } ||
+            (recordingId != null && recordingId in context.last24hRecordingIds)
+        if (in24h) return last24hPenalty
+        val in7d = track.neteaseId in context.last7dTrackIds ||
+            sourceKeys.any { it in context.last7dSourceKeys } ||
+            (recordingId != null && recordingId in context.last7dRecordingIds)
+        return if (in7d) last7dPenalty else 0.0
     }
 
     private fun clamp01(x: Double): Double = if (x < 0) 0.0 else if (x > 1) 1.0 else x

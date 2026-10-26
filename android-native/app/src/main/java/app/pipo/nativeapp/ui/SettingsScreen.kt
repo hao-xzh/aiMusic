@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.widget.Toast
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,11 +16,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -35,9 +33,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
@@ -63,6 +64,7 @@ import app.pipo.nativeapp.data.AiConfigView
 import app.pipo.nativeapp.data.AiProviderView
 import app.pipo.nativeapp.data.ModelOption
 import app.pipo.nativeapp.data.NativeSettings
+import app.pipo.nativeapp.data.MusicProviders
 import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoRepository
@@ -74,6 +76,7 @@ import kotlinx.coroutines.withContext
 fun SettingsScreen(repository: PipoRepository = PipoGraph.repository, aiOnly: Boolean = false) {
     val context = LocalContext.current
     val account by repository.account.collectAsState(initial = null)
+    val qqConnection by PipoGraph.music.qqTransport.connection.collectAsState()
     val playlists by repository.playlists.collectAsState(initial = emptyList())
     val cacheStats by repository.audioCacheStats.collectAsState(initial = AudioCacheStats(0, 0, 0))
     val aiConfig by repository.aiConfig.collectAsState(initial = AiConfigView("", emptyList()))
@@ -97,7 +100,7 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository, aiOnly: Bo
         }
     }
     LaunchedEffect(Unit) {
-        try { repository.refreshAccount(); repository.refreshAudioCacheStats(); repository.refreshAiConfig() }
+        try { repository.refreshAccount(); PipoGraph.music.qqTransport.refreshAccount(); repository.refreshAudioCacheStats(); repository.refreshAiConfig() }
         catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { reply = e.message ?: "设置加载失败" }
     }
@@ -112,14 +115,15 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository, aiOnly: Bo
     BrowsePageScaffold(if (aiOnly) "服务商与模型" else "设置", playlists.firstOrNull()?.coverUrl) {
         if (aiOnly) {
             Text("用于选歌与对话的 AI 服务", color = BrowseMuted, modifier = Modifier.padding(bottom = 24.dp))
-            Text(if (active?.hasKey == true) "已配置 · ${active.label}" else "等待配置 / 添加 API Key 后启用", color = BrowseInk, modifier = Modifier.fillMaxWidth().background(PipoColors.GlassFill, androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp)).padding(20.dp))
+            Text(if (active?.hasKey == true) "已配置 · ${active.label}" else "等待配置 / 添加 API Key 后启用", color = BrowseInk, fontSize = 18.sp, fontWeight = FontWeight.Medium, modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp))
+            PipoDivider()
             Spacer(Modifier.height(24.dp))
             Text("服务商", color = BrowseMuted)
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(4.dp))
             PipoDropdown(currentLabel = active?.label ?: "选择服务商", selectedId = aiConfig.activeProvider, options = aiConfig.providers.map { PipoDropdownOption(it.id, it.label, providerStatusText(it)) }, onSelect = { option -> perform { repository.setAiProvider(option.id); repository.refreshAiConfig() } }, modifier = Modifier.fillMaxWidth(), fillTriggerWidth = true)
             Spacer(Modifier.height(22.dp))
             Text("模型", color = BrowseMuted)
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(4.dp))
             active?.let { provider ->
                 PipoDropdown(currentLabel = provider.model.ifBlank { "选择模型" }, selectedId = provider.model, options = mergedModelOptions(provider.model, modelOptions), onSelect = { option -> perform { repository.aiSetModel(provider.id, option.id); repository.refreshAiConfig() } }, modifier = Modifier.fillMaxWidth(), fillTriggerWidth = true)
             }
@@ -130,61 +134,89 @@ fun SettingsScreen(repository: PipoRepository = PipoGraph.repository, aiOnly: Bo
                 val id = active?.id ?: return@Button
                 val key = apiKeyDraft.trim()
                 perform("Key 已保存") { repository.aiSetApiKey(id, key); apiKeyDraft = ""; repository.refreshAiConfig() }
-            }, modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp), colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = BrowseInk, contentColor = Color.Black), shape = androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp)) { Text("保存 Key") }
-            androidx.compose.material3.OutlinedButton(enabled = active?.hasKey == true && !busy, onClick = { perform { reply = repository.aiPing() } }, modifier = Modifier.fillMaxWidth().padding(top = 10.dp).heightIn(min = 50.dp), shape = androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp)) { Text("测试连接", color = PipoColors.Mint) }
+            }, modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp), colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = BrowseInk, contentColor = Color.Black), shape = RoundedCornerShape(8.dp)) { Text("保存 Key") }
+            androidx.compose.material3.TextButton(enabled = active?.hasKey == true && !busy, onClick = { perform { reply = repository.aiPing() } }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp).heightIn(min = 50.dp), colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = BrowseInk)) { Text("测试连接") }
             Spacer(Modifier.height(24.dp))
             Text("连接结果", color = BrowseMuted)
             Text(if (busy) "正在处理…" else reply ?: "保存后可测试连接", color = BrowseMuted, modifier = Modifier.padding(top = 12.dp))
         } else {
-            SettingsPanel {
-            PipoRow("网易云账号", account?.nickname ?: "未登录", showDivider = false) {
-                PipoButton(if (account == null) "去登录 →" else "退出登录", {
-                    if (account == null) nav?.openLogin?.invoke()
-                    else perform("已退出登录") { repository.logout(); PipoGraph.lastPlayback.clear(); PipoGraph.library.invalidate() }
-                })
+            SettingsGroup {
+                PipoRow("网易云账号", account?.nickname ?: "未登录") {
+                    PipoButton(if (account == null) "去登录 →" else "退出登录", {
+                        if (account == null) nav?.openLogin?.invoke()
+                        else perform("已退出登录") { repository.logout(); PipoGraph.lastPlayback.clear(); PipoGraph.library.invalidate() }
+                    })
+                }
+                PipoRow("QQ 音乐账号", qqConnection.account?.nickname ?: qqConnection.error ?: "未登录") {
+                    PipoButton(if (qqConnection.account == null) "去登录 →" else "退出登录", {
+                        if (qqConnection.account == null) nav?.openLogin?.invoke()
+                        else perform("已退出 QQ 音乐") { PipoGraph.music.qqTransport.logout() }
+                    })
+                }
             }
+            SettingsSectionHeader("播放")
+            SettingsGroup {
+                PipoToggleRow(
+                    "允许与其他应用同时播放",
+                    subtitle = "开启后，其他应用播放声音时不自动暂停或降低音乐音量；通话、闹钟和耳机断开仍会暂停",
+                    checked = settings.allowConcurrentPlayback,
+                    onCheckedChange = { enabled ->
+                        perform { repository.updateSettings(settings.copy(allowConcurrentPlayback = enabled)) }
+                    },
+                )
             }
             SettingsSectionHeader("AI 与偏好")
-            SettingsPanel {
-            PipoRow(
-                title = "音乐口味",
-                subtitle = "查看偏好、聆听倾向与来源",
-                onClick = { nav?.openTaste?.invoke() },
-            ) {
-                Text("查看 ›", color = PipoColors.Mint, fontSize = 14.sp)
-            }
-            PipoRow(
-                title = "服务商与模型",
-                subtitle = active?.let { if (it.hasKey) "${it.label} · ${it.model}" else "未配置" } ?: "未配置",
-                onClick = { nav?.openAiSettings?.invoke() },
-            ) {
-                Text("›", color = PipoColors.Mint, fontSize = 14.sp)
-            }
-            PipoRow("Pipo 性格", "调整与你聊天的语气") {
-                PipoPersonaDropdown(current = PetPersona.fromId(settings.personaId), onSelect = { persona -> perform { repository.updateSettings(settings.copy(personaId = persona.id)) } })
-            }
-            PipoToggleRow("封面短提示", checked = settings.aiNarration, onCheckedChange = { enabled -> perform { repository.updateSettings(settings.copy(aiNarration = enabled)) } })
-            PipoToggleRow("隐藏 AI 圆球", checked = settings.hideAiPetOrb, onCheckedChange = { enabled -> perform { repository.updateSettings(settings.copy(hideAiPetOrb = enabled)) } }, showDivider = false)
+            SettingsGroup {
+                PipoRow("优先搜索曲库", "仅一个平台有会员时优先该平台，否则沿用此设置") {
+                    PipoDropdown(
+                        currentLabel = MusicProviders.label(settings.preferredSearchProviderId),
+                        selectedId = settings.preferredSearchProviderId,
+                        options = listOf(
+                            PipoDropdownOption(MusicProviders.NETEASE, "网易云"),
+                            PipoDropdownOption(MusicProviders.QQ, "QQ 音乐"),
+                        ),
+                        onSelect = { option -> perform { repository.updateSettings(settings.copy(preferredSearchProviderId = option.id)) } },
+                    )
+                }
+                PipoRow(
+                    title = "音乐口味",
+                    subtitle = "查看偏好、聆听倾向与来源",
+                    onClick = { nav?.openTaste?.invoke() },
+                ) {
+                    Text("查看 ›", color = BrowseMuted, fontSize = 14.sp)
+                }
+                PipoRow(
+                    title = "服务商与模型",
+                    subtitle = active?.let { if (it.hasKey) "${it.label} · ${it.model}" else "未配置" } ?: "未配置",
+                    onClick = { nav?.openAiSettings?.invoke() },
+                ) {
+                    Text("›", color = BrowseMuted, fontSize = 14.sp)
+                }
+                PipoRow("Pipo 性格", "调整与你聊天的语气") {
+                    PipoPersonaDropdown(current = PetPersona.fromId(settings.personaId), onSelect = { persona -> perform { repository.updateSettings(settings.copy(personaId = persona.id)) } })
+                }
+                PipoToggleRow("封面短提示", checked = settings.aiNarration, onCheckedChange = { enabled -> perform { repository.updateSettings(settings.copy(aiNarration = enabled)) } })
+                PipoToggleRow("隐藏 AI 圆球", checked = settings.hideAiPetOrb, onCheckedChange = { enabled -> perform { repository.updateSettings(settings.copy(hideAiPetOrb = enabled)) } })
             }
             SettingsSectionHeader("关于你")
             PipoTextField(value = settings.userFacts, onValueChange = { value ->
                 val facts = value.take(400)
                 scope.launch { try { repository.updateSettings(settings.copy(userFacts = facts)); PipoGraph.petMemory.setUserFacts(facts) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { reply = e.message ?: "保存失败" } }
             }, label = "", placeholder = "写下你的喜好与习惯", singleLine = false, minLines = 3, maxLines = 6)
-            Text("${settings.userFacts.length} / 400", color = BrowseMuted, modifier = Modifier.align(Alignment.End).padding(top = 6.dp))
+            Text("${settings.userFacts.length} / 400", color = BrowseMuted, fontSize = 12.sp, modifier = Modifier.align(Alignment.End).padding(top = 8.dp))
             PipoButton("清空 AI 对话记忆", { perform("AI 对话记忆已清空") { val epoch = PipoGraph.petMemory.clearConversation(); PetChatStore.clear(epoch); DiagnosticsLogStore.record("ai_pet", "clear_conversation") } }, modifier = Modifier.align(Alignment.End).padding(top = 10.dp))
             SettingsSectionHeader("存储与诊断")
-            SettingsPanel {
-            PipoRow("音频缓存", "${cacheStats.totalMb} MB / ${cacheStats.maxMb} MB") {
-                PipoButton("清空", { perform("缓存已清空") { repository.clearAudioCache(); repository.refreshAudioCacheStats() } })
-            }
-            PipoRow("缓存容量", "4 GB 上限") { PipoButton("设为 4 GB", { perform("缓存上限已设为 4 GB") { repository.setCacheMaxMb(4096); repository.refreshAudioCacheStats() } }) }
-            PipoRow("诊断日志", showDivider = false) {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    PipoButton("复制", { perform("日志已复制") { copyDiagnosticsToClipboard(context) } })
-                    PipoButton("分享", { perform { shareDiagnosticsTxt(context) } })
+            SettingsGroup {
+                PipoRow("音频缓存", "${cacheStats.totalMb} MB / ${cacheStats.maxMb} MB") {
+                    PipoButton("清空", { perform("缓存已清空") { repository.clearAudioCache(); repository.refreshAudioCacheStats() } })
                 }
-            }
+                PipoRow("缓存容量", "4 GB 上限") { PipoButton("设为 4 GB", { perform("缓存上限已设为 4 GB") { repository.setCacheMaxMb(4096); repository.refreshAudioCacheStats() } }) }
+                PipoRow("诊断日志") {
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        PipoButton("复制", { perform("日志已复制") { copyDiagnosticsToClipboard(context) } })
+                        PipoButton("分享", { perform { shareDiagnosticsTxt(context) } })
+                    }
+                }
             }
             reply?.let { BrowseNotice(it) }
             if (busy) BrowseNotice("正在处理…")
@@ -232,7 +264,16 @@ private suspend fun shareDiagnosticsTxt(context: Context) {
 
 @Composable
 private fun SettingsSectionHeader(title: String) {
-    Text(title, color = BrowseMuted, fontSize = 16.sp, modifier = Modifier.padding(top = 24.dp, bottom = 12.dp))
+    Column(Modifier.fillMaxWidth().padding(top = 24.dp)) {
+        PipoDivider()
+        Text(
+            title,
+            color = BrowseInk,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 24.dp, bottom = 8.dp),
+        )
+    }
 }
 
 @Composable
@@ -240,8 +281,8 @@ private fun PipoDivider() {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(1.dp)
-            .background(PipoColors.GlassStroke)
+            .height(0.5.dp)
+            .background(Color.White.copy(alpha = 0.10f))
     )
 }
 
@@ -249,50 +290,42 @@ private fun PipoDivider() {
 private fun PipoRow(
     title: String,
     subtitle: String? = null,
-    showDivider: Boolean = true,
     onClick: (() -> Unit)? = null,
     content: @Composable (() -> Unit)? = null
 ) {
-    Column(
-        modifier = Modifier.fillMaxWidth()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
+            .heightIn(min = if (subtitle == null) 64.dp else 76.dp)
+            .padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
-                .heightIn(min = 60.dp)
-                .padding(vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = PipoColors.Ink,
+                style = TextStyle(
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            )
+            if (subtitle != null) {
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = title,
-                    color = PipoColors.Ink,
+                    text = subtitle,
+                    color = BrowseMuted,
                     style = TextStyle(
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Medium
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp
                     )
                 )
-                if (subtitle != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = subtitle,
-                        color = BrowseMuted,
-                        style = TextStyle(
-                            fontSize = 13.sp,
-                            lineHeight = 18.sp
-                        )
-                    )
-                }
-            }
-            if (content != null) {
-                Spacer(modifier = Modifier.width(16.dp))
-                content()
             }
         }
-        if (showDivider) {
-            PipoDivider()
+        if (content != null) {
+            Spacer(modifier = Modifier.width(16.dp))
+            content()
         }
     }
 }
@@ -303,12 +336,10 @@ private fun PipoToggleRow(
     subtitle: String? = null,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
-    showDivider: Boolean = true
 ) {
     PipoRow(
         title = title,
         subtitle = subtitle,
-        showDivider = showDivider
     ) {
         Switch(
             checked = checked,
@@ -330,16 +361,32 @@ private fun PipoButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    isPrimary: Boolean = false
 ) {
-    androidx.compose.material3.TextButton(onClick = onClick, modifier = modifier.heightIn(min = 48.dp), contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp)) {
-        Text(text, color = if (isPrimary) BrowseInk else PipoColors.Mint, fontSize = 14.sp, fontWeight = FontWeight.Normal)
+    Box(
+        modifier = modifier
+            .widthIn(min = 48.dp)
+            .heightIn(min = 48.dp)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.CenterEnd,
+    ) {
+        Text(text, color = BrowseMuted, fontSize = 14.sp, fontWeight = FontWeight.Normal)
     }
 }
 
 @Composable
-private fun SettingsPanel(content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
-    Column(Modifier.fillMaxWidth().background(Color.White.copy(alpha = 0.025f), androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp)).border(0.5.dp, Color.White.copy(alpha = 0.1f), androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp)).padding(horizontal = 12.dp), content = content)
+private fun SettingsGroup(content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
+    Column(Modifier.fillMaxWidth(), content = content)
+}
+
+private fun Modifier.settingsUnderline(highlighted: Boolean = false): Modifier = drawBehind {
+    val strokeWidth = (if (highlighted) 1.dp else 0.5.dp).toPx()
+    val y = size.height - strokeWidth / 2
+    drawLine(
+        color = if (highlighted) BrowseInk else Color.White.copy(alpha = 0.14f),
+        start = Offset(0f, y),
+        end = Offset(size.width, y),
+        strokeWidth = strokeWidth,
+    )
 }
 
 
@@ -382,7 +429,7 @@ private fun mergedModelOptions(
 }
 
 /**
- * 单选下拉，复用 PipoButton 的视觉（透明底 + GlassStroke 边框 + Ink/SemiBold/12sp/letter-spacing 1）。
+ * 单选下拉：行内显示文字与箭头，独占一行时使用底线。
  * trigger 显示当前项，点开 Popup 在 trigger 正下方对齐右边线弹出选项面板，
  * 选项内 (当前) 项 mint 高亮 + "当前" 角标。Popup 用 PopupPositionProvider 精确对齐，
  * 避免默认 alignment 把弹层贴到右侧外面。
@@ -413,13 +460,11 @@ private fun PipoDropdown(
         }
     }
     Box(modifier = modifier, contentAlignment = Alignment.CenterEnd) {
-        // trigger：跟 PipoButton 同款 chip
         Box(
-            modifier = (if (fillTriggerWidth) Modifier.fillMaxWidth() else Modifier)
-                .border(1.dp, PipoColors.GlassStroke, androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp))
-                .clickable { expanded = !expanded }
+            modifier = (if (fillTriggerWidth) Modifier.fillMaxWidth().settingsUnderline(highlighted = expanded) else Modifier)
+                .clickable(role = Role.Button) { expanded = !expanded }
                 .heightIn(min = 48.dp)
-                .padding(horizontal = 14.dp, vertical = 8.dp),
+                .padding(vertical = 12.dp),
             contentAlignment = Alignment.CenterStart,
         ) {
             Row(
@@ -429,7 +474,7 @@ private fun PipoDropdown(
             ) {
                 Text(
                     text = currentLabel,
-                    color = PipoColors.Ink,
+                    color = if (fillTriggerWidth) BrowseInk else BrowseMuted,
                     style = TextStyle(
                         fontSize = if (fillTriggerWidth) 16.sp else 14.sp,
                         fontWeight = FontWeight.Normal,
@@ -441,7 +486,7 @@ private fun PipoDropdown(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = if (expanded) "▴" else "▾",
-                    color = PipoColors.Ink,
+                    color = BrowseMuted,
                     style = TextStyle(fontSize = 10.sp),
                 )
             }
@@ -455,15 +500,16 @@ private fun PipoDropdown(
                 Column(
                     modifier = Modifier
                         .widthIn(min = 240.dp, max = 320.dp)
-                        .background(PipoColors.Bg1)
-                        .border(1.dp, PipoColors.GlassStroke, androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp))
-                        .padding(vertical = 4.dp),
+                        .shadow(16.dp, RoundedCornerShape(8.dp))
+                        .background(PipoColors.Bg1, RoundedCornerShape(8.dp))
+                        .padding(vertical = 8.dp),
                 ) {
                     options.forEach { option ->
                         val isCurrent = option.id == selectedId
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .heightIn(min = 48.dp)
                                 .clickable {
                                     if (!isCurrent) {
                                         onSelect(option)
@@ -580,13 +626,9 @@ private fun PipoTextField(
                 .fillMaxWidth()
                 .focusRequester(focusRequester)
                 .onFocusChanged { isFocused = it.isFocused }
-                .background(PipoColors.Bg1, androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp))
-                .border(
-                    width = 1.dp,
-                    color = if (isFocused) PipoColors.Ink else PipoColors.GlassStroke,
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(PipoDimens.SurfaceCornerDp)
-                )
-                .padding(horizontal = 16.dp, vertical = 16.dp),
+                .heightIn(min = 56.dp)
+                .settingsUnderline(highlighted = isFocused)
+                .padding(vertical = 16.dp),
             decorationBox = { innerTextField ->
                 Box(modifier = Modifier.fillMaxWidth()) {
                     if (value.isEmpty() && placeholder != null) {

@@ -53,6 +53,10 @@ data class EdgeColors(
     val rightUpper: IntArray? = null,
     val rightMiddle: IntArray? = null,
     val rightLower: IntArray? = null,
+    // 竖屏溶解区域按宽度分区，让封面底部左右的颜色分别向下延续。
+    val bottomLeft: IntArray? = null,
+    val bottomMiddle: IntArray? = null,
+    val bottomRight: IntArray? = null,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -268,11 +272,16 @@ private fun sampleEdges(bitmap: Bitmap): EdgeColors {
     val rightUpper = dominant(0, (h * 0.40f).roundToInt(), dissolveStart, w, EdgeSide.Right)
     val rightMiddle = dominant((h * 0.30f).roundToInt(), (h * 0.70f).roundToInt(), dissolveStart, w, EdgeSide.Right)
     val rightLower = dominant((h * 0.60f).roundToInt(), h, dissolveStart, w, EdgeSide.Right)
+    val bottomDissolveStart = (h * 0.56f).roundToInt()
+    val bottomLeft = dominant(bottomDissolveStart, h, 0, (w * 0.40f).roundToInt(), EdgeSide.Bottom)
+    val bottomMiddle = dominant(bottomDissolveStart, h, (w * 0.30f).roundToInt(), (w * 0.70f).roundToInt(), EdgeSide.Bottom)
+    val bottomRight = dominant(bottomDissolveStart, h, (w * 0.60f).roundToInt(), w, EdgeSide.Bottom)
     if (small !== bitmap) small.recycle()
     return EdgeColors(
         top = top, bottom = bottom, right = right, left = left,
         lower = lower, seam = seam, accent = accent, ambient = ambient,
         rightUpper = rightUpper, rightMiddle = rightMiddle, rightLower = rightLower,
+        bottomLeft = bottomLeft, bottomMiddle = bottomMiddle, bottomRight = bottomRight,
     )
 }
 
@@ -352,6 +361,13 @@ fun appleMusicPureSurfaceColor(edges: EdgeColors, fallback: Color = PipoColors.B
     return normalizeAppleMusicSurface(mixed, fallback)
 }
 
+fun appleMusicPortraitSurfaceColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
+    val base = edges.bottomMiddle ?: edges.seam ?: edges.lower ?: edges.bottom
+        ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
+    // 与横屏共用保留灰度和暗部层次的归一化；不往黑白封面强加饱和度或 accent。
+    return normalizeAppleMusicLandscapeSurface(base, fallback)
+}
+
 fun appleMusicPureTopColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
     val seamBase = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient
     val base = blendRgb(edges.top ?: edges.ambient ?: seamBase, seamBase, 0.18f)
@@ -361,20 +377,6 @@ fun appleMusicPureTopColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1):
 fun appleMusicDissolveBridgeColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
     val base = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
     val mixed = blendRgb(base, edges.accent ?: edges.ambient, 0.06f)
-    return normalizeAppleMusicBridgeSurface(mixed, fallback)
-}
-
-/**
- * 歌曲专属的中段色场：它不是直接把高饱和 accent 铺在屏幕上，而是以封面
- * seam/lower 为稳定底色，混入少量主色。用在清晰封面与下方背景之间，
- * 让每首歌的过渡带有不同色相，同时保持足够低频、不形成一块明显色条。
- */
-fun appleMusicTransitionWashColor(edges: EdgeColors, fallback: Color = PipoColors.Bg1): Color {
-    val base = edges.seam ?: edges.lower ?: edges.bottom ?: edges.ambient ?: edges.top ?: edges.right ?: edges.left
-    val songColor = edges.accent ?: edges.top ?: edges.right ?: edges.ambient ?: base
-    // 主色只提供柔和色相偏移；二维色云的空间分布由 backdrop 负责，避免在某个
-    // 固定 Y stop 堆出一条高饱和色脊。
-    val mixed = blendRgb(base, songColor, 0.18f)
     return normalizeAppleMusicBridgeSurface(mixed, fallback)
 }
 

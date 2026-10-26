@@ -28,6 +28,13 @@ object PipoColors {
     val Blue = Color(0xFF9BB7FF)
     val Gold = Color(0xFFF3C46A)
 
+    // 音乐口味页：私人唱片档案。
+    val TasteBackground = Color(0xFF080F12)
+    val TasteMuted = Color(0xFF94A4AA)
+    val TasteGold = Color(0xFFD4B77A)
+    val TasteBlue = Color(0xFF9BB7CF)
+    val TasteRule = Color(0x1AFFFFFF)
+
     // glass 卡（沉浸式控件容器）
     val GlassFill = Color(0x8A172029)
     val GlassStroke = Color(0x24FFFFFF)
@@ -50,6 +57,9 @@ object PipoTypography {
     val Title = 19.sp
     val Subtitle = 13.sp
     val Mono = 12.sp
+    val TasteSummary = 36.sp
+    val TasteSummaryCompact = 28.sp
+    val TasteSection = 18.sp
     val LyricActive = 18.sp
     val LyricDim = 12.sp
     val ImmersiveLyricFs = 28.sp
@@ -79,6 +89,8 @@ object PipoMotion {
 
 object PipoDimens {
     val SurfaceCornerDp = 14.dp
+    val TastePagePaddingDp = 24.dp
+    val TasteGenreChartSizeDp = 168.dp
     val ThumbnailCornerDp = 7.dp
     val GlassBlurDp = 24.dp
     // PlayerCard compact

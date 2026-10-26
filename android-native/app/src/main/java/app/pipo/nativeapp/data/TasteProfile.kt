@@ -25,6 +25,10 @@ data class TasteProfile(
     val culturalContext: List<String>,
     val taglines: List<String>,
     val summary: String,
+    /** v2 mixed-library provenance. Account key remains local-only and never enters AI prompts. */
+    val sourceProviderIds: List<String> = emptyList(),
+    val sourceAccountKey: String = "",
+    val sourceDataComplete: Boolean = true,
 )
 
 data class GenreTag(val tag: String, val weight: Float, val examples: List<String>)
@@ -70,15 +74,19 @@ object TasteProfileSerde {
         obj.put("culturalContext", JSONArray().apply { p.culturalContext.forEach { put(it) } })
         obj.put("taglines", JSONArray().apply { p.taglines.forEach { put(it) } })
         obj.put("summary", p.summary)
+        obj.put("sourceProviderIds", JSONArray().apply { p.sourceProviderIds.forEach { put(it) } })
+        obj.put("sourceAccountKey", p.sourceAccountKey)
+        obj.put("sourceDataComplete", p.sourceDataComplete)
         return obj.toString()
     }
 
     fun fromJson(raw: String): TasteProfile? {
         return try {
             val obj = JSONObject(raw)
-            if (obj.optInt("version", 0) != 1) return null
+            val version = obj.optInt("version", 0)
+            if (version !in 1..2) return null
             TasteProfile(
-                version = 1,
+                version = version,
                 derivedAt = obj.optLong("derivedAt"),
                 sourcePlaylistCount = obj.optInt("sourcePlaylistCount"),
                 sampledTrackCount = obj.optInt("sampledTrackCount"),
@@ -92,6 +100,9 @@ object TasteProfileSerde {
                 culturalContext = readStringArray(obj.optJSONArray("culturalContext")),
                 taglines = readStringArray(obj.optJSONArray("taglines")),
                 summary = obj.optString("summary"),
+                sourceProviderIds = readStringArray(obj.optJSONArray("sourceProviderIds")),
+                sourceAccountKey = obj.optString("sourceAccountKey"),
+                sourceDataComplete = obj.optBoolean("sourceDataComplete", true),
             )
         } catch (_: Exception) { null }
     }

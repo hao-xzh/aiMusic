@@ -1,12 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
-import { PlayerProvider } from "@/lib/player-state";
-import { AdaptiveDotField } from "@/components/AdaptiveDotField";
-import { PlatformTag } from "@/components/PlatformTag";
-import { AiPet } from "@/components/AiPet";
-import { WindowResizer } from "@/components/WindowResizer";
-import { AnalysisAutoResume } from "@/components/AnalysisAutoResume";
-import { SmartSessionPlanner } from "@/components/SmartSessionPlanner";
+import { AppShell } from "@/components/AppShell";
 
 export const metadata: Metadata = {
   title: "Pipo",
@@ -29,28 +23,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="zh-CN">
       <body>
-        <PlayerProvider>
-          <AdaptiveDotField />
-          {/* 平台探测（旧 Nav.tsx 里的逻辑迁出来），仅在 <html> 上挂 data-platform */}
-          <PlatformTag />
-          <AiPet />
-          <WindowResizer />
-          <AnalysisAutoResume />
-          <SmartSessionPlanner />
-          <main
-            style={{
-              position: "relative",
-              zIndex: 2,
-              flex: "1 1 auto",
-              minHeight: 0,
-              display: "flex",
-              flexDirection: "column",
-              overflowY: "auto",
-            }}
-          >
-            {children}
-          </main>
-        </PlayerProvider>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

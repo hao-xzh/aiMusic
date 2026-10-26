@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 #[path = "../../../../src-tauri/src/audio/analysis.rs"]
 mod analysis;
+pub use analysis::AnalysisControl;
 
 const DEFAULT_MAX_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 const MIN_MAX_BYTES: i64 = 64 * 1024 * 1024;
@@ -108,18 +110,23 @@ impl NativeAudioStore {
         track_id: i64,
         url: String,
         cache_bytes: bool,
+        control: &analysis::AnalysisControl,
     ) -> Result<Value> {
+        control.check("feature cache")?;
         if let Some(features) = self.read_features(track_id)? {
             return Ok(serde_json::to_value(features)?);
         }
 
-        let audio_file = self.ensure_audio_file(track_id, &url, cache_bytes).await?;
-        let features_result = analysis::analyze_file(track_id, &audio_file.path)
+        let audio_file = self
+            .ensure_audio_file(track_id, &url, cache_bytes, control)
+            .await?;
+        let features_result = analysis::analyze_file_controlled(track_id, &audio_file.path, control)
             .with_context(|| format!("analyze audio features for track {track_id}"));
         if audio_file.temporary {
             let _ = std::fs::remove_file(&audio_file.path);
         }
         let features = features_result?;
+        control.check("feature cache write")?;
         self.write_features(track_id, &features)?;
         Ok(serde_json::to_value(features)?)
     }
@@ -146,6 +153,7 @@ impl NativeAudioStore {
         track_id: i64,
         url: &str,
         cache_bytes: bool,
+        control: &analysis::AnalysisControl,
     ) -> Result<AudioFile> {
         if let Some(path) = self.cached_audio_path(track_id)? {
             return Ok(AudioFile {
@@ -157,11 +165,13 @@ impl NativeAudioStore {
             return Err(anyhow!("missing audio url for track {track_id}"));
         }
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
+        control.check("download start")?;
+        let response = await_cancellable(
+            control,
+            "download request",
+            self.client.get(url).send(),
+        )
+        .await
             .with_context(|| format!("download audio {url}"))?
             .error_for_status()
             .with_context(|| format!("download audio status {url}"))?;
@@ -177,7 +187,10 @@ impl NativeAudioStore {
 
         if cache_bytes {
             let tmp = path.with_extension(format!("{ext}.tmp"));
-            write_response_to_file(response, &tmp).await?;
+            if let Err(error) = write_response_to_file(response, &tmp, control).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(error);
+            }
             tokio::fs::rename(&tmp, &path)
                 .await
                 .with_context(|| format!("rename audio cache {}", path.display()))?;
@@ -190,7 +203,10 @@ impl NativeAudioStore {
             let tmp = self
                 .audio_dir
                 .join(format!("{track_id}.analysis.{ext}.tmp"));
-            write_response_to_file(response, &tmp).await?;
+            if let Err(error) = write_response_to_file(response, &tmp, control).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(error);
+            }
             Ok(AudioFile {
                 path: tmp,
                 temporary: true,
@@ -266,23 +282,49 @@ impl NativeAudioStore {
 
 }
 
-async fn write_response_to_file(mut response: reqwest::Response, path: &PathBuf) -> Result<()> {
+async fn write_response_to_file(
+    mut response: reqwest::Response,
+    path: &PathBuf,
+    control: &analysis::AnalysisControl,
+) -> Result<()> {
     let mut file = tokio::fs::File::create(path)
         .await
         .with_context(|| format!("create audio file {}", path.display()))?;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("read audio response chunk")?
-    {
-        file.write_all(&chunk)
+    loop {
+        let Some(chunk) = await_cancellable(control, "download body", response.chunk())
+            .await
+            .context("read audio response chunk")?
+        else {
+            break;
+        };
+        await_cancellable(control, "download write", file.write_all(&chunk))
             .await
             .with_context(|| format!("write audio file {}", path.display()))?;
     }
-    file.flush()
+    await_cancellable(control, "download flush", file.flush())
         .await
         .with_context(|| format!("flush audio file {}", path.display()))?;
     Ok(())
+}
+
+async fn await_cancellable<T, E: Into<anyhow::Error>>(
+    control: &analysis::AnalysisControl,
+    stage: &str,
+    future: impl Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    tokio::select! {
+        value = future => {
+            control.check(stage)?;
+            value.map_err(Into::into)
+        }
+        _ = wait_for_stop(control) => Err(anyhow!("audio feature analysis cancelled during {stage}")),
+    }
+}
+
+async fn wait_for_stop(control: &analysis::AnalysisControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn infer_ext_from_url(url: &str) -> Option<String> {

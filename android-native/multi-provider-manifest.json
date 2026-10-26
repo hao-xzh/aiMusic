@@ -1,0 +1,108 @@
+{
+  "manifest_version": 3,
+  "manifest_kind": "execution_control",
+  "scope_id": "android-multi-provider",
+  "objective": "仅Android实现网易云与QQ账号、混播、资料库录音去重、统一推荐和已关联歌单双向补齐；保留现有未提交工作。",
+  "canonical_execution_manifest": "android-native/multi-provider-manifest.json",
+  "work_queue_status": "blocked",
+  "items": [
+    {
+      "item_id": "FOUNDATION",
+      "title": "平台身份、持久化兼容与QQ协议取证",
+      "source_ref": "docs/development/multi-provider-development-plan.md#2-源码现状决定开发顺序",
+      "contract_ref": null,
+      "depends_on": [],
+      "phase": "implementation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "源码与集成构建完成；设备及真实账号完成条件统一保留在 ACCEPTANCE，尚未通过。",
+      "result_ref": "docs/development/multi-provider-development-plan.md#9-android-当前实现与验收状态",
+      "audit_ref": null,
+      "updated_at": "2026-09-14"
+    },
+    {
+      "item_id": "PROVIDERS",
+      "title": "Android双源账号、查询与写入适配",
+      "source_ref": "docs/development/multi-provider-development-plan.md#41-provider-是唯一平台接口边界",
+      "contract_ref": null,
+      "depends_on": [
+        "FOUNDATION"
+      ],
+      "phase": "implementation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "源码与集成构建完成；设备及真实账号完成条件统一保留在 ACCEPTANCE，尚未通过。",
+      "result_ref": "docs/development/multi-provider-development-plan.md#9-android-当前实现与验收状态",
+      "audit_ref": null,
+      "updated_at": "2026-09-14"
+    },
+    {
+      "item_id": "PLAYBACK",
+      "title": "混合播放、预热、缓存和恢复",
+      "source_ref": "docs/development/multi-provider-development-plan.md#5-分阶段实施每阶段都包含实际使用验收",
+      "contract_ref": null,
+      "depends_on": [
+        "PROVIDERS"
+      ],
+      "phase": "implementation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "源码与集成构建完成；设备及真实账号完成条件统一保留在 ACCEPTANCE，尚未通过。",
+      "result_ref": "docs/development/multi-provider-development-plan.md#9-android-当前实现与验收状态",
+      "audit_ref": null,
+      "updated_at": "2026-09-14"
+    },
+    {
+      "item_id": "LIBRARY_SYNC",
+      "title": "统一资料库、版本关联与歌单持久同步",
+      "source_ref": "docs/development/multi-provider-development-plan.md#3-锁定用户可见行为",
+      "contract_ref": null,
+      "depends_on": [
+        "PROVIDERS"
+      ],
+      "phase": "implementation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "源码与集成构建完成；设备及真实账号完成条件统一保留在 ACCEPTANCE，尚未通过。",
+      "result_ref": "docs/development/multi-provider-development-plan.md#9-android-当前实现与验收状态",
+      "audit_ref": null,
+      "updated_at": "2026-09-14"
+    },
+    {
+      "item_id": "RECOMMENDATION",
+      "title": "推荐与AI全链路来源兼容",
+      "source_ref": "docs/development/multi-provider-development-plan.md#34-推荐和-ai-使用统一身份",
+      "contract_ref": null,
+      "depends_on": [
+        "PLAYBACK",
+        "LIBRARY_SYNC"
+      ],
+      "phase": "implementation",
+      "status": "done",
+      "blocker": null,
+      "next_action": "源码与集成构建完成；设备及真实账号完成条件统一保留在 ACCEPTANCE，尚未通过。",
+      "result_ref": "docs/development/multi-provider-development-plan.md#9-android-当前实现与验收状态",
+      "audit_ref": null,
+      "updated_at": "2026-09-14"
+    },
+    {
+      "item_id": "ACCEPTANCE",
+      "title": "Android入口整合与受影响链路验收",
+      "source_ref": "docs/development/multi-provider-development-plan.md#6-验收矩阵覆盖正常失败和恢复",
+      "contract_ref": null,
+      "depends_on": [
+        "PLAYBACK",
+        "LIBRARY_SYNC",
+        "RECOMMENDATION"
+      ],
+      "phase": "validation",
+      "status": "blocked",
+      "blocker": "本轮没有已登录的指定 Android 验收会话与同步歌单。真实扫码、实播、写入读回、账号切换及断网恢复未验证。",
+      "next_action": "在应用内登录两家账号并指定 Android 验收环境与歌单后，按计划第9节进行实际路径验收。",
+      "result_ref": "docs/development/multi-provider-development-plan.md#9-android-当前实现与验收状态",
+      "audit_ref": null,
+      "updated_at": "2026-09-14"
+    }
+  ],
+  "updated_at": "2026-09-14"
+}

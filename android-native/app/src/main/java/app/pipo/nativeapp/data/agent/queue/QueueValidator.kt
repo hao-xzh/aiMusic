@@ -10,6 +10,7 @@ import app.pipo.nativeapp.data.agent.domain.QueueValidation
 import app.pipo.nativeapp.data.agent.domain.TrackRequirement
 import app.pipo.nativeapp.data.agent.normalize.CatalogConstraintMatcher
 import app.pipo.nativeapp.data.agent.normalize.CommandTextSignals
+import app.pipo.nativeapp.data.agent.resolve.ArtistResolver
 
 class QueueValidator(
     private val metadataForTrack: (NativeTrack) -> TrackConstraintMetadata = ConstraintScorer::pipoMetadata,
@@ -333,11 +334,11 @@ class QueueValidator(
 
     private fun artistMatchesAny(actualRaw: String, artistKeys: List<String>): Boolean {
         return actualRaw.split("/", "&", ",", "、")
-            .map { CommandTextSignals.normalizeForMatch(it) }
+            .map(ArtistResolver::identityKey)
             .filter { it.isNotBlank() }
             .any { actual ->
                 artistKeys.any { expected ->
-                    actual == CommandTextSignals.normalizeForMatch(expected)
+                    actual == ArtistResolver.identityKey(expected)
                 }
             }
     }

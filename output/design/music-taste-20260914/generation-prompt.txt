@@ -1,0 +1,36 @@
+Use case: ui-mockup.
+Create ONE exceptionally refined, production-believable mobile music taste profile UI for the existing Claudio / Pipo music app, in Simplified Chinese. This is a new design concept based on researched music products, NOT implementation. Output a flat edge-to-edge single screen, logical viewport 432 x 960, render at 1296 x 2880 or same aspect ratio. No device frame, no perspective, no presentation board, no surrounding labels, no collage of screens.
+
+DESIGN DIRECTION: "私人唱片档案" — a private record collection rendered with the precision and restraint of an independent music magazine. Strong asymmetric editorial typography, warm cover art, rich near-black blue-green background, exquisite fine rules and generous intentional spacing. The page should feel personal, musical, curated, and expensive. It must have a distinct recognizable layout, not a stack of generic rounded dashboard cards.
+
+INPUT IMAGE ROLE: the supplied colorful painterly vinyl-record music scene is an EXISTING APP ARTWORK, and the only required image asset. Incorporate this exact artwork into the upper hero: keep its painted musicians, turquoise record grooves and amber/pink sunset recognizable, not newly invented imagery. Use it as a full-bleed atmospheric background occupying roughly the top 300 logical pixels, subtly darken it and fade it into the nearly black page, with the art concentrated upper right and clean dark negative space at lower left for text. Do not replace with a generic concert, random artist photo, aurora, glass sphere, or glowing AI orb. Never copy Spotify/Apple/YouTube trademarks or UI.
+
+PALETTE: page #080F12; quiet surface #111C20; primary text #E9EFFF; secondary #94A4AA; accent mint #9BE3C6; supporting muted gold #D4B77A and misty blue #9BB7CF; subtle dividing lines white at 10%. The artwork is the only richly colored area. Matte surfaces; no heavy drop shadows; no neon glow. Chinese UI uses a crisp modern sans akin Noto Sans SC, with display weight 650 and elegant typographic scale. Use 24 logical pixel horizontal margins, 16-24 section gaps, comfortable 48px controls, no tiny illegible type.
+
+EXACT SCREEN CONTENT AND HIERARCHY, all text readable:
+1. Compact realistic Android-style status area at top, time "9:41", understated signal and battery icons, NO notch. Under it, a 48px navigation row with a thin back chevron left and "音乐口味" center in 17px medium white. No extra invented top-right action.
+2. Hero identity beneath nav. Small restrained eyebrow "你的音乐画像", then striking 34-36px left aligned two-line main title, exactly:
+"浪漫藏在"
+"律动之间"
+Very subtle mint detail alongside the eyebrow. Below the title one short muted sentence: "从对话、收藏与聆听，持续了解你". Then three understated outlined mood labels "温暖" "松弛" "律动". One quiet source line "来自 12 张歌单 · 368 首分析样本". The image melts into page background; no card border surrounding hero.
+3. Section "流派倾向", with tiny secondary label right "倾向强度". Under this heading, create a visually beautiful RECORD GROOVE DATA GRAPH at left, approx 140px diameter: THREE perfectly circular concentric open arcs, delicately rounded ends, line thickness 7px, fine faint background tracks, all start at twelve o'clock. Outer mint arc is 86% of its own circle, middle muted gold arc 72% of its own circle, inner misty blue arc 58% of its own circle. Each is an independent score, not slices of a pie. Center has a tiny spindle dot and faint decorative record grooves, no invented number. This should look like a precise sophisticated vinyl data instrument, NOT a generic health ring dashboard, no 3D. To the right align THREE clean editorial legend rows with tiny corresponding color swatches, genre left and large elegant numeric value right:
+"R&B" "86%"
+"Jazz" "72%"
+"Soul" "58%"
+Use subtle fine rules between legend rows. No big card enclosing this section.
+4. "常听艺人", then a visually elegant horizontal three-column typographic strip with very faint vertical dividers, no photographs or fabricated album covers. Each column has a tiny muted rank at top, name below, and a quiet affinity note:
+"01" / "方大同" / "亲和度 92"
+"02" / "陶喆" / "亲和度 86"
+"03" / "陈奕迅" / "亲和度 79"
+Chinese names 16px semibold; small ranks 11px.
+5. "你明确说过", then ONE restrained dark flat inset with 16px corners, fine mint-tinted left rule and no heavy shadow. Two compact rows separated with a faint line:
+first main text "偏爱 · R&B" with a right aligned low-emphasis text action "忘记"; source text below "对话 · 9/12 · 喜欢有律动的人声".
+second main text "尽量避开 · 重金属" with a right aligned action "忘记"; source below "对话 · 9/10 · 不太喜欢太吵的".
+Keep source labels subordinate but legible, actions have comfortable touch space.
+6. If content height permits, show a compact open section "最近的聆听" and one muted line "最近更常重听 R&B，偏爱温暖人声。". This continues down the scroll, never overlap the fixed navigation. Other existing content is below the fold and should NOT be crammed into the screen.
+7. Fixed bottom navigation about 64px plus Android gesture safe area, subtle top divider and matching matte dark background. Exactly TWO navigation destinations: simple house outline icon above "首页" at one-third, simple library outline icon above "资料库" at two-thirds. Both low emphasis, since this is a pushed detail page. No invented "口味" tab, no extra center action button, no mini music player. Thin Android gesture indicator at very bottom.
+
+Make the final composition feel designed as a whole: balance warm painterly top against precise mint record-groove dataviz; make the two-line Chinese identity statement the single dominant text anchor; align every baseline and margin with meticulous care. Negative space should be deliberate. Keep the entire screen clean, legible and feasible in native layouts. Do not add chat inputs, share actions, edit actions, percentage trend arrows, streaks, total listening hours, celebrity photographs, or unsupported new functions. All displayed profile examples are fictional UI demonstration values, do not add a demo watermark within the product UI.
+
+FINAL PRECISION EDIT (input: first generated image):
+Edit the supplied mobile UI design image with ONE very small correction. Preserve the entire artwork, composition, layout, all colors, record groove chart, every number, Chinese title, artists, preference rows, icons, bottom navigation, and output aspect ratio exactly as the supplied image. In the existing top navigation row that currently contains the back chevron, add the missing centered page label '音乐口味' in crisp Simplified Chinese, medium weight sans serif, around 17 logical px (~33 image pixels) in soft white, horizontally centered at the same vertical center as the existing back arrow. Keep the navigation label subdued and clearly separate from the larger hero title below. No new button. Do not resize the hero, move any lower content, or redesign anything else. Ensure the center artist remains correctly written '陶喆'. This is a precision text correction of an existing UI, not a new design. Deliver only the flat complete screen without a frame.

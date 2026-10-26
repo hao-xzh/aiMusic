@@ -1,0 +1,16 @@
+Make a precise alignment-only edit to this existing full mobile music taste UI. Preserve the rest of the image.
+
+PROBLEM: In the section titled "你明确说过", the now borderless two preference rows still have the old removed card's horizontal padding. Their left edge is indented relative to the section heading. The right-side "忘记" text and horizontal divider are also inset relative to the normal page right margin.
+
+REQUIRED CORRECTION:
+Use the LEFT EDGE OF THE HEADING "你明确说过" as the exact shared vertical alignment line. Move all FOUR text lines below to start at this same left edge:
+"偏爱 · R&B"
+"对话 · 9/12 · 喜欢有律动的人声"
+"尽量避开 · 重金属"
+"对话 · 9/10 · 不太喜欢太吵的"
+These four text lines must NOT be indented at all. Their first glyph must line up precisely with the first glyph of "你明确说过" and with the first glyph of the next heading "最近的聆听".
+Extend the existing single thin divider between the two records to start exactly at this same left margin and end at the normal page right margin.
+Move each "忘记" action to end exactly at the normal page right margin, matching the right edge used by the percentage column above. Keep action baselines aligned with each corresponding main preference line.
+Retain the existing font sizes, font weights, line heights, two-row order and ALL vertical positions. Do not make the rows into cards. No borders except the one subtle divider between rows, no colored stripe, no new background panel, no icons.
+
+Everything outside this one preference section MUST stay identical: full top artwork, status bar, back arrow, page title, hero text, mood tags, source counts, record chart, genre values, artists, recent listening section, bottom navigation and image dimensions. Do not crop or move any section. Deliver the whole single flat mobile screen. The edit is solely to remove leftover horizontal card padding and enforce the shared page alignment.

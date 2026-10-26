@@ -3,7 +3,6 @@ package app.pipo.nativeapp.ui
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.progressSemantics
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -20,15 +19,22 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.LayoutDirection
 import app.pipo.nativeapp.playback.PlayerViewModel
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
@@ -130,19 +136,27 @@ internal fun BrowseMiniPlayerContents(player: PlayerViewModel, onQueue: () -> Un
             }
             IconButton(onClick = onQueue, modifier = Modifier.semantics { contentDescription = "播放队列" }) { ListIcon(ink, Modifier.size(26.dp)) }
         }
-        val progress = if (state.durationMs > 0) (player.positionMs.toFloat() / state.durationMs).coerceIn(0f, 1f) else 0f
+        // 位置只由绘制和无障碍节点读取，不让整条 mini player 随进度重新组合、测量。
+        val progress = {
+            if (state.durationMs > 0) (player.positionMs.toFloat() / state.durationMs).coerceIn(0f, 1f) else 0f
+        }
         Box(
             Modifier.padding(start = 12.dp, end = 12.dp, bottom = 7.dp)
                 .fillMaxWidth().height(2.dp)
                 .clip(RoundedCornerShape(1.dp))
                 .background(ink.copy(alpha = 0.16f))
-                .progressSemantics(progress),
-        ) {
-            Box(
-                Modifier.fillMaxWidth(progress).fillMaxHeight()
-                    .clip(RoundedCornerShape(1.dp))
-                    .background(ink),
-            )
-        }
+                .drawBehind {
+                    val filledWidth = size.width * progress()
+                    drawRoundRect(
+                        color = ink,
+                        topLeft = Offset(if (layoutDirection == LayoutDirection.Rtl) size.width - filledWidth else 0f, 0f),
+                        size = Size(filledWidth, size.height),
+                        cornerRadius = CornerRadius(1.dp.toPx()),
+                    )
+                }
+                .semantics(mergeDescendants = true) {
+                    progressBarRangeInfo = ProgressBarRangeInfo(progress(), 0f..1f)
+                },
+        )
     }
 }

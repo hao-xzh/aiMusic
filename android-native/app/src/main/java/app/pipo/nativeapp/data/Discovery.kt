@@ -87,6 +87,12 @@ class Discovery(
 fun interface ContinuousQueueSource {
     suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack>
 
+    /** 可持久的 AI 续播约束；普通发现流不携带该状态。 */
+    fun snapshot(): AiQueueContinuationSnapshot? = null
+
+    /** Already ranked additions to this batch; no I/O. The player dedupes against its live queue. */
+    fun pendingTracks(): List<NativeTrack> = emptyList()
+
     /** 是否自动追加推荐；关闭时可单曲循环或播完停止，用户仍可手动开启续播。 */
     fun startsAutomatically(): Boolean = true
 
@@ -106,8 +112,11 @@ class GuardedContinuousQueueSource(
     private val fetcher: suspend (Set<Long>) -> List<NativeTrack>,
     private val startAutomatically: Boolean = true,
     private val repeatCurrentTrack: Boolean = false,
+    private val continuationSnapshot: AiQueueContinuationSnapshot? = null,
 ) : ContinuousQueueSource {
     override suspend fun fetchMore(excludeIds: Set<Long>): List<NativeTrack> = fetcher(excludeIds)
+
+    override fun snapshot(): AiQueueContinuationSnapshot? = continuationSnapshot
 
     override fun startsAutomatically(): Boolean = startAutomatically
 

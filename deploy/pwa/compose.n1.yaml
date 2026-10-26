@@ -1,0 +1,29 @@
+services:
+  pipo:
+    image: node:22-alpine
+    container_name: pipo-pwa-lan
+    network_mode: host
+    user: "1000:1000"
+    restart: unless-stopped
+    cpus: 1.5
+    mem_limit: 768m
+    command: ["node", "/app/server.js"]
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      HOSTNAME: 192.168.1.168
+      PORT: "4331"
+      NODE_OPTIONS: --max-old-space-size=384
+      TOKIO_WORKER_THREADS: "2"
+      UV_THREADPOOL_SIZE: "2"
+      PIPO_PWA_DATA_DIR: /data
+      PIPO_PWA_BRIDGE_BIN: /app/bin/pipo_pwa_bridge
+      PIPO_PWA_PUBLIC_ORIGIN: http://192.168.1.168:4331
+    volumes:
+      - /mnt/mmcblk2p4/pipo/releases/n1-20260912/app:/app:ro
+      - /mnt/mmcblk2p4/pipo/data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "2"

@@ -37,17 +37,19 @@ internal class BrowseSession(context: android.content.Context) {
     var librarySort by mutableStateOf("最近更新")
     var tab by mutableStateOf(BrowseTab.Home)
     var playlist by mutableStateOf<PipoPlaylist?>(null)
+    var unifiedPlaylistId by mutableStateOf<String?>(null)
     var cloud by mutableStateOf(false)
     var detailRevision by mutableStateOf(0)
     fun select(value: BrowseTab) { tab = value; if (value != BrowseTab.Library) closeSearch(); closeDetail() }
     fun openSearch() { select(BrowseTab.Library); librarySearchScroll = LazyListState(); searchOpen = true; searchFocusPending = true }
     fun closeSearch() { searchOpen = false; searchFocusPending = false }
-    fun closeDetail() { playlist = null; cloud = false; detailQuery = ""; detailScroll = LazyListState() }
+    fun closeDetail() { playlist = null; unifiedPlaylistId = null; cloud = false; detailQuery = ""; detailScroll = LazyListState() }
 }
 
 @Composable
 internal fun BrowseHost(session: BrowseSession, model: BrowseViewModel, player: PlayerViewModel, onAccount: () -> Unit, onLogin: () -> Unit, onPlayer: () -> Unit, onAi: () -> Unit, onCreateVisibility: (Boolean) -> Unit) {
     val repository = PipoGraph.repository
+    val musicCatalog = PipoGraph.music
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, model) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -58,6 +60,14 @@ internal fun BrowseHost(session: BrowseSession, model: BrowseViewModel, player: 
     }
     LaunchedEffect(session.tab) {
         if (session.tab == BrowseTab.Home) model.ensureHome()
+        if (session.tab == BrowseTab.Library) {
+            try {
+                musicCatalog.library.refresh()
+                PipoGraph.distillCoordinator.ensureMixed()
+            }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { }
+        }
     }
     LaunchedEffect(model.accountId) {
         if (session.accountId != model.accountId) {
@@ -68,11 +78,42 @@ internal fun BrowseHost(session: BrowseSession, model: BrowseViewModel, player: 
     val playlists by repository.playlists.collectAsState(initial = emptyList())
     val account by repository.account.collectAsState(initial = null)
     val cloudTracks by repository.cloudTracks.collectAsState(initial = emptyList())
+    val qqConnection by musicCatalog.qqTransport.connection.collectAsState()
+    val netEaseConnection by musicCatalog.provider(MusicProviders.NETEASE).connection.collectAsState()
+    val accountsReady by musicCatalog.accountsReady.collectAsState()
+    LaunchedEffect(accountsReady, netEaseConnection.account?.id, qqConnection.account?.id) {
+        PipoGraph.distillCoordinator.ensureMixed()
+    }
+    val unifiedLibrary by musicCatalog.library.state.collectAsState()
     val detailPlaylist = playlists.firstOrNull { it.id == session.playlist?.id } ?: session.playlist
+    val detailUnifiedPlaylistId = session.unifiedPlaylistId ?: detailPlaylist?.let { legacy ->
+        unifiedLibrary.playlists.firstOrNull { unified ->
+            unified.bindings.any { binding ->
+                binding.providerId == MusicProviders.NETEASE && binding.remoteId == legacy.id.toString()
+            }
+        }?.id
+    }
     var create by remember { mutableStateOf(false) }
+    var createUnified by remember { mutableStateOf(false) }
+    var bindUnified by remember { mutableStateOf(false) }
     var actionTrack by remember { mutableStateOf<NativeTrack?>(null) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    var manualLibraryRefreshing by remember { mutableStateOf(false) }
+    val refreshUnified: () -> Unit = {
+        if (!manualLibraryRefreshing) {
+            manualLibraryRefreshing = true
+            scope.launch {
+                try {
+                    musicCatalog.library.refresh()
+                    PipoGraph.distillCoordinator.ensureMixed(force = true)
+                }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (_: Exception) { snackbar.showSnackbar("暂时无法刷新，请稍后重试。") }
+                finally { manualLibraryRefreshing = false }
+            }
+        }
+    }
     val play: (List<NativeTrack>) -> Unit = { tracks ->
         if (tracks.isNotEmpty()) {
             val result = player.playBrowseQueue(
@@ -86,11 +127,13 @@ internal fun BrowseHost(session: BrowseSession, model: BrowseViewModel, player: 
     LaunchedEffect(create) { onCreateVisibility(create) }
     DisposableEffect(Unit) { onDispose { onCreateVisibility(false) } }
     Box(Modifier.fillMaxSize()) {
-        if (session.playlist != null || session.cloud) {
+        if (session.unifiedPlaylistId != null) {
+            UnifiedPlaylistDetail(unifiedLibrary.playlists.firstOrNull { it.id == session.unifiedPlaylistId }, unifiedLibrary, player.state.currentTrackId, session::closeDetail, play, { actionTrack = it })
+        } else if (session.playlist != null || session.cloud) {
             PlaylistBrowseDetail(session, detailPlaylist, session.cloud, session.detailRevision, player.state.currentTrackId, session::closeDetail, play, { actionTrack = it })
         } else when (session.tab) {
             BrowseTab.Home -> HomeBrowseScreen(session, model, playlists, account != null, onAccount, session::openSearch, { session.select(BrowseTab.Library) }, { session.playlist = it; session.tab = BrowseTab.Library }, { session.cloud = true; session.tab = BrowseTab.Library }, onLogin, play, { actionTrack = it })
-            BrowseTab.Library -> LibraryBrowseScreen(session, model, playlists, account != null, cloudTracks.size, onAccount, session::openSearch, { session.playlist = it }, { session.cloud = true }, { create = true }, onLogin, play, { actionTrack = it }, onAi)
+            BrowseTab.Library -> LibraryBrowseScreen(session, model, account != null, qqConnection.account != null, cloudTracks.size, unifiedLibrary, manualLibraryRefreshing, onAccount, session::openSearch, { session.cloud = true }, { create = true }, { session.unifiedPlaylistId = it }, { createUnified = true }, { bindUnified = true }, refreshUnified, onLogin, play, { actionTrack = it }, onAi)
         }
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
     }
@@ -100,8 +143,10 @@ internal fun BrowseHost(session: BrowseSession, model: BrowseViewModel, player: 
         session.tab = BrowseTab.Library
         model.refreshLibrary()
     })
+    if (createUnified) CreateUnifiedPlaylistSheet(onDismiss = { createUnified = false }, onCreated = refreshUnified)
+    if (bindUnified) BindUnifiedPlaylistSheet(onDismiss = { bindUnified = false }, onBound = refreshUnified)
     actionTrack?.let { track ->
-        TrackActionsSheet(track, detailPlaylist, player, { actionTrack = null }, { session.detailRevision++; model.refreshLibrary() },
+        TrackActionsSheet(track, detailUnifiedPlaylistId, player, { actionTrack = null }, { session.detailRevision++ },
             onNotInterested = if (session.tab == BrowseTab.Home && session.playlist == null && !session.cloud) {
                 { model.dismissRecommendation(track) }
             } else null,

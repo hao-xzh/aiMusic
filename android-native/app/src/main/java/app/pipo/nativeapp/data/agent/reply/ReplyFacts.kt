@@ -1,7 +1,8 @@
 package app.pipo.nativeapp.data.agent.reply
 
-import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.NativeTrack
+import app.pipo.nativeapp.data.PetMemory
+import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
 import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
 import app.pipo.nativeapp.data.agent.domain.PlannedAction
@@ -38,6 +39,9 @@ data class ReplyFacts(
     val errorMessage: String = "",
     val resultMessage: String = "",
     val successShownByCard: Boolean = false,
+    val conversation: PetMemory.ConversationContext = PetMemory.ConversationContext(),
+    val currentTrackBeforeAction: NativeTrack? = null,
+    val earlierReplies: List<String> = emptyList(),
 )
 
 object ReplyFactsBuilder {
@@ -64,7 +68,11 @@ object ReplyFactsBuilder {
         val changedTracks = firstResult?.tracks.orEmpty().ifEmpty {
             firstResult?.insertedTrack?.let(::listOf).orEmpty()
         }
-        val responseTracks = if (actionType == "insert_next") changedTracks else queue.ifEmpty { changedTracks }
+        val responseTracks = if (actionType == "insert_next" || actionType == "like") {
+            changedTracks
+        } else {
+            queue.ifEmpty { changedTracks }
+        }
         val firstTrack = responseTracks.firstOrNull()
         val summary = firstResult?.committedQueueSummary
         val requiredArtist = primaryGoal?.primaryArtists

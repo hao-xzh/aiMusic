@@ -116,6 +116,11 @@ class AgentLedgerStore(context: Context) {
         return true
     }
 
+    @Synchronized
+    fun clearListeningRequest() {
+        prefs.edit().remove(KEY_ACTIVE_LISTENING_REQUEST).apply()
+    }
+
     data class LedgerEntry(
         val turnId: String,
         val userText: String,

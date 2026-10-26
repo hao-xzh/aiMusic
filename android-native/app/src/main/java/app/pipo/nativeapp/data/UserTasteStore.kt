@@ -1,6 +1,7 @@
 package app.pipo.nativeapp.data
 
 import android.content.Context
+import app.pipo.nativeapp.data.agent.resolve.ArtistResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,11 +24,60 @@ data class UserTasteSnapshot(
     val profile: TasteProfile?, val behavior: BehaviorPreferenceSnapshot,
     val explicit: List<ExplicitTaste>, val libraryArtists: List<String>, val libraryCount: Int,
 ) {
+    fun preferredArtists(limit: Int = 6): List<String> {
+        val disliked = explicit.asSequence()
+            .filter { it.dimension == "artist" && !it.liked }
+            .map { ArtistResolver.identityKey(it.value) }
+            .filter { it.isNotBlank() }
+            .toSet()
+        val preferred = LinkedHashMap<String, String>()
+        fun add(artist: String) {
+            val key = ArtistResolver.identityKey(artist)
+            if (key.isNotBlank() && key !in disliked) {
+                preferred.putIfAbsent(key, ArtistResolver(emptyList()).resolve(artist).canonical)
+            }
+        }
+        explicit.asReversed()
+            .filter { it.dimension == "artist" && it.liked }
+            .forEach { add(it.value) }
+        profile?.topArtists
+            ?.filter { it.affinity > 0 }
+            ?.sortedByDescending { it.affinity }
+            ?.forEach { add(it.name) }
+        return preferred.values.take(limit.coerceAtLeast(0))
+    }
+
+    fun artistAffinity(track: NativeTrack): Double {
+        val artists = track.artist.split('/', '&', ',', '、')
+            .map(ArtistResolver::identityKey)
+            .filter { it.isNotBlank() }
+        if (artists.isEmpty()) return 0.0
+        val disliked = explicit.asSequence()
+            .filter { it.dimension == "artist" && !it.liked }
+            .map { ArtistResolver.identityKey(it.value) }
+            .toSet()
+        if (artists.any { it in disliked }) return 0.0
+        val liked = explicit.asSequence()
+            .filter { it.dimension == "artist" && it.liked }
+            .map { ArtistResolver.identityKey(it.value) }
+            .toSet()
+        if (artists.any { it in liked }) return 1.0
+        val profileAffinity = HashMap<String, Double>()
+        profile?.topArtists?.forEach {
+            val key = ArtistResolver.identityKey(it.name)
+            if (key.isNotBlank()) {
+                profileAffinity[key] = maxOf(profileAffinity[key] ?: 0.0, it.affinity.toDouble().coerceIn(0.0, 1.0))
+            }
+        }
+        return artists.maxOfOrNull { profileAffinity[it] ?: 0.0 } ?: 0.0
+    }
+
     fun context(): JSONObject = JSONObject()
-        .put("usage", "背景偏好，仅用于当前要求允许的选择空间；本次明确要求优先。近期情绪不能升级为长期偏好。")
+        .put("usage", "当前风格内继续参考画像和艺人偏好；本次明确要求优先。artists来自长期喜好与画像；library_artists只表示库内已有歌手，不代表喜欢。近期情绪不能升级为长期偏好。")
         .put("playlist_profile", profile?.summary.orEmpty().take(650))
         .put("genres", JSONArray(profile?.genres.orEmpty().map { it.tag }))
-        .put("artists", JSONArray((profile?.topArtists.orEmpty().map { it.name } + libraryArtists).distinct().take(12)))
+        .put("artists", JSONArray(preferredArtists(12)))
+        .put("library_artists", JSONArray(libraryArtists))
         .put("recent_listening", behavior.brief().orEmpty())
         .put("explicit_preferences", JSONArray(explicit.takeLast(12).map {
             JSONObject().put("dimension", it.dimension).put("value", it.value)
@@ -45,7 +95,10 @@ data class UserTasteSnapshot(
                 "category" -> if (FunctionalMusicFilter.isReligious(track.title, track.artist)) listOf("宗教音乐", "佛教音乐") else emptyList()
                 else -> emptyList()
             }
-            values.any { canonical(it) == canonical(fact.value) }
+            values.any {
+                if (fact.dimension == "artist") ArtistResolver.identityKey(it) == ArtistResolver.identityKey(fact.value)
+                else canonical(it) == canonical(fact.value)
+            }
         }
         if (matching.any { !it.liked }) return -1.0
         return if (matching.any { it.liked }) 1.0 else 0.0
@@ -67,12 +120,14 @@ class UserTasteStore(context: Context) {
     val explicit = mutable.asStateFlow()
 
     suspend fun context(): JSONObject {
+        PipoGraph.distillCoordinator.ensureMixed()
         val behavior = withTimeoutOrNull(2_000L) { PipoGraph.behaviorPreference.current() } ?: BehaviorPreferenceSnapshot.Empty
         val library = PipoGraph.library.peek()
         return UserTasteSnapshot(PipoGraph.tasteProfileStore.flow.value, behavior, explicit.value, artists(library), library.size).context()
     }
 
     suspend fun snapshot(libraryTracks: List<NativeTrack>? = null): UserTasteSnapshot {
+        PipoGraph.distillCoordinator.ensureMixed()
         val library = libraryTracks ?: PipoGraph.library.library()
         return UserTasteSnapshot(PipoGraph.tasteProfileStore.flow.value, PipoGraph.behaviorPreference.current(),
             explicit.value, artists(library), library.size)

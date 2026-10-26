@@ -8,6 +8,7 @@ import app.pipo.nativeapp.data.NativeTrack
 import app.pipo.nativeapp.data.PetMemory
 import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.PipoPlaylist
+import app.pipo.nativeapp.data.PipoGraph
 import app.pipo.nativeapp.data.PipoRepository
 import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
 import app.pipo.nativeapp.data.agent.domain.AgentTurnInput
@@ -38,6 +39,7 @@ import app.pipo.nativeapp.data.agent.queue.AgentQueuePlanner
 import app.pipo.nativeapp.data.agent.reply.ReplyGrounder
 import app.pipo.nativeapp.data.agent.reply.PersonaReplyPrompt
 import app.pipo.nativeapp.data.agent.resolve.MusicResolver
+import app.pipo.nativeapp.data.agent.resolve.ArtistResolver
 import app.pipo.nativeapp.data.agent.resolve.PlaylistResolver
 import app.pipo.nativeapp.data.agent.resolve.ResolutionResult
 import app.pipo.nativeapp.data.agent.task.isRetryOnlyRequest
@@ -265,10 +267,10 @@ class AgentToolLoop(
 【用户在设置中选定的性格】
 当前是「${persona.label}」：${persona.description}。
 表达方式：${PersonaReplyPrompt.actionVoice(persona).guidance}
+聊天方式：${PersonaReplyPrompt.CONVERSATION_GUIDANCE}
 音乐点评：${PersonaReplyPrompt.MUSIC_COMMENTARY_GUIDANCE}
 普通聊天、澄清和 final_response 都遵循此性格，并结合用户当前话语及已有对话接着说。
-像日常聊天一样自然回应；不强行调侃、撒娇或共情，不套用“替你省心”“交给音乐”“今天辛苦了”等广告式关怀，不猜用户没有表达的心情。
-按内容决定长短，简单回应一两句即可；不用每次汇报曲目、数量或操作清单。真实行动结果仍须遵守上面的工具事实规则。
+长短随当下话题和性格决定，不设固定表达步骤。真实行动结果仍须遵守上面的工具事实规则。
 """.trimIndent()
 
     /** 只保留错误类型/HTTP 状态，避免把 provider 返回体中的 prompt 或敏感字段写入日志。 */
@@ -299,9 +301,13 @@ class AgentToolLoop(
         AgentTurnExecutionException(
             retryable = reason !in setOf("turn_budget_exhausted", "max_steps_exhausted", "no_progress") &&
                 !state.musicSearchUnavailable && state.lastProviderFailureRetryable,
-            reason = if (state.musicSearchUnavailable) "音乐搜索服务暂时不可用，请稍后再试。"
-                else listOf(reason, state.lastProviderError.takeIf { reason == "aiChatTools_failed" }.orEmpty())
-                    .filter { it.isNotBlank() }.joinToString(":"),
+            reason = when {
+                state.musicSearchUnavailable -> "音乐搜索服务暂时不可用，请稍后再试。"
+                reason in setOf("no_progress", "max_steps_exhausted") && state.lastSelectionFailure != null ->
+                    "selection_failed:${state.lastSelectionFailure}"
+                else -> listOf(reason, state.lastProviderError.takeIf { reason == "aiChatTools_failed" }.orEmpty())
+                    .filter { it.isNotBlank() }.joinToString(":")
+            },
         )
 
     /**
@@ -406,7 +412,7 @@ class AgentToolLoop(
         val pending = state.plannedActions.values.filterNot { it.id in state.finishedActions }
         val pendingNote = pending.takeIf { it.isNotEmpty() }
             ?.joinToString("、", prefix = "尚未完成：", postfix = "。") { it.description }.orEmpty()
-        val reply = listOf(composeReply(committed, input.persona), state.finalNote, pendingNote)
+        val reply = listOf(composeReply(committed, input), state.finalNote, pendingNote)
             .filter(String::isNotBlank).distinct().joinToString(" ")
         val combinedPlan = MusicTurnPlan(
             turnId = state.turnId,
@@ -460,7 +466,7 @@ class AgentToolLoop(
      */
     private suspend fun composeReply(
         committed: List<LoopState.Committed>,
-        persona: PetPersona,
+        input: AgentTurnInput,
     ): String {
         // 纯聊天 / 澄清（final_response 单条）：直接用文本。
         if (committed.size == 1) {
@@ -469,6 +475,11 @@ class AgentToolLoop(
         }
         // 其余每个真实动作（含收藏/跳过/改歌单）都过 ReplyGrounder → 人格 LLM 文案 + ReplyVerifier
         // 校验，按执行顺序拼接；成功卡片允许没有额外文字。
+        val conversation = PetMemory.ConversationContext(
+            summary = input.historySummary,
+            turns = input.history.takeLast(10),
+            musicReferences = input.musicReferences.take(5),
+        )
         val parts = ArrayList<String>()
         for (c in committed) {
             if (c.result.type == "say" || c.result.type == "clarify") continue
@@ -487,8 +498,11 @@ class AgentToolLoop(
                 continue
             }
             parts.add(replyGrounder.ground(
-                c.plan, c.validation, listOf(c.result), persona,
+                c.plan, c.validation, listOf(c.result), input.persona,
                 successShownByCard = cardFor(c.result)?.ok == true,
+                conversation = conversation,
+                currentTrackBeforeAction = input.currentTrack,
+                earlierReplies = parts.filter(String::isNotBlank),
             ))
         }
         return parts.filter { it.isNotBlank() }.joinToString(" ")
@@ -800,10 +814,10 @@ class AgentToolLoop(
         }
         if (state.musicSearchUnavailable) return musicSearchUnavailable(state, "search_tracks", query)
         val tracks = try {
-            repository.searchTracks(query, limit)
+            PipoGraph.music.searchCandidates(query, limit)
         } catch (error: CancellationException) {
             throw error
-        } catch (error: MusicSearchException) {
+        } catch (error: Exception) {
             return musicSearchUnavailable(state, "search_tracks", query)
         }
         state.trace("search_tracks:$query:${tracks.size}")
@@ -892,6 +906,7 @@ class AgentToolLoop(
         state.queuePlan = queuePlan.actions.joinToString(",") { describeAction(it) }
         state.trace("draft_queue:$draftId:${play?.tracks?.size ?: 0}:${queuePlan.validation.passed}")
         val valid = play != null && play.tracks.isNotEmpty() && queuePlan.validation.passed
+        state.lastSelectionFailure = if (valid) null else selectionFailureMessage(queuePlan.validation.messages)
         // 单一播放请求在 draft 校验通过后直接提交，省掉“只为调用 commit_queue”的第二次
         // LLM。多动作由模型把 more_actions_pending=true 传进来，仍会继续工具循环。
         val moreActionsPending = args.optBoolean("more_actions_pending", false) ||
@@ -916,6 +931,7 @@ class AgentToolLoop(
             .put("mode", play?.mode?.name.orEmpty())
             .put("validationPassed", queuePlan.validation.passed)
             .put("validation", JSONArray(queuePlan.validation.messages))
+            .put("selectionFailure", state.lastSelectionFailure ?: JSONObject.NULL)
             .put("trackTotal", play?.tracks?.size ?: 0)
             .put("tracks", play?.tracks.orEmpty().take(15).toTrackArray(state))
             .put("requiresModelReview", requiresModelReview)
@@ -924,6 +940,19 @@ class AgentToolLoop(
                     "不合适时搜索符合条件的具体歌手/歌曲，重新选择真实key；确认后用 commit_queue 提交。"
             } else JSONObject.NULL)
             .put("error", if (play == null || play.tracks.isEmpty()) "empty_draft_queue" else JSONObject.NULL)
+    }
+
+    private fun selectionFailureMessage(messages: List<String>): String? {
+        val missingArtists = messages.filter { it.startsWith("strict_artist_coverage_missing:") }
+            .flatMap { it.substringAfter(':').split('|') }.filter(String::isNotBlank).distinct()
+        if (missingArtists.isNotEmpty()) {
+            return "这次还没找到" + missingArtists.joinToString("、") +
+                "符合本轮条件的歌曲，新歌单尚未播放。可以补充这些歌手的一首代表作，帮助确认歌曲和歌手。"
+        }
+        if (messages.any { it.startsWith("hard_genre_unknown:") || it.startsWith("hard_language_unknown:") }) {
+            return "部分歌曲的风格或语言资料不足，暂时无法满足逐首确认的要求，本次新歌单尚未播放。"
+        }
+        return null
     }
 
     private fun hasMusicSelectionSignal(action: PlannedAction.PlayRequest): Boolean {
@@ -1088,6 +1117,14 @@ class AgentToolLoop(
                 .put("error", error)
                 .put("message", message)
         }
+        val rejectedTracks = resolver.rejectedRecommendationTracks(contractAction, input.userText, tracks)
+        if (rejectedTracks.isNotEmpty()) {
+            state.lastSelectionFailure = "还有歌曲未通过本轮风格、语言或排除条件，或缺少风格资料：" +
+                rejectedTracks.take(3).joinToString("、") { "${it.artist}《${it.title}》" } + "。本次新歌单尚未播放。"
+            return JSONObject().put("ok", false).put("error", "recommendation_selection_mismatch")
+                .put("rejected_tracks", JSONArray(rejectedTracks.map { "${it.artist} - ${it.title}" }))
+                .put("message", "这些候选未通过本轮风格、语言或排除条件，或尚无足够风格资料。请保留本轮条件，只替换不符合的曲目；不能因画像排序或最近听过而拒绝有效歌曲，也不能为凑数量放宽要求。")
+        }
         val continuous = directCommitContinuousSource(contractAction, input.copy(currentTrack = tracks.first()))
         val action = PlannedAction.PlayTracks(
             actionId = "commit",
@@ -1183,15 +1220,18 @@ class AgentToolLoop(
                 .put("message", "用户要求《${requestedCloser.title}》最后播放。insert_next 会保留旧后续队列，使收尾后仍有旧歌。请用 replace_queue、preserve_current=true 提交用户指定的完整后续顺序，并传 closer 和 continuation_mode=disabled；不要把旧队列再次追加进去，已完成的播放不要重做。")
         }
         if (!validation.passed) {
+            state.lastSelectionFailure = selectionFailureMessage(validation.messages)
             return JSONObject()
                 .put("ok", false)
                 .put("error", "queue_validation_failed")
                 .put("validation", JSONArray(validation.messages))
-                .put("repairHint", "Use search_tracks/get_playlist_tracks/draft_queue again, then commit a different draft.")
+                .put("selectionFailure", state.lastSelectionFailure ?: JSONObject.NULL)
+                .put("repairHint", "Preserve the accepted tracks and current constraints. Search only for missing artists or replace rejected tracks. If an artist cannot be identified or required evidence is unavailable, explain that specific gap with final_response instead of repeating the entire draft.")
         }
         if (play.tracks.isEmpty()) {
             return JSONObject().put("ok", false).put("error", "empty_tracks")
         }
+        state.lastSelectionFailure = null
         val result = when (play.mode) {
             PlayMode.ReplaceQueue, PlayMode.PlayNow -> executor.playQueue(
                 actionId = play.actionId,
@@ -1710,14 +1750,25 @@ class AgentToolLoop(
         val groupImplied = opening != null || (!targetNamedByUser && semantics.playableSignal) ||
             Regex("(?:一些|几首|一组|一点|的歌)(?:曲)?").containsMatchIn(groupText) && !targetNamedByUser
         val requestedGenres = stringArray(args, "genres")
-        val requestedLanguages = stringArray(args, "languages")
+        val explicitLanguages = semantics.languages
+        val languageIsExplicitForThisRequest = explicitLanguages.isNotEmpty() ||
+            explicitlyPreservesPreviousLanguage(groupText) ||
+            explicitlyContinuesPreviousStyle(groupText, semantics.wantsCurrentStyle)
+        // 风格/情绪/场景是新的选歌范围时，不能因为模型读到中文对话、画像、当前曲或旧队列
+        // 就把语言缩窄。只有本轮点明语言，或原话明确在延续上一轮风格时才接收该字段。
+        val requestedLanguages = explicitLanguages.ifEmpty {
+            stringArray(args, "languages").takeIf { languageIsExplicitForThisRequest }.orEmpty()
+        }
         val strictSemantics = args.optBoolean("strict_semantics", false) ||
             Regex("只(?:想|要)?(?:听|放)|只要|只能|必须|全(?:部|都)|全(?:听|放|是)|每(?:一)?首|严格").containsMatchIn(groupText)
         val suppliedStyle = styleFromArgs(args.optJSONObject("style") ?: args.optJSONObject("styleProfile"), args.optString("query"))
         val style = suppliedStyle.copy(
             energy = suppliedStyle.energy.takeUnless { it == "any" }.orEmpty().ifBlank { if (groupImplied) semantics.energy else "any" },
             genres = suppliedStyle.genres.ifEmpty { requestedGenres }.ifEmpty { if (groupImplied) semantics.genres else emptyList() },
-            languages = suppliedStyle.languages.ifEmpty { requestedLanguages }.ifEmpty { if (groupImplied) semantics.languages else emptyList() },
+            languages = explicitLanguages.ifEmpty {
+                suppliedStyle.languages.takeIf { languageIsExplicitForThisRequest }.orEmpty()
+                    .ifEmpty { requestedLanguages }
+            },
             moods = suppliedStyle.moods.ifEmpty { if (groupImplied) semantics.moods else emptyList() },
             scenes = suppliedStyle.scenes.ifEmpty { if (groupImplied) semantics.scenes else emptyList() },
             semanticQuery = if (opening != null) {
@@ -1729,6 +1780,8 @@ class AgentToolLoop(
         )
         val artists = stringArray(args, "artists").ifEmpty { stringArray(args, "primary_artists") }
             .filterNot { artist -> opening?.artist == artist && !groupText.contains(artist) }
+            .map { ArtistResolver(emptyList()).resolve(it).canonical }
+            .distinctBy(CommandTextSignals::normalizeForMatch)
         val requestedMode = selectionMode(
             args.optString("intent_mode").ifBlank { args.optString("selection_mode") },
         )
@@ -1746,8 +1799,10 @@ class AgentToolLoop(
             ArtistScope.Strict,
         )
         val effectiveArtistScope = if (artists.isNotEmpty()) {
-            if (args.has("artist_scope") || args.has("artistScope")) requestedArtistScope
-            else CommandTextSignals.explicitArtistScope(userText) ?: ArtistScope.Strict
+            // 点名歌手与“这些歌手的 R&B 风格歌曲”都不授权混入别的歌手。
+            // 只有原话明确要求类似/混合，或明确延续当前上下文时才采用扩展范围。
+            CommandTextSignals.explicitArtistScope(userText)
+                ?: if (mode == MusicSelectionMode.ContextualContinuation) requestedArtistScope else ArtistScope.Strict
         } else {
             requestedArtistScope
         }
@@ -1785,7 +1840,9 @@ class AgentToolLoop(
                     else -> ContinuationMode.SameIntent
                 },
             ),
-            includeArtists = stringArray(args, "include_artists").ifEmpty { stringArray(args, "includeArtists") },
+            includeArtists = stringArray(args, "include_artists").ifEmpty { stringArray(args, "includeArtists") }
+                .map { ArtistResolver(emptyList()).resolve(it).canonical }
+                .distinctBy(CommandTextSignals::normalizeForMatch),
         )
     }
 
@@ -1822,6 +1879,22 @@ class AgentToolLoop(
             transitionStyle = obj.optString("transitionStyle").ifBlank { obj.optString("transition_style") }.ifBlank { "soft" },
             exploration = obj.optString("exploration").ifBlank { "balanced" },
         )
+    }
+
+    private fun explicitlyPreservesPreviousLanguage(text: String): Boolean =
+        Regex(
+            "(?:保留|保持|沿用|延续|继续|仍按|仍然按|还是按).{0,16}(?:刚才|上次|之前|前面|上一轮|原来).{0,16}" +
+                "(?:语言|语种|中文|英文|粤语|国语|普通话|英语|日语|韩语)|" +
+                "(?:刚才|上次|之前|前面|上一轮|原来).{0,16}(?:语言|语种|中文|英文|粤语|国语|普通话|英语|日语|韩语)" +
+                ".{0,16}(?:保留|保持|沿用|延续|继续)",
+        ).containsMatchIn(text)
+
+    private fun explicitlyContinuesPreviousStyle(text: String, wantsCurrentStyle: Boolean): Boolean {
+        if (wantsCurrentStyle) return true
+        val key = CommandTextSignals.normalizeCommandText(text)
+        return Regex(
+            "^(?:再|再来|再调|调得再)(?:安静|舒缓|放松|轻柔|温柔|治愈|慢|快|嗨|燃|伤感).{0,3}一点(?:的歌|音乐)?[。!！?？]*$",
+        ).containsMatchIn(key)
     }
 
     private fun playMode(raw: String, fallback: PlayMode): PlayMode =
@@ -2377,6 +2450,7 @@ class AgentToolLoop(
         var resolution: String = ""
         var queuePlan: String = ""
         var lastProviderError: String = ""
+        var lastSelectionFailure: String? = null
         var lastProviderFailureRetryable: Boolean = true
         var lastLlmStopReason: String = "aiChatTools_failed"
         var toolResponseTokenLimit: Int = TOOL_RESPONSE_TOKENS
@@ -2533,7 +2607,7 @@ class AgentToolLoop(
 - 纯偏好陈述（如“I always like jazz”“我一直喜欢爵士”）只作为记忆，不起草或提交队列。用户出现实际选歌、推荐或调整当前听歌要求时，仍按完整语义和已有草稿校验正常执行。
 
 【口味与当前需求】
-- user_taste 是统一口味库，区分用户明确长期偏好、歌单画像、近期行为。只在当前需求允许的空间内用于召回与排序；当前点名歌曲/歌手、风格、语言、场景、排除项始终优先。不要因用户平时爱R&B而把这次明确的摇滚换成R&B。
+- user_taste 是统一口味库，区分用户明确长期偏好、歌单画像、近期行为。风格确定选择范围，画像继续决定范围内优先选谁、什么作品；用户只说R&B、爵士或摇滚也必须参考画像，不能退化成泛风格热门搜索。优先从画像中寻找符合本轮风格的歌手/作品，再补充接近的发现；不能把画像歌手变成必选名单，不能由画像推断本轮语言。当前点名歌曲/歌手、风格、语言、场景、排除项始终优先。不要因用户平时爱R&B而把这次明确的摇滚换成R&B。
 - 普通“安静、舒缓、放松”描述音量感、能量和编曲密度，不等于宗教、佛教、大悲咒、助眠流水线、白噪音或纯音乐。保留既有语言/人声要求，选真实适合的歌曲。只有用户明确请求相应类别才可选择；宗教题材不能从口味库或模型联想擅自引入。
 - 不把本次临时情绪写成稳定偏好；用户当前明确要尝试平时不喜欢的风格时照本次要求执行。
 
@@ -2545,11 +2619,13 @@ class AgentToolLoop(
 - “来一些安静中文歌，第一首要易烊千玺的粉雾海”是整组推荐加首曲约束：intent_mode=open_recommendation、operation=replace_queue、first_track={title:粉雾海,artist:易烊千玺}、count默认12，并完整传中文/安静条件。首曲歌手不能限定整组；不能只交付这一首。R&B等风格请求也默认是一组，只有用户明确要一首时才count=1。
 - draft_queue 校验后，单动作可自动提交；返回 autoCommitted=true 不要再提交。requiresModelReview=true 的整组首曲草稿尚未播放，需要核对后续曲目的语言、风格、情绪，再用 draft_id commit_queue；不符时重新搜索真实候选选择。多动作草稿带 more_actions_pending=true；不要拿未校验的搜索结果冒充草稿。
 - 单句或多轮要求A和B都要有，artists必须完整，两位必须在队列中出现。默认 Strict，缺一位应继续搜或说明缺口。只有用户明确以某人为主混其他歌手才 Focus，明确类似某人风格才 Similar。
+- “听A、B他们的R&B风格歌曲”仍是这些歌手范围内选R&B，不能只因出现“风格”就用Similar；“类似A、B的感觉”才允许其它歌手。使用真实正式艺人名解析昵称，无法确定的人名不得猜测替换。多歌手草稿缺人时只补缺少者并保留已有合格结果；资料不足或姓名无法确认时在final_response说明具体缺口，不重复整组搜索至耗尽。
 - “再加C，后续也有/把B去掉/剩下改风格”是在更新持续听歌要求，不是临时插一首。读取 active_listening_request，合并或删除歌手与当前要求，完整传新的 artists、style、排除项，使用 replace_queue；要保留当前歌曲就 preserve_current=true。这会同时替换未来队列并更新自动续播源。不要继承上轮的 operation。
 - 临时“下一首插C”才 insert_next，不改变持续听歌范围。
 - 指定一首歌默认 continuation_mode=single_loop；“只播这首”也只循环这首。推荐一组歌使用 same_intent，按本轮音乐要求继续补歌；整组请求的 count 只控制首批数量。用户明确“播一次、播完停止、不要循环、不要续播”或指定最后收尾曲时使用 disabled，播完当前队列停止。单曲之后还安排了下一首时使用 disabled，让后续歌曲正常播放；后续明确要求推荐或继续补歌时切回 same_intent。
 - 风格/情绪/语言/场景放 query/style/genres/languages/moods/scenes，不能当作歌手。明确不要的内容放 exclude_terms/style.avoid_tags，绝不能同时作为正向条件。风格转换仍保留用户明确继续要求的排除条件。
-- 结构化标签优先使用稳定值：R&B=rnb、爵士=jazz；中文=zh、英文=en；女声放 style.vocal_types=[female]，男声=male。不要说唱/现场版用 avoid_tags=[rap,live]。用户给的是偏好时不要额外添加未要求的硬性排除；“安静一点”保留已有风格、人声、语言和排除，只调整 energy=low。
+- 新的风格、情绪或场景点歌只按当前句明确的选择范围执行。本轮未说明语言时，languages 和 style.languages 必须留空，让中文、英文等语言都可入选；不能按中文对话、用户画像、当前歌曲或上一轮自动补语言，也不强制任何语言比例。只有用户明确说中文、英文、粤语等，或原话明确在延续上一轮风格（如“再安静一点”“继续刚才那种”“类似当前”）时，才传已有语言。
+- 结构化标签优先使用稳定值：R&B=rnb、爵士=jazz；中文=zh、英文=en；女声放 style.vocal_types=[female]，男声=male。不要说唱/现场版用 avoid_tags=[rap,live]。用户给的是偏好时不要额外添加未要求的硬性排除；“安静一点”只调整 energy=low，只有明确要求延续时才保留上一轮语言等条件。
 - 普通“听R&B/中文歌”使用风格与语言偏好召回排序，strict_semantics=false。只有用户明确“必须/只听/全部”等硬要求或延续此前硬要求时才true；若观察到hard_*_unknown，说明歌曲资料不全，不能说成网络或AI配置错误，也不能声称已逐首验证。
 - 必含歌曲用 must_include[{title,artist}]，末曲用 closer{title,artist}；严格保留歌手版本和最后位置。专辑/原声需 catalog={name,aliases,search_queries}，aliases为可核验的album名称；没归属证据不能提交。
 - 同时指定当前曲、下一首、收尾曲时，优先一个有序队列提交并传 closer；多次 insert_next 会反向叠放，不能用最后一次 insert_next 表示队尾。只调整队尾时保留当前、替换完整未来顺序。
@@ -2561,7 +2637,7 @@ class AgentToolLoop(
 - 播放已有歌单先 list_playlists/get_playlist_tracks，再 draft或commit。不存在的歌单不能悄悄新建。
 - 明确新建歌单且给出名称和歌曲清单，调用 create_playlist_from_tracks；当前正在播放时，“用这首 / this song 创建歌单”可引用该真实 currentTrack。缺名称/清单就澄清。不要把歌单名称或风格当歌曲，也不要补用户没点的歌。
 - 收藏当前曲用 like_current；具名曲用 like_track。改已有歌单当前曲用 modify_playlist_current。skip_current 只做无具名目标的跳过，不能代替播放指定曲。
-- 用户说“这首歌我也喜欢”等明确喜欢当前歌曲的自然表达，可以用 like_current。只有用户明确要求取消收藏时才用 like=false；“不要收藏”不能执行收藏或取消收藏。
+- 用户说“我喜欢这首”“这首歌我也喜欢”等明确喜欢当前歌曲的自然表达，应调用 like_current 完成收藏，再根据真实结果接话；不能只点评、反问喜欢哪里或要求听完而漏掉收藏。具名歌曲的喜欢用 like_track；一般风格偏好仍只作为记忆。只有用户明确要求取消收藏时才用 like=false；“不要收藏”不能执行收藏或取消收藏。
 - 用户本轮仅说“重试一下”等重试表达，且 favorite_retry_data.available=false 时，说明没有可恢复的精确失败收藏记录。请用户明确歌曲，不从聊天回复推测目标，不改用 like_current 收藏现在的新歌，也不能声称已重试成功。
 - 纠错时参考最近真实执行事实与当前队列；历史助手的成功宣称不能当作真实结果。
 - “我要听原唱的/我要听这个版本”是播放请求：先从当前曲/最近具名曲确定目标，再用真实key提交播放；即使当前已是所要版本，也不要仅用 final_response 解释正在播放。target_title/first_track.title 复制实际候选的完整标题，包括版本后缀；未指定版本时可选原歌手可用版本并展示其真实标题，不能把翻唱歌手冒充原唱。只有单个播放动作时不需要 plan_actions。

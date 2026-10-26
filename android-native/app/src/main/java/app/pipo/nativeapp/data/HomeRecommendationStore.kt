@@ -18,21 +18,17 @@ class HomeRecommendationStore(context: Context) {
     )
     private val directory = context.applicationContext.filesDir
     private val mutex = Mutex()
-    private fun file(userId: Long?) = AtomicFile(File(directory, "home-recommendations-${userId ?: "guest"}.json"))
+    private fun file(accountKey: String) = AtomicFile(File(directory, "home-recommendations-${java.net.URLEncoder.encode(accountKey, "UTF-8")}.json"))
 
-    suspend fun load(userId: Long?): Snapshot = mutex.withLock {
+    suspend fun load(accountKey: String): Snapshot = mutex.withLock {
         withContext(Dispatchers.IO) {
             runCatching {
-                val json = JSONObject(file(userId).openRead().bufferedReader().use { it.readText() })
-                if (json.optInt("discoveryPolicyVersion") != 3) return@runCatching Snapshot()
+                val json = JSONObject(file(accountKey).openRead().bufferedReader().use { it.readText() })
+                if (json.optInt("discoveryPolicyVersion") != 4) return@runCatching Snapshot()
                 val array = json.optJSONArray("tracks") ?: JSONArray()
                 val tracks = (0 until array.length()).mapNotNull { index ->
                     val item = array.optJSONObject(index) ?: return@mapNotNull null
-                    val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    NativeTrack(id = id, neteaseId = item.optLong("neteaseId").takeIf { it > 0 },
-                        title = item.optString("title"), artist = item.optString("artist"), album = item.optString("album"),
-                        streamUrl = "", artworkUrl = item.optString("artworkUrl").takeIf { it.isNotBlank() },
-                        durationMs = item.optLong("durationMs"))
+                    NativeTrackJson.decode(item)
                 }
                 Snapshot(tracks.filterNot { FunctionalMusicFilter.isReligious(it) },
                     json.optString("message"), json.optString("refreshDay"), json.optString("caption"))
@@ -40,17 +36,15 @@ class HomeRecommendationStore(context: Context) {
         }
     }
 
-    suspend fun save(userId: Long?, snapshot: Snapshot) = mutex.withLock {
+    suspend fun save(accountKey: String, snapshot: Snapshot) = mutex.withLock {
         withContext(Dispatchers.IO) {
             val tracks = JSONArray()
             snapshot.tracks.takeLast(200).forEach { track ->
-                tracks.put(JSONObject().put("id", track.id).put("neteaseId", track.neteaseId)
-                    .put("title", track.title).put("artist", track.artist).put("album", track.album)
-                    .put("artworkUrl", track.artworkUrl).put("durationMs", track.durationMs))
+                tracks.put(NativeTrackJson.encode(track))
             }
-            val bytes = JSONObject().put("discoveryPolicyVersion", 3).put("tracks", tracks).put("message", snapshot.message)
+            val bytes = JSONObject().put("discoveryPolicyVersion", 4).put("tracks", tracks).put("message", snapshot.message)
                 .put("refreshDay", snapshot.refreshDay).put("caption", snapshot.caption).toString().toByteArray()
-            val target = file(userId)
+            val target = file(accountKey)
             val stream = target.startWrite()
             try { stream.write(bytes); target.finishWrite(stream) }
             catch (error: Exception) { target.failWrite(stream); throw error }

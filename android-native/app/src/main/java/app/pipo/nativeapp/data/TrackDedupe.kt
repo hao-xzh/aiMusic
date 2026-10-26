@@ -41,6 +41,14 @@ object TrackDedupe {
         add(songKey(t))
         idKey(t)?.let { add(it) }
         t.neteaseId?.let { add("netease:$it") }
+        sourceKeys(t).forEach { add("source:$it") }
+        t.recordingId?.takeIf { it.isNotBlank() }?.let { add("recording:$it") }
+    }
+
+    /** Opaque source references remain case-sensitive, including QQ media IDs. */
+    fun sourceKeys(t: NativeTrack): Set<String> = linkedSetOf<String>().apply {
+        t.sourceKey.takeIf { it.isNotBlank() }?.let(::add)
+        t.alternateSources.forEach { add(it.key) }
     }
 
     fun idKey(t: NativeTrack): String? =

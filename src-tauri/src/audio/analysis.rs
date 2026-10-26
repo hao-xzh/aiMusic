@@ -20,6 +20,11 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,6 +36,42 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 const TARGET_SR: u32 = 22050;
+
+/// 取消只影响已经过期的分析任务；未取消时不会改变任何采样或 DSP 路径。
+#[derive(Clone)]
+pub struct AnalysisControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl AnalysisControl {
+    pub fn new(cancelled: Arc<AtomicBool>, max_work: Duration) -> Self {
+        Self {
+            cancelled,
+            deadline: Instant::now().checked_add(max_work),
+        }
+    }
+
+    pub fn unbounded() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: None,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+            || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn check(&self, stage: &str) -> Result<()> {
+        if self.is_cancelled() {
+            Err(anyhow!("audio feature analysis cancelled during {stage}"))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,7 +130,16 @@ pub struct Acoustics {
 ///
 /// `path` 不需要符合特定扩展名；Symphonia 用 magic bytes + 扩展名混合 hint。
 pub fn analyze_file(track_id: i64, path: &Path) -> Result<Acoustics> {
-    let samples = decode_to_mono(path)?;
+    analyze_file_controlled(track_id, path, &AnalysisControl::unbounded())
+}
+
+pub fn analyze_file_controlled(
+    track_id: i64,
+    path: &Path,
+    control: &AnalysisControl,
+) -> Result<Acoustics> {
+    control.check("decode")?;
+    let samples = decode_to_mono(path, control)?;
     if samples.len() < TARGET_SR as usize * 8 {
         return Err(anyhow!(
             "audio too short: {} samples ({}s)",
@@ -99,30 +149,35 @@ pub fn analyze_file(track_id: i64, path: &Path) -> Result<Acoustics> {
     }
 
     let duration_s = samples.len() as f32 / TARGET_SR as f32;
-    let (rms_db, peak_db) = rms_and_peak_db(&samples);
+    let (rms_db, peak_db) = rms_and_peak_db(&samples, control)?;
 
     let intro_window = (TARGET_SR as usize * 8).min(samples.len());
     let intro_energy = rms_lin(&samples[..intro_window]);
     let outro_start = samples.len().saturating_sub(TARGET_SR as usize * 8);
     let outro_energy = rms_lin(&samples[outro_start..]);
 
-    let lowband = lowpass(&samples, TARGET_SR as f32, 200.0);
+    let lowband = lowpass(&samples, TARGET_SR as f32, 200.0, control)?;
+    let vocal_highpass = biquad_filter(
+        &samples,
+        TARGET_SR as f32,
+        BiquadKind::Highpass,
+        250.0,
+        0.707,
+        control,
+    )?;
     let vocal_band = biquad_filter(
-        &biquad_filter(
-            &samples,
-            TARGET_SR as f32,
-            BiquadKind::Highpass,
-            250.0,
-            0.707,
-        ),
+        &vocal_highpass,
         TARGET_SR as f32,
         BiquadKind::Lowpass,
         3500.0,
         0.707,
-    );
-    let energy_per_sec = rms_per_second(&samples, TARGET_SR);
-    let low_energy_per_sec = rms_per_second(&lowband, TARGET_SR);
-    let vocal_energy_per_sec = rms_per_second(&vocal_band, TARGET_SR);
+        control,
+    )?;
+    drop(vocal_highpass);
+    let energy_per_sec = rms_per_second(&samples, TARGET_SR, control)?;
+    let low_energy_per_sec = rms_per_second(&lowband, TARGET_SR, control)?;
+    let vocal_energy_per_sec = rms_per_second(&vocal_band, TARGET_SR, control)?;
+    control.check("dsp vocal probability")?;
     let vocal_per_sec =
         compute_vocal_prob(&energy_per_sec, &vocal_energy_per_sec, &low_energy_per_sec);
     let total_sec = energy_per_sec.len();
@@ -133,11 +188,11 @@ pub fn analyze_file(track_id: i64, path: &Path) -> Result<Acoustics> {
     let drum_entry_s = detect_drum_entry(&low_energy_per_sec);
     let vocal_entry_s = detect_vocal_entry(&vocal_per_sec);
     let outro_start_s = detect_outro_start(&vocal_per_sec, total_sec);
-    let (bpm, bpm_conf, first_beat_s) = detect_bpm(&lowband);
+    let (bpm, bpm_conf, first_beat_s) = detect_bpm(&lowband, control)?;
 
-    let spectral_centroid_hz = spectral_centroid(&samples, TARGET_SR);
-    let (tonal_key, tonal_confidence) = estimate_tonal_key(&samples, TARGET_SR);
-    let (head_silence_s, tail_silence_s) = silence_boundaries(&samples, TARGET_SR);
+    let spectral_centroid_hz = spectral_centroid(&samples, TARGET_SR, control)?;
+    let (tonal_key, tonal_confidence) = estimate_tonal_key(&samples, TARGET_SR, control)?;
+    let (head_silence_s, tail_silence_s) = silence_boundaries(&samples, TARGET_SR, control)?;
 
     Ok(Acoustics {
         track_id,
@@ -170,10 +225,14 @@ pub fn analyze_file(track_id: i64, path: &Path) -> Result<Acoustics> {
 ///
 /// 50ms 是兼容大多数 fade-in / pre-roll 的精度；阈值 -50 dBFS 比纯 0 检测更宽松，
 /// 能处理"几乎不可闻的电平噪声"那种"看起来是静音但有底噪"的情况。
-fn silence_boundaries(samples: &[f32], sr: u32) -> (f32, f32) {
+fn silence_boundaries(
+    samples: &[f32],
+    sr: u32,
+    control: &AnalysisControl,
+) -> Result<(f32, f32)> {
     let frame_size = (sr as f32 * 0.05) as usize;
     if frame_size == 0 || samples.len() < frame_size {
-        return (0.0, 0.0);
+        return Ok((0.0, 0.0));
     }
     let frame_count = samples.len() / frame_size;
     let frame_dur = frame_size as f32 / sr as f32;
@@ -192,6 +251,9 @@ fn silence_boundaries(samples: &[f32], sr: u32) -> (f32, f32) {
 
     let mut head_frames = 0usize;
     for i in 0..frame_count {
+        if i % 64 == 0 {
+            control.check("dsp silence boundaries")?;
+        }
         if frame_rms(i) > threshold_lin {
             break;
         }
@@ -199,6 +261,9 @@ fn silence_boundaries(samples: &[f32], sr: u32) -> (f32, f32) {
     }
     let mut tail_frames = 0usize;
     for i in (0..frame_count).rev() {
+        if i % 64 == 0 {
+            control.check("dsp silence boundaries")?;
+        }
         if frame_rms(i) > threshold_lin {
             break;
         }
@@ -207,10 +272,10 @@ fn silence_boundaries(samples: &[f32], sr: u32) -> (f32, f32) {
             break; // 整曲静默 —— 不可能但防御
         }
     }
-    (
+    Ok((
         head_frames as f32 * frame_dur,
         tail_frames as f32 * frame_dur,
-    )
+    ))
 }
 
 // ---------- 解码 ----------
@@ -218,7 +283,7 @@ fn silence_boundaries(samples: &[f32], sr: u32) -> (f32, f32) {
 /// Symphonia 解码 → 单声道 Float32，重采样到 22050 Hz。
 ///
 /// 简化版：用线性插值重采样（够分析用，不做 anti-aliasing 滤镜）。
-fn decode_to_mono(path: &Path) -> Result<Vec<f32>> {
+fn decode_to_mono(path: &Path, control: &AnalysisControl) -> Result<Vec<f32>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -254,6 +319,7 @@ fn decode_to_mono(path: &Path) -> Result<Vec<f32>> {
     let mut mono: Vec<f32> = Vec::new();
 
     loop {
+        control.check("decode packets")?;
         let packet = match format.next_packet() {
             Ok(p) => p,
             // EOF / 末尾的 reset 算正常结束
@@ -280,7 +346,7 @@ fn decode_to_mono(path: &Path) -> Result<Vec<f32>> {
     if src_sr == TARGET_SR {
         Ok(mono)
     } else {
-        Ok(resample_linear(&mono, src_sr, TARGET_SR))
+        resample_linear(&mono, src_sr, TARGET_SR, control)
     }
 }
 
@@ -320,14 +386,22 @@ fn mix_with_conv<S: symphonia::core::sample::Sample + Copy>(
 }
 
 /// 线性插值重采样 —— 不做 anti-aliasing。仅用于分析，听感无所谓。
-fn resample_linear(input: &[f32], src_sr: u32, dst_sr: u32) -> Vec<f32> {
+fn resample_linear(
+    input: &[f32],
+    src_sr: u32,
+    dst_sr: u32,
+    control: &AnalysisControl,
+) -> Result<Vec<f32>> {
     if input.is_empty() || src_sr == dst_sr {
-        return input.to_vec();
+        return Ok(input.to_vec());
     }
     let ratio = src_sr as f64 / dst_sr as f64;
     let dst_len = ((input.len() as f64) / ratio).floor() as usize;
     let mut out = Vec::with_capacity(dst_len);
     for i in 0..dst_len {
+        if i % 16_384 == 0 {
+            control.check("resample")?;
+        }
         let pos = i as f64 * ratio;
         let idx = pos.floor() as usize;
         let frac = (pos - idx as f64) as f32;
@@ -339,7 +413,7 @@ fn resample_linear(input: &[f32], src_sr: u32, dst_sr: u32) -> Vec<f32> {
         };
         out.push(a + (b - a) * frac);
     }
-    out
+    Ok(out)
 }
 
 // ---------- 算法 ----------
@@ -355,13 +429,16 @@ fn rms_lin(samples: &[f32]) -> f32 {
     (sum / samples.len() as f64).sqrt() as f32
 }
 
-fn rms_and_peak_db(samples: &[f32]) -> (f32, f32) {
+fn rms_and_peak_db(samples: &[f32], control: &AnalysisControl) -> Result<(f32, f32)> {
     if samples.is_empty() {
-        return (-100.0, -100.0);
+        return Ok((-100.0, -100.0));
     }
     let mut sum_sq = 0.0f64;
     let mut peak = 0.0f32;
-    for &s in samples {
+    for (i, &s) in samples.iter().enumerate() {
+        if i % 16_384 == 0 {
+            control.check("dsp loudness")?;
+        }
         sum_sq += (s as f64) * (s as f64);
         let a = s.abs();
         if a > peak {
@@ -379,21 +456,24 @@ fn rms_and_peak_db(samples: &[f32]) -> (f32, f32) {
     } else {
         -100.0
     };
-    (rms_db, peak_db)
+    Ok((rms_db, peak_db))
 }
 
 /// 一阶 RC 低通 —— 简单够用。fc 是截止频率（Hz）。
-fn lowpass(input: &[f32], sr: f32, fc: f32) -> Vec<f32> {
+fn lowpass(input: &[f32], sr: f32, fc: f32, control: &AnalysisControl) -> Result<Vec<f32>> {
     let dt = 1.0 / sr;
     let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
     let alpha = dt / (rc + dt);
     let mut out = Vec::with_capacity(input.len());
     let mut prev = 0.0;
-    for &x in input {
+    for (i, &x) in input.iter().enumerate() {
+        if i % 16_384 == 0 {
+            control.check("dsp lowpass")?;
+        }
         prev = prev + alpha * (x - prev);
         out.push(prev);
     }
-    out
+    Ok(out)
 }
 
 enum BiquadKind {
@@ -401,7 +481,14 @@ enum BiquadKind {
     Highpass,
 }
 
-fn biquad_filter(input: &[f32], sr: f32, kind: BiquadKind, fc: f32, q: f32) -> Vec<f32> {
+fn biquad_filter(
+    input: &[f32],
+    sr: f32,
+    kind: BiquadKind,
+    fc: f32,
+    q: f32,
+    control: &AnalysisControl,
+) -> Result<Vec<f32>> {
     let w0 = std::f32::consts::TAU * fc / sr;
     let cosw = w0.cos();
     let sinw = w0.sin();
@@ -423,7 +510,10 @@ fn biquad_filter(input: &[f32], sr: f32, kind: BiquadKind, fc: f32, q: f32) -> V
     let a2 = (1.0 - alpha) / a0;
     let mut out = Vec::with_capacity(input.len());
     let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for &x0 in input {
+    for (i, &x0) in input.iter().enumerate() {
+        if i % 16_384 == 0 {
+            control.check("dsp biquad")?;
+        }
         let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
         out.push(y0);
         x2 = x1;
@@ -431,19 +521,20 @@ fn biquad_filter(input: &[f32], sr: f32, kind: BiquadKind, fc: f32, q: f32) -> V
         y2 = y1;
         y1 = y0;
     }
-    out
+    Ok(out)
 }
 
-fn rms_per_second(samples: &[f32], sr: u32) -> Vec<f32> {
+fn rms_per_second(samples: &[f32], sr: u32, control: &AnalysisControl) -> Result<Vec<f32>> {
     let sr = sr as usize;
     let total_sec = samples.len() / sr;
     let mut out = Vec::with_capacity(total_sec);
     for s in 0..total_sec {
+        control.check("dsp energy")?;
         let start = s * sr;
         let end = start + sr;
         out.push(rms_lin(&samples[start..end]));
     }
-    out
+    Ok(out)
 }
 
 fn compute_vocal_prob(total: &[f32], vocal: &[f32], low: &[f32]) -> Vec<f32> {
@@ -552,17 +643,23 @@ fn detect_outro_start(vocal_per_sec: &[f32], total_sec: usize) -> Option<f32> {
 /// BPM 检测：能量包络（hop=256, ~86 fps）→ 高通去 DC → 自相关在 60-200 BPM 找峰。
 ///
 /// 返回 (bpm, confidence)。confidence 是主峰高度归一化到 0..1，0.3 以上算可信。
-fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32, Option<f32>) {
+fn detect_bpm(
+    lowband: &[f32],
+    control: &AnalysisControl,
+) -> Result<(Option<f32>, f32, Option<f32>)> {
     const HOP: usize = 256;
     let frame_count = lowband.len() / HOP;
     if frame_count < 64 {
-        return (None, 0.0, None);
+        return Ok((None, 0.0, None));
     }
     let frame_rate = TARGET_SR as f32 / HOP as f32; // ~86 Hz
 
     // 帧能量
     let mut env: Vec<f32> = Vec::with_capacity(frame_count);
     for i in 0..frame_count {
+        if i % 64 == 0 {
+            control.check("dsp bpm envelope")?;
+        }
         let start = i * HOP;
         let end = start + HOP;
         let mut e = 0.0f32;
@@ -576,6 +673,9 @@ fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32, Option<f32>) {
     let mut onset: Vec<f32> = Vec::with_capacity(env.len());
     onset.push(0.0);
     for i in 1..env.len() {
+        if i % 64 == 0 {
+            control.check("dsp bpm onset")?;
+        }
         let d = env[i] - env[i - 1];
         onset.push(d.max(0.0));
     }
@@ -590,17 +690,21 @@ fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32, Option<f32>) {
     let lag_max = (frame_rate * 60.0 / 60.0).ceil() as usize; // 60 BPM
     let lag_max = lag_max.min(env.len() / 2);
     if lag_min >= lag_max {
-        return (None, 0.0, None);
+        return Ok((None, 0.0, None));
     }
 
     // 自相关系数 r(lag)
     let mut best_lag = 0usize;
     let mut best_val = f32::NEG_INFINITY;
     let mut energy0 = 0.0f32;
-    for &v in &onset {
+    for (i, &v) in onset.iter().enumerate() {
+        if i % 64 == 0 {
+            control.check("dsp bpm energy")?;
+        }
         energy0 += v * v;
     }
     for lag in lag_min..=lag_max {
+        control.check("dsp bpm correlation")?;
         let mut sum = 0.0f32;
         for i in 0..(onset.len() - lag) {
             sum += onset[i] * onset[i + lag];
@@ -611,12 +715,12 @@ fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32, Option<f32>) {
         }
     }
     if best_lag == 0 || energy0 < 1e-9 {
-        return (None, 0.0, None);
+        return Ok((None, 0.0, None));
     }
     let bpm = 60.0 * frame_rate / best_lag as f32;
     let confidence = (best_val / energy0).clamp(0.0, 1.0);
     if confidence < 0.05 {
-        return (None, confidence, None);
+        return Ok((None, confidence, None));
     }
     let search_end = (frame_rate * 6.0).floor() as usize;
     let mut peak_i = 0usize;
@@ -627,15 +731,15 @@ fn detect_bpm(lowband: &[f32]) -> (Option<f32>, f32, Option<f32>) {
             peak_v = v;
         }
     }
-    (Some(bpm), confidence, Some(peak_i as f32 / frame_rate))
+    Ok((Some(bpm), confidence, Some(peak_i as f32 / frame_rate)))
 }
 
 /// 谱重心：取曲中中段的 N 帧 FFT，频率加权均值。
 /// 不做 hann 窗也行 —— 我们要的是粗略亮度，不是 mastering 级精度。
-fn spectral_centroid(samples: &[f32], sr: u32) -> f32 {
+fn spectral_centroid(samples: &[f32], sr: u32, control: &AnalysisControl) -> Result<f32> {
     const FFT_SIZE: usize = 2048;
     if samples.len() < FFT_SIZE * 4 {
-        return 0.0;
+        return Ok(0.0);
     }
     // 取曲子中间 1/3 区域采样，避免开头静音 / 结尾 outro 拉偏
     let mid = samples.len() / 2;
@@ -646,9 +750,10 @@ fn spectral_centroid(samples: &[f32], sr: u32) -> f32 {
     let mut acc_den = 0.0f64;
     let frames = (win_end - win_start) / FFT_SIZE;
     for f in 0..frames {
+        control.check("dsp spectral centroid")?;
         let start = win_start + f * FFT_SIZE;
         let frame = &samples[start..start + FFT_SIZE];
-        let bins = fft_mag_dft(frame);
+        let bins = fft_mag_dft(frame, control)?;
         let bin_hz = sr as f32 / FFT_SIZE as f32;
         for (i, &mag) in bins.iter().enumerate().skip(1) {
             let hz = (i as f32) * bin_hz;
@@ -657,29 +762,34 @@ fn spectral_centroid(samples: &[f32], sr: u32) -> f32 {
         }
     }
     if acc_den > 1e-9 {
-        (acc_num / acc_den) as f32
+        Ok((acc_num / acc_den) as f32)
     } else {
-        0.0
+        Ok(0.0)
     }
 }
 
-fn estimate_tonal_key(samples: &[f32], sr: u32) -> (Option<i32>, f32) {
+fn estimate_tonal_key(
+    samples: &[f32],
+    sr: u32,
+    control: &AnalysisControl,
+) -> Result<(Option<i32>, f32)> {
     const FFT_SIZE: usize = 2048;
     if samples.len() < FFT_SIZE * 8 {
-        return (None, 0.0);
+        return Ok((None, 0.0));
     }
     let start = samples.len() / 4;
     let end = (samples.len() * 3 / 4).min(samples.len());
     let frames_available = (end - start) / FFT_SIZE;
     if frames_available == 0 {
-        return (None, 0.0);
+        return Ok((None, 0.0));
     }
     let step = (frames_available / 12).max(1);
     let mut chroma = [0.0f64; 12];
     let mut used = 0usize;
     for f in (0..frames_available).step_by(step).take(16) {
+        control.check("dsp tonal key")?;
         let frame_start = start + f * FFT_SIZE;
-        let bins = fft_mag_dft(&samples[frame_start..frame_start + FFT_SIZE]);
+        let bins = fft_mag_dft(&samples[frame_start..frame_start + FFT_SIZE], control)?;
         let bin_hz = sr as f32 / FFT_SIZE as f32;
         for (i, &mag) in bins.iter().enumerate().skip(5) {
             let hz = i as f32 * bin_hz;
@@ -695,11 +805,11 @@ fn estimate_tonal_key(samples: &[f32], sr: u32) -> (Option<i32>, f32) {
         used += 1;
     }
     if used == 0 {
-        return (None, 0.0);
+        return Ok((None, 0.0));
     }
     let total: f64 = chroma.iter().sum();
     if total <= 1e-9 {
-        return (None, 0.0);
+        return Ok((None, 0.0));
     }
     let mut indexed: Vec<(usize, f64)> = chroma.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -707,20 +817,23 @@ fn estimate_tonal_key(samples: &[f32], sr: u32) -> (Option<i32>, f32) {
     let second = indexed.get(1).map(|(_, v)| *v).unwrap_or(0.0);
     let confidence = ((best.1 - second) / total).clamp(0.0, 1.0) as f32;
     if confidence < 0.015 {
-        (None, confidence)
+        Ok((None, confidence))
     } else {
-        (Some(best.0 as i32), confidence)
+        Ok((Some(best.0 as i32), confidence))
     }
 }
 
 /// 朴素 DFT，FFT_SIZE=2048 时 ~4M 乘加，调用一次开销 ~10-20ms。
 /// 对几帧合适；要对全曲做才换 rustfft。
-fn fft_mag_dft(input: &[f32]) -> Vec<f32> {
+fn fft_mag_dft(input: &[f32], control: &AnalysisControl) -> Result<Vec<f32>> {
     let n = input.len();
     let half = n / 2;
     let mut out = Vec::with_capacity(half);
     let two_pi = std::f32::consts::TAU;
     for k in 0..half {
+        if k % 16 == 0 {
+            control.check("dsp fft")?;
+        }
         let mut re = 0.0f32;
         let mut im = 0.0f32;
         let coef = two_pi * (k as f32) / (n as f32);
@@ -731,5 +844,5 @@ fn fft_mag_dft(input: &[f32]) -> Vec<f32> {
         }
         out.push((re * re + im * im).sqrt());
     }
-    out
+    Ok(out)
 }

@@ -119,7 +119,7 @@ internal fun PlayerExpansionSurface(
                 }
             } else if (!isLandscape && (canCollapse || (!expanded && progress.value > 0.001f))) {
                 val controlEdges = useCoverEdgeColors(artworkUrl)
-                val controlColor = pickFg(toneForColor(appleMusicPureSurfaceColor(controlEdges)))
+                val controlColor = pickFg(toneForColor(appleMusicPortraitSurfaceColor(controlEdges)))
                 Box(Modifier.fillMaxWidth().statusBarsPadding().height(48.dp)) {
                     IconButton(
                         onClick = latestCollapse,

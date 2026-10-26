@@ -17,7 +17,11 @@ internal class QqLyricsSource {
         if (track.title.isBlank() || track.artist.isBlank() || track.durationMs <= 0L) return null
 
         val query = "${track.artist} ${track.title}".trim()
-        val candidates = search(query)
+        val knownId = track.musicSource?.takeIf { it.providerId == MusicProviders.QQ }?.numericId
+            ?: track.alternateSources.firstOrNull { it.providerId == MusicProviders.QQ }?.numericId
+        val candidates = (knownId?.let {
+            listOf(QqCandidate(it, track.title, track.artist.split('/', '&', ',', '、'), track.album, track.durationMs))
+        } ?: search(query))
             .mapNotNull { candidate ->
                 OnlineLyricSupport.matchScore(
                     track = track,

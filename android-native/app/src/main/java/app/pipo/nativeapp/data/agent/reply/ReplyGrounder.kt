@@ -1,6 +1,8 @@
 package app.pipo.nativeapp.data.agent.reply
 
 import app.pipo.nativeapp.DiagnosticsLogStore
+import app.pipo.nativeapp.data.NativeTrack
+import app.pipo.nativeapp.data.PetMemory
 import app.pipo.nativeapp.data.PetPersona
 import app.pipo.nativeapp.data.agent.domain.ActionExecutionResult
 import app.pipo.nativeapp.data.agent.domain.MusicTurnPlan
@@ -35,6 +37,9 @@ class ReplyGrounder(
         results: List<ActionExecutionResult>,
         persona: PetPersona,
         successShownByCard: Boolean = false,
+        conversation: PetMemory.ConversationContext = PetMemory.ConversationContext(),
+        currentTrackBeforeAction: NativeTrack? = null,
+        earlierReplies: List<String> = emptyList(),
     ): String {
         if (plan.actions.size == 1 && plan.actions.first() is PlannedAction.Say) {
             return (plan.actions.first() as PlannedAction.Say).text.ifBlank { plan.replyHint }.ifBlank { "嗯。" }.take(420)
@@ -45,6 +50,9 @@ class ReplyGrounder(
         val executionFacts = ReplyFactsBuilder.from(plan, validation, results, persona)
         val facts = executionFacts.copy(
             successShownByCard = successShownByCard && executionFacts.success && executionFacts.warnings.isEmpty(),
+            conversation = conversation,
+            currentTrackBeforeAction = currentTrackBeforeAction,
+            earlierReplies = earlierReplies,
         )
         if (!facts.success && facts.errorMessage.contains(NO_PLAYABLE_SOURCE_MESSAGE)) {
             logPersonaReply(persona, facts, NO_PLAYABLE_SOURCE_MESSAGE, ReplyDraftSource.FALLBACK, verified = true)
